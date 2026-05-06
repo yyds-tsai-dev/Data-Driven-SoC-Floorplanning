@@ -43,6 +43,7 @@ contest_venv/
 # Results and logs (optional - contestants may want to track these)
 *_results.json
 *.log
+LiteTensorDataTest/*
 
 # Other
 presentation/*

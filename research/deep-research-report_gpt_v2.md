@@ -107,7 +107,7 @@ def solve(instance):
 圖建議做成 **heterogeneous factor graph**：block node 帶 `log(area)`、degree、fixed/preplaced flag、boundary type、group/MIB id、target `(w,h)`；pin node 帶座標；group/MIB 則是 constraint node。邊型至少包含 `block↔block`、`block↔pin`、`block↔group`、`block↔mib`。若你想保留高階 net 結構，可把 pin / constraint node 視為 hyperedge proxy，這與 KDD 2022 的 Hypergraph Embedding 思路一致；實作上建議 6 層 edge-aware Graph Transformer 或 GINE + attention，hidden 256、8 heads、全域 token 一個。citeturn16search1turn7view1turn17search7
 
 **Decoder 與表示法選擇。**
-純 CBL 的優點是線性時間重建、對 size 變化友善；B\*-tree 則有一對一 admissible placement 與高效增量評估；但這兩者對「已有 preplaced obstacle 的連續幾何可行域」不如 MER 直接。因此我建議：**訓練時可使用 CBL/B\*-tree 衍生 supervision signal；runtime 則用 MER/skyline 混合表示**。action factorization 為 `a_t = (next_block, aspect_code, candidate_slot, optional_orientation)`；其中 slot 來自 MER 列表、group frontier、boundary frontier。citeturn12search4turn6view3turn6view5
+純 CBL 的優點是線性時間重建、對 size 變化友善；B\*-tree 則有一對一 admissible placement 與高效增量評估；但這兩者對「已有 preplaced obstacle 的連續幾何可行域」不如 MER 直接。因此我建議：**訓練時可使用 CBL/B\*-tree 衍生 supervision signal；runtime 則用 MER/skyline 混合表示**。action factorization 為 `a_t = (next_block, aspect_code, candidate_slot, optional_orientation)`；其中 slot 來自 MER 列表、group frontier、boundary frontier。
 
 **Area-preserving 參數化與 legality。**
 soft block 不直接預測 `(w,h)`，而預測 `r=log(w/h)`，再以 `w=sqrt(A*e^r), h=sqrt(A/e^r)` 保證面積守恆；固定形狀與 preplaced block 則完全覆寫為指定尺寸，preplaced 連位置也直接鎖死。legality mask 分三層：`remaining-mask` 防重複選塊，`shape-mask` 防 fixed/MIB 錯形，`slot-mask` 防 overlap 與 preplaced 衝突。這樣硬限制在 decode 時就已大部分滿足。citeturn10view0turn6view3
