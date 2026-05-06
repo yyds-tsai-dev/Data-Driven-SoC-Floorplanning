@@ -46,4 +46,5 @@ contest_venv/
 LiteTensorDataTest/*
 
 # Other
+test/*
 presentation/*
