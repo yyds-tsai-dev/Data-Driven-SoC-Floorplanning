@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -84,5 +84,6 @@ class Instance:
     target_rects: Dict[int, Rect]
     valid_b2b: torch.Tensor
     valid_p2b: torch.Tensor
+    b2b_by_block: Dict[int, List[Tuple[int, float]]] = field(default_factory=dict)
+    p2b_by_block: Dict[int, List[Tuple[int, float]]] = field(default_factory=dict)
     model_hints: Optional[Dict[int, Rect]] = None
-

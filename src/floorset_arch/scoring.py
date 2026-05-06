@@ -28,12 +28,30 @@ def hpwl_proxy(inst: Instance, rects: dict[int, Rect]) -> float:
     return total
 
 
+def candidate_hpwl_proxy(inst: Instance, candidate_block: int, candidate: Rect, rects: dict[int, Rect]) -> float:
+    total = 0.0
+    cx, cy = _center(candidate)
+    for other_idx, weight in inst.b2b_by_block.get(candidate_block, []):
+        other = rects.get(other_idx)
+        if other is None:
+            continue
+        other_cx, other_cy = _center(other)
+        total += weight * (abs(cx - other_cx) + abs(cy - other_cy))
+    for pin_idx, weight in inst.p2b_by_block.get(candidate_block, []):
+        if pin_idx >= inst.pins_pos.shape[0]:
+            continue
+        px = float(inst.pins_pos[pin_idx, 0])
+        py = float(inst.pins_pos[pin_idx, 1])
+        total += weight * (abs(cx - px) + abs(cy - py))
+    return total
+
+
 def placement_score(inst: Instance, candidate_block: int, candidate: Rect, rects: dict[int, Rect]) -> float:
     trial = dict(rects)
     trial[candidate_block] = candidate
     bounds = bbox(list(trial.values()))
     area_term = bounds.area * 0.02
-    hpwl_term = hpwl_proxy(inst, trial)
+    hpwl_term = candidate_hpwl_proxy(inst, candidate_block, candidate, rects)
 
     soft_bonus = 0.0
     code = inst.boundary.get(candidate_block, 0)
@@ -47,4 +65,3 @@ def placement_score(inst: Instance, candidate_block: int, candidate: Rect, rects
             if other is not None:
                 soft_bonus -= 10.0 * edge_touch_length(candidate, other)
     return hpwl_term + area_term + soft_bonus
-

@@ -53,6 +53,17 @@ def parse_instance(
     pins = pins.reshape(-1, 2)
     valid_b2b = _trim_tensor(b2b_connectivity, 3)
     valid_p2b = _trim_tensor(p2b_connectivity, 3)
+    b2b_by_block: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for i_f, j_f, weight_f in valid_b2b.tolist():
+        i, j, weight = int(i_f), int(j_f), float(weight_f)
+        if 0 <= i < block_count and 0 <= j < block_count:
+            b2b_by_block[i].append((j, weight))
+            b2b_by_block[j].append((i, weight))
+    p2b_by_block: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for pin_f, block_f, weight_f in valid_p2b.tolist():
+        pin_idx, block, weight = int(pin_f), int(block_f), float(weight_f)
+        if 0 <= block < block_count and pin_idx >= 0:
+            p2b_by_block[block].append((pin_idx, weight))
 
     fixed = {i for i in range(block_count) if cons[i, 0].item() != 0}
     preplaced = {i for i in range(block_count) if cons[i, 1].item() != 0}
@@ -104,5 +115,6 @@ def parse_instance(
         target_rects=target_rects,
         valid_b2b=valid_b2b,
         valid_p2b=valid_p2b,
+        b2b_by_block=dict(b2b_by_block),
+        p2b_by_block=dict(p2b_by_block),
     )
-
