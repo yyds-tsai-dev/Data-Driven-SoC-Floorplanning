@@ -8,9 +8,11 @@ from typing import List, Optional, Tuple
 import torch
 
 from floorset_arch.constructive import construct_initial_placement
-from floorset_arch.models import Rect, SolverConfig
+from floorset_arch.geometry import bbox, boundary_satisfied, edge_touch_length
+from floorset_arch.models import Placement, Rect, SolverConfig
 from floorset_arch.parser import parse_instance
 from floorset_arch.repair import repair_placement
+from floorset_arch.scoring import hpwl_proxy
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +34,9 @@ class ArchitectureV1Optimizer(FloorplanOptimizer):
     def __init__(self, verbose: bool = False, config: Optional[SolverConfig] = None):
         super().__init__(verbose=verbose)
         self.config = config or SolverConfig()
+        self._checkpoint_key: Optional[Path] = None
+        self._checkpoint_model = None
+        self._checkpoint_config: dict = {}
 
     def solve(
         self,
@@ -53,33 +58,110 @@ class ArchitectureV1Optimizer(FloorplanOptimizer):
             target_positions,
         )
         inst.model_hints = self._try_model_hints(inst)
-        placement = construct_initial_placement(inst, self.config)
-        repaired = repair_placement(inst, placement, self.config)
-        return repaired.to_position_list(block_count)
+        placements = []
+        for mode in self._order_modes(inst):
+            placement = construct_initial_placement(inst, self.config, order_mode=mode)
+            repaired = repair_placement(inst, placement, self.config)
+            placements.append(repaired)
+
+        best = min(placements, key=lambda placement: self._proxy_cost(inst, placement))
+        return best.to_position_list(block_count)
 
     def _try_model_hints(self, inst) -> Optional[dict[int, Rect]]:
-        checkpoint = os.environ.get(self.config.checkpoint_env)
+        checkpoint = self._resolve_checkpoint_path(os.environ.get(self.config.checkpoint_env))
         if not checkpoint:
             return None
         try:
             from floorset_arch.features import build_model_inputs
             from floorset_arch.nn.model import SimpleGraphFloorplanner
             from floorset_arch.nn.postprocess import predictions_to_rects
-            from floorset_arch.training.checkpoint import load_checkpoint
 
-            payload = load_checkpoint(checkpoint, map_location="cpu")
-            cfg = payload.get("model_config", {})
+            if self._checkpoint_key != checkpoint or self._checkpoint_model is None:
+                from floorset_arch.training import checkpoint as checkpoint_io
+
+                payload = checkpoint_io.load_checkpoint(checkpoint, map_location="cpu")
+                cfg = payload.get("model_config", {})
+                self._checkpoint_config = dict(cfg)
+                inputs = build_model_inputs(inst)
+                model = SimpleGraphFloorplanner(
+                    input_dim=int(cfg.get("input_dim", inputs.block_features.shape[1])),
+                    hidden_dim=int(cfg.get("hidden_dim", 128)),
+                    layers=int(cfg.get("layers", 3)),
+                )
+                model.load_state_dict(payload["model_state"], strict=False)
+                model.eval()
+                self._checkpoint_model = model
+                self._checkpoint_key = checkpoint
+            else:
+                model = self._checkpoint_model
+
             inputs = build_model_inputs(inst)
-            model = SimpleGraphFloorplanner(
-                input_dim=inputs.block_features.shape[1],
-                hidden_dim=int(cfg.get("hidden_dim", 128)),
-                layers=int(cfg.get("layers", 3)),
-            )
-            model.load_state_dict(payload["model_state"])
-            model.eval()
             with torch.no_grad():
                 pred = model(inputs)
                 return predictions_to_rects(inst, pred)
         except Exception:
             return None
 
+    def _resolve_checkpoint_path(self, value: Optional[str]) -> Optional[Path]:
+        if not value:
+            return None
+        raw = Path(value).expanduser()
+        candidates = [raw]
+        if not raw.is_absolute() and self.config.checkpoint_repo_relative:
+            candidates.extend([ROOT / raw, ROOT / "checkpoints" / raw.name])
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return raw.resolve() if raw.is_absolute() else (ROOT / raw).resolve()
+
+    def _order_modes(self, inst) -> list[str]:
+        modes = ["legacy"]
+        if self.config.beam_width > 1:
+            modes.extend(["default", "cluster_first", "boundary_first", "degree_first"])
+        if inst.model_hints and self.config.beam_width > 2:
+            modes.append("model_first")
+        return modes[: max(1, self.config.beam_width)]
+
+    def _proxy_cost(self, inst, placement: Placement) -> float:
+        rects = placement.rects
+        bounds = bbox(list(rects.values()))
+        hpwl = hpwl_proxy(inst, rects)
+        total_area = float(torch.clamp(inst.area_targets[: inst.block_count], min=1.0).sum().item())
+        edge_weight = sum(float(w) for *_ij, w in inst.valid_b2b.tolist()) + sum(
+            float(w) for *_ij, w in inst.valid_p2b.tolist()
+        )
+        hpwl_scale = max(1.0, edge_weight * max(1.0, total_area**0.5))
+        area_score = bounds.area / max(total_area, 1.0)
+        hpwl_score = hpwl / hpwl_scale
+        boundary_violations = 0
+        for block, code in inst.boundary.items():
+            rect = rects.get(block)
+            if rect is None or not boundary_satisfied(rect, bounds, code):
+                boundary_violations += 1
+        group_violations = 0
+        for members in inst.cluster_groups.values():
+            present = [block for block in members if block in rects]
+            if len(present) <= 1:
+                continue
+            seen = {present[0]}
+            stack = [present[0]]
+            while stack:
+                cur = stack.pop()
+                for other in present:
+                    if other not in seen and edge_touch_length(rects[cur], rects[other]) > 0:
+                        seen.add(other)
+                        stack.append(other)
+            group_violations += len(present) - len(seen)
+        mib_violations = 0
+        for members in inst.mib_groups.values():
+            shapes = {
+                (round(rects[block].width, 4), round(rects[block].height, 4))
+                for block in members
+                if block in rects
+            }
+            mib_violations += max(0, len(shapes) - 1)
+        n_soft = max(1, len(inst.boundary))
+        n_soft += sum(max(0, len(members) - 1) for members in inst.cluster_groups.values())
+        n_soft += sum(max(0, len(members) - 1) for members in inst.mib_groups.values())
+        v_rel = (boundary_violations + group_violations + mib_violations) / n_soft
+        return (1.0 + 0.5 * (hpwl_score + area_score)) * (2.718281828 ** (2.0 * v_rel))

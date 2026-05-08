@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 from floorset_arch.constructive import block_dimensions
-from floorset_arch.geometry import bbox, candidate_frontier_points, first_non_overlapping, overlaps
+from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
 
 
@@ -89,22 +89,148 @@ def _repair_boundary(inst: Instance, placement: Placement) -> None:
         if block in inst.preplaced or block not in placement.rects:
             continue
         rect = placement.rects[block]
-        candidates = []
-        x, y = rect.x, rect.y
-        if code & 1:
-            x = bounds.x
-        if code & 2:
-            x = bounds.right - rect.width
-        if code & 8:
-            y = bounds.y
-        if code & 4:
-            y = bounds.top - rect.height
-        candidates.append(Rect(max(0.0, x), max(0.0, y), rect.width, rect.height))
         others = [r for i, r in placement.rects.items() if i != block]
+        xs = {rect.x, bounds.x, max(bounds.x, bounds.right - rect.width)}
+        ys = {rect.y, bounds.y, max(bounds.y, bounds.top - rect.height)}
+        for other in others:
+            xs.update({other.x, other.right, other.right - rect.width})
+            ys.update({other.y, other.top, other.top - rect.height})
+        if code & 1:
+            xs = {bounds.x}
+        elif code & 2:
+            xs = {max(bounds.x, bounds.right - rect.width)}
+        if code & 8:
+            ys = {bounds.y}
+        elif code & 4:
+            ys = {max(bounds.y, bounds.top - rect.height)}
+
+        candidates = []
+        for x in sorted(xs, key=lambda value: abs(value - rect.x)):
+            for y in sorted(ys, key=lambda value: abs(value - rect.y)):
+                candidate = Rect(max(0.0, x), max(0.0, y), rect.width, rect.height)
+                trial_bounds = bbox([*others, candidate])
+                if boundary_satisfied_local(candidate, trial_bounds, code):
+                    candidates.append(candidate)
+        best: Rect | None = None
+        best_score = float("inf")
         for candidate in candidates:
-            if first_non_overlapping(candidate, others):
-                placement.rects[block] = candidate
+            if not first_non_overlapping(candidate, others):
+                continue
+            trial_bounds = bbox([*others, candidate])
+            move = abs(candidate.x - rect.x) + abs(candidate.y - rect.y)
+            score = trial_bounds.area + 0.05 * move
+            if score < best_score:
+                best = candidate
+                best_score = score
+        if best is not None:
+            placement.rects[block] = best
+
+
+def boundary_satisfied_local(rect: Rect, bounds: Rect, code: int) -> bool:
+    return (
+        (not (code & 1) or abs(rect.x - bounds.x) <= 1e-6)
+        and (not (code & 2) or abs(rect.right - bounds.right) <= 1e-6)
+        and (not (code & 4) or abs(rect.top - bounds.top) <= 1e-6)
+        and (not (code & 8) or abs(rect.y - bounds.y) <= 1e-6)
+    )
+
+
+def _cluster_components(inst: Instance, placement: Placement, members: list[int]) -> list[list[int]]:
+    present = [block for block in members if block in placement.rects]
+    components: list[list[int]] = []
+    seen: set[int] = set()
+    for start in present:
+        if start in seen:
+            continue
+        comp = [start]
+        seen.add(start)
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            cur_rect = placement.rects[cur]
+            for other in present:
+                if other in seen:
+                    continue
+                if edge_touch_length(cur_rect, placement.rects[other]) > 0.0:
+                    seen.add(other)
+                    stack.append(other)
+                    comp.append(other)
+        components.append(comp)
+    return components
+
+
+def _adjacent_positions(anchor: Rect, width: float, height: float) -> list[tuple[float, float]]:
+    return [
+        (anchor.right, anchor.y),
+        (anchor.x - width, anchor.y),
+        (anchor.x, anchor.top),
+        (anchor.x, anchor.y - height),
+        (anchor.right, anchor.top - height),
+        (anchor.right - width, anchor.top),
+    ]
+
+
+def _connect_clusters(inst: Instance, placement: Placement, config: SolverConfig) -> None:
+    for members in inst.cluster_groups.values():
+        for _ in range(max(1, min(3, config.max_repair_passes))):
+            components = _cluster_components(inst, placement, members)
+            if len(components) <= 1:
                 break
+            anchor_component = max(components, key=len)
+            moved = False
+            anchors = [placement.rects[block] for block in anchor_component]
+            for comp in components:
+                if comp is anchor_component:
+                    continue
+                for block in sorted(comp, key=lambda idx: idx in inst.preplaced):
+                    if block in inst.preplaced:
+                        continue
+                    rect = placement.rects[block]
+                    others = [r for i, r in placement.rects.items() if i != block]
+                    candidates = []
+                    for anchor in anchors:
+                        candidates.extend(_adjacent_positions(anchor, rect.width, rect.height))
+                    best: Rect | None = None
+                    best_score = float("inf")
+                    for x, y in candidates:
+                        candidate = Rect(max(0.0, x), max(0.0, y), rect.width, rect.height)
+                        if not first_non_overlapping(candidate, others):
+                            continue
+                        touch = max(edge_touch_length(candidate, anchor) for anchor in anchors)
+                        bounds = bbox([*others, candidate])
+                        score = bounds.area - 1000.0 * touch
+                        if score < best_score:
+                            best = candidate
+                            best_score = score
+                    if best is not None:
+                        placement.rects[block] = best
+                        moved = True
+                        break
+                if moved:
+                    break
+            if not moved:
+                break
+
+
+def _compact_left_down(inst: Instance, placement: Placement) -> None:
+    for axis in ("x", "y"):
+        movable = sorted(
+            [block for block in placement.rects if block not in inst.preplaced],
+            key=lambda block: getattr(placement.rects[block], axis),
+        )
+        for block in movable:
+            rect = placement.rects[block]
+            others = [r for i, r in placement.rects.items() if i != block]
+            values = {0.0}
+            for other in others:
+                values.add(other.right if axis == "x" else other.top)
+            best = rect
+            for value in sorted(v for v in values if v <= getattr(rect, axis) + 1e-6):
+                candidate = Rect(value, rect.y, rect.width, rect.height) if axis == "x" else Rect(rect.x, value, rect.width, rect.height)
+                if first_non_overlapping(candidate, others):
+                    best = candidate
+                    break
+            placement.rects[block] = best
 
 
 def repair_placement(inst: Instance, placement: Placement, config: SolverConfig | None = None) -> Placement:
@@ -113,9 +239,13 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
     _snap_hard(inst, repaired)
     _unify_compatible_mib(inst, repaired)
     _resolve_overlaps(inst, repaired, config)
+    _connect_clusters(inst, repaired, config)
+    _compact_left_down(inst, repaired)
     _repair_boundary(inst, repaired)
     _snap_hard(inst, repaired)
     _resolve_overlaps(inst, repaired, config)
+    _connect_clusters(inst, repaired, config)
+    _repair_boundary(inst, repaired)
 
     for block in range(inst.block_count):
         if block not in repaired.rects:
@@ -124,4 +254,3 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
             _move_to_first_slot(inst, repaired, block)
 
     return repaired
-

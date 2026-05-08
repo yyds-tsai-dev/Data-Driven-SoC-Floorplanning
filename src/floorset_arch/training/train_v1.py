@@ -89,6 +89,10 @@ def main() -> int:
     parser.add_argument("--out", default="checkpoints/v1.pt")
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
+    parser.add_argument("--boundary-weight", type=float, default=2.0)
+    parser.add_argument("--group-weight", type=float, default=1.0)
+    parser.add_argument("--mib-weight", type=float, default=1.0)
+    parser.add_argument("--area-weight", type=float, default=0.02)
     parser.add_argument(
         "--use-validation-smoke",
         action="store_true",
@@ -104,7 +108,13 @@ def main() -> int:
     device = torch.device(args.device)
     model = None
     optimizer = None
-    model_config = {"hidden_dim": args.hidden_dim, "layers": args.layers}
+    loss_weights = {
+        "boundary": args.boundary_weight,
+        "group": args.group_weight,
+        "mib": args.mib_weight,
+        "area": args.area_weight,
+    }
+    model_config = {"hidden_dim": args.hidden_dim, "layers": args.layers, "model_version": 2}
     for epoch in range(args.epochs):
         running = 0.0
         count = 0
@@ -117,6 +127,7 @@ def main() -> int:
                     hidden_dim=args.hidden_dim,
                     layers=args.layers,
                 ).to(device)
+                model_config["input_dim"] = inputs.block_features.shape[1]
                 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
             inputs.block_features = inputs.block_features.to(device)
             inputs.edge_index = inputs.edge_index.to(device)
@@ -127,7 +138,7 @@ def main() -> int:
             pred = model(inputs)
             positions = predictions_to_positions(inst, pred)
             target = target.to(device)
-            loss = compute_v1_loss(positions, target, inst, metrics.to(device))
+            loss = compute_v1_loss(positions, target, inst, metrics.to(device), weights=loss_weights)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -138,7 +149,12 @@ def main() -> int:
 
     if model is None:
         raise RuntimeError("no training samples were loaded")
-    save_checkpoint(args.out, model, model_config, {"num_samples": args.num_samples, "epochs": args.epochs})
+    save_checkpoint(
+        args.out,
+        model,
+        model_config,
+        {"num_samples": args.num_samples, "epochs": args.epochs, "loss_weights": loss_weights},
+    )
     print(f"saved checkpoint to {args.out}")
     return 0
 

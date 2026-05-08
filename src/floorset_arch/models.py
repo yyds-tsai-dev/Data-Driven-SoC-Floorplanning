@@ -57,15 +57,27 @@ class Placement:
 @dataclass
 class SolverConfig:
     max_repair_passes: int = 8
-    max_candidates_per_block: int = 256
+    max_candidates_per_block: int = 160
     coordinate_eps: float = 1e-6
     checkpoint_env: str = "FLOORSET_V1_CHECKPOINT"
+    beam_width: int = 1
+    shape_variant_count: int = 3
+    local_search_moves: int = 64
+    quality_mode: str = "score_first"
+    hpwl_weight: float = 1.0
+    bbox_weight: float = 0.015
+    boundary_penalty: float = 350.0
+    group_penalty: float = 240.0
+    mib_penalty: float = 300.0
+    checkpoint_repo_relative: bool = True
 
 
 @dataclass
 class ModelPrediction:
     centers: torch.Tensor
     log_aspect: torch.Tensor
+    priority: Optional[torch.Tensor] = None
+    order_logits: Optional[torch.Tensor] = None
 
 
 @dataclass

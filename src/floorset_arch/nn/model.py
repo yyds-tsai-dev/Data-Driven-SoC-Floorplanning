@@ -38,6 +38,11 @@ class SimpleGraphFloorplanner(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 3),
         )
+        self.priority_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def forward(self, inputs: ModelInputs) -> ModelPrediction:
         h = self.input(inputs.block_features)
@@ -46,5 +51,5 @@ class SimpleGraphFloorplanner(nn.Module):
         raw = self.head(h)
         centers = torch.sigmoid(raw[:, :2])
         log_aspect = torch.clamp(raw[:, 2], min=-3.0, max=3.0)
-        return ModelPrediction(centers=centers, log_aspect=log_aspect)
-
+        priority = self.priority_head(h).squeeze(-1)
+        return ModelPrediction(centers=centers, log_aspect=log_aspect, priority=priority, order_logits=priority)

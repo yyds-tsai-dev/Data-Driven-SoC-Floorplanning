@@ -47,5 +47,6 @@ LiteTensorDataTest/*
 smoke.*
 
 # Other
-test/*
-presentation/*
+test/
+presentation/
+graphify-out/
