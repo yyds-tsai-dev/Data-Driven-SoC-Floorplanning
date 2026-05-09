@@ -8,7 +8,7 @@ from pathlib import Path
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--optimizer", default="src/architecture_v1_optimizer.py")
+    parser.add_argument("--optimizer", default="src/architecture_v2_optimizer.py")
     parser.add_argument("--test-id", type=int)
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -31,4 +31,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

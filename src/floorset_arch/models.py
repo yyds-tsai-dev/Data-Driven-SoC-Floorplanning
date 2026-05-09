@@ -57,11 +57,14 @@ class Placement:
 @dataclass
 class SolverConfig:
     max_repair_passes: int = 8
-    max_candidates_per_block: int = 160
+    max_candidates_per_block: int = 20
+    max_start_candidates: int = 2
+    max_push_iters: int = 32
     coordinate_eps: float = 1e-6
-    checkpoint_env: str = "FLOORSET_V1_CHECKPOINT"
+    checkpoint_env: str = "FLOORSET_GNN_CHECKPOINT"
+    default_checkpoint: str = "checkpoints/gnn_best.pt"
     beam_width: int = 1
-    shape_variant_count: int = 3
+    shape_variant_count: int = 2
     local_search_moves: int = 64
     quality_mode: str = "score_first"
     hpwl_weight: float = 1.0
@@ -69,15 +72,25 @@ class SolverConfig:
     boundary_penalty: float = 350.0
     group_penalty: float = 240.0
     mib_penalty: float = 300.0
+    anchor_weight: float = 0.35
+    raw_weight: float = 0.30
+    boundary_order_bias: float = 0.72
+    anchor_translation_strength: float = 0.58
+    guarded_repair_slack: float = 0.025
+    soft_proxy_slack: float = 0.42
+    equal_soft_proxy_slack: float = 0.015
+    max_boundary_component_snaps: int = 30
+    max_cluster_component_moves: int = 26
+    max_pair_candidates_per_component: int = 40
     checkpoint_repo_relative: bool = True
 
 
 @dataclass
-class ModelPrediction:
-    centers: torch.Tensor
-    log_aspect: torch.Tensor
-    priority: Optional[torch.Tensor] = None
-    order_logits: Optional[torch.Tensor] = None
+class AnchorGuidance:
+    rect_priors: Dict[int, Rect] = field(default_factory=dict)
+    priority: Dict[int, float] = field(default_factory=dict)
+    log_aspect: Dict[int, float] = field(default_factory=dict)
+    scale: float = 1.0
 
 
 @dataclass
@@ -98,4 +111,4 @@ class Instance:
     valid_p2b: torch.Tensor
     b2b_by_block: Dict[int, List[Tuple[int, float]]] = field(default_factory=dict)
     p2b_by_block: Dict[int, List[Tuple[int, float]]] = field(default_factory=dict)
-    model_hints: Optional[Dict[int, Rect]] = None
+    anchor_guidance: Optional[AnchorGuidance] = None

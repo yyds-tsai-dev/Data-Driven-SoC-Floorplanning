@@ -1,2 +1,1 @@
-"""Training utilities for architecture v1.0."""
-
+"""Checkpoint and loss utilities for the Anchor-GNN floorplanner."""

@@ -1,91 +1,139 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
 from floorset_arch.models import Instance
 
 
-@dataclass
-class ModelInputs:
-    block_features: torch.Tensor
-    edge_index: torch.Tensor
-    edge_weight: torch.Tensor
-    pin_features: torch.Tensor
+def _safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
 
-def build_model_inputs(inst: Instance) -> ModelInputs:
+def build_anchor_node_features(inst: Instance, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
+    """Feature builder compatible with arch_new Anchor-GNN checkpoints."""
     n = inst.block_count
-    device = inst.area_targets.device
-    dtype = inst.area_targets.dtype
-    areas = torch.clamp(inst.area_targets[:n].to(dtype=dtype), min=1.0)
-    log_area = torch.log(areas).unsqueeze(1)
-    log_area = log_area / torch.clamp(log_area.abs().max(), min=1.0)
+    device = device or inst.area_targets.device
+    area = torch.clamp(inst.area_targets[:n].float().to(device), min=1.0)
+    sqrt_area = torch.sqrt(area)
+    total_area = torch.clamp(area.sum(), min=1.0)
+    scale = float(torch.sqrt(total_area).item())
 
-    fixed = torch.zeros(n, 1, dtype=dtype, device=device)
-    preplaced = torch.zeros(n, 1, dtype=dtype, device=device)
-    mib = torch.zeros(n, 1, dtype=dtype, device=device)
-    cluster = torch.zeros(n, 1, dtype=dtype, device=device)
-    boundary_bits = torch.zeros(n, 4, dtype=dtype, device=device)
-    for i in range(n):
-        fixed[i, 0] = 1.0 if i in inst.fixed else 0.0
-        preplaced[i, 0] = 1.0 if i in inst.preplaced else 0.0
-        mib[i, 0] = float(inst.constraints[i, 2].item()) / 32.0
-        cluster[i, 0] = float(inst.constraints[i, 3].item()) / 32.0
-        code = inst.boundary.get(i, 0)
-        boundary_bits[i] = torch.tensor(
-            [1.0 if code & bit else 0.0 for bit in (1, 2, 4, 8)],
-            dtype=dtype,
-            device=device,
-        )
+    degree = torch.zeros(n, device=device)
+    pin_degree = torch.zeros(n, device=device)
+    pin_cx = torch.zeros(n, device=device)
+    pin_cy = torch.zeros(n, device=device)
+    pin_wsum = torch.zeros(n, device=device)
 
-    degree = torch.zeros(n, 1, dtype=dtype, device=device)
-    pin_agg = torch.zeros(n, 3, dtype=dtype, device=device)
-    edge_pairs = []
-    edge_weights = []
     for i_f, j_f, weight_f in inst.valid_b2b.tolist():
-        i, j = int(i_f), int(j_f)
-        if i >= n or j >= n:
-            continue
-        weight = float(weight_f)
-        degree[i, 0] += weight
-        degree[j, 0] += weight
-        edge_pairs.extend([(i, j), (j, i)])
-        edge_weights.extend([weight, weight])
+        i = int(i_f)
+        j = int(j_f)
+        weight = _safe_float(weight_f)
+        if 0 <= i < n and 0 <= j < n:
+            degree[i] += weight
+            degree[j] += weight
 
     for pin_f, block_f, weight_f in inst.valid_p2b.tolist():
-        pin_idx, block = int(pin_f), int(block_f)
-        if block >= n or pin_idx >= inst.pins_pos.shape[0]:
-            continue
-        weight = float(weight_f)
-        px = float(inst.pins_pos[pin_idx, 0])
-        py = float(inst.pins_pos[pin_idx, 1])
-        pin_agg[block, 0] += weight * px
-        pin_agg[block, 1] += weight * py
-        pin_agg[block, 2] += weight
-    pin_norm = torch.clamp(pin_agg[:, 2:3], min=1.0)
-    pin_agg[:, :2] = pin_agg[:, :2] / pin_norm
-    coord_scale = torch.clamp(pin_agg[:, :2].abs().max(), min=1.0)
-    pin_agg[:, :2] = pin_agg[:, :2] / coord_scale
-    degree = degree / torch.clamp(degree.max(), min=1.0)
+        pin_idx = int(pin_f)
+        block_idx = int(block_f)
+        weight = _safe_float(weight_f)
+        if 0 <= block_idx < n and 0 <= pin_idx < inst.pins_pos.shape[0]:
+            px = _safe_float(inst.pins_pos[pin_idx, 0])
+            py = _safe_float(inst.pins_pos[pin_idx, 1])
+            if px != -1.0 and py != -1.0:
+                pin_degree[block_idx] += weight
+                pin_cx[block_idx] += weight * px
+                pin_cy[block_idx] += weight * py
+                pin_wsum[block_idx] += weight
 
-    if edge_pairs:
-        edge_index = torch.tensor(edge_pairs, dtype=torch.long, device=device).t().contiguous()
-        edge_weight = torch.tensor(edge_weights, dtype=dtype, device=device)
-        edge_weight = edge_weight / torch.clamp(edge_weight.max(), min=1.0)
-    else:
-        edge_index = torch.empty(2, 0, dtype=torch.long, device=device)
-        edge_weight = torch.empty(0, dtype=dtype, device=device)
+    has_pin = pin_wsum > 0.0
+    pin_cx = torch.where(has_pin, pin_cx / pin_wsum.clamp_min(1e-6), torch.zeros_like(pin_cx))
+    pin_cy = torch.where(has_pin, pin_cy / pin_wsum.clamp_min(1e-6), torch.zeros_like(pin_cy))
+    max_degree = torch.clamp(degree.max(), min=1.0)
+    max_pin_degree = torch.clamp(pin_degree.max(), min=1.0)
 
-    block_features = torch.cat(
-        [log_area, fixed, preplaced, mib, cluster, boundary_bits, degree, pin_agg],
+    fixed = torch.zeros(n, device=device)
+    preplaced = torch.zeros(n, device=device)
+    mib_flag = torch.zeros(n, device=device)
+    cluster_flag = torch.zeros(n, device=device)
+    left_b = torch.zeros(n, device=device)
+    right_b = torch.zeros(n, device=device)
+    top_b = torch.zeros(n, device=device)
+    bottom_b = torch.zeros(n, device=device)
+    mib_norm = torch.zeros(n, device=device)
+    cluster_norm = torch.zeros(n, device=device)
+
+    if inst.constraints is not None and inst.constraints.dim() > 1:
+        c = inst.constraints[:n].to(device)
+        if c.shape[1] > 0:
+            fixed = (c[:, 0] != 0).float()
+        if c.shape[1] > 1:
+            preplaced = (c[:, 1] != 0).float()
+        if c.shape[1] > 2:
+            mib_id = c[:, 2].float()
+            mib_flag = (mib_id != 0).float()
+            mib_norm = mib_id / torch.clamp(mib_id.abs().max(), min=1.0)
+        if c.shape[1] > 3:
+            cluster_id = c[:, 3].float()
+            cluster_flag = (cluster_id != 0).float()
+            cluster_norm = cluster_id / torch.clamp(cluster_id.abs().max(), min=1.0)
+        if c.shape[1] > 4:
+            bc = c[:, 4].long()
+            left_b = ((bc & 1) != 0).float()
+            right_b = ((bc & 2) != 0).float()
+            top_b = ((bc & 4) != 0).float()
+            bottom_b = ((bc & 8) != 0).float()
+
+    feat = torch.stack(
+        [
+            sqrt_area / max(scale, 1.0),
+            torch.log1p(area) / 10.0,
+            degree / max_degree,
+            torch.log1p(degree) / 10.0,
+            pin_degree / max_pin_degree,
+            has_pin.float(),
+            pin_cx / max(scale, 1.0),
+            pin_cy / max(scale, 1.0),
+            fixed,
+            preplaced,
+            mib_flag,
+            cluster_flag,
+            left_b,
+            right_b,
+            top_b,
+            bottom_b,
+            mib_norm,
+            cluster_norm,
+        ],
         dim=1,
     )
-    return ModelInputs(
-        block_features=block_features,
-        edge_index=edge_index,
-        edge_weight=edge_weight,
-        pin_features=pin_agg,
-    )
+    return feat.float(), scale
 
+
+def build_anchor_edge_tensors(inst: Instance, device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Edge tensors compatible with arch_new Anchor-GNN checkpoints."""
+    n = inst.block_count
+    device = device or inst.area_targets.device
+    src: list[int] = []
+    dst: list[int] = []
+    weights: list[float] = []
+    for i_f, j_f, weight_f in inst.valid_b2b.tolist():
+        i = int(i_f)
+        j = int(j_f)
+        weight = max(_safe_float(weight_f), 0.0)
+        if 0 <= i < n and 0 <= j < n and i != j:
+            ww = torch.log1p(torch.tensor(weight)).item()
+            src.extend([i, j])
+            dst.extend([j, i])
+            weights.extend([ww, ww])
+    if not src:
+        return (
+            torch.empty((2, 0), dtype=torch.long, device=device),
+            torch.empty((0, 1), dtype=torch.float32, device=device),
+        )
+    edge_index = torch.tensor([src, dst], dtype=torch.long, device=device)
+    edge_attr = torch.tensor(weights, dtype=torch.float32, device=device).view(-1, 1)
+    edge_attr = edge_attr / edge_attr.max().clamp_min(1.0)
+    return edge_index, edge_attr

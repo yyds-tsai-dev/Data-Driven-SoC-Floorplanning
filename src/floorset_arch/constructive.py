@@ -4,25 +4,15 @@ from dataclasses import dataclass, field
 import math
 
 from floorset_arch.geometry import (
-    bbox,
     boundary_satisfied,
     candidate_frontier_points,
     edge_touch_length,
     first_non_overlapping,
     overlaps,
 )
+from floorset_arch.hetero_graph import HeteroFloorplanGraph
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
-from floorset_arch.scoring import candidate_hpwl_proxy, placement_score
-
-
-def block_dimensions(inst: Instance, block: int) -> tuple[float, float]:
-    target = inst.target_rects.get(block)
-    if target is not None and (block in inst.fixed or block in inst.preplaced):
-        return target.width, target.height
-    area = float(inst.area_targets[block])
-    if area <= 0:
-        area = 1.0
-    return math.sqrt(area), math.sqrt(area)
+from floorset_arch.scoring import candidate_hpwl_proxy
 
 
 @dataclass
@@ -42,9 +32,6 @@ class PlacementState:
             state.add(block, rect)
         return state
 
-    def copy(self) -> "PlacementState":
-        return PlacementState.from_rects(dict(self.rects))
-
     def add(self, block: int, rect: Rect) -> None:
         self.rects[block] = rect
         self.placed.append(rect)
@@ -56,6 +43,9 @@ class PlacementState:
             self.x_max = max(self.x_max, rect.right)
             self.y_max = max(self.y_max, rect.top)
         self._frontier_cache = None
+
+    def copy(self) -> "PlacementState":
+        return PlacementState.from_rects(dict(self.rects))
 
     def frontier(self) -> list[tuple[float, float]]:
         if self._frontier_cache is None:
@@ -79,54 +69,37 @@ class PlacementState:
         return max(0.0, self.x_max - self.x_min) * max(0.0, self.y_max - self.y_min)
 
 
+@dataclass(frozen=True)
+class Slot:
+    rect: Rect
+    kind: str
+
+
+@dataclass
+class BeamState:
+    state: PlacementState
+    remaining: frozenset[int]
+    score: float = 0.0
+    order: tuple[int, ...] = ()
+
+
+def block_dimensions(inst: Instance, block: int) -> tuple[float, float]:
+    target = inst.target_rects.get(block)
+    if target is not None and (block in inst.fixed or block in inst.preplaced):
+        return target.width, target.height
+    area = max(1.0, float(inst.area_targets[block]))
+    return math.sqrt(area), math.sqrt(area)
+
+
 def _degree(inst: Instance, block: int) -> float:
     return sum(weight for _, weight in inst.b2b_by_block.get(block, [])) + sum(
         weight for _, weight in inst.p2b_by_block.get(block, [])
     )
 
 
-def _priority(inst: Instance, block: int, order_mode: str) -> tuple[float, float, float, float]:
-    constraint_score = 0.0
-    if block in inst.boundary:
-        constraint_score += 4.0
-    if any(block in members for members in inst.cluster_groups.values()):
-        constraint_score += 2.0
-    if any(block in members for members in inst.mib_groups.values()):
-        constraint_score += 1.0
-    degree = _degree(inst, block)
-    area = float(inst.area_targets[block])
-    if order_mode == "cluster_first":
-        cluster = 1.0 if any(block in members for members in inst.cluster_groups.values()) else 0.0
-        return (-cluster, -constraint_score, -degree, -area)
-    if order_mode == "boundary_first":
-        return (0.0 if block in inst.boundary else 1.0, -constraint_score, -degree, -area)
-    if order_mode == "degree_first":
-        return (-degree, -constraint_score, -area, float(block))
-    if order_mode == "model_first" and inst.model_hints and block in inst.model_hints:
-        hint = inst.model_hints[block]
-        return (hint.x + hint.y, -constraint_score, -degree, -area)
-    return (-constraint_score, -degree, -area, float(block))
-
-
-def _fallback_point(state: PlacementState) -> tuple[float, float]:
-    if not state.placed:
-        return 0.0, 0.0
-    return state.x_max, state.y_min
-
-
-def _boundary_points(code: int, width: float, height: float, state: PlacementState) -> list[tuple[float, float]]:
-    if not state.placed or code == 0:
-        return []
-    points = []
-    if code & 1:
-        points.extend([(state.x_min, state.y_min), (state.x_min, state.y_max)])
-    if code & 2:
-        points.extend([(state.x_max, state.y_min), (state.x_max, state.y_max)])
-    if code & 4:
-        points.extend([(state.x_min, state.y_max), (max(state.x_min, state.x_max - width), state.y_max)])
-    if code & 8:
-        points.extend([(state.x_min, state.y_min), (max(state.x_min, state.x_max - width), state.y_min)])
-    return points
+def _total_area_scale(inst: Instance) -> float:
+    total = sum(max(1.0, float(inst.area_targets[i])) for i in range(inst.block_count))
+    return math.sqrt(max(total, 1.0))
 
 
 def _pin_anchor_points(inst: Instance, block: int, width: float, height: float) -> list[tuple[float, float]]:
@@ -144,26 +117,25 @@ def _pin_anchor_points(inst: Instance, block: int, width: float, height: float) 
     return [(weighted_x / total - width / 2.0, weighted_y / total - height / 2.0)]
 
 
-def _group_points(inst: Instance, block: int, width: float, height: float, state: PlacementState) -> list[tuple[float, float]]:
-    points: list[tuple[float, float]] = []
-    for members in inst.cluster_groups.values():
-        if block not in members:
-            continue
-        for other_idx in members:
-            other = state.rects.get(other_idx)
-            if other is None:
-                continue
-            points.extend(
-                [
-                    (other.right, other.y),
-                    (other.x - width, other.y),
-                    (other.x, other.top),
-                    (other.x, other.y - height),
-                    (other.right, other.top - height),
-                    (other.right - width, other.top),
-                ]
-            )
-    return points
+def _anchor_rect(inst: Instance, block: int) -> Rect | None:
+    if inst.anchor_guidance is None:
+        return None
+    return inst.anchor_guidance.rect_priors.get(block)
+
+
+def _anchor_center(inst: Instance, block: int, width: float, height: float) -> tuple[float, float]:
+    target = inst.target_rects.get(block)
+    if target is not None and block in inst.preplaced:
+        return target.center_x, target.center_y
+    prior = _anchor_rect(inst, block)
+    if prior is not None:
+        return prior.center_x, prior.center_y
+    pin_points = _pin_anchor_points(inst, block, width, height)
+    if pin_points:
+        x, y = pin_points[0]
+        return x + width / 2.0, y + height / 2.0
+    scale = _total_area_scale(inst)
+    return scale * 0.5, scale * 0.5
 
 
 def _mib_reference_shape(inst: Instance, block: int, state: PlacementState) -> tuple[float, float] | None:
@@ -187,10 +159,16 @@ def _shape_variants(inst: Instance, block: int, config: SolverConfig, state: Pla
     mib_shape = _mib_reference_shape(inst, block, state)
     if mib_shape is not None and abs(mib_shape[0] * mib_shape[1] - area) / area <= 0.01:
         variants.append(mib_shape)
-    if inst.model_hints and block in inst.model_hints:
-        hint = inst.model_hints[block]
-        aspect = max(0.05, min(20.0, hint.width / max(hint.height, 1e-6)))
+
+    if inst.anchor_guidance is not None and block in inst.anchor_guidance.log_aspect:
+        aspect = math.exp(max(-2.5, min(2.5, inst.anchor_guidance.log_aspect[block])))
         variants.append((math.sqrt(area * aspect), math.sqrt(area / aspect)))
+
+    prior = _anchor_rect(inst, block)
+    if prior is not None and prior.height > 0:
+        aspect = max(0.05, min(20.0, prior.width / prior.height))
+        variants.append((math.sqrt(area * aspect), math.sqrt(area / aspect)))
+
     for aspect in (1.0, 2.0, 0.5, 3.0, 1.0 / 3.0, 4.0, 0.25):
         variants.append((math.sqrt(area * aspect), math.sqrt(area / aspect)))
 
@@ -207,18 +185,93 @@ def _shape_variants(inst: Instance, block: int, config: SolverConfig, state: Pla
     return deduped
 
 
-def _candidate_points(inst: Instance, block: int, width: float, height: float, state: PlacementState) -> list[tuple[float, float]]:
-    points: list[tuple[float, float]] = []
-    if inst.model_hints and block in inst.model_hints:
-        hint = inst.model_hints[block]
-        points.extend([(hint.x, hint.y), (hint.center_x - width / 2.0, hint.center_y - height / 2.0)])
-    points.extend(_pin_anchor_points(inst, block, width, height))
-    points.extend(_group_points(inst, block, width, height, state))
-    points.extend(_boundary_points(inst.boundary.get(block, 0), width, height, state))
-    points.extend(state.frontier())
-    if not points:
-        points.append((0.0, 0.0))
+def _boundary_points(code: int, width: float, height: float, state: PlacementState) -> list[tuple[float, float]]:
+    if not state.placed or code == 0:
+        return []
+    points = []
+    if code & 1:
+        points.extend([(state.x_min, state.y_min), (state.x_min, state.y_max)])
+    if code & 2:
+        points.extend([(state.x_max, state.y_min), (state.x_max, state.y_max)])
+    if code & 4:
+        points.extend([(state.x_min, state.y_max), (max(state.x_min, state.x_max - width), state.y_max)])
+    if code & 8:
+        points.extend([(state.x_min, state.y_min), (max(state.x_min, state.x_max - width), state.y_min)])
     return points
+
+
+def _abut_positions(anchor: Rect, width: float, height: float) -> list[tuple[float, float]]:
+    return [
+        (anchor.right, anchor.y),
+        (anchor.x - width, anchor.y),
+        (anchor.x, anchor.top),
+        (anchor.x, anchor.y - height),
+        (anchor.right, anchor.top - height),
+        (anchor.right - width, anchor.top),
+    ]
+
+
+def _group_points(inst: Instance, block: int, width: float, height: float, state: PlacementState) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for members in inst.cluster_groups.values():
+        if block not in members:
+            continue
+        for other_idx in members:
+            other = state.rects.get(other_idx)
+            if other is not None:
+                points.extend(_abut_positions(other, width, height))
+    return points
+
+
+def _mer_skyline_points(width: float, height: float, state: PlacementState, limit: int) -> list[tuple[float, float]]:
+    if not state.placed:
+        return [(0.0, 0.0)]
+    xs = {0.0, state.x_min, state.x_max}
+    ys = {0.0, state.y_min, state.y_max}
+    points: set[tuple[float, float]] = set(state.frontier())
+    for rect in state.placed:
+        xs.update({rect.x, rect.right, max(0.0, rect.x - width), max(0.0, rect.right - width)})
+        ys.update({rect.y, rect.top, max(0.0, rect.y - height), max(0.0, rect.top - height)})
+        points.update(
+            {
+                (rect.right, rect.y),
+                (rect.x, rect.top),
+                (rect.right, rect.top),
+                (max(0.0, rect.x - width), rect.y),
+                (rect.x, max(0.0, rect.y - height)),
+            }
+        )
+
+    for x in sorted(xs):
+        points.add((x, state.y_max))
+        points.add((x, 0.0))
+    for y in sorted(ys):
+        points.add((state.x_max, y))
+        points.add((0.0, y))
+
+    # A small bounded set of obstacle-edge intersections approximates MER
+    # corners without the quadratic grid explosion on 100+ block instances.
+    xs_sorted = sorted(xs, key=lambda x: (abs(x - state.x_max), x))[: max(8, limit // 4)]
+    ys_sorted = sorted(ys, key=lambda y: (abs(y - state.y_max), y))[: max(8, limit // 4)]
+    for x in xs_sorted:
+        for y in ys_sorted[:4]:
+            points.add((x, y))
+
+    def compact_key(point: tuple[float, float]) -> tuple[float, float, float, float]:
+        x, y = point
+        candidate = Rect(max(0.0, x), max(0.0, y), width, height)
+        bounds = state.bounds_with(candidate)
+        return (bounds.area - state.bbox_area, bounds.width + bounds.height, candidate.x + candidate.y, candidate.x)
+
+    legal: list[tuple[float, float]] = []
+    ordered = sorted(points, key=compact_key)[: max(limit * 6, limit)]
+    for x, y in ordered:
+        candidate = Rect(max(0.0, x), max(0.0, y), width, height)
+        if first_non_overlapping(candidate, state.placed):
+            legal.append((candidate.x, candidate.y))
+        if len(legal) >= limit:
+            break
+    return legal
 
 
 def _placement_score(inst: Instance, config: SolverConfig, block: int, candidate: Rect, state: PlacementState) -> float:
@@ -257,137 +310,186 @@ def _placement_score(inst: Instance, config: SolverConfig, block: int, candidate
     return score
 
 
-def construct_initial_placement(
+def _slot_candidates(
     inst: Instance,
-    config: SolverConfig | None = None,
-    order_mode: str = "default",
-) -> Placement:
-    config = config or SolverConfig()
-    if order_mode == "legacy":
-        return _construct_legacy(inst, config)
-    state = PlacementState()
+    config: SolverConfig,
+    block: int,
+    width: float,
+    height: float,
+    state: PlacementState,
+) -> list[Slot]:
+    points: list[tuple[str, float, float]] = []
+    prior = _anchor_rect(inst, block)
+    if prior is not None:
+        points.append(("anchor", prior.x, prior.y))
+        points.append(("anchor", prior.center_x - width / 2.0, prior.center_y - height / 2.0))
+    for x, y in _pin_anchor_points(inst, block, width, height):
+        points.append(("pin", x, y))
+    for x, y in _group_points(inst, block, width, height, state):
+        points.append(("group", x, y))
+    for x, y in _boundary_points(inst.boundary.get(block, 0), width, height, state):
+        points.append(("boundary", x, y))
+    remaining_budget = max(8, min(32, config.max_candidates_per_block - len(points)))
+    for x, y in _mer_skyline_points(width, height, state, remaining_budget):
+        points.append(("mer_skyline", x, y))
 
+    slots: list[Slot] = []
+    seen: set[tuple[float, float, float, float]] = set()
+    legal_checks = 0
+    for kind, x, y in points:
+        rect = Rect(max(0.0, float(x)), max(0.0, float(y)), width, height)
+        key = (round(rect.x, 6), round(rect.y, 6), round(width, 6), round(height, 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        legal_checks += 1
+        if first_non_overlapping(rect, state.placed):
+            slots.append(Slot(rect, kind))
+        if len(slots) >= max(1, config.max_candidates_per_block):
+            break
+        if legal_checks >= max(config.max_candidates_per_block * 4, 12):
+            break
+    return slots
+
+
+def _block_rank(
+    inst: Instance,
+    graph: HeteroFloorplanGraph,
+    block: int,
+    state: PlacementState,
+) -> tuple[float, float, float, float, float]:
+    guidance_priority = 0.0
+    if inst.anchor_guidance is not None:
+        guidance_priority = inst.anchor_guidance.priority.get(block, 0.0)
+    width, height = block_dimensions(inst, block)
+    cx, cy = _anchor_center(inst, block, width, height)
+    placed_neighbor_weight = sum(weight for other, weight in inst.b2b_by_block.get(block, []) if other in state.rects)
+    constraint = 0.0
+    constraint += 5.0 if block in inst.boundary else 0.0
+    constraint += 3.0 if block in graph.block_to_cluster else 0.0
+    constraint += 2.0 if block in graph.block_to_mib else 0.0
+    return (
+        -guidance_priority,
+        -placed_neighbor_weight,
+        -constraint,
+        cx + cy,
+        -_degree(inst, block),
+    )
+
+
+def _slot_score(
+    inst: Instance,
+    config: SolverConfig,
+    block: int,
+    slot: Slot,
+    state: PlacementState,
+) -> float:
+    score = _placement_score(inst, config, block, slot.rect, state)
+    prior = _anchor_rect(inst, block)
+    if prior is not None:
+        score += config.anchor_weight * (
+            abs(slot.rect.center_x - prior.center_x) + abs(slot.rect.center_y - prior.center_y)
+        )
+    if slot.kind == "group":
+        score -= config.group_penalty * 0.35
+    elif slot.kind == "boundary":
+        score -= config.boundary_penalty * 0.15
+    elif slot.kind == "mer_skyline":
+        score -= 0.02
+    return score
+
+
+def _initial_state(inst: Instance) -> PlacementState:
+    state = PlacementState()
     for block in sorted(inst.preplaced):
         target = inst.target_rects.get(block)
         if target is not None:
             state.add(block, target)
-
-    remaining = [i for i in range(inst.block_count) if i not in state.rects]
-    remaining.sort(key=lambda block: _priority(inst, block, order_mode))
-
-    for block in remaining:
-        best: Rect | None = None
-        best_score = float("inf")
-        seen: set[tuple[float, float, float, float]] = set()
-
-        for width, height in _shape_variants(inst, block, config, state):
-            for x, y in _candidate_points(inst, block, width, height, state):
-                rect = Rect(max(0.0, float(x)), max(0.0, float(y)), width, height)
-                key = (round(rect.x, 6), round(rect.y, 6), round(width, 6), round(height, 6))
-                if key in seen:
-                    continue
-                seen.add(key)
-                if len(seen) > config.max_candidates_per_block:
-                    break
-                if state.overlaps_any(rect):
-                    continue
-                score = _placement_score(inst, config, block, rect, state)
-                if score < best_score:
-                    best = rect
-                    best_score = score
-
-        if best is None:
-            width, height = block_dimensions(inst, block)
-            x, y = _fallback_point(state)
-            best = Rect(x, y, width, height)
-            while state.overlaps_any(best):
-                y = best.top
-                best = Rect(x, y, width, height)
-        state.add(block, best)
-
-    return Placement(dict(state.rects))
+    return state
 
 
-def _legacy_priority(inst: Instance, block: int) -> tuple[int, int, float]:
-    constraint_score = 0
-    if block in inst.boundary:
-        constraint_score += 4
-    if any(block in members for members in inst.cluster_groups.values()):
-        constraint_score += 2
-    if any(block in members for members in inst.mib_groups.values()):
-        constraint_score += 1
-    degree = int((inst.valid_b2b[:, :2] == block).sum().item()) if inst.valid_b2b.numel() else 0
-    return (-constraint_score, -degree, -float(inst.area_targets[block]))
+def _fallback_place(inst: Instance, block: int, state: PlacementState) -> Rect:
+    width, height = block_dimensions(inst, block)
+    x = state.x_max if state.placed else 0.0
+    y = state.y_min if state.placed else 0.0
+    rect = Rect(x, y, width, height)
+    while state.overlaps_any(rect):
+        y = rect.top
+        rect = Rect(x, y, width, height)
+    return rect
 
 
-def _legacy_fallback_point(rects: dict[int, Rect]) -> tuple[float, float]:
-    bounds = bbox(list(rects.values()))
-    return bounds.right, bounds.y
+def construct_beam_placement(
+    inst: Instance,
+    config: SolverConfig | None = None,
+    graph: HeteroFloorplanGraph | None = None,
+) -> Placement:
+    config = config or SolverConfig()
+    graph = graph or HeteroFloorplanGraph()
+    initial = _initial_state(inst)
+    remaining = frozenset(i for i in range(inst.block_count) if i not in initial.rects)
+    beams = [BeamState(initial, remaining)]
+    width = max(1, int(config.beam_width))
 
+    while beams and beams[0].remaining:
+        candidates: list[BeamState] = []
+        for beam in beams:
+            beam_candidates: list[BeamState] = []
+            ranked_blocks = sorted(
+                beam.remaining,
+                key=lambda block: _block_rank(inst, graph, block, beam.state),
+            )[: max(min(width + 1, len(beam.remaining)), 2)]
+            for block in ranked_blocks:
+                block_best: list[tuple[float, Slot]] = []
+                for shape_w, shape_h in _shape_variants(inst, block, config, beam.state):
+                    for slot in _slot_candidates(inst, config, block, shape_w, shape_h, beam.state):
+                        block_best.append((_slot_score(inst, config, block, slot, beam.state), slot))
+                block_best.sort(key=lambda item: item[0])
+                for delta, slot in block_best[: max(1, min(width, config.max_start_candidates))]:
+                    next_state = beam.state.copy()
+                    next_state.add(block, slot.rect)
+                    beam_candidates.append(
+                        BeamState(
+                            state=next_state,
+                            remaining=frozenset(b for b in beam.remaining if b != block),
+                            score=beam.score + delta,
+                            order=beam.order + (block,),
+                        )
+                    )
+            if not beam_candidates:
+                block = min(beam.remaining, key=lambda b: _block_rank(inst, graph, b, beam.state))
+                next_state = beam.state.copy()
+                next_state.add(block, _fallback_place(inst, block, next_state))
+                beam_candidates.append(
+                    BeamState(
+                        state=next_state,
+                        remaining=frozenset(b for b in beam.remaining if b != block),
+                        score=beam.score + 1e6,
+                        order=beam.order + (block,),
+                    )
+                )
+            candidates.extend(beam_candidates)
 
-def _legacy_boundary_points(code: int, width: float, height: float, rects: dict[int, Rect]) -> list[tuple[float, float]]:
-    if not rects or code == 0:
-        return []
-    bounds = bbox(list(rects.values()))
-    points = []
-    if code & 1:
-        points.append((bounds.x, bounds.top))
-        points.append((bounds.x, bounds.y))
-    if code & 2:
-        points.append((bounds.right, bounds.y))
-        points.append((bounds.right, bounds.top))
-    if code & 4:
-        points.append((bounds.x, bounds.top))
-        points.append((max(bounds.x, bounds.right - width), bounds.top))
-    if code & 8:
-        points.append((bounds.x, bounds.y))
-        points.append((max(bounds.x, bounds.right - width), bounds.y))
-    return points
-
-
-def _construct_legacy(inst: Instance, config: SolverConfig) -> Placement:
-    placement = Placement()
-
-    for block in sorted(inst.preplaced):
-        target = inst.target_rects.get(block)
-        if target is not None:
-            placement.rects[block] = target
-
-    remaining = [i for i in range(inst.block_count) if i not in placement.rects]
-    remaining.sort(key=lambda block: _legacy_priority(inst, block))
-
-    for block in remaining:
-        width, height = block_dimensions(inst, block)
-        placed_rects = list(placement.rects.values())
-        candidates = []
-        if inst.model_hints and block in inst.model_hints:
-            hint = inst.model_hints[block]
-            candidates.append((hint.x, hint.y))
-        candidates.extend(_legacy_boundary_points(inst.boundary.get(block, 0), width, height, placement.rects))
-        candidates.extend(candidate_frontier_points(placed_rects))
-
-        best: Rect | None = None
-        best_score = float("inf")
-        seen = set()
-        for x, y in candidates[: config.max_candidates_per_block * 2]:
-            key = (round(float(x), 6), round(float(y), 6))
-            if key in seen:
+        candidates.sort(key=lambda beam: (beam.score, beam.state.bbox_area, beam.order))
+        diverse: list[BeamState] = []
+        seen_prefix: set[tuple[int, ...]] = set()
+        for beam in candidates:
+            prefix = beam.order[-3:]
+            if prefix in seen_prefix and len(diverse) >= width:
                 continue
-            seen.add(key)
-            rect = Rect(max(0.0, float(x)), max(0.0, float(y)), width, height)
-            if not first_non_overlapping(rect, placed_rects):
-                continue
-            score = placement_score(inst, block, rect, placement.rects)
-            if score < best_score:
-                best = rect
-                best_score = score
+            seen_prefix.add(prefix)
+            diverse.append(beam)
+            if len(diverse) >= width:
+                break
+        beams = diverse
 
-        if best is None:
-            x, y = _legacy_fallback_point(placement.rects)
-            best = Rect(x, y, width, height)
-            while not first_non_overlapping(best, list(placement.rects.values())):
-                y = best.top
-                best = Rect(x, y, width, height)
-        placement.rects[block] = best
+    best = min(beams, key=lambda beam: (beam.score, beam.state.bbox_area))
+    return Placement(dict(best.state.rects))
 
-    return placement
+
+def construct_initial_placement(
+    inst: Instance,
+    config: SolverConfig | None = None,
+    graph: HeteroFloorplanGraph | None = None,
+) -> Placement:
+    return construct_beam_placement(inst, config=config, graph=graph)

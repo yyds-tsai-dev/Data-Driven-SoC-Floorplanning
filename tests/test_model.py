@@ -1,13 +1,12 @@
 import torch
 
-from floorset_arch.features import build_model_inputs
-from floorset_arch.nn.model import SimpleGraphFloorplanner
-from floorset_arch.nn.postprocess import predictions_to_positions
+from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
+from floorset_arch.hetero_graph import build_hetero_floorplan_graph
+from floorset_arch.nn.model import FloorplanGNN
 from floorset_arch.parser import parse_instance
-from floorset_arch.training.losses import compute_v1_loss
 
 
-def test_model_forward_outputs_positions_and_loss_backpropagates():
+def test_anchor_gnn_forward_matches_runtime_features():
     inst = parse_instance(
         3,
         torch.tensor([4.0, 9.0, 16.0]),
@@ -17,24 +16,37 @@ def test_model_forward_outputs_positions_and_loss_backpropagates():
         torch.zeros(3, 5),
         None,
     )
-    inputs = build_model_inputs(inst)
-    model = SimpleGraphFloorplanner(input_dim=inputs.block_features.shape[1], hidden_dim=16, layers=2)
+    node_feat, _scale = build_anchor_node_features(inst)
+    edge_index, edge_attr = build_anchor_edge_tensors(inst)
+    model = FloorplanGNN(node_feat_dim=node_feat.shape[1], hidden_dim=16, num_layers=2)
 
-    pred = model(inputs)
-    positions = predictions_to_positions(inst, pred)
-    target = torch.tensor(
-        [
-            [0.0, 0.0, 2.0, 2.0],
-            [2.0, 0.0, 3.0, 3.0],
-            [0.0, 3.0, 4.0, 4.0],
-        ]
+    pred = model(node_feat, edge_index, edge_attr)
+
+    assert pred["anchor"].shape == (3, 2)
+    assert pred["priority"].shape == (3,)
+    assert pred["log_aspect"].shape == (3,)
+
+
+def test_hetero_graph_keeps_constraints_as_first_class_nodes():
+    inst = parse_instance(
+        3,
+        torch.tensor([4.0, 9.0, 16.0]),
+        torch.tensor([[0.0, 1.0, 2.0]]),
+        torch.tensor([[0.0, 2.0, 1.5]]),
+        torch.tensor([[10.0, 20.0]]),
+        torch.tensor(
+            [
+                [0.0, 0.0, 1.0, 7.0, 1.0],
+                [0.0, 0.0, 1.0, 7.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 2.0],
+            ]
+        ),
+        None,
     )
-    metrics = torch.tensor([29.0, 1.0, 3.0, 2.0, 1.0, 0.0, 2.0, 1.5])
 
-    loss, parts = compute_v1_loss(positions, target, inst, metrics, return_parts=True)
-    loss.backward()
+    graph = build_hetero_floorplan_graph(inst)
 
-    assert positions.shape == (3, 4)
-    assert parts["supervised"].item() >= 0.0
-    assert any(param.grad is not None for param in model.parameters())
-
+    assert {"block", "pin", "cluster", "mib", "boundary"} <= set(graph.node_features)
+    assert graph.block_to_cluster[0] == graph.block_to_cluster[1]
+    assert graph.block_to_mib[0] == graph.block_to_mib[1]
+    assert 2 in graph.block_to_boundary

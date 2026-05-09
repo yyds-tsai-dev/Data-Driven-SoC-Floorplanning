@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -7,9 +8,10 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from floorset_arch.constructive import construct_initial_placement
+from floorset_arch.constructive import construct_beam_placement
 from floorset_arch.geometry import bbox, boundary_satisfied, edge_touch_length
-from floorset_arch.models import Placement, Rect, SolverConfig
+from floorset_arch.hetero_graph import build_hetero_floorplan_graph
+from floorset_arch.models import AnchorGuidance, Placement, Rect, SolverConfig
 from floorset_arch.parser import parse_instance
 from floorset_arch.repair import repair_placement
 from floorset_arch.scoring import hpwl_proxy
@@ -28,15 +30,21 @@ except Exception:
             self.verbose = verbose
 
 
-class ArchitectureV1Optimizer(FloorplanOptimizer):
-    """Hard-constraint-safe architecture v1.0 solver."""
+class ArchitectureV2Optimizer(FloorplanOptimizer):
+    """Anchor-GNN guided hetero-graph beam solver."""
 
     def __init__(self, verbose: bool = False, config: Optional[SolverConfig] = None):
         super().__init__(verbose=verbose)
         self.config = config or SolverConfig()
+        if os.environ.get("FLOORSET_BEAM_WIDTH"):
+            try:
+                self.config.beam_width = max(1, int(os.environ["FLOORSET_BEAM_WIDTH"]))
+            except ValueError:
+                pass
         self._checkpoint_key: Optional[Path] = None
         self._checkpoint_model = None
         self._checkpoint_config: dict = {}
+        self._checkpoint_kind = ""
 
     def solve(
         self,
@@ -57,54 +65,93 @@ class ArchitectureV1Optimizer(FloorplanOptimizer):
             constraints,
             target_positions,
         )
-        inst.model_hints = self._try_model_hints(inst)
-        placements = []
-        for mode in self._order_modes(inst):
-            placement = construct_initial_placement(inst, self.config, order_mode=mode)
-            repaired = repair_placement(inst, placement, self.config)
-            placements.append(repaired)
+        inst.anchor_guidance = self._try_anchor_guidance(inst)
+        graph = build_hetero_floorplan_graph(inst)
+        placement = construct_beam_placement(inst, self.config, graph=graph)
+        repaired = repair_placement(inst, placement, self.config)
+        return repaired.to_position_list(block_count)
 
-        best = min(placements, key=lambda placement: self._proxy_cost(inst, placement))
-        return best.to_position_list(block_count)
-
-    def _try_model_hints(self, inst) -> Optional[dict[int, Rect]]:
+    def _try_anchor_guidance(self, inst) -> Optional[AnchorGuidance]:
         checkpoint = self._resolve_checkpoint_path(os.environ.get(self.config.checkpoint_env))
         if not checkpoint:
             return None
         try:
-            from floorset_arch.features import build_model_inputs
-            from floorset_arch.nn.model import SimpleGraphFloorplanner
-            from floorset_arch.nn.postprocess import predictions_to_rects
+            from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
+            from floorset_arch.nn.model import FloorplanGNN
 
             if self._checkpoint_key != checkpoint or self._checkpoint_model is None:
                 from floorset_arch.training import checkpoint as checkpoint_io
 
                 payload = checkpoint_io.load_checkpoint(checkpoint, map_location="cpu")
-                cfg = payload.get("model_config", {})
-                self._checkpoint_config = dict(cfg)
-                inputs = build_model_inputs(inst)
-                model = SimpleGraphFloorplanner(
-                    input_dim=int(cfg.get("input_dim", inputs.block_features.shape[1])),
-                    hidden_dim=int(cfg.get("hidden_dim", 128)),
-                    layers=int(cfg.get("layers", 3)),
+                if "model_state_dict" not in payload:
+                    return None
+                self._checkpoint_kind = "anchor_gnn_v2"
+                model = FloorplanGNN(
+                    node_feat_dim=int(payload["node_feat_dim"]),
+                    hidden_dim=int(payload.get("hidden_dim", 160)),
+                    num_layers=int(payload.get("layers", 5)),
                 )
-                model.load_state_dict(payload["model_state"], strict=False)
+                model.load_state_dict(payload["model_state_dict"])
+                self._checkpoint_config = {
+                    "node_feat_dim": int(payload["node_feat_dim"]),
+                    "hidden_dim": int(payload.get("hidden_dim", 160)),
+                    "layers": int(payload.get("layers", 5)),
+                }
                 model.eval()
                 self._checkpoint_model = model
                 self._checkpoint_key = checkpoint
             else:
                 model = self._checkpoint_model
 
-            inputs = build_model_inputs(inst)
             with torch.no_grad():
-                pred = model(inputs)
-                return predictions_to_rects(inst, pred)
+                node_feat, scale = build_anchor_node_features(inst, device=torch.device("cpu"))
+                if node_feat.shape[1] != int(self._checkpoint_config.get("node_feat_dim", node_feat.shape[1])):
+                    return None
+                edge_index, edge_attr = build_anchor_edge_tensors(inst, device=torch.device("cpu"))
+                pred = model(node_feat, edge_index, edge_attr)
+                return self._anchor_predictions_to_guidance(inst, pred, scale)
         except Exception:
             return None
 
+    def _anchor_predictions_to_guidance(
+        self,
+        inst,
+        pred: dict[str, torch.Tensor],
+        scale: float,
+    ) -> AnchorGuidance:
+        anchors = pred["anchor"].detach().cpu() * max(float(scale), 1.0)
+        priority_tensor = pred.get("priority")
+        aspect_tensor = pred.get("log_aspect")
+        guidance = AnchorGuidance(scale=max(float(scale), 1.0))
+        for i in range(inst.block_count):
+            target = inst.target_rects.get(i)
+            if target is not None and i in inst.preplaced:
+                guidance.rect_priors[i] = target
+                continue
+            if target is not None and i in inst.fixed:
+                width, height = target.width, target.height
+            else:
+                area = max(1.0, float(inst.area_targets[i]))
+                width = math.sqrt(area)
+                height = math.sqrt(area)
+            if aspect_tensor is not None and i not in inst.fixed and i not in inst.preplaced:
+                log_aspect = float(aspect_tensor.detach().cpu()[i])
+                guidance.log_aspect[i] = log_aspect
+                aspect = math.exp(max(-2.5, min(2.5, log_aspect)))
+                area = max(1.0, float(inst.area_targets[i]))
+                width = math.sqrt(area * aspect)
+                height = math.sqrt(area / aspect)
+            cx = float(anchors[i, 0])
+            cy = float(anchors[i, 1])
+            if math.isfinite(cx) and math.isfinite(cy):
+                guidance.rect_priors[i] = Rect(max(0.0, cx - width / 2.0), max(0.0, cy - height / 2.0), width, height)
+            if priority_tensor is not None:
+                guidance.priority[i] = float(priority_tensor.detach().cpu()[i])
+        return guidance
+
     def _resolve_checkpoint_path(self, value: Optional[str]) -> Optional[Path]:
         if not value:
-            return None
+            value = self.config.default_checkpoint
         raw = Path(value).expanduser()
         candidates = [raw]
         if not raw.is_absolute() and self.config.checkpoint_repo_relative:
@@ -113,14 +160,6 @@ class ArchitectureV1Optimizer(FloorplanOptimizer):
             if candidate.exists():
                 return candidate.resolve()
         return raw.resolve() if raw.is_absolute() else (ROOT / raw).resolve()
-
-    def _order_modes(self, inst) -> list[str]:
-        modes = ["legacy"]
-        if self.config.beam_width > 1:
-            modes.extend(["default", "cluster_first", "boundary_first", "degree_first"])
-        if inst.model_hints and self.config.beam_width > 2:
-            modes.append("model_first")
-        return modes[: max(1, self.config.beam_width)]
 
     def _proxy_cost(self, inst, placement: Placement) -> float:
         rects = placement.rects

@@ -5,6 +5,7 @@ import math
 from floorset_arch.constructive import block_dimensions
 from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
+from floorset_arch.scoring import hpwl_proxy
 
 
 def _snap_hard(inst: Instance, placement: Placement) -> None:
@@ -159,6 +160,41 @@ def _cluster_components(inst: Instance, placement: Placement, members: list[int]
     return components
 
 
+def soft_violation_counts(inst: Instance, placement: Placement) -> tuple[int, int, int]:
+    bounds = bbox(list(placement.rects.values()))
+    boundary = 0
+    for block, code in inst.boundary.items():
+        rect = placement.rects.get(block)
+        if rect is None or not boundary_satisfied_local(rect, bounds, code):
+            boundary += 1
+
+    grouping = 0
+    for members in inst.cluster_groups.values():
+        components = _cluster_components(inst, placement, members)
+        grouping += max(0, len(components) - 1)
+
+    mib = 0
+    for members in inst.mib_groups.values():
+        shapes = {
+            (round(placement.rects[block].width, 5), round(placement.rects[block].height, 5))
+            for block in members
+            if block in placement.rects
+        }
+        mib += max(0, len(shapes) - 1)
+    return boundary, grouping, mib
+
+
+def _placement_proxy(inst: Instance, placement: Placement) -> float:
+    bounds = bbox(list(placement.rects.values()))
+    area = max(bounds.area, 1.0)
+    soft = sum(soft_violation_counts(inst, placement))
+    try:
+        hpwl = hpwl_proxy(inst, placement.rects)
+    except Exception:
+        hpwl = 0.0
+    return 0.0025 * hpwl + 0.018 * area + 2500.0 * soft
+
+
 def _adjacent_positions(anchor: Rect, width: float, height: float) -> list[tuple[float, float]]:
     return [
         (anchor.right, anchor.y),
@@ -212,6 +248,48 @@ def _connect_clusters(inst: Instance, placement: Placement, config: SolverConfig
                 break
 
 
+def _score_better_soft_first(inst: Instance, config: SolverConfig, candidate: Placement, current: Placement) -> bool:
+    cand_counts = soft_violation_counts(inst, candidate)
+    cur_counts = soft_violation_counts(inst, current)
+    cand_soft = sum(cand_counts)
+    cur_soft = sum(cur_counts)
+    cand_proxy = _placement_proxy(inst, candidate)
+    cur_proxy = _placement_proxy(inst, current)
+    if cand_soft < cur_soft:
+        return cand_proxy <= cur_proxy * (1.0 + config.soft_proxy_slack)
+    if cand_soft == cur_soft:
+        if cand_counts[0] < cur_counts[0] and cand_proxy <= cur_proxy * 1.12:
+            return True
+        if cand_counts[0] == cur_counts[0] and cand_counts[1] < cur_counts[1] and cand_proxy <= cur_proxy * 1.10:
+            return True
+        return cand_proxy <= cur_proxy * (1.0 - config.equal_soft_proxy_slack)
+    return False
+
+
+def _guarded_soft_repair(inst: Instance, placement: Placement, config: SolverConfig) -> Placement:
+    best = placement.copy()
+    boundary_budget = max(0, config.max_boundary_component_snaps)
+    cluster_budget = max(0, config.max_cluster_component_moves)
+
+    for _ in range(max(1, min(config.max_repair_passes, 3))):
+        trial = best.copy()
+        before = best.copy()
+        _repair_boundary(inst, trial)
+        boundary_budget -= 1
+        _connect_clusters(inst, trial, config)
+        cluster_budget -= 1
+        _resolve_overlaps(inst, trial, config)
+        _repair_boundary(inst, trial)
+        if _score_better_soft_first(inst, config, trial, best):
+            best = trial
+        else:
+            best = before
+            break
+        if boundary_budget <= 0 and cluster_budget <= 0:
+            break
+    return best
+
+
 def _compact_left_down(inst: Instance, placement: Placement) -> None:
     for axis in ("x", "y"):
         movable = sorted(
@@ -246,6 +324,7 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
     _resolve_overlaps(inst, repaired, config)
     _connect_clusters(inst, repaired, config)
     _repair_boundary(inst, repaired)
+    repaired = _guarded_soft_repair(inst, repaired, config)
 
     for block in range(inst.block_count):
         if block not in repaired.rects:
