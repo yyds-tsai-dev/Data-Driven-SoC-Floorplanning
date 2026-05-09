@@ -68,16 +68,29 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
         )
         inst.anchor_guidance = self._try_anchor_guidance(inst)
         candidates: list[Placement] = []
-        candidates.append(repair_placement(inst, construct_relative_order_placement(inst, self.config), self.config))
+        profile_policy = os.environ.get("FLOORSET_PROFILE_POLICY", "adaptive").strip().lower()
+        if profile_policy == "compact":
+            profile_order = ["compact"]
+        elif profile_policy == "soft":
+            profile_order = ["soft"]
+        elif profile_policy == "both":
+            profile_order = ["soft", "compact"]
+        else:
+            profile_order = self._adaptive_profile_order(inst)
+
         include_compact = os.environ.get("FLOORSET_INCLUDE_COMPACT_RELATIVE", "1") == "1"
-        if include_compact:
+        for profile in profile_order:
+            if profile == "compact" and not include_compact:
+                continue
             candidates.append(
                 repair_placement(
                     inst,
-                    construct_relative_order_placement(inst, self.config, profile="compact"),
+                    construct_relative_order_placement(inst, self.config, profile=profile),
                     self.config,
                 )
             )
+        if not candidates:
+            candidates.append(repair_placement(inst, construct_relative_order_placement(inst, self.config), self.config))
         include_beam = os.environ.get("FLOORSET_INCLUDE_BEAM_CANDIDATES", "0") == "1"
         if include_beam:
             graph = build_hetero_floorplan_graph(inst)
@@ -185,6 +198,47 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
             if candidate.exists():
                 return candidate.resolve()
         return raw.resolve() if raw.is_absolute() else (ROOT / raw).resolve()
+
+    def _adaptive_profile_order(self, inst) -> list[str]:
+        """Pick one relative-order profile for runtime-heavy cases.
+
+        Computing both soft and compact profiles is useful for ablations, but the
+        official score applies a runtime factor and the 100+ block cases dominate
+        the weighted total.  The features below are cheap instance statistics that
+        separate pin-heavy compact wins from net-heavy / boundary-sensitive soft
+        wins without touching the evaluator loop.
+        """
+
+        if inst.block_count < 90:
+            return ["soft", "compact"]
+
+        b2b_count = int(inst.valid_b2b.shape[0]) if inst.valid_b2b is not None else 0
+        p2b_count = int(inst.valid_p2b.shape[0]) if inst.valid_p2b is not None else 0
+        cluster_count = len(inst.cluster_groups)
+        max_mib = max((len(members) for members in inst.mib_groups.values()), default=0)
+        fixed_count = len(inst.fixed)
+        preplaced_count = len(inst.preplaced)
+        boundary_count = len(inst.boundary)
+
+        if p2b_count > 2500:
+            return ["soft"] if b2b_count > 5000 else ["compact"]
+        if b2b_count > 5000:
+            return ["soft"] if p2b_count < 200 else ["compact"]
+        if cluster_count <= 3:
+            if p2b_count < 700 and b2b_count < 1300 and preplaced_count <= 3:
+                return ["soft"]
+            return ["compact"]
+        if p2b_count < 100:
+            return ["soft"]
+        if preplaced_count >= 5 and boundary_count <= 30:
+            return ["soft"]
+        if max_mib >= 7 and preplaced_count < 5:
+            return ["compact"]
+        if fixed_count >= 14:
+            return ["compact"] if p2b_count > 800 else ["soft"]
+        if boundary_count <= 28:
+            return ["soft"]
+        return ["compact"]
 
     def _proxy_cost(self, inst, placement: Placement) -> float:
         rects = placement.rects

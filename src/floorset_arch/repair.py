@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 from floorset_arch.constructive import block_dimensions
 from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
@@ -86,6 +87,11 @@ def _repair_boundary(inst: Instance, placement: Placement) -> None:
     if not inst.boundary:
         return
     bounds = bbox(list(placement.rects.values()))
+    cap_override = os.environ.get("FLOORSET_BOUNDARY_AXIS_CAP")
+    if cap_override:
+        axis_cap = int(cap_override)
+    else:
+        axis_cap = 24 if len(placement.rects) >= 100 else 160
     for block, code in inst.boundary.items():
         if block in inst.preplaced or block not in placement.rects:
             continue
@@ -105,6 +111,8 @@ def _repair_boundary(inst: Instance, placement: Placement) -> None:
         elif code & 4:
             ys = {max(bounds.y, bounds.top - rect.height)}
 
+        xs = set(_nearest_axis_values(xs, rect.x, axis_cap))
+        ys = set(_nearest_axis_values(ys, rect.y, axis_cap))
         candidates = []
         for x in sorted(xs, key=lambda value: abs(value - rect.x)):
             for y in sorted(ys, key=lambda value: abs(value - rect.y)):
@@ -125,6 +133,134 @@ def _repair_boundary(inst: Instance, placement: Placement) -> None:
                 best_score = score
         if best is not None:
             placement.rects[block] = best
+
+
+def _boundary_distance(rect: Rect, bounds: Rect, code: int) -> float:
+    distance = 0.0
+    if code & 1:
+        distance += abs(rect.x - bounds.x)
+    if code & 2:
+        distance += abs(rect.right - bounds.right)
+    if code & 8:
+        distance += abs(rect.y - bounds.y)
+    if code & 4:
+        distance += abs(rect.top - bounds.top)
+    return distance
+
+
+def _same_cluster_component(inst: Instance, placement: Placement, block: int) -> list[int]:
+    for members in inst.cluster_groups.values():
+        if block not in members:
+            continue
+        for component in _cluster_components(inst, placement, members):
+            if block in component:
+                return [] if any(member in inst.preplaced for member in component) else component
+    return [] if block in inst.preplaced else [block]
+
+
+def _boundary_component_shifts(inst: Instance, placement: Placement, component: list[int]) -> list[tuple[float, float]]:
+    bounds = bbox(list(placement.rects.values()))
+    shifts: list[tuple[float, float]] = []
+    seen: set[tuple[float, float]] = set()
+
+    def add(dx: float, dy: float) -> None:
+        key = (round(dx, 7), round(dy, 7))
+        if key not in seen and (abs(dx) > 1e-10 or abs(dy) > 1e-10):
+            seen.add(key)
+            shifts.append((dx, dy))
+
+    for block in component:
+        code = inst.boundary.get(block, 0)
+        if not code:
+            continue
+        rect = placement.rects[block]
+        dxs = [0.0]
+        dys = [0.0]
+        if code & 1:
+            dxs.append(bounds.x - rect.x)
+        if code & 2:
+            dxs.append(bounds.right - rect.right)
+        if code & 8:
+            dys.append(bounds.y - rect.y)
+        if code & 4:
+            dys.append(bounds.top - rect.top)
+        for dx in dxs:
+            for dy in dys:
+                add(dx, dy)
+
+    def shift_key(shift: tuple[float, float]) -> tuple[int, float]:
+        dx, dy = shift
+        satisfied = 0
+        for block in component:
+            code = inst.boundary.get(block, 0)
+            if not code:
+                continue
+            rect = placement.rects[block]
+            moved = Rect(rect.x + dx, rect.y + dy, rect.width, rect.height)
+            if boundary_satisfied_local(moved, bounds, code):
+                satisfied += 1
+        return (-satisfied, abs(dx) + abs(dy))
+
+    return sorted(shifts, key=shift_key)[:24]
+
+
+def _shifted_component_placement(
+    placement: Placement,
+    component: list[int],
+    dx: float,
+    dy: float,
+) -> Placement | None:
+    trial_rects: dict[int, Rect] = {}
+    for block in component:
+        rect = placement.rects[block]
+        nx = rect.x + dx
+        ny = rect.y + dy
+        if nx < -1e-8 or ny < -1e-8:
+            return None
+        trial_rects[block] = Rect(max(0.0, nx), max(0.0, ny), rect.width, rect.height)
+    if not _component_shift_is_legal(placement, set(component), trial_rects):
+        return None
+    trial = placement.copy()
+    trial.rects.update(trial_rects)
+    return trial
+
+
+def _snap_boundary_components(inst: Instance, placement: Placement, config: SolverConfig) -> None:
+    if not inst.boundary:
+        return
+    budget = max(0, min(config.max_boundary_component_snaps, 24))
+    bounds = bbox(list(placement.rects.values()))
+    candidates: list[tuple[float, float, int]] = []
+    for block, code in inst.boundary.items():
+        rect = placement.rects.get(block)
+        if rect is None or block in inst.preplaced or boundary_satisfied_local(rect, bounds, code):
+            continue
+        candidates.append((-_boundary_distance(rect, bounds, code), -rect.area, block))
+    candidates.sort()
+
+    used = 0
+    for _neg_distance, _neg_area, block in candidates:
+        if used >= budget:
+            break
+        component = _same_cluster_component(inst, placement, block)
+        if not component:
+            continue
+        current = placement.copy()
+        best = current
+        for dx, dy in _boundary_component_shifts(inst, placement, component):
+            trial = _shifted_component_placement(placement, component, dx, dy)
+            if trial is not None and _score_better_soft_fast(inst, config, trial, best):
+                best = trial
+        used += 1
+        if best is not current:
+            placement.rects = best.rects
+
+
+def _nearest_axis_values(values: set[float], current: float, limit: int) -> list[float]:
+    if len(values) <= limit:
+        return list(values)
+    ordered = sorted(values, key=lambda value: (abs(value - current), value))
+    return ordered[:limit]
 
 
 def boundary_satisfied_local(rect: Rect, bounds: Rect, code: int) -> bool:
@@ -193,6 +329,12 @@ def _placement_proxy(inst: Instance, placement: Placement) -> float:
     except Exception:
         hpwl = 0.0
     return 0.0025 * hpwl + 0.018 * area + 2500.0 * soft
+
+
+def _area_soft_proxy(inst: Instance, placement: Placement) -> float:
+    bounds = bbox(list(placement.rects.values()))
+    area = max(bounds.area, 1.0)
+    return 0.018 * area + 2500.0 * sum(soft_violation_counts(inst, placement))
 
 
 def _adjacent_positions(anchor: Rect, width: float, height: float) -> list[tuple[float, float]]:
@@ -348,6 +490,24 @@ def _score_better_soft_first(inst: Instance, config: SolverConfig, candidate: Pl
     return False
 
 
+def _score_better_soft_fast(inst: Instance, config: SolverConfig, candidate: Placement, current: Placement) -> bool:
+    cand_counts = soft_violation_counts(inst, candidate)
+    cur_counts = soft_violation_counts(inst, current)
+    cand_soft = sum(cand_counts)
+    cur_soft = sum(cur_counts)
+    cand_proxy = _area_soft_proxy(inst, candidate)
+    cur_proxy = _area_soft_proxy(inst, current)
+    if cand_soft < cur_soft:
+        return cand_proxy <= cur_proxy * (1.0 + config.soft_proxy_slack)
+    if cand_soft == cur_soft:
+        if cand_counts[0] < cur_counts[0] and cand_proxy <= cur_proxy * 1.12:
+            return True
+        if cand_counts[0] == cur_counts[0] and cand_counts[1] < cur_counts[1] and cand_proxy <= cur_proxy * 1.10:
+            return True
+        return cand_proxy <= cur_proxy * (1.0 - config.equal_soft_proxy_slack)
+    return False
+
+
 def _guarded_soft_repair(inst: Instance, placement: Placement, config: SolverConfig) -> Placement:
     best = placement.copy()
     boundary_budget = max(0, config.max_boundary_component_snaps)
@@ -399,12 +559,15 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
     _snap_hard(inst, repaired)
     _unify_compatible_mib(inst, repaired)
     _resolve_overlaps(inst, repaired, config)
+    _snap_boundary_components(inst, repaired, config)
     _connect_clusters(inst, repaired, config)
     _compact_left_down(inst, repaired)
+    _snap_boundary_components(inst, repaired, config)
     _repair_boundary(inst, repaired)
     _snap_hard(inst, repaired)
     _resolve_overlaps(inst, repaired, config)
     _connect_clusters(inst, repaired, config)
+    _snap_boundary_components(inst, repaired, config)
     _repair_boundary(inst, repaired)
     repaired = _guarded_soft_repair(inst, repaired, config)
 

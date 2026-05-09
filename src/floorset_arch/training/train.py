@@ -22,6 +22,24 @@ if FLOORSET_DIR.exists() and str(FLOORSET_DIR) not in sys.path:
 from lite_dataset import FloorplanDatasetLite, floorplan_collate  # noqa: E402
 
 
+def maybe_init_wandb(args):
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError("W&B logging requested; install dependencies with `uv sync` or `pip install wandb`.") from exc
+
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity or None,
+        name=args.wandb_run_name or None,
+        mode=args.wandb_mode,
+        config=vars(args),
+    )
+    return run
+
+
 def valid_block_count(area_targets: torch.Tensor) -> int:
     return int((area_targets.detach().flatten() != -1).sum().item())
 
@@ -172,6 +190,9 @@ def run_epoch(model, optimizer, loader, device: torch.device, args, epoch: int, 
     model.train(train)
     sums = {key: 0.0 for key in ("loss", "anchor", "aspect", "priority", "order", "edge", "ord_frac", "ord_acc")}
     count = 0
+    accumulation_steps = max(1, int(args.accumulation_steps))
+    if train:
+        optimizer.zero_grad(set_to_none=True)
     for batch in loader:
         area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = unpack_batch(batch)
         block_count = valid_block_count(area_targets)
@@ -196,11 +217,12 @@ def run_epoch(model, optimizer, loader, device: torch.device, args, epoch: int, 
                 + args.edge_weight * edge
             )
             if train:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+                (loss / accumulation_steps).backward()
+                if (count + 1) % accumulation_steps == 0:
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
         sums["loss"] += float(loss.item())
         sums["anchor"] += float(anchor.item())
@@ -219,6 +241,11 @@ def run_epoch(model, optimizer, loader, device: torch.device, args, epoch: int, 
                 f"ord_acc={ord_acc:.3f}",
                 flush=True,
             )
+    if train and count % accumulation_steps != 0:
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
     return {key: value / max(count, 1) for key, value in sums.items()}
 
 
@@ -256,6 +283,7 @@ def main(args) -> None:
     best_val = float("inf")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = maybe_init_wandb(args)
 
     print("=" * 72)
     print("Architecture v2 Anchor-GNN training")
@@ -264,6 +292,7 @@ def main(args) -> None:
     print(f"  val window       = {vs}..{ve}")
     print(f"  device           = {device}")
     print(f"  hidden/layers    = {args.hidden_dim}/{args.layers}")
+    print(f"  accumulation     = {max(1, args.accumulation_steps)}")
     print("=" * 72, flush=True)
 
     for epoch in range(1, args.epochs + 1):
@@ -297,6 +326,15 @@ def main(args) -> None:
             f"edge={val_stats['edge']:.5f} ord_acc={val_stats['ord_acc']:.3f}",
             flush=True,
         )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": epoch,
+                    **{f"train/{key}": value for key, value in train_stats.items()},
+                    **{f"val/{key}": value for key, value in val_stats.items()},
+                    "lr": optimizer.param_groups[0]["lr"],
+                }
+            )
 
         save_checkpoint(out_dir / "gnn_latest.pt", model, args, epoch, train_stats, val_stats)
         if val_stats["loss"] < best_val:
@@ -306,6 +344,9 @@ def main(args) -> None:
 
     print(f"Best val loss: {best_val:.5f}")
     print(f"Best checkpoint: {out_dir / 'gnn_best.pt'}")
+    if wandb_run is not None:
+        wandb_run.summary["best_val_loss"] = best_val
+        wandb_run.finish()
 
 
 def parse_args():
@@ -322,6 +363,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--accumulation-steps", type=int, default=8)
     parser.add_argument("--anchor-weight", type=float, default=1.0)
     parser.add_argument("--aspect-weight", type=float, default=0.12)
     parser.add_argument("--priority-weight", type=float, default=0.08)
@@ -338,6 +380,11 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--print-every", type=int, default=200)
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="floorset-arch-v2")
+    parser.add_argument("--wandb-entity", default="")
+    parser.add_argument("--wandb-run-name", default="")
+    parser.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
     return parser.parse_args()
 
 
