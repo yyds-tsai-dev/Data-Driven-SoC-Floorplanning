@@ -44,7 +44,9 @@ contest_venv/
 *_results.json
 *.log
 LiteTensorDataTest/*
+smoke.*
 
 # Other
-test/*
-presentation/*
+test/
+presentation/
+graphify-out/
