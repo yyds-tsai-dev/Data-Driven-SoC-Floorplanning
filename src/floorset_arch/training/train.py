@@ -9,10 +9,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
+import wandb
 from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
 from floorset_arch.nn.model import FloorplanGNN
 from floorset_arch.parser import parse_instance
-
 
 ROOT = Path(__file__).resolve().parents[3]
 FLOORSET_DIR = ROOT / "FloorSet"
@@ -28,7 +28,9 @@ def maybe_init_wandb(args):
     try:
         import wandb
     except ImportError as exc:
-        raise RuntimeError("W&B logging requested; install dependencies with `uv sync` or `pip install wandb`.") from exc
+        raise RuntimeError(
+            "W&B logging requested; install dependencies with `uv sync` or `pip install wandb`."
+        ) from exc
 
     run = wandb.init(
         project=args.wandb_project,
@@ -44,7 +46,9 @@ def valid_block_count(area_targets: torch.Tensor) -> int:
     return int((area_targets.detach().flatten() != -1).sum().item())
 
 
-def choose_window_start(total: int, count: int, seed: int, epoch: int, fixed_start: int) -> int:
+def choose_window_start(
+    total: int, count: int, seed: int, epoch: int, fixed_start: int
+) -> int:
     if total <= count:
         return 0
     if fixed_start >= 0:
@@ -52,7 +56,9 @@ def choose_window_start(total: int, count: int, seed: int, epoch: int, fixed_sta
     return random.Random(seed + 1009 * epoch).randint(0, total - count)
 
 
-def make_loader(dataset, start: int, count: int, shuffle: bool, seed: int, num_workers: int):
+def make_loader(
+    dataset, start: int, count: int, shuffle: bool, seed: int, num_workers: int
+):
     total = len(dataset)
     n = min(max(1, count), total)
     start = max(0, min(start, total - n)) if total > n else 0
@@ -69,13 +75,17 @@ def make_loader(dataset, start: int, count: int, shuffle: bool, seed: int, num_w
     return loader, start, start + n - 1
 
 
-def build_targets(fp_sol: torch.Tensor, block_count: int, scale: float, device: torch.device) -> dict[str, torch.Tensor]:
+def build_targets(
+    fp_sol: torch.Tensor, block_count: int, scale: float, device: torch.device
+) -> dict[str, torch.Tensor]:
     gt = fp_sol[:block_count].float().to(device)
     width = gt[:, 0].clamp_min(1e-6)
     height = gt[:, 1].clamp_min(1e-6)
     x = gt[:, 2]
     y = gt[:, 3]
-    anchor = torch.stack([x + width / 2.0, y + height / 2.0], dim=1) / max(float(scale), 1.0)
+    anchor = torch.stack([x + width / 2.0, y + height / 2.0], dim=1) / max(
+        float(scale), 1.0
+    )
     log_aspect = torch.log(width / height).clamp(-2.5, 2.5)
     center_sum = anchor.sum(dim=1)
     span = (center_sum.max() - center_sum.min()).clamp_min(1e-6)
@@ -83,7 +93,9 @@ def build_targets(fp_sol: torch.Tensor, block_count: int, scale: float, device: 
     return {"anchor": anchor, "log_aspect": log_aspect, "priority": priority}
 
 
-def constraint_weights(constraints: torch.Tensor, block_count: int, device: torch.device, args) -> torch.Tensor:
+def constraint_weights(
+    constraints: torch.Tensor, block_count: int, device: torch.device, args
+) -> torch.Tensor:
     weights = torch.ones(block_count, device=device)
     if constraints is None or constraints.dim() <= 1:
         return weights
@@ -101,24 +113,32 @@ def constraint_weights(constraints: torch.Tensor, block_count: int, device: torc
     return weights
 
 
-def weighted_smooth_l1(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+def weighted_smooth_l1(
+    pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
     loss = F.smooth_l1_loss(pred, target, reduction="none")
     if loss.dim() > 1:
         loss = loss.sum(dim=1)
     return (loss * weights).sum() / weights.sum().clamp_min(1.0)
 
 
-def sample_pairs(block_count: int, max_pairs: int, device: torch.device) -> torch.Tensor:
+def sample_pairs(
+    block_count: int, max_pairs: int, device: torch.device
+) -> torch.Tensor:
     pairs = [(i, j) for i in range(block_count) for j in range(i + 1, block_count)]
     if not pairs:
         return torch.empty((0, 2), dtype=torch.long, device=device)
     pair_tensor = torch.tensor(pairs, dtype=torch.long, device=device)
     if max_pairs > 0 and pair_tensor.shape[0] > max_pairs:
-        pair_tensor = pair_tensor[torch.randperm(pair_tensor.shape[0], device=device)[:max_pairs]]
+        pair_tensor = pair_tensor[
+            torch.randperm(pair_tensor.shape[0], device=device)[:max_pairs]
+        ]
     return pair_tensor
 
 
-def order_aux_loss(pred_anchor: torch.Tensor, target_anchor: torch.Tensor, args) -> tuple[torch.Tensor, float, float]:
+def order_aux_loss(
+    pred_anchor: torch.Tensor, target_anchor: torch.Tensor, args
+) -> tuple[torch.Tensor, float, float]:
     device = pred_anchor.device
     pairs = sample_pairs(pred_anchor.shape[0], args.order_pairs, device)
     if pairs.numel() == 0:
@@ -152,7 +172,9 @@ def order_aux_loss(pred_anchor: torch.Tensor, target_anchor: torch.Tensor, args)
     return loss, used / max(float(pairs.shape[0]), 1.0), acc_sum / max(acc_count, 1)
 
 
-def edge_delta_loss(pred_anchor: torch.Tensor, target_anchor: torch.Tensor, valid_b2b: torch.Tensor) -> torch.Tensor:
+def edge_delta_loss(
+    pred_anchor: torch.Tensor, target_anchor: torch.Tensor, valid_b2b: torch.Tensor
+) -> torch.Tensor:
     edges = []
     weights = []
     for i_f, j_f, weight_f in valid_b2b.tolist():
@@ -165,7 +187,9 @@ def edge_delta_loss(pred_anchor: torch.Tensor, target_anchor: torch.Tensor, vali
     if not edges:
         return pred_anchor.sum() * 0.0
     edge_t = torch.tensor(edges, dtype=torch.long, device=pred_anchor.device)
-    weight_t = torch.log1p(torch.tensor(weights, dtype=torch.float32, device=pred_anchor.device))
+    weight_t = torch.log1p(
+        torch.tensor(weights, dtype=torch.float32, device=pred_anchor.device)
+    )
     weight_t = weight_t / weight_t.mean().clamp_min(1.0)
     pred_delta = pred_anchor[edge_t[:, 1]] - pred_anchor[edge_t[:, 0]]
     target_delta = target_anchor[edge_t[:, 1]] - target_anchor[edge_t[:, 0]]
@@ -186,17 +210,35 @@ def unpack_batch(batch):
     )
 
 
-def run_epoch(model, optimizer, loader, device: torch.device, args, epoch: int, train: bool) -> dict[str, float]:
+def run_epoch(
+    model, optimizer, loader, device: torch.device, args, epoch: int, train: bool
+) -> dict[str, float]:
     model.train(train)
-    sums = {key: 0.0 for key in ("loss", "anchor", "aspect", "priority", "order", "edge", "ord_frac", "ord_acc")}
+    sums = {
+        key: 0.0
+        for key in (
+            "loss",
+            "anchor",
+            "aspect",
+            "priority",
+            "order",
+            "edge",
+            "ord_frac",
+            "ord_acc",
+        )
+    }
     count = 0
     accumulation_steps = max(1, int(args.accumulation_steps))
     if train:
         optimizer.zero_grad(set_to_none=True)
     for batch in loader:
-        area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = unpack_batch(batch)
+        area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = unpack_batch(
+            batch
+        )
         block_count = valid_block_count(area_targets)
-        inst = parse_instance(block_count, area_targets, b2b, p2b, pins, constraints, fp_sol)
+        inst = parse_instance(
+            block_count, area_targets, b2b, p2b, pins, constraints, fp_sol
+        )
         node_feat, scale = build_anchor_node_features(inst, device=device)
         edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
         targets = build_targets(fp_sol, block_count, scale, device)
@@ -205,9 +247,15 @@ def run_epoch(model, optimizer, loader, device: torch.device, args, epoch: int, 
         with torch.set_grad_enabled(train):
             pred = model(node_feat, edge_index, edge_attr)
             anchor = weighted_smooth_l1(pred["anchor"], targets["anchor"], weights)
-            aspect = weighted_smooth_l1(pred["log_aspect"], targets["log_aspect"], weights)
-            priority = weighted_smooth_l1(pred["priority"], targets["priority"], weights)
-            order, ord_frac, ord_acc = order_aux_loss(pred["anchor"], targets["anchor"], args)
+            aspect = weighted_smooth_l1(
+                pred["log_aspect"], targets["log_aspect"], weights
+            )
+            priority = weighted_smooth_l1(
+                pred["priority"], targets["priority"], weights
+            )
+            order, ord_frac, ord_acc = order_aux_loss(
+                pred["anchor"], targets["anchor"], args
+            )
             edge = edge_delta_loss(pred["anchor"], targets["anchor"], inst.valid_b2b)
             loss = (
                 args.anchor_weight * anchor
@@ -220,7 +268,9 @@ def run_epoch(model, optimizer, loader, device: torch.device, args, epoch: int, 
                 (loss / accumulation_steps).backward()
                 if (count + 1) % accumulation_steps == 0:
                     if args.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), args.grad_clip
+                        )
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
@@ -249,7 +299,9 @@ def run_epoch(model, optimizer, loader, device: torch.device, args, epoch: int, 
     return {key: value / max(count, 1) for key, value in sums.items()}
 
 
-def save_checkpoint(path: Path, model: FloorplanGNN, args, epoch: int, train_stats, val_stats) -> None:
+def save_checkpoint(
+    path: Path, model: FloorplanGNN, args, epoch: int, train_stats, val_stats
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -275,8 +327,12 @@ def main(args) -> None:
 
     dataset = FloorplanDatasetLite(args.data_path)
     total = len(dataset)
-    val_start = choose_window_start(total, args.val_samples, args.seed + 777, 0, args.val_start)
-    val_loader, vs, ve = make_loader(dataset, val_start, args.val_samples, False, args.seed, args.num_workers)
+    val_start = choose_window_start(
+        total, args.val_samples, args.seed + 777, 0, args.val_start
+    )
+    val_loader, vs, ve = make_loader(
+        dataset, val_start, args.val_samples, False, args.seed, args.num_workers
+    )
 
     model = None
     optimizer = None
@@ -296,22 +352,58 @@ def main(args) -> None:
     print("=" * 72, flush=True)
 
     for epoch in range(1, args.epochs + 1):
-        train_start = choose_window_start(total, args.num_samples, args.seed, epoch, args.window_start)
-        train_loader, ts, te = make_loader(dataset, train_start, args.num_samples, True, args.seed + epoch, args.num_workers)
+        train_start = choose_window_start(
+            total, args.num_samples, args.seed, epoch, args.window_start
+        )
+        train_loader, ts, te = make_loader(
+            dataset,
+            train_start,
+            args.num_samples,
+            True,
+            args.seed + epoch,
+            args.num_workers,
+        )
         print(f"Epoch {epoch:03d}: train window {ts}..{te}", flush=True)
 
         if model is None:
             first = next(iter(train_loader))
-            area_targets, b2b, p2b, pins, constraints, _fp_sol, _metrics = unpack_batch(first)
-            inst = parse_instance(valid_block_count(area_targets), area_targets, b2b, p2b, pins, constraints, None)
+            area_targets, b2b, p2b, pins, constraints, _fp_sol, _metrics = unpack_batch(
+                first
+            )
+            inst = parse_instance(
+                valid_block_count(area_targets),
+                area_targets,
+                b2b,
+                p2b,
+                pins,
+                constraints,
+                None,
+            )
             node_feat, _scale = build_anchor_node_features(inst, device=device)
-            model = FloorplanGNN(node_feat_dim=node_feat.shape[1], hidden_dim=args.hidden_dim, num_layers=args.layers).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            train_loader, _, _ = make_loader(dataset, train_start, args.num_samples, True, args.seed + epoch, args.num_workers)
+            model = FloorplanGNN(
+                node_feat_dim=node_feat.shape[1],
+                hidden_dim=args.hidden_dim,
+                num_layers=args.layers,
+            ).to(device)
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+            )
+            train_loader, _, _ = make_loader(
+                dataset,
+                train_start,
+                args.num_samples,
+                True,
+                args.seed + epoch,
+                args.num_workers,
+            )
             print(f"Created model with node_feat_dim={node_feat.shape[1]}", flush=True)
 
-        train_stats = run_epoch(model, optimizer, train_loader, device, args, epoch, train=True)
-        val_stats = run_epoch(model, optimizer, val_loader, device, args, epoch, train=False)
+        train_stats = run_epoch(
+            model, optimizer, train_loader, device, args, epoch, train=True
+        )
+        val_stats = run_epoch(
+            model, optimizer, val_loader, device, args, epoch, train=False
+        )
         print(
             f"Epoch {epoch:03d} train loss={train_stats['loss']:.5f} "
             f"anchor={train_stats['anchor']:.5f} aspect={train_stats['aspect']:.5f} "
@@ -336,10 +428,14 @@ def main(args) -> None:
                 }
             )
 
-        save_checkpoint(out_dir / "gnn_latest.pt", model, args, epoch, train_stats, val_stats)
+        save_checkpoint(
+            out_dir / "gnn_latest.pt", model, args, epoch, train_stats, val_stats
+        )
         if val_stats["loss"] < best_val:
             best_val = val_stats["loss"]
-            save_checkpoint(out_dir / "gnn_best.pt", model, args, epoch, train_stats, val_stats)
+            save_checkpoint(
+                out_dir / "gnn_best.pt", model, args, epoch, train_stats, val_stats
+            )
             print(f"Saved best checkpoint to {out_dir / 'gnn_best.pt'}", flush=True)
 
     print(f"Best val loss: {best_val:.5f}")
@@ -384,7 +480,9 @@ def parse_args():
     parser.add_argument("--wandb-project", default="floorset-arch-v2")
     parser.add_argument("--wandb-entity", default="")
     parser.add_argument("--wandb-run-name", default="")
-    parser.add_argument("--wandb-mode", default="online", choices=("online", "offline", "disabled"))
+    parser.add_argument(
+        "--wandb-mode", default="online", choices=("online", "offline", "disabled")
+    )
     return parser.parse_args()
 
 
