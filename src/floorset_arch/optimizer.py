@@ -13,6 +13,7 @@ from floorset_arch.geometry import bbox, boundary_satisfied, edge_touch_length
 from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 from floorset_arch.models import AnchorGuidance, Placement, Rect, SolverConfig
 from floorset_arch.parser import parse_instance
+from floorset_arch.relative_order import construct_relative_order_placement
 from floorset_arch.repair import repair_placement
 from floorset_arch.scoring import hpwl_proxy
 
@@ -66,10 +67,34 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
             target_positions,
         )
         inst.anchor_guidance = self._try_anchor_guidance(inst)
-        graph = build_hetero_floorplan_graph(inst)
-        placement = construct_beam_placement(inst, self.config, graph=graph)
-        repaired = repair_placement(inst, placement, self.config)
-        return repaired.to_position_list(block_count)
+        candidates: list[Placement] = []
+        candidates.append(repair_placement(inst, construct_relative_order_placement(inst, self.config), self.config))
+        include_compact = os.environ.get("FLOORSET_INCLUDE_COMPACT_RELATIVE", "1") == "1"
+        if include_compact:
+            candidates.append(
+                repair_placement(
+                    inst,
+                    construct_relative_order_placement(inst, self.config, profile="compact"),
+                    self.config,
+                )
+            )
+        include_beam = os.environ.get("FLOORSET_INCLUDE_BEAM_CANDIDATES", "0") == "1"
+        if include_beam:
+            graph = build_hetero_floorplan_graph(inst)
+            candidates.append(repair_placement(inst, construct_beam_placement(inst, self.config, graph=graph), self.config))
+
+        include_no_guidance = os.environ.get("FLOORSET_INCLUDE_NO_GUIDANCE_CANDIDATE", "0") == "1"
+        if include_no_guidance and inst.anchor_guidance is not None:
+            saved_guidance = inst.anchor_guidance
+            inst.anchor_guidance = None
+            candidates.append(repair_placement(inst, construct_relative_order_placement(inst, self.config), self.config))
+            if include_beam:
+                graph_no_guidance = build_hetero_floorplan_graph(inst)
+                candidates.append(repair_placement(inst, construct_beam_placement(inst, self.config, graph=graph_no_guidance), self.config))
+            inst.anchor_guidance = saved_guidance
+
+        best = min(candidates, key=lambda placement: self._proxy_cost(inst, placement))
+        return best.to_position_list(block_count)
 
     def _try_anchor_guidance(self, inst) -> Optional[AnchorGuidance]:
         checkpoint = self._resolve_checkpoint_path(os.environ.get(self.config.checkpoint_env))

@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import math
+
+from floorset_arch.models import AnchorGuidance, Instance, Placement, Rect, SolverConfig
+
+
+def _constraint_id(inst: Instance, block: int, column: int) -> int:
+    if inst.constraints is None or inst.constraints.dim() <= 1 or inst.constraints.shape[1] <= column:
+        return 0
+    return int(float(inst.constraints[block, column]))
+
+
+def _shape_for_block(inst: Instance, block: int, guidance: AnchorGuidance | None, profile: str) -> tuple[float, float]:
+    target = inst.target_rects.get(block)
+    if target is not None and (block in inst.fixed or block in inst.preplaced):
+        return target.width, target.height
+
+    area = max(1.0, float(inst.area_targets[block]))
+    for members in inst.mib_groups.values():
+        if block not in members:
+            continue
+        for other in members:
+            target = inst.target_rects.get(other)
+            if target is None or other not in (inst.fixed | inst.preplaced):
+                continue
+            ref_area = target.width * target.height
+            if abs(ref_area - area) / max(ref_area, area, 1.0) <= 0.010001:
+                return target.width, target.height
+
+    log_aspect = None
+    if profile != "compact":
+        if guidance is not None and block in guidance.log_aspect:
+            log_aspect = max(-2.5, min(2.5, guidance.log_aspect[block]))
+        elif guidance is not None and block in guidance.rect_priors:
+            prior = guidance.rect_priors[block]
+            if prior.width > 0 and prior.height > 0:
+                log_aspect = math.log(max(0.05, min(20.0, prior.width / prior.height)))
+    aspect = 1.0 if log_aspect is None else math.exp(log_aspect)
+    return math.sqrt(area * aspect), math.sqrt(area / aspect)
+
+
+def _fallback_anchor(inst: Instance, block: int, width: float, height: float, scale: float) -> tuple[float, float]:
+    weighted_x = 0.0
+    weighted_y = 0.0
+    total = 0.0
+    for pin, weight in inst.p2b_by_block.get(block, []):
+        if 0 <= pin < inst.pins_pos.shape[0]:
+            px = float(inst.pins_pos[pin, 0])
+            py = float(inst.pins_pos[pin, 1])
+            if px != -1.0 and py != -1.0:
+                weighted_x += px * weight
+                weighted_y += py * weight
+                total += weight
+    if total > 0:
+        return weighted_x / total, weighted_y / total
+    return scale * 0.5 + width * 0.5, scale * 0.5 + height * 0.5
+
+
+def _anchors(inst: Instance, widths: list[float], heights: list[float], guidance: AnchorGuidance | None) -> tuple[list[float], list[float]]:
+    total_area = sum(widths[i] * heights[i] for i in range(inst.block_count))
+    scale = math.sqrt(max(total_area, 1.0))
+    raw_x: list[float] = []
+    raw_y: list[float] = []
+    for block in range(inst.block_count):
+        target = inst.target_rects.get(block)
+        if target is not None and block in inst.preplaced:
+            cx, cy = target.center_x, target.center_y
+        elif guidance is not None and block in guidance.rect_priors:
+            prior = guidance.rect_priors[block]
+            cx, cy = prior.center_x, prior.center_y
+        else:
+            cx, cy = _fallback_anchor(inst, block, widths[block], heights[block], scale)
+        raw_x.append(max(cx, widths[block] * 0.5))
+        raw_y.append(max(cy, heights[block] * 0.5))
+    return raw_x, raw_y
+
+
+def _bias_order_keys(
+    inst: Instance,
+    raw_x: list[float],
+    raw_y: list[float],
+    widths: list[float],
+    heights: list[float],
+    config: SolverConfig,
+    profile: str,
+) -> tuple[list[float], list[float]]:
+    key_x = list(raw_x)
+    key_y = list(raw_y)
+    if not key_x:
+        return key_x, key_y
+    span_x = max(max(raw_x) - min(raw_x), max(widths), 1.0)
+    span_y = max(max(raw_y) - min(raw_y), max(heights), 1.0)
+
+    clusters: dict[int, list[int]] = {}
+    for block in range(inst.block_count):
+        cluster = _constraint_id(inst, block, 3)
+        if cluster:
+            clusters.setdefault(cluster, []).append(block)
+    blend = 0.0 if profile == "compact" else 0.18
+    for members in clusters.values():
+        if len(members) <= 1:
+            continue
+        cx = sum(key_x[i] for i in members) / len(members)
+        cy = sum(key_y[i] for i in members) / len(members)
+        for block in members:
+            key_x[block] = (1.0 - blend) * key_x[block] + blend * cx
+            key_y[block] = (1.0 - blend) * key_y[block] + blend * cy
+
+    offset_x = config.boundary_order_bias * span_x
+    offset_y = config.boundary_order_bias * span_y
+    edge_counts = {1: 0, 2: 0, 4: 0, 8: 0}
+    for block, code in inst.boundary.items():
+        if code & 1:
+            key_x[block] -= offset_x + edge_counts[1] * max(widths[block], 1.0) * 0.05
+            edge_counts[1] += 1
+        if code & 2:
+            key_x[block] += offset_x + edge_counts[2] * max(widths[block], 1.0) * 0.05
+            edge_counts[2] += 1
+        if code & 8:
+            key_y[block] -= offset_y + edge_counts[8] * max(heights[block], 1.0) * 0.05
+            edge_counts[8] += 1
+        if code & 4:
+            key_y[block] += offset_y + edge_counts[4] * max(heights[block], 1.0) * 0.05
+            edge_counts[4] += 1
+    return key_x, key_y
+
+
+def _cluster_orientations(inst: Instance, raw_x: list[float], raw_y: list[float]) -> dict[int, str]:
+    orientations: dict[int, str] = {}
+    for cluster, members in inst.cluster_groups.items():
+        if len(members) <= 1:
+            orientations[cluster] = "H"
+            continue
+        span_x = max(raw_x[i] for i in members) - min(raw_x[i] for i in members)
+        span_y = max(raw_y[i] for i in members) - min(raw_y[i] for i in members)
+        orientations[cluster] = "H" if span_x >= span_y else "V"
+    return orientations
+
+
+def construct_relative_order_placement(inst: Instance, config: SolverConfig | None = None, profile: str = "soft") -> Placement:
+    config = config or SolverConfig()
+    guidance = inst.anchor_guidance
+    widths: list[float] = []
+    heights: list[float] = []
+    for block in range(inst.block_count):
+        width, height = _shape_for_block(inst, block, guidance, profile)
+        widths.append(width)
+        heights.append(height)
+
+    raw_x, raw_y = _anchors(inst, widths, heights, guidance)
+    key_x, key_y = _bias_order_keys(inst, raw_x, raw_y, widths, heights, config, profile)
+    movable = [i for i in range(inst.block_count) if i not in inst.preplaced]
+    order_x = sorted(movable, key=lambda i: (key_x[i], key_y[i], -sum(w for _, w in inst.b2b_by_block.get(i, [])), i))
+    order_y = sorted(movable, key=lambda i: (key_y[i], key_x[i], -sum(w for _, w in inst.b2b_by_block.get(i, [])), i))
+    pos_x = {block: idx for idx, block in enumerate(order_x)}
+    pos_y = {block: idx for idx, block in enumerate(order_y)}
+    h_adj = {block: [] for block in movable}
+    v_adj = {block: [] for block in movable}
+    orient = _cluster_orientations(inst, raw_x, raw_y)
+
+    def add_h(a: int, b: int) -> None:
+        if pos_x[a] <= pos_x[b]:
+            h_adj[a].append(b)
+        else:
+            h_adj[b].append(a)
+
+    def add_v(a: int, b: int) -> None:
+        if pos_y[a] <= pos_y[b]:
+            v_adj[a].append(b)
+        else:
+            v_adj[b].append(a)
+
+    for offset, i in enumerate(movable):
+        for j in movable[offset + 1 :]:
+            dx = abs(raw_x[i] - raw_x[j]) / max((widths[i] + widths[j]) * 0.5, 1e-6)
+            dy = abs(raw_y[i] - raw_y[j]) / max((heights[i] + heights[j]) * 0.5, 1e-6)
+            h_score = dx
+            v_score = dy
+            if profile != "compact" and ((inst.boundary.get(i, 0) & 3) or (inst.boundary.get(j, 0) & 3)):
+                h_score += 0.25
+            if profile != "compact" and ((inst.boundary.get(i, 0) & 12) or (inst.boundary.get(j, 0) & 12)):
+                v_score += 0.25
+            ci = _constraint_id(inst, i, 3)
+            cj = _constraint_id(inst, j, 3)
+            if ci and ci == cj:
+                if orient.get(ci, "H") == "H":
+                    h_score += 0.0 if profile == "compact" else 0.45
+                else:
+                    v_score += 0.0 if profile == "compact" else 0.45
+            if h_score >= v_score:
+                add_h(i, j)
+            else:
+                add_v(i, j)
+
+    if profile != "compact":
+        for cluster, members in inst.cluster_groups.items():
+            chain = [block for block in members if block in pos_x]
+            if len(chain) <= 1:
+                continue
+            if orient.get(cluster, "H") == "H":
+                chain.sort(key=lambda i: (key_x[i], key_y[i], i))
+                for a, b in zip(chain, chain[1:]):
+                    add_h(a, b)
+            else:
+                chain.sort(key=lambda i: (key_y[i], key_x[i], i))
+                for a, b in zip(chain, chain[1:]):
+                    add_v(a, b)
+
+    x_pos = {block: 0.0 for block in movable}
+    y_pos = {block: 0.0 for block in movable}
+    for block in order_x:
+        base = x_pos[block] + widths[block]
+        for other in h_adj[block]:
+            x_pos[other] = max(x_pos[other], base)
+    for block in order_y:
+        base = y_pos[block] + heights[block]
+        for other in v_adj[block]:
+            y_pos[other] = max(y_pos[other], base)
+
+    if movable:
+        inv = 1.0 / len(movable)
+        pack_cx = sum(x_pos[i] + widths[i] * 0.5 for i in movable) * inv
+        pack_cy = sum(y_pos[i] + heights[i] * 0.5 for i in movable) * inv
+        raw_cx = sum(raw_x[i] for i in movable) * inv
+        raw_cy = sum(raw_y[i] for i in movable) * inv
+        dx_shift = (raw_cx - pack_cx) * config.anchor_translation_strength
+        dy_shift = (raw_cy - pack_cy) * config.anchor_translation_strength
+        dx_shift -= min(0.0, min(x_pos[i] + dx_shift for i in movable))
+        dy_shift -= min(0.0, min(y_pos[i] + dy_shift for i in movable))
+    else:
+        dx_shift = 0.0
+        dy_shift = 0.0
+
+    rects: dict[int, Rect] = {}
+    for block in range(inst.block_count):
+        target = inst.target_rects.get(block)
+        if target is not None and block in inst.preplaced:
+            rects[block] = target
+        else:
+            rects[block] = Rect(max(0.0, x_pos.get(block, 0.0) + dx_shift), max(0.0, y_pos.get(block, 0.0) + dy_shift), widths[block], heights[block])
+    return Placement(rects)

@@ -218,6 +218,11 @@ def _connect_clusters(inst: Instance, placement: Placement, config: SolverConfig
             for comp in components:
                 if comp is anchor_component:
                     continue
+                if not any(block in inst.preplaced for block in comp):
+                    shifted = _try_connect_component(inst, placement, comp, anchor_component, config)
+                    if shifted:
+                        moved = True
+                        break
                 for block in sorted(comp, key=lambda idx: idx in inst.preplaced):
                     if block in inst.preplaced:
                         continue
@@ -246,6 +251,83 @@ def _connect_clusters(inst: Instance, placement: Placement, config: SolverConfig
                     break
             if not moved:
                 break
+
+
+def _try_connect_component(
+    inst: Instance,
+    placement: Placement,
+    component: list[int],
+    anchor_component: list[int],
+    config: SolverConfig,
+) -> bool:
+    shifts: list[tuple[float, float]] = []
+    for block in component[: max(1, min(len(component), 12))]:
+        rect = placement.rects[block]
+        for anchor_block in anchor_component[: max(1, min(len(anchor_component), 12))]:
+            anchor = placement.rects[anchor_block]
+            for x, y in _adjacent_positions(anchor, rect.width, rect.height):
+                shifts.append((x - rect.x, y - rect.y))
+
+    seen: set[tuple[float, float]] = set()
+    best_shift: tuple[float, float] | None = None
+    best_score = float("inf")
+    anchor_rects = [placement.rects[block] for block in anchor_component]
+    old_rects = {block: placement.rects[block] for block in component}
+    limit = max(1, config.max_pair_candidates_per_component)
+
+    checked = 0
+    for dx, dy in sorted(shifts, key=lambda s: abs(s[0]) + abs(s[1])):
+        key = (round(dx, 6), round(dy, 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        checked += 1
+        trial_rects = {
+            block: Rect(max(0.0, rect.x + dx), max(0.0, rect.y + dy), rect.width, rect.height)
+            for block, rect in old_rects.items()
+        }
+        if not _component_shift_is_legal(placement, set(component), trial_rects):
+            if checked >= limit:
+                break
+            continue
+        touch = 0.0
+        for rect in trial_rects.values():
+            touch = max(touch, max(edge_touch_length(rect, anchor) for anchor in anchor_rects))
+        trial_all = [rect for block, rect in placement.rects.items() if block not in trial_rects]
+        trial_all.extend(trial_rects.values())
+        bounds = bbox(trial_all)
+        score = bounds.area + 0.05 * (abs(dx) + abs(dy)) - 2500.0 * touch
+        if score < best_score:
+            best_score = score
+            best_shift = (dx, dy)
+        if checked >= limit:
+            break
+
+    if best_shift is None:
+        return False
+    dx, dy = best_shift
+    for block, rect in old_rects.items():
+        placement.rects[block] = Rect(max(0.0, rect.x + dx), max(0.0, rect.y + dy), rect.width, rect.height)
+    return True
+
+
+def _component_shift_is_legal(
+    placement: Placement,
+    component: set[int],
+    trial_rects: dict[int, Rect],
+) -> bool:
+    moved = list(trial_rects.values())
+    for i, rect in enumerate(moved):
+        for other in moved[i + 1 :]:
+            if overlaps(rect, other):
+                return False
+    for block, rect in trial_rects.items():
+        for other_block, other in placement.rects.items():
+            if other_block in component:
+                continue
+            if overlaps(rect, other):
+                return False
+    return True
 
 
 def _score_better_soft_first(inst: Instance, config: SolverConfig, candidate: Placement, current: Placement) -> bool:

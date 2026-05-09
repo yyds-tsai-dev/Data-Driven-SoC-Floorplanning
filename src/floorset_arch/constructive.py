@@ -368,12 +368,14 @@ def _block_rank(
     constraint += 5.0 if block in inst.boundary else 0.0
     constraint += 3.0 if block in graph.block_to_cluster else 0.0
     constraint += 2.0 if block in graph.block_to_mib else 0.0
+    area = max(1.0, float(inst.area_targets[block]))
     return (
-        -guidance_priority,
         -placed_neighbor_weight,
         -constraint,
-        cx + cy,
         -_degree(inst, block),
+        -area,
+        cx + cy,
+        -0.05 * guidance_priority,
     )
 
 
