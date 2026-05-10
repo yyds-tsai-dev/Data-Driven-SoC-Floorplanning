@@ -63,6 +63,14 @@ class FloorplanGNN(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+        pair_in = hidden_dim * 4
+        self.pair_head = nn.Sequential(
+            nn.Linear(pair_in, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 2),
+        )
 
     def encode(self, node_feat: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
         h = self.node_in(node_feat)
@@ -83,12 +91,26 @@ class FloorplanGNN(nn.Module):
             h = norm(h + upd)
         return h
 
-    def forward(self, node_feat: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        node_feat: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        pairs: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         h = self.encode(node_feat, edge_index, edge_attr)
         g = h.mean(dim=0, keepdim=True).expand_as(h)
         z = torch.cat([h, g, node_feat], dim=1)
-        return {
+        output = {
             "anchor": self.anchor_head(z),
             "priority": self.priority_head(z).squeeze(-1),
             "log_aspect": self.aspect_head(z).squeeze(-1).clamp(-2.5, 2.5),
         }
+        if pairs is not None:
+            if pairs.numel() == 0:
+                output["pair_logits"] = h.new_empty((0, 2))
+            else:
+                src = h[pairs[:, 0]]
+                dst = h[pairs[:, 1]]
+                output["pair_logits"] = self.pair_head(torch.cat([src, dst, dst - src, (dst - src).abs()], dim=1))
+        return output

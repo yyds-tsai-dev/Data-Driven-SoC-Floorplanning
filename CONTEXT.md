@@ -32,6 +32,10 @@ _Avoid_: arbitrary greedy coordinate.
 A constructive decoder that expands multiple partial placements by selecting a remaining block, shape, and legal slot at each step.
 _Avoid_: evaluator-in-loop reranking, single greedy placement.
 
+**Architecture v3**:
+The current production architecture generation that keeps `floorset_arch` as the active solver package while exposing a v3 contest wrapper.
+_Avoid_: architecture_v2, treating wrapper version names as separate solver packages.
+
 ## Relationships
 
 - The **Production Solver Path** uses **Anchor-GNN Guidance** as a prior, not as a complete floorplan.
@@ -39,6 +43,7 @@ _Avoid_: evaluator-in-loop reranking, single greedy placement.
 - A **Legacy Strategy** may donate geometry helper logic, but it is not a selectable **Production Solver Path**.
 - A **Reference Architecture** may be consulted while tuning `floorset_arch`, but it does not define the active solver architecture.
 - A **MER/Skyline Slot** must respect hard placement legality before repair is allowed to refine soft constraints.
+- **Architecture v3** names the contest-facing wrapper generation; the **Production Solver Path** remains `floorset_arch`.
 
 ## Example Dialogue
 
@@ -48,3 +53,4 @@ _Avoid_: evaluator-in-loop reranking, single greedy placement.
 ## Flagged Ambiguities
 
 - "Remove greedy/hint architecture" was resolved to mean removing `legacy`, `default`, and `model_first` as production solver branches while preserving reusable geometry helpers where needed by the beam decoder.
+- "Rename architecture_v2" was resolved to mean renaming the contest wrapper and active optimizer class to **Architecture v3**, not renaming the `floorset_arch` package.

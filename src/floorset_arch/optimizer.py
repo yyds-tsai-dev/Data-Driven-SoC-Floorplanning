@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -9,6 +10,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from floorset_arch.constructive import construct_beam_placement
+from floorset_arch.diagnostics import placement_metrics, repair_delta
 from floorset_arch.geometry import bbox, boundary_satisfied, edge_touch_length
 from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 from floorset_arch.models import AnchorGuidance, Placement, Rect, SolverConfig
@@ -31,7 +33,7 @@ except Exception:
             self.verbose = verbose
 
 
-class ArchitectureV2Optimizer(FloorplanOptimizer):
+class ArchitectureV3Optimizer(FloorplanOptimizer):
     """Anchor-GNN guided hetero-graph beam solver."""
 
     def __init__(self, verbose: bool = False, config: Optional[SolverConfig] = None):
@@ -83,31 +85,83 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
             if profile == "compact" and not include_compact:
                 continue
             candidates.append(
-                repair_placement(
+                self._repair_candidate(
                     inst,
                     construct_relative_order_placement(inst, self.config, profile=profile),
-                    self.config,
+                    profile=profile,
+                    kind="relative_order",
                 )
             )
         if not candidates:
-            candidates.append(repair_placement(inst, construct_relative_order_placement(inst, self.config), self.config))
+            candidates.append(
+                self._repair_candidate(
+                    inst,
+                    construct_relative_order_placement(inst, self.config),
+                    profile="soft",
+                    kind="relative_order",
+                )
+            )
         include_beam = os.environ.get("FLOORSET_INCLUDE_BEAM_CANDIDATES", "0") == "1"
         if include_beam:
             graph = build_hetero_floorplan_graph(inst)
-            candidates.append(repair_placement(inst, construct_beam_placement(inst, self.config, graph=graph), self.config))
+            candidates.append(
+                self._repair_candidate(
+                    inst,
+                    construct_beam_placement(inst, self.config, graph=graph),
+                    profile="beam",
+                    kind="beam",
+                )
+            )
 
         include_no_guidance = os.environ.get("FLOORSET_INCLUDE_NO_GUIDANCE_CANDIDATE", "0") == "1"
         if include_no_guidance and inst.anchor_guidance is not None:
             saved_guidance = inst.anchor_guidance
             inst.anchor_guidance = None
-            candidates.append(repair_placement(inst, construct_relative_order_placement(inst, self.config), self.config))
+            candidates.append(
+                self._repair_candidate(
+                    inst,
+                    construct_relative_order_placement(inst, self.config),
+                    profile="no_guidance",
+                    kind="relative_order",
+                )
+            )
             if include_beam:
                 graph_no_guidance = build_hetero_floorplan_graph(inst)
-                candidates.append(repair_placement(inst, construct_beam_placement(inst, self.config, graph=graph_no_guidance), self.config))
+                candidates.append(
+                    self._repair_candidate(
+                        inst,
+                        construct_beam_placement(inst, self.config, graph=graph_no_guidance),
+                        profile="no_guidance_beam",
+                        kind="beam",
+                    )
+                )
             inst.anchor_guidance = saved_guidance
 
         best = min(candidates, key=lambda placement: self._proxy_cost(inst, placement))
         return best.to_position_list(block_count)
+
+    def _repair_candidate(self, inst, placement: Placement, profile: str, kind: str) -> Placement:
+        before = placement
+        after = repair_placement(inst, before, self.config)
+        self._trace_repair(inst, before, after, {"profile": profile, "kind": kind})
+        return after
+
+    def _trace_repair(self, inst, before: Placement, after: Placement, candidate: dict[str, str]) -> None:
+        trace_path = os.environ.get("FLOORSET_REPAIR_TRACE_JSONL")
+        if not trace_path:
+            return
+        before_metrics = placement_metrics(inst, before)
+        after_metrics = placement_metrics(inst, after)
+        row = {
+            "block_count": inst.block_count,
+            "checkpoint_loaded": self._checkpoint_model is not None,
+            "candidate": candidate,
+            "before_repair": before_metrics,
+            "after_repair": after_metrics,
+            "delta": repair_delta(before, after, before_metrics, after_metrics),
+        }
+        with open(trace_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
 
     def _try_anchor_guidance(self, inst) -> Optional[AnchorGuidance]:
         checkpoint = self._resolve_checkpoint_path(os.environ.get(self.config.checkpoint_env))
@@ -130,12 +184,13 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
                     num_layers=int(payload.get("layers", 5)),
                     dropout=float(payload.get("dropout", 0.05)),
                 )
-                model.load_state_dict(payload["model_state_dict"])
+                model.load_state_dict(payload["model_state_dict"], strict=False)
                 self._checkpoint_config = {
                     "node_feat_dim": int(payload["node_feat_dim"]),
                     "hidden_dim": int(payload.get("hidden_dim", 160)),
                     "layers": int(payload.get("layers", 5)),
                     "dropout": float(payload.get("dropout", 0.05)),
+                    "has_pair_head": bool(payload.get("has_pair_head", False)),
                 }
                 model.eval()
                 self._checkpoint_model = model
@@ -148,8 +203,14 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
                 if node_feat.shape[1] != int(self._checkpoint_config.get("node_feat_dim", node_feat.shape[1])):
                     return None
                 edge_index, edge_attr = build_anchor_edge_tensors(inst, device=torch.device("cpu"))
-                pred = model(node_feat, edge_index, edge_attr)
-                return self._anchor_predictions_to_guidance(inst, pred, scale)
+                pairs = None
+                if self._checkpoint_config.get("has_pair_head"):
+                    pairs = torch.tensor(
+                        [(i, j) for i in range(inst.block_count) for j in range(i + 1, inst.block_count)],
+                        dtype=torch.long,
+                    )
+                pred = model(node_feat, edge_index, edge_attr, pairs=pairs)
+                return self._anchor_predictions_to_guidance(inst, pred, scale, pairs)
         except Exception:
             return None
 
@@ -158,6 +219,7 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
         inst,
         pred: dict[str, torch.Tensor],
         scale: float,
+        pairs: torch.Tensor | None = None,
     ) -> AnchorGuidance:
         anchors = pred["anchor"].detach().cpu() * max(float(scale), 1.0)
         priority_tensor = pred.get("priority")
@@ -187,6 +249,11 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
                 guidance.rect_priors[i] = Rect(max(0.0, cx - width / 2.0), max(0.0, cy - height / 2.0), width, height)
             if priority_tensor is not None:
                 guidance.priority[i] = float(priority_tensor.detach().cpu()[i])
+        pair_logits = pred.get("pair_logits")
+        if pair_logits is not None and pairs is not None:
+            logits = pair_logits.detach().cpu()
+            for pair, logit in zip(pairs.detach().cpu().tolist(), logits.tolist()):
+                guidance.pairwise_axis[(int(pair[0]), int(pair[1]))] = (float(logit[0]), float(logit[1]))
         return guidance
 
     def _resolve_checkpoint_path(self, value: Optional[str]) -> Optional[Path]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 from floorset_arch.models import AnchorGuidance, Instance, Placement, Rect, SolverConfig
 
@@ -76,6 +77,43 @@ def _anchors(inst: Instance, widths: list[float], heights: list[float], guidance
     return raw_x, raw_y
 
 
+def _preplaced_frame(inst: Instance) -> tuple[float | None, float | None, float | None, float | None]:
+    left = right = bottom = top = None
+    for block in inst.preplaced:
+        rect = inst.target_rects.get(block)
+        code = inst.boundary.get(block, 0)
+        if rect is None or code == 0:
+            continue
+        if code & 1:
+            left = rect.x if left is None else min(left, rect.x)
+        if code & 2:
+            right = rect.right if right is None else max(right, rect.right)
+        if code & 8:
+            bottom = rect.y if bottom is None else min(bottom, rect.y)
+        if code & 4:
+            top = rect.top if top is None else max(top, rect.top)
+    return left, right, bottom, top
+
+
+def _clamp_to_preplaced_frame(inst: Instance, raw_x: list[float], raw_y: list[float], widths: list[float], heights: list[float]) -> None:
+    left, right, bottom, top = _preplaced_frame(inst)
+    for block in range(inst.block_count):
+        if block in inst.preplaced:
+            continue
+        if left is not None and right is not None and right - left >= widths[block]:
+            raw_x[block] = min(max(raw_x[block], left + widths[block] * 0.5), right - widths[block] * 0.5)
+        elif right is not None:
+            raw_x[block] = min(raw_x[block], right - widths[block] * 0.5)
+        elif left is not None:
+            raw_x[block] = max(raw_x[block], left + widths[block] * 0.5)
+        if bottom is not None and top is not None and top - bottom >= heights[block]:
+            raw_y[block] = min(max(raw_y[block], bottom + heights[block] * 0.5), top - heights[block] * 0.5)
+        elif top is not None:
+            raw_y[block] = min(raw_y[block], top - heights[block] * 0.5)
+        elif bottom is not None:
+            raw_y[block] = max(raw_y[block], bottom + heights[block] * 0.5)
+
+
 def _bias_order_keys(
     inst: Instance,
     raw_x: list[float],
@@ -149,6 +187,8 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
         heights.append(height)
 
     raw_x, raw_y = _anchors(inst, widths, heights, guidance)
+    if os.environ.get("FLOORSET_PREPLACED_FRAME_CLAMP") == "1":
+        _clamp_to_preplaced_frame(inst, raw_x, raw_y, widths, heights)
     key_x, key_y = _bias_order_keys(inst, raw_x, raw_y, widths, heights, config, profile)
     movable = [i for i in range(inst.block_count) if i not in inst.preplaced]
     order_x = sorted(movable, key=lambda i: (key_x[i], key_y[i], -sum(w for _, w in inst.b2b_by_block.get(i, [])), i))
@@ -188,6 +228,14 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
                     h_score += 0.0 if profile == "compact" else 0.45
                 else:
                     v_score += 0.0 if profile == "compact" else 0.45
+            if guidance is not None and guidance.pairwise_axis:
+                key = (i, j) if i < j else (j, i)
+                pair_logits = guidance.pairwise_axis.get(key)
+                if pair_logits is not None:
+                    x_logit, y_logit = pair_logits
+                    model_axis_bias = max(-1.0, min(1.0, x_logit - y_logit))
+                    h_score -= 0.20 * model_axis_bias
+                    v_score += 0.20 * model_axis_bias
             if h_score >= v_score:
                 add_h(i, j)
             else:

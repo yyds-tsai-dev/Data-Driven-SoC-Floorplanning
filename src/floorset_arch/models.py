@@ -90,6 +90,7 @@ class AnchorGuidance:
     rect_priors: Dict[int, Rect] = field(default_factory=dict)
     priority: Dict[int, float] = field(default_factory=dict)
     log_aspect: Dict[int, float] = field(default_factory=dict)
+    pairwise_axis: Dict[Tuple[int, int], Tuple[float, float]] = field(default_factory=dict)
     scale: float = 1.0
 
 

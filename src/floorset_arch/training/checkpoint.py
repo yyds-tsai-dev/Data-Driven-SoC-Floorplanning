@@ -45,6 +45,7 @@ def anchor_checkpoint_payload(
         "hidden_dim": model.hidden_dim,
         "layers": model.num_layers,
         "dropout": getattr(model, "dropout_p", None),
+        "has_pair_head": hasattr(model, "pair_head"),
         "epoch": epoch,
         "train_stats": train_stats,
         "val_stats": val_stats,

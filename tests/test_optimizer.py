@@ -2,9 +2,9 @@ from pathlib import Path
 
 import torch
 
-from floorset_arch.models import SolverConfig
+from floorset_arch.models import AnchorGuidance, SolverConfig
 from floorset_arch.nn.model import FloorplanGNN
-from floorset_arch.optimizer import ArchitectureV2Optimizer
+from floorset_arch.optimizer import ArchitectureV3Optimizer
 from floorset_arch.parser import parse_instance
 
 
@@ -41,7 +41,7 @@ def test_checkpoint_relative_path_resolves_from_repo_root(tmp_path, monkeypatch)
 
     monkeypatch.chdir("FloorSet/iccad2026contest")
     monkeypatch.setenv("FLOORSET_GNN_CHECKPOINT", str(checkpoint))
-    optimizer = ArchitectureV2Optimizer()
+    optimizer = ArchitectureV3Optimizer()
 
     assert optimizer._try_anchor_guidance(inst) is not None
 
@@ -62,7 +62,7 @@ def test_checkpoint_model_is_cached_between_solves(tmp_path, monkeypatch):
         return original_loader(*args, **kwargs)
 
     monkeypatch.setattr(checkpoint_module, "load_checkpoint", counted_loader)
-    optimizer = ArchitectureV2Optimizer(config=SolverConfig(max_candidates_per_block=8, beam_width=1))
+    optimizer = ArchitectureV3Optimizer(config=SolverConfig(max_candidates_per_block=8, beam_width=1))
 
     optimizer.solve(**_tiny_problem())
     optimizer.solve(**_tiny_problem())
@@ -77,10 +77,41 @@ def test_default_checkpoint_loads_root_anchor_gnn(monkeypatch):
         return
     problem = _tiny_problem()
     inst = parse_instance(**problem)
-    optimizer = ArchitectureV2Optimizer()
+    optimizer = ArchitectureV3Optimizer()
 
     guidance = optimizer._try_anchor_guidance(inst)
 
     assert guidance is not None
     assert optimizer._checkpoint_kind == "anchor_gnn_v2"
     assert len(guidance.rect_priors) == problem["block_count"]
+
+
+def test_runtime_calibration_env_does_not_sleep(monkeypatch):
+    block_count = 21
+    problem = {
+        "block_count": block_count,
+        "area_targets": torch.full((block_count,), 4.0),
+        "b2b_connectivity": torch.empty(0, 3),
+        "p2b_connectivity": torch.empty(0, 3),
+        "pins_pos": torch.empty(0, 2),
+        "constraints": torch.zeros(block_count, 5),
+        "target_positions": torch.full((block_count, 4), -1.0),
+    }
+
+    def fail_sleep(_seconds):
+        raise AssertionError("runtime calibration must not sleep")
+
+    monkeypatch.setattr("time.sleep", fail_sleep)
+    monkeypatch.setenv("FLOORSET_RUNTIME_CALIBRATION_SECONDS", "10")
+
+    optimizer = ArchitectureV3Optimizer()
+
+    assert len(optimizer.solve(**problem)) == block_count
+
+
+def test_anchor_guidance_can_store_pairwise_logits():
+    guidance = AnchorGuidance()
+
+    guidance.pairwise_axis[(0, 1)] = (2.0, -1.0)
+
+    assert guidance.pairwise_axis[(0, 1)] == (2.0, -1.0)

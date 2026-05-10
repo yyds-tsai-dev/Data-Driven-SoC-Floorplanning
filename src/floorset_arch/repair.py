@@ -6,7 +6,7 @@ import os
 from floorset_arch.constructive import block_dimensions
 from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
-from floorset_arch.scoring import hpwl_proxy
+from floorset_arch.scoring import candidate_hpwl_proxy, hpwl_proxy
 
 
 def _snap_hard(inst: Instance, placement: Placement) -> None:
@@ -58,16 +58,64 @@ def _unify_compatible_mib(inst: Instance, placement: Placement) -> None:
                 placement.rects[block] = rect.resized(width, height)
 
 
-def _move_to_first_slot(inst: Instance, placement: Placement, block: int) -> None:
+def _move_to_best_slot(inst: Instance, placement: Placement, block: int) -> None:
     rect = placement.rects[block]
     others = [r for i, r in placement.rects.items() if i != block]
+    best: Rect | None = None
+    best_score = float("inf")
+    limit = int(os.environ.get("FLOORSET_OVERLAP_REPAIR_CANDIDATES", "24"))
     for x, y in candidate_frontier_points(others):
         candidate = Rect(max(0.0, x), max(0.0, y), rect.width, rect.height)
-        if first_non_overlapping(candidate, others):
-            placement.rects[block] = candidate
-            return
+        if not first_non_overlapping(candidate, others):
+            continue
+        move = abs(candidate.x - rect.x) + abs(candidate.y - rect.y)
+        score = _relocation_proxy(inst, placement, block, candidate) + 0.01 * move
+        if score < best_score:
+            best = candidate
+            best_score = score
+        limit -= 1
+        if limit <= 0:
+            break
+    if best is not None:
+        placement.rects[block] = best
+        return
     bounds = bbox(others)
     placement.rects[block] = Rect(bounds.right, bounds.y, rect.width, rect.height)
+
+
+def _relocation_proxy(inst: Instance, placement: Placement, block: int, candidate: Rect) -> float:
+    others = {idx: rect for idx, rect in placement.rects.items() if idx != block}
+    bounds = bbox([*others.values(), candidate])
+    score = 0.018 * max(bounds.area, 1.0)
+    score += 0.0025 * candidate_hpwl_proxy(inst, block, candidate, others)
+
+    code = inst.boundary.get(block, 0)
+    if code and not boundary_satisfied_local(candidate, bounds, code):
+        score += 2500.0
+
+    for members in inst.cluster_groups.values():
+        if block not in members:
+            continue
+        placed = [others[idx] for idx in members if idx in others]
+        if not placed:
+            continue
+        touch = max(edge_touch_length(candidate, other) for other in placed)
+        if touch <= 0.0:
+            score += 2500.0
+        else:
+            score -= 1000.0 * touch
+
+    for members in inst.mib_groups.values():
+        if block not in members:
+            continue
+        shapes = {
+            (round(others[idx].width, 5), round(others[idx].height, 5))
+            for idx in members
+            if idx in others
+        }
+        if shapes and (round(candidate.width, 5), round(candidate.height, 5)) not in shapes:
+            score += 2500.0
+    return score
 
 
 def _resolve_overlaps(inst: Instance, placement: Placement, config: SolverConfig) -> None:
@@ -77,7 +125,7 @@ def _resolve_overlaps(inst: Instance, placement: Placement, config: SolverConfig
             if block in inst.preplaced:
                 continue
             if any(overlaps(rect, other) for other_idx, other in placement.rects.items() if other_idx != block):
-                _move_to_first_slot(inst, placement, block)
+                _move_to_best_slot(inst, placement, block)
                 changed = True
         if not changed:
             return
@@ -575,6 +623,6 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
         if block not in repaired.rects:
             width, height = block_dimensions(inst, block)
             repaired.rects[block] = Rect(0.0, 0.0, width, height)
-            _move_to_first_slot(inst, repaired, block)
+            _move_to_best_slot(inst, repaired, block)
 
     return repaired

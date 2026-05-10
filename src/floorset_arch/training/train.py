@@ -18,8 +18,11 @@ from floorset_arch.training.checkpoint import (
 )
 from floorset_arch.training.losses import (
     build_anchor_targets,
+    build_pairwise_relation_targets,
     compute_anchor_losses,
     constraint_weights,
+    pairwise_relation_loss,
+    sample_pairs,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -111,6 +114,8 @@ def run_epoch(
             "edge",
             "ord_frac",
             "ord_acc",
+            "pairwise",
+            "pair_acc",
         )
     }
     count = 0
@@ -129,12 +134,21 @@ def run_epoch(
         edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
         targets = build_anchor_targets(fp_sol, block_count, scale, device)
         weights = constraint_weights(constraints, block_count, device, args)
+        pairs = sample_pairs(block_count, args.pairwise_pairs, device)
 
         with torch.set_grad_enabled(train):
-            pred = model(node_feat, edge_index, edge_attr)
+            pred = model(node_feat, edge_index, edge_attr, pairs=pairs)
             loss, parts = compute_anchor_losses(
                 pred, targets, weights, inst.valid_b2b, args
             )
+            pair_targets = build_pairwise_relation_targets(
+                fp_sol[:block_count].to(device),
+                pairs,
+                min_gap=args.min_order_gap * max(float(scale), 1.0),
+                clear_ratio=args.clear_ratio,
+            )
+            pair_loss, pair_acc = pairwise_relation_loss(pred["pair_logits"], pair_targets)
+            loss = loss + args.pairwise_weight * pair_loss
             if train:
                 (loss / accumulation_steps).backward()
                 if (count + 1) % accumulation_steps == 0:
@@ -153,6 +167,8 @@ def run_epoch(
         sums["edge"] += float(parts["edge"].item())
         sums["ord_frac"] += float(parts["ord_frac"])
         sums["ord_acc"] += float(parts["ord_acc"])
+        sums["pairwise"] += float(pair_loss.item())
+        sums["pair_acc"] += float(pair_acc)
         count += 1
         if train and args.print_every > 0 and count % args.print_every == 0:
             print(
@@ -160,7 +176,7 @@ def run_epoch(
                 f"loss={loss.item():.5f} anchor={parts['anchor'].item():.5f} "
                 f"aspect={parts['aspect'].item():.5f} priority={parts['priority'].item():.5f} "
                 f"order={parts['order'].item():.5f} edge={parts['edge'].item():.5f} "
-                f"ord_acc={float(parts['ord_acc']):.3f}",
+                f"ord_acc={float(parts['ord_acc']):.3f} pair_acc={pair_acc:.3f}",
                 flush=True,
             )
     if train and count % accumulation_steps != 0:
@@ -210,7 +226,7 @@ def load_resume_model(
         num_layers=layers,
         dropout=dropout,
     ).to(device)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     resume_epoch = int(payload.get("epoch", 0))
     print(f"Loaded resume checkpoint from {checkpoint_path}", flush=True)
     print(f"Resume checkpoint epoch = {resume_epoch}", flush=True)
@@ -267,7 +283,7 @@ def main(args) -> None:
     wandb_run = maybe_init_wandb(args)
 
     print("=" * 72)
-    print("Architecture v2 Anchor-GNN training")
+    print("Architecture v3 Anchor-GNN training")
     print(f"  dataset samples  = {total}")
     print(f"  train per epoch  = {args.num_samples}")
     print(f"  val window       = {vs}..{ve}")
@@ -339,14 +355,16 @@ def main(args) -> None:
             f"Epoch {epoch:03d} train loss={train_stats['loss']:.5f} "
             f"anchor={train_stats['anchor']:.5f} aspect={train_stats['aspect']:.5f} "
             f"priority={train_stats['priority']:.5f} order={train_stats['order']:.5f} "
-            f"edge={train_stats['edge']:.5f} ord_acc={train_stats['ord_acc']:.3f}",
+            f"edge={train_stats['edge']:.5f} pair={train_stats['pairwise']:.5f} "
+            f"ord_acc={train_stats['ord_acc']:.3f} pair_acc={train_stats['pair_acc']:.3f}",
             flush=True,
         )
         print(
             f"Epoch {epoch:03d} val   loss={val_stats['loss']:.5f} "
             f"anchor={val_stats['anchor']:.5f} aspect={val_stats['aspect']:.5f} "
             f"priority={val_stats['priority']:.5f} order={val_stats['order']:.5f} "
-            f"edge={val_stats['edge']:.5f} ord_acc={val_stats['ord_acc']:.3f}",
+            f"edge={val_stats['edge']:.5f} pair={val_stats['pairwise']:.5f} "
+            f"ord_acc={val_stats['ord_acc']:.3f} pair_acc={val_stats['pair_acc']:.3f}",
             flush=True,
         )
         if wandb_run is not None:
@@ -428,6 +446,8 @@ def parse_args():
     parser.add_argument("--priority-weight", type=float, default=0.08)
     parser.add_argument("--order-weight", type=float, default=0.25)
     parser.add_argument("--edge-weight", type=float, default=0.08)
+    parser.add_argument("--pairwise-weight", type=float, default=0.20)
+    parser.add_argument("--pairwise-pairs", type=int, default=4096)
     parser.add_argument("--boundary-weight-boost", type=float, default=0.45)
     parser.add_argument("--cluster-weight-boost", type=float, default=0.20)
     parser.add_argument("--mib-weight-boost", type=float, default=0.25)
@@ -445,7 +465,7 @@ def parse_args():
     parser.add_argument("--resume-checkpoint", default="")
     parser.add_argument("--ignore-optimizer-state", action="store_true")
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", default="floorset-arch-v2")
+    parser.add_argument("--wandb-project", default="floorset-arch-v3")
     parser.add_argument("--wandb-entity", default="")
     parser.add_argument("--wandb-run-name", default="")
     parser.add_argument(

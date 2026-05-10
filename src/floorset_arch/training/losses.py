@@ -99,6 +99,47 @@ def order_aux_loss(
     return loss, used / max(float(pairs.shape[0]), 1.0), acc_sum / max(acc_count, 1)
 
 
+def build_pairwise_relation_targets(
+    fp_sol: torch.Tensor,
+    pairs: torch.Tensor,
+    min_gap: float,
+    clear_ratio: float,
+) -> dict[str, torch.Tensor]:
+    device = fp_sol.device
+    if pairs.numel() == 0:
+        empty = torch.empty((0,), dtype=torch.float32, device=device)
+        return {"x_label": empty, "y_label": empty, "mask": empty.bool()}
+    gt = fp_sol.float()
+    centers = torch.stack([gt[:, 2] + gt[:, 0] / 2.0, gt[:, 3] + gt[:, 1] / 2.0], dim=1)
+    i = pairs[:, 0].to(device)
+    j = pairs[:, 1].to(device)
+    delta = centers[j] - centers[i]
+    abs_dx = delta[:, 0].abs()
+    abs_dy = delta[:, 1].abs()
+    clear_x = (abs_dx > clear_ratio * abs_dy) & (abs_dx > min_gap)
+    clear_y = (abs_dy > clear_ratio * abs_dx) & (abs_dy > min_gap)
+    x_label = (delta[:, 0] > 0).float() * clear_x.float()
+    y_label = (delta[:, 1] > 0).float() * clear_y.float()
+    return {"x_label": x_label, "y_label": y_label, "mask": clear_x | clear_y}
+
+
+def pairwise_relation_loss(
+    pair_logits: torch.Tensor,
+    targets: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, float]:
+    mask = targets["mask"].to(pair_logits.device)
+    if mask.numel() == 0 or not mask.any():
+        return pair_logits.sum() * 0.0, 1.0
+    labels = torch.stack(
+        [targets["x_label"].to(pair_logits.device), targets["y_label"].to(pair_logits.device)],
+        dim=1,
+    )
+    loss = F.binary_cross_entropy_with_logits(pair_logits[mask], labels[mask])
+    pred = (pair_logits[mask] > 0).float()
+    acc = float((pred == labels[mask]).float().mean().item())
+    return loss, acc
+
+
 def edge_delta_loss(
     pred_anchor: torch.Tensor, target_anchor: torch.Tensor, valid_b2b: torch.Tensor
 ) -> torch.Tensor:
