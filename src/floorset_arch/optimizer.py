@@ -128,12 +128,14 @@ class ArchitectureV2Optimizer(FloorplanOptimizer):
                     node_feat_dim=int(payload["node_feat_dim"]),
                     hidden_dim=int(payload.get("hidden_dim", 160)),
                     num_layers=int(payload.get("layers", 5)),
+                    dropout=float(payload.get("dropout", 0.05)),
                 )
                 model.load_state_dict(payload["model_state_dict"])
                 self._checkpoint_config = {
                     "node_feat_dim": int(payload["node_feat_dim"]),
                     "hidden_dim": int(payload.get("hidden_dim", 160)),
                     "layers": int(payload.get("layers", 5)),
+                    "dropout": float(payload.get("dropout", 0.05)),
                 }
                 model.eval()
                 self._checkpoint_model = model

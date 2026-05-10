@@ -188,6 +188,7 @@ def load_resume_model(
         payload.get("hidden_dim", model_config.get("hidden_dim", args.hidden_dim))
     )
     layers = int(payload.get("layers", model_config.get("layers", args.layers)))
+    dropout = float(payload.get("dropout", model_config.get("dropout", args.dropout)))
     if node_feat_dim <= 0:
         raise RuntimeError(
             f"Resume checkpoint has no node feature dimension: {checkpoint_path}"
@@ -201,11 +202,13 @@ def load_resume_model(
         )
         args.hidden_dim = hidden_dim
         args.layers = layers
+    args.dropout = dropout
 
     model = FloorplanGNN(
         node_feat_dim=node_feat_dim,
         hidden_dim=hidden_dim,
         num_layers=layers,
+        dropout=dropout,
     ).to(device)
     model.load_state_dict(state)
     resume_epoch = int(payload.get("epoch", 0))
@@ -270,6 +273,7 @@ def main(args) -> None:
     print(f"  val window       = {vs}..{ve}")
     print(f"  device           = {device}")
     print(f"  hidden/layers    = {args.hidden_dim}/{args.layers}")
+    print(f"  dropout          = {args.dropout}")
     print(f"  accumulation     = {max(1, args.accumulation_steps)}")
     print(f"  checkpoint tag   = {run_tag}")
     if args.resume_checkpoint:
@@ -310,6 +314,7 @@ def main(args) -> None:
                 node_feat_dim=node_feat.shape[1],
                 hidden_dim=args.hidden_dim,
                 num_layers=args.layers,
+                dropout=args.dropout,
             ).to(device)
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -413,6 +418,7 @@ def parse_args():
     parser.add_argument("--val-start", type=int, default=-1)
     parser.add_argument("--hidden-dim", type=int, default=160)
     parser.add_argument("--layers", type=int, default=5)
+    parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
