@@ -6,13 +6,21 @@ import sys
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-import wandb
 from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
 from floorset_arch.nn.model import FloorplanGNN
 from floorset_arch.parser import parse_instance
+from floorset_arch.training.checkpoint import (
+    build_run_tag,
+    load_checkpoint,
+    save_anchor_checkpoint,
+)
+from floorset_arch.training.losses import (
+    build_anchor_targets,
+    compute_anchor_losses,
+    constraint_weights,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 FLOORSET_DIR = ROOT / "FloorSet"
@@ -75,128 +83,6 @@ def make_loader(
     return loader, start, start + n - 1
 
 
-def build_targets(
-    fp_sol: torch.Tensor, block_count: int, scale: float, device: torch.device
-) -> dict[str, torch.Tensor]:
-    gt = fp_sol[:block_count].float().to(device)
-    width = gt[:, 0].clamp_min(1e-6)
-    height = gt[:, 1].clamp_min(1e-6)
-    x = gt[:, 2]
-    y = gt[:, 3]
-    anchor = torch.stack([x + width / 2.0, y + height / 2.0], dim=1) / max(
-        float(scale), 1.0
-    )
-    log_aspect = torch.log(width / height).clamp(-2.5, 2.5)
-    center_sum = anchor.sum(dim=1)
-    span = (center_sum.max() - center_sum.min()).clamp_min(1e-6)
-    priority = 1.0 - (center_sum - center_sum.min()) / span
-    return {"anchor": anchor, "log_aspect": log_aspect, "priority": priority}
-
-
-def constraint_weights(
-    constraints: torch.Tensor, block_count: int, device: torch.device, args
-) -> torch.Tensor:
-    weights = torch.ones(block_count, device=device)
-    if constraints is None or constraints.dim() <= 1:
-        return weights
-    c = constraints[:block_count].to(device)
-    if c.shape[1] > 0:
-        weights = weights + 0.10 * (c[:, 0] != 0).float()
-    if c.shape[1] > 1:
-        weights = weights + 0.10 * (c[:, 1] != 0).float()
-    if c.shape[1] > 2:
-        weights = weights + args.mib_weight_boost * (c[:, 2] != 0).float()
-    if c.shape[1] > 3:
-        weights = weights + args.cluster_weight_boost * (c[:, 3] != 0).float()
-    if c.shape[1] > 4:
-        weights = weights + args.boundary_weight_boost * (c[:, 4] != 0).float()
-    return weights
-
-
-def weighted_smooth_l1(
-    pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor
-) -> torch.Tensor:
-    loss = F.smooth_l1_loss(pred, target, reduction="none")
-    if loss.dim() > 1:
-        loss = loss.sum(dim=1)
-    return (loss * weights).sum() / weights.sum().clamp_min(1.0)
-
-
-def sample_pairs(
-    block_count: int, max_pairs: int, device: torch.device
-) -> torch.Tensor:
-    pairs = [(i, j) for i in range(block_count) for j in range(i + 1, block_count)]
-    if not pairs:
-        return torch.empty((0, 2), dtype=torch.long, device=device)
-    pair_tensor = torch.tensor(pairs, dtype=torch.long, device=device)
-    if max_pairs > 0 and pair_tensor.shape[0] > max_pairs:
-        pair_tensor = pair_tensor[
-            torch.randperm(pair_tensor.shape[0], device=device)[:max_pairs]
-        ]
-    return pair_tensor
-
-
-def order_aux_loss(
-    pred_anchor: torch.Tensor, target_anchor: torch.Tensor, args
-) -> tuple[torch.Tensor, float, float]:
-    device = pred_anchor.device
-    pairs = sample_pairs(pred_anchor.shape[0], args.order_pairs, device)
-    if pairs.numel() == 0:
-        return pred_anchor.sum() * 0.0, 0.0, 1.0
-    i = pairs[:, 0]
-    j = pairs[:, 1]
-    gt_delta = target_anchor[j] - target_anchor[i]
-    abs_dx = gt_delta[:, 0].abs()
-    abs_dy = gt_delta[:, 1].abs()
-    clear_x = (abs_dx > args.clear_ratio * abs_dy) & (abs_dx > args.min_order_gap)
-    clear_y = (abs_dy > args.clear_ratio * abs_dx) & (abs_dy > args.min_order_gap)
-
-    loss = pred_anchor.sum() * 0.0
-    used = 0
-    acc_sum = 0.0
-    acc_count = 0
-    if clear_x.any():
-        sign = torch.sign(gt_delta[clear_x, 0])
-        pred_delta = pred_anchor[j[clear_x], 0] - pred_anchor[i[clear_x], 0]
-        loss = loss + F.softplus(-sign * pred_delta / args.order_temp).mean()
-        used += int(clear_x.sum().item())
-        acc_sum += float(((pred_delta * sign) > 0).float().mean().item())
-        acc_count += 1
-    if clear_y.any():
-        sign = torch.sign(gt_delta[clear_y, 1])
-        pred_delta = pred_anchor[j[clear_y], 1] - pred_anchor[i[clear_y], 1]
-        loss = loss + F.softplus(-sign * pred_delta / args.order_temp).mean()
-        used += int(clear_y.sum().item())
-        acc_sum += float(((pred_delta * sign) > 0).float().mean().item())
-        acc_count += 1
-    return loss, used / max(float(pairs.shape[0]), 1.0), acc_sum / max(acc_count, 1)
-
-
-def edge_delta_loss(
-    pred_anchor: torch.Tensor, target_anchor: torch.Tensor, valid_b2b: torch.Tensor
-) -> torch.Tensor:
-    edges = []
-    weights = []
-    for i_f, j_f, weight_f in valid_b2b.tolist():
-        i = int(i_f)
-        j = int(j_f)
-        weight = max(float(weight_f), 0.0)
-        if 0 <= i < pred_anchor.shape[0] and 0 <= j < pred_anchor.shape[0] and i != j:
-            edges.append((i, j))
-            weights.append(weight)
-    if not edges:
-        return pred_anchor.sum() * 0.0
-    edge_t = torch.tensor(edges, dtype=torch.long, device=pred_anchor.device)
-    weight_t = torch.log1p(
-        torch.tensor(weights, dtype=torch.float32, device=pred_anchor.device)
-    )
-    weight_t = weight_t / weight_t.mean().clamp_min(1.0)
-    pred_delta = pred_anchor[edge_t[:, 1]] - pred_anchor[edge_t[:, 0]]
-    target_delta = target_anchor[edge_t[:, 1]] - target_anchor[edge_t[:, 0]]
-    per = F.smooth_l1_loss(pred_delta, target_delta, reduction="none").sum(dim=1)
-    return (per * weight_t).mean()
-
-
 def unpack_batch(batch):
     area_targets, b2b, p2b, pins, constraints, _tree_sol, fp_sol, metrics = batch
     return (
@@ -241,28 +127,13 @@ def run_epoch(
         )
         node_feat, scale = build_anchor_node_features(inst, device=device)
         edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
-        targets = build_targets(fp_sol, block_count, scale, device)
+        targets = build_anchor_targets(fp_sol, block_count, scale, device)
         weights = constraint_weights(constraints, block_count, device, args)
 
         with torch.set_grad_enabled(train):
             pred = model(node_feat, edge_index, edge_attr)
-            anchor = weighted_smooth_l1(pred["anchor"], targets["anchor"], weights)
-            aspect = weighted_smooth_l1(
-                pred["log_aspect"], targets["log_aspect"], weights
-            )
-            priority = weighted_smooth_l1(
-                pred["priority"], targets["priority"], weights
-            )
-            order, ord_frac, ord_acc = order_aux_loss(
-                pred["anchor"], targets["anchor"], args
-            )
-            edge = edge_delta_loss(pred["anchor"], targets["anchor"], inst.valid_b2b)
-            loss = (
-                args.anchor_weight * anchor
-                + args.aspect_weight * aspect
-                + args.priority_weight * priority
-                + args.order_weight * order
-                + args.edge_weight * edge
+            loss, parts = compute_anchor_losses(
+                pred, targets, weights, inst.valid_b2b, args
             )
             if train:
                 (loss / accumulation_steps).backward()
@@ -275,20 +146,21 @@ def run_epoch(
                     optimizer.zero_grad(set_to_none=True)
 
         sums["loss"] += float(loss.item())
-        sums["anchor"] += float(anchor.item())
-        sums["aspect"] += float(aspect.item())
-        sums["priority"] += float(priority.item())
-        sums["order"] += float(order.item())
-        sums["edge"] += float(edge.item())
-        sums["ord_frac"] += float(ord_frac)
-        sums["ord_acc"] += float(ord_acc)
+        sums["anchor"] += float(parts["anchor"].item())
+        sums["aspect"] += float(parts["aspect"].item())
+        sums["priority"] += float(parts["priority"].item())
+        sums["order"] += float(parts["order"].item())
+        sums["edge"] += float(parts["edge"].item())
+        sums["ord_frac"] += float(parts["ord_frac"])
+        sums["ord_acc"] += float(parts["ord_acc"])
         count += 1
         if train and args.print_every > 0 and count % args.print_every == 0:
             print(
                 f"[epoch {epoch:03d} step {count:05d}] "
-                f"loss={loss.item():.5f} anchor={anchor.item():.5f} aspect={aspect.item():.5f} "
-                f"priority={priority.item():.5f} order={order.item():.5f} edge={edge.item():.5f} "
-                f"ord_acc={ord_acc:.3f}",
+                f"loss={loss.item():.5f} anchor={parts['anchor'].item():.5f} "
+                f"aspect={parts['aspect'].item():.5f} priority={parts['priority'].item():.5f} "
+                f"order={parts['order'].item():.5f} edge={parts['edge'].item():.5f} "
+                f"ord_acc={float(parts['ord_acc']):.3f}",
                 flush=True,
             )
     if train and count % accumulation_steps != 0:
@@ -299,23 +171,52 @@ def run_epoch(
     return {key: value / max(count, 1) for key, value in sums.items()}
 
 
-def save_checkpoint(
-    path: Path, model: FloorplanGNN, args, epoch: int, train_stats, val_stats
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "node_feat_dim": model.node_feat_dim,
-            "hidden_dim": model.hidden_dim,
-            "layers": model.num_layers,
-            "epoch": epoch,
-            "train_stats": train_stats,
-            "val_stats": val_stats,
-            "args": vars(args),
-        },
-        path,
+def load_resume_model(
+    path: str, device: torch.device, args
+) -> tuple[FloorplanGNN, int, dict | None]:
+    checkpoint_path = Path(path)
+    payload = load_checkpoint(checkpoint_path, map_location=device)
+    state = payload.get("model_state_dict") or payload.get("model_state")
+    if state is None:
+        raise RuntimeError(f"Resume checkpoint has no model state: {checkpoint_path}")
+
+    model_config = payload.get("model_config", {})
+    node_feat_dim = int(
+        payload.get("node_feat_dim", model_config.get("node_feat_dim", 0))
     )
+    hidden_dim = int(
+        payload.get("hidden_dim", model_config.get("hidden_dim", args.hidden_dim))
+    )
+    layers = int(payload.get("layers", model_config.get("layers", args.layers)))
+    if node_feat_dim <= 0:
+        raise RuntimeError(
+            f"Resume checkpoint has no node feature dimension: {checkpoint_path}"
+        )
+
+    if hidden_dim != args.hidden_dim or layers != args.layers:
+        print(
+            "Resume checkpoint model config overrides CLI: "
+            f"hidden/layers {args.hidden_dim}/{args.layers} -> {hidden_dim}/{layers}",
+            flush=True,
+        )
+        args.hidden_dim = hidden_dim
+        args.layers = layers
+
+    model = FloorplanGNN(
+        node_feat_dim=node_feat_dim,
+        hidden_dim=hidden_dim,
+        num_layers=layers,
+    ).to(device)
+    model.load_state_dict(state)
+    resume_epoch = int(payload.get("epoch", 0))
+    print(f"Loaded resume checkpoint from {checkpoint_path}", flush=True)
+    print(f"Resume checkpoint epoch = {resume_epoch}", flush=True)
+    if payload.get("val_stats"):
+        print(
+            f"Resume checkpoint val loss = {payload['val_stats'].get('loss')}",
+            flush=True,
+        )
+    return model, resume_epoch, payload.get("optimizer_state_dict")
 
 
 def main(args) -> None:
@@ -336,9 +237,30 @@ def main(args) -> None:
 
     model = None
     optimizer = None
+    resume_epoch_offset = 0
+    optimizer_state = None
+    if args.resume_checkpoint:
+        model, resume_epoch_offset, optimizer_state = load_resume_model(
+            args.resume_checkpoint, device, args
+        )
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+        if optimizer_state is not None and not args.ignore_optimizer_state:
+            optimizer.load_state_dict(optimizer_state)
+            print("Loaded optimizer state from resume checkpoint", flush=True)
+        elif optimizer_state is None:
+            print(
+                "Resume checkpoint has no optimizer state; using fresh AdamW",
+                flush=True,
+            )
+
     best_val = float("inf")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    run_tag = args.checkpoint_tag or build_run_tag(args)
+    latest_path = out_dir / f"{args.checkpoint_prefix}_latest_{run_tag}.pt"
+    best_path = out_dir / f"{args.checkpoint_prefix}_best_{run_tag}.pt"
     wandb_run = maybe_init_wandb(args)
 
     print("=" * 72)
@@ -349,9 +271,13 @@ def main(args) -> None:
     print(f"  device           = {device}")
     print(f"  hidden/layers    = {args.hidden_dim}/{args.layers}")
     print(f"  accumulation     = {max(1, args.accumulation_steps)}")
+    print(f"  checkpoint tag   = {run_tag}")
+    if args.resume_checkpoint:
+        print(f"  resume checkpoint= {args.resume_checkpoint}")
     print("=" * 72, flush=True)
 
-    for epoch in range(1, args.epochs + 1):
+    for local_epoch in range(1, args.epochs + 1):
+        epoch = resume_epoch_offset + local_epoch
         train_start = choose_window_start(
             total, args.num_samples, args.seed, epoch, args.window_start
         )
@@ -428,18 +354,49 @@ def main(args) -> None:
                 }
             )
 
-        save_checkpoint(
-            out_dir / "gnn_latest.pt", model, args, epoch, train_stats, val_stats
+        save_anchor_checkpoint(
+            latest_path, model, args, epoch, train_stats, val_stats, optimizer=optimizer
         )
+        if args.write_stable_checkpoints:
+            save_anchor_checkpoint(
+                out_dir / f"{args.checkpoint_prefix}_latest.pt",
+                model,
+                args,
+                epoch,
+                train_stats,
+                val_stats,
+                optimizer=optimizer,
+            )
         if val_stats["loss"] < best_val:
             best_val = val_stats["loss"]
-            save_checkpoint(
-                out_dir / "gnn_best.pt", model, args, epoch, train_stats, val_stats
+            save_anchor_checkpoint(
+                best_path,
+                model,
+                args,
+                epoch,
+                train_stats,
+                val_stats,
+                optimizer=optimizer,
             )
-            print(f"Saved best checkpoint to {out_dir / 'gnn_best.pt'}", flush=True)
+            if args.write_stable_checkpoints:
+                save_anchor_checkpoint(
+                    out_dir / f"{args.checkpoint_prefix}_best.pt",
+                    model,
+                    args,
+                    epoch,
+                    train_stats,
+                    val_stats,
+                    optimizer=optimizer,
+                )
+            print(f"Saved best checkpoint to {best_path}", flush=True)
+            if args.write_stable_checkpoints:
+                print(
+                    f"Updated stable checkpoint at {out_dir / f'{args.checkpoint_prefix}_best.pt'}",
+                    flush=True,
+                )
 
     print(f"Best val loss: {best_val:.5f}")
-    print(f"Best checkpoint: {out_dir / 'gnn_best.pt'}")
+    print(f"Best checkpoint: {best_path}")
     if wandb_run is not None:
         wandb_run.summary["best_val_loss"] = best_val
         wandb_run.finish()
@@ -476,6 +433,11 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--print-every", type=int, default=200)
+    parser.add_argument("--checkpoint-prefix", default="gnn")
+    parser.add_argument("--checkpoint-tag", default="")
+    parser.add_argument("--write-stable-checkpoints", action="store_true")
+    parser.add_argument("--resume-checkpoint", default="")
+    parser.add_argument("--ignore-optimizer-state", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="floorset-arch-v2")
     parser.add_argument("--wandb-entity", default="")
