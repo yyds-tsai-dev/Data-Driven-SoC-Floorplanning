@@ -63,7 +63,7 @@ def _move_to_best_slot(inst: Instance, placement: Placement, block: int) -> None
     others = [r for i, r in placement.rects.items() if i != block]
     best: Rect | None = None
     best_score = float("inf")
-    limit = int(os.environ.get("FLOORSET_OVERLAP_REPAIR_CANDIDATES", "24"))
+    limit = _overlap_repair_candidate_limit(inst)
     for x, y in candidate_frontier_points(others):
         candidate = Rect(max(0.0, x), max(0.0, y), rect.width, rect.height)
         if not first_non_overlapping(candidate, others):
@@ -81,6 +81,13 @@ def _move_to_best_slot(inst: Instance, placement: Placement, block: int) -> None
         return
     bounds = bbox(others)
     placement.rects[block] = Rect(bounds.right, bounds.y, rect.width, rect.height)
+
+
+def _overlap_repair_candidate_limit(inst: Instance) -> int:
+    override = os.environ.get("FLOORSET_OVERLAP_REPAIR_CANDIDATES")
+    if override:
+        return int(override)
+    return 24
 
 
 def _relocation_proxy(inst: Instance, placement: Placement, block: int, candidate: Rect) -> float:
@@ -131,15 +138,11 @@ def _resolve_overlaps(inst: Instance, placement: Placement, config: SolverConfig
             return
 
 
-def _repair_boundary(inst: Instance, placement: Placement) -> None:
+def _repair_boundary(inst: Instance, placement: Placement, axis_cap: int | None = None) -> None:
     if not inst.boundary:
         return
     bounds = bbox(list(placement.rects.values()))
-    cap_override = os.environ.get("FLOORSET_BOUNDARY_AXIS_CAP")
-    if cap_override:
-        axis_cap = int(cap_override)
-    else:
-        axis_cap = 24 if len(placement.rects) >= 100 else 160
+    axis_cap = axis_cap if axis_cap is not None else _boundary_axis_cap(len(placement.rects))
     for block, code in inst.boundary.items():
         if block in inst.preplaced or block not in placement.rects:
             continue
@@ -181,6 +184,16 @@ def _repair_boundary(inst: Instance, placement: Placement) -> None:
                 best_score = score
         if best is not None:
             placement.rects[block] = best
+
+
+def _boundary_axis_cap(block_count: int) -> int:
+    large_override = os.environ.get("FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP")
+    if large_override and block_count >= 118:
+        return int(large_override)
+    cap_override = os.environ.get("FLOORSET_BOUNDARY_AXIS_CAP")
+    if cap_override:
+        return int(cap_override)
+    return 24 if block_count >= 100 else 160
 
 
 def _boundary_distance(rect: Rect, bounds: Rect, code: int) -> float:
@@ -580,6 +593,22 @@ def _guarded_soft_repair(inst: Instance, placement: Placement, config: SolverCon
     return best
 
 
+def _large_case_boundary_refine(inst: Instance, placement: Placement, config: SolverConfig) -> Placement:
+    if inst.block_count < 118 or os.environ.get("FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_REFINE") != "1":
+        return placement
+    trial = placement.copy()
+    axis_cap = int(os.environ.get("FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP", "160"))
+    _repair_boundary(inst, trial, axis_cap=axis_cap)
+    _resolve_overlaps(inst, trial, config)
+    return trial if _score_better_soft_first(inst, config, trial, placement) else placement
+
+
+def _large_case_boundary_axis_cap(inst: Instance) -> int | None:
+    if inst.block_count < 118 or os.environ.get("FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_PASS") != "1":
+        return None
+    return int(os.environ.get("FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP", "160"))
+
+
 def _compact_left_down(inst: Instance, placement: Placement) -> None:
     for axis in ("x", "y"):
         movable = sorted(
@@ -611,13 +640,14 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
     _connect_clusters(inst, repaired, config)
     _compact_left_down(inst, repaired)
     _snap_boundary_components(inst, repaired, config)
-    _repair_boundary(inst, repaired)
+    _repair_boundary(inst, repaired, axis_cap=_large_case_boundary_axis_cap(inst))
     _snap_hard(inst, repaired)
     _resolve_overlaps(inst, repaired, config)
     _connect_clusters(inst, repaired, config)
     _snap_boundary_components(inst, repaired, config)
     _repair_boundary(inst, repaired)
     repaired = _guarded_soft_repair(inst, repaired, config)
+    repaired = _large_case_boundary_refine(inst, repaired, config)
 
     for block in range(inst.block_count):
         if block not in repaired.rects:

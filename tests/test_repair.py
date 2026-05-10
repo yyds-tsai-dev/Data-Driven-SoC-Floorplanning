@@ -3,7 +3,7 @@ import torch
 from floorset_arch.geometry import Rect, bbox, edge_touch_length, has_overlaps
 from floorset_arch.models import Placement
 from floorset_arch.parser import parse_instance
-from floorset_arch.repair import repair_placement, soft_violation_counts
+from floorset_arch.repair import _overlap_repair_candidate_limit, _repair_boundary, repair_placement, soft_violation_counts
 
 
 def test_repair_does_not_move_preplaced_or_resize_fixed_blocks():
@@ -171,3 +171,87 @@ def test_guarded_repair_reduces_soft_violation_counts():
 
     assert not has_overlaps(list(repaired.rects.values()))
     assert after < before
+
+
+def test_large_case_boundary_repair_searches_wider_axis_candidates(monkeypatch):
+    block_count = 118
+    areas = torch.full((block_count,), 1.0)
+    constraints = torch.zeros(block_count, 5)
+    constraints[0, 4] = 2.0
+    inst = parse_instance(
+        block_count,
+        areas,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        None,
+    )
+    rects = {0: Rect(0.0, 0.0, 1.0, 1.0)}
+    for block in range(1, block_count):
+        if block <= 40:
+            rects[block] = Rect(10.0, float(block - 1), 1.0, 1.0)
+        else:
+            x = float((block - 41) % 10)
+            y = 100.0 + float((block - 41) // 10)
+            rects[block] = Rect(x, y, 1.0, 1.0)
+    placement = Placement(rects)
+    monkeypatch.setenv("FLOORSET_BOUNDARY_AXIS_CAP", "24")
+
+    repaired = repair_placement(inst, placement)
+    bounds = bbox(list(repaired.rects.values()))
+
+    assert not has_overlaps(list(repaired.rects.values()))
+    assert abs(repaired.rects[0].right - bounds.right) <= 1e-6
+
+
+def test_large_case_boundary_pass_can_override_axis_cap(monkeypatch):
+    block_count = 118
+    areas = torch.full((block_count,), 1.0)
+    constraints = torch.zeros(block_count, 5)
+    constraints[0, 4] = 2.0
+    inst = parse_instance(
+        block_count,
+        areas,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        None,
+    )
+    rects = {0: Rect(0.0, 0.0, 1.0, 1.0)}
+    for block in range(1, block_count):
+        if block <= 40:
+            rects[block] = Rect(10.0, float(block - 1), 1.0, 1.0)
+        else:
+            x = float((block - 41) % 10)
+            y = 100.0 + float((block - 41) // 10)
+            rects[block] = Rect(x, y, 1.0, 1.0)
+    placement = Placement(rects)
+    monkeypatch.setenv("FLOORSET_BOUNDARY_AXIS_CAP", "24")
+    monkeypatch.setenv("FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP", "160")
+
+    _repair_boundary(inst, placement)
+    bounds = bbox(list(placement.rects.values()))
+
+    assert not has_overlaps(list(placement.rects.values()))
+    assert abs(placement.rects[0].right - bounds.right) <= 1e-6
+
+
+def test_overlap_repair_candidate_limit_is_env_controlled(monkeypatch):
+    monkeypatch.delenv("FLOORSET_OVERLAP_REPAIR_CANDIDATES", raising=False)
+    inst = parse_instance(
+        119,
+        torch.ones(119),
+        torch.zeros(1699, 3),
+        torch.zeros(908, 3),
+        torch.empty(0, 2),
+        torch.zeros(119, 5),
+        None,
+    )
+
+    assert _overlap_repair_candidate_limit(inst) == 24
+
+    monkeypatch.setenv("FLOORSET_OVERLAP_REPAIR_CANDIDATES", "64")
+
+    assert _overlap_repair_candidate_limit(inst) == 64
