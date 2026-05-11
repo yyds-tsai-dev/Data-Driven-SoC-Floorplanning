@@ -2,9 +2,10 @@ from pathlib import Path
 
 import torch
 
-from floorset_arch.models import SolverConfig
+from floorset_arch.models import Placement, Rect
+from floorset_arch.models import AnchorGuidance, SolverConfig
 from floorset_arch.nn.model import FloorplanGNN
-from floorset_arch.optimizer import ArchitectureV2Optimizer
+from floorset_arch.optimizer import ArchitectureV4Optimizer, CandidateSpec
 from floorset_arch.parser import parse_instance
 
 
@@ -41,7 +42,7 @@ def test_checkpoint_relative_path_resolves_from_repo_root(tmp_path, monkeypatch)
 
     monkeypatch.chdir("FloorSet/iccad2026contest")
     monkeypatch.setenv("FLOORSET_GNN_CHECKPOINT", str(checkpoint))
-    optimizer = ArchitectureV2Optimizer()
+    optimizer = ArchitectureV4Optimizer()
 
     assert optimizer._try_anchor_guidance(inst) is not None
 
@@ -62,7 +63,7 @@ def test_checkpoint_model_is_cached_between_solves(tmp_path, monkeypatch):
         return original_loader(*args, **kwargs)
 
     monkeypatch.setattr(checkpoint_module, "load_checkpoint", counted_loader)
-    optimizer = ArchitectureV2Optimizer(config=SolverConfig(max_candidates_per_block=8, beam_width=1))
+    optimizer = ArchitectureV4Optimizer(config=SolverConfig(max_candidates_per_block=8, beam_width=1))
 
     optimizer.solve(**_tiny_problem())
     optimizer.solve(**_tiny_problem())
@@ -77,10 +78,181 @@ def test_default_checkpoint_loads_root_anchor_gnn(monkeypatch):
         return
     problem = _tiny_problem()
     inst = parse_instance(**problem)
-    optimizer = ArchitectureV2Optimizer()
+    optimizer = ArchitectureV4Optimizer()
 
     guidance = optimizer._try_anchor_guidance(inst)
 
     assert guidance is not None
     assert optimizer._checkpoint_kind == "anchor_gnn_v2"
     assert len(guidance.rect_priors) == problem["block_count"]
+
+
+def test_optimizer_loads_repo_dotenv_for_checkpoint_env(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "from-dotenv.pt"
+    _write_anchor_checkpoint(checkpoint)
+    env_file = Path(".env")
+    original = env_file.read_text() if env_file.exists() else None
+    try:
+        env_file.write_text(f"FLOORSET_GNN_CHECKPOINT={checkpoint}\n", encoding="utf-8")
+        monkeypatch.delenv("FLOORSET_GNN_CHECKPOINT", raising=False)
+
+        optimizer = ArchitectureV4Optimizer()
+        inst = parse_instance(**_tiny_problem())
+
+        assert optimizer._try_anchor_guidance(inst) is not None
+        assert optimizer._checkpoint_key == checkpoint.resolve()
+    finally:
+        if original is None:
+            env_file.unlink(missing_ok=True)
+        else:
+            env_file.write_text(original, encoding="utf-8")
+
+
+def test_runtime_calibration_env_does_not_sleep(monkeypatch):
+    block_count = 21
+    problem = {
+        "block_count": block_count,
+        "area_targets": torch.full((block_count,), 4.0),
+        "b2b_connectivity": torch.empty(0, 3),
+        "p2b_connectivity": torch.empty(0, 3),
+        "pins_pos": torch.empty(0, 2),
+        "constraints": torch.zeros(block_count, 5),
+        "target_positions": torch.full((block_count, 4), -1.0),
+    }
+
+    def fail_sleep(_seconds):
+        raise AssertionError("runtime calibration must not sleep")
+
+    monkeypatch.setattr("time.sleep", fail_sleep)
+    monkeypatch.setenv("FLOORSET_RUNTIME_CALIBRATION_SECONDS", "10")
+
+    optimizer = ArchitectureV4Optimizer()
+
+    assert len(optimizer.solve(**problem)) == block_count
+
+
+def test_anchor_guidance_can_store_pairwise_logits():
+    guidance = AnchorGuidance()
+
+    guidance.pairwise_axis[(0, 1)] = (2.0, -1.0)
+
+    assert guidance.pairwise_axis[(0, 1)] == (2.0, -1.0)
+
+
+def test_large_case_candidate_specs_include_relative_order_profiles(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_LARGE_CASE_CANDIDATES", "1")
+    monkeypatch.delenv("FLOORSET_INCLUDE_BEAM_CANDIDATES", raising=False)
+    monkeypatch.delenv("FLOORSET_INCLUDE_NO_GUIDANCE_CANDIDATE", raising=False)
+    block_count = 118
+    problem = {
+        "block_count": block_count,
+        "area_targets": torch.full((block_count,), 4.0),
+        "b2b_connectivity": torch.empty(0, 3),
+        "p2b_connectivity": torch.empty(0, 3),
+        "pins_pos": torch.empty(0, 2),
+        "constraints": torch.zeros(block_count, 5),
+        "target_positions": torch.full((block_count, 4), -1.0),
+    }
+    inst = parse_instance(**problem)
+    optimizer = ArchitectureV4Optimizer()
+
+    specs = optimizer._candidate_specs(inst)
+
+    names = {(spec.name, spec.profile, spec.repair_profile) for spec in specs}
+    assert ("adaptive_relative_order", optimizer._adaptive_profile_order(inst)[0], "normal") in names
+    assert {spec.profile for spec in specs} == {"soft", "compact"}
+    assert {spec.repair_profile for spec in specs} == {"normal"}
+    assert all(spec.kind == "relative_order" for spec in specs)
+
+
+def test_large_case_boundary_repair_profile_is_opt_in(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_LARGE_CASE_CANDIDATES", "1")
+    monkeypatch.setenv("FLOORSET_LARGE_CASE_REPAIR_PROFILES", "normal,large_boundary")
+    block_count = 120
+    inst = parse_instance(
+        block_count,
+        torch.full((block_count,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.zeros(block_count, 5),
+        torch.full((block_count, 4), -1.0),
+    )
+    optimizer = ArchitectureV4Optimizer()
+
+    specs = optimizer._candidate_specs(inst)
+
+    assert {spec.repair_profile for spec in specs} == {"normal", "large_boundary"}
+
+
+def test_large_case_candidate_matrix_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("FLOORSET_ENABLE_LARGE_CASE_CANDIDATES", raising=False)
+    block_count = 120
+    inst = parse_instance(
+        block_count,
+        torch.full((block_count,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.zeros(block_count, 5),
+        torch.full((block_count, 4), -1.0),
+    )
+    optimizer = ArchitectureV4Optimizer()
+
+    specs = optimizer._candidate_specs(inst)
+
+    assert len(specs) == 1
+    assert specs[0].name in {"soft_relative_order", "compact_relative_order"}
+
+
+def test_candidate_workers_are_bounded_by_candidate_count(monkeypatch):
+    optimizer = ArchitectureV4Optimizer()
+    monkeypatch.setenv("FLOORSET_CANDIDATE_WORKERS", "8")
+
+    assert optimizer._candidate_workers(3) == 3
+    assert optimizer._candidate_workers(1) == 1
+
+
+def test_invalid_candidate_workers_falls_back_to_sequential(monkeypatch):
+    optimizer = ArchitectureV4Optimizer()
+    monkeypatch.setenv("FLOORSET_CANDIDATE_WORKERS", "many")
+
+    assert optimizer._candidate_workers(3) == 1
+
+
+def test_candidate_selection_prefers_fewer_soft_violations():
+    constraints = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    inst = parse_instance(
+        3,
+        torch.tensor([4.0, 4.0, 4.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        torch.full((3, 4), -1.0),
+    )
+    compact_dirty = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    larger_clean = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(12.0, 0.0, 2.0, 2.0),
+        }
+    )
+    optimizer = ArchitectureV4Optimizer()
+
+    best = optimizer._select_best_candidate(inst, [compact_dirty, larger_clean])
+
+    assert best is larger_clean

@@ -1,5 +1,6 @@
 #!/bin/bash
 
-cd FloorSet/iccad2026contest
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT/FloorSet/iccad2026contest"
 uv run iccad2026_evaluate.py \
-  --validate ../../src/architecture_v2_optimizer.py
+  --validate "$ROOT/src/architecture_v4_optimizer.py"

@@ -1,168 +1,249 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-from typing import Mapping, Tuple
-
 import torch
 import torch.nn.functional as F
 
-from floorset_arch.models import Instance
+from floorset_arch.models import Placement, Rect
+from floorset_arch.parser import parse_instance
+from floorset_arch.repair import soft_violation_counts
 
 
-ROOT = Path(__file__).resolve().parents[3]
-CONTEST_DIR = ROOT / "FloorSet" / "iccad2026contest"
-if CONTEST_DIR.exists() and str(CONTEST_DIR) not in sys.path:
-    sys.path.insert(0, str(CONTEST_DIR))
-
-try:
-    from iccad2026_evaluate import compute_training_loss_differentiable
-except Exception:
-    compute_training_loss_differentiable = None
+def _placement_from_fp_sol(fp_sol: torch.Tensor, block_count: int) -> Placement:
+    gt = fp_sol[:block_count].detach().cpu().float()
+    rects = {}
+    for block in range(block_count):
+        width, height, x, y = [float(value) for value in gt[block].tolist()]
+        rects[block] = Rect(x, y, width, height)
+    return Placement(rects)
 
 
-def _overlap_proxy(positions: torch.Tensor) -> torch.Tensor:
-    x, y, w, h = positions[:, 0], positions[:, 1], positions[:, 2], positions[:, 3]
-    penalty = torch.tensor(0.0, dtype=positions.dtype, device=positions.device)
-    for i in range(positions.shape[0]):
-        for j in range(i + 1, positions.shape[0]):
-            ox = torch.relu(torch.minimum(x[i] + w[i], x[j] + w[j]) - torch.maximum(x[i], x[j]))
-            oy = torch.relu(torch.minimum(y[i] + h[i], y[j] + h[j]) - torch.maximum(y[i], y[j]))
-            penalty = penalty + ox * oy
-    return penalty / torch.clamp((w * h).sum(), min=1.0)
-
-
-def _hard_snap_penalty(positions: torch.Tensor, inst: Instance) -> torch.Tensor:
-    penalty = torch.tensor(0.0, dtype=positions.dtype, device=positions.device)
-    for block in inst.fixed | inst.preplaced:
-        target = inst.target_rects.get(block)
-        if target is None:
-            continue
-        target_dims = torch.tensor([target.width, target.height], dtype=positions.dtype, device=positions.device)
-        penalty = penalty + F.smooth_l1_loss(positions[block, 2:4], target_dims)
-        if block in inst.preplaced:
-            target_xy = torch.tensor([target.x, target.y], dtype=positions.dtype, device=positions.device)
-            penalty = penalty + F.smooth_l1_loss(positions[block, 0:2], target_xy)
-    return penalty
-
-
-def _bbox_area(positions: torch.Tensor) -> torch.Tensor:
-    x_min = positions[:, 0].min()
-    y_min = positions[:, 1].min()
-    x_max = (positions[:, 0] + positions[:, 2]).max()
-    y_max = (positions[:, 1] + positions[:, 3]).max()
-    return torch.relu(x_max - x_min) * torch.relu(y_max - y_min)
-
-
-def _boundary_hinge(positions: torch.Tensor, inst: Instance) -> torch.Tensor:
-    if not inst.boundary:
-        return torch.tensor(0.0, dtype=positions.dtype, device=positions.device)
-    x_min = positions[:, 0].min()
-    y_min = positions[:, 1].min()
-    x_max = (positions[:, 0] + positions[:, 2]).max()
-    y_max = (positions[:, 1] + positions[:, 3]).max()
-    penalty = torch.tensor(0.0, dtype=positions.dtype, device=positions.device)
-    scale = torch.clamp(torch.sqrt(torch.clamp(_bbox_area(positions), min=1.0)), min=1.0)
-    for block, code in inst.boundary.items():
-        rect = positions[block]
-        if code & 1:
-            penalty = penalty + torch.abs(rect[0] - x_min) / scale
-        if code & 2:
-            penalty = penalty + torch.abs(rect[0] + rect[2] - x_max) / scale
-        if code & 4:
-            penalty = penalty + torch.abs(rect[1] + rect[3] - y_max) / scale
-        if code & 8:
-            penalty = penalty + torch.abs(rect[1] - y_min) / scale
-    return penalty / max(len(inst.boundary), 1)
-
-
-def _group_adjacency_surrogate(positions: torch.Tensor, inst: Instance) -> torch.Tensor:
-    penalty = torch.tensor(0.0, dtype=positions.dtype, device=positions.device)
-    count = 0
-    for members in inst.cluster_groups.values():
-        if len(members) <= 1:
-            continue
-        for offset, i in enumerate(members):
-            a = positions[i]
-            best = None
-            for j in members[offset + 1 :]:
-                b = positions[j]
-                horizontal_gap = torch.minimum(torch.abs(a[0] + a[2] - b[0]), torch.abs(b[0] + b[2] - a[0]))
-                vertical_overlap = torch.relu(torch.minimum(a[1] + a[3], b[1] + b[3]) - torch.maximum(a[1], b[1]))
-                vertical_gap = torch.minimum(torch.abs(a[1] + a[3] - b[1]), torch.abs(b[1] + b[3] - a[1]))
-                horizontal_overlap = torch.relu(torch.minimum(a[0] + a[2], b[0] + b[2]) - torch.maximum(a[0], b[0]))
-                edge_gap = torch.minimum(horizontal_gap + 0.01 / torch.clamp(vertical_overlap, min=0.01),
-                                         vertical_gap + 0.01 / torch.clamp(horizontal_overlap, min=0.01))
-                best = edge_gap if best is None else torch.minimum(best, edge_gap)
-            if best is not None:
-                penalty = penalty + best
-                count += 1
-    return penalty / max(count, 1)
-
-
-def _mib_shape_loss(positions: torch.Tensor, inst: Instance) -> torch.Tensor:
-    penalty = torch.tensor(0.0, dtype=positions.dtype, device=positions.device)
-    count = 0
-    for members in inst.mib_groups.values():
-        if len(members) <= 1:
-            continue
-        ref = positions[members[0], 2:4].detach()
-        for block in members[1:]:
-            penalty = penalty + F.smooth_l1_loss(positions[block, 2:4], ref)
-            count += 1
-    return penalty / max(count, 1)
-
-
-def compute_v1_loss(
-    positions: torch.Tensor,
-    target_positions_xywh: torch.Tensor,
-    inst: Instance,
-    metrics: torch.Tensor,
-    weights: Mapping[str, float] | None = None,
-    return_parts: bool = False,
-) -> torch.Tensor | Tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    weights = weights or {}
-    target = target_positions_xywh.to(device=positions.device, dtype=positions.dtype)
-    supervised = F.smooth_l1_loss(positions, target)
-    overlap = _overlap_proxy(positions)
-    snap = _hard_snap_penalty(positions, inst)
-    boundary = _boundary_hinge(positions, inst)
-    group = _group_adjacency_surrogate(positions, inst)
-    mib = _mib_shape_loss(positions, inst)
-    area = _bbox_area(positions) / torch.clamp(inst.area_targets[: inst.block_count].to(device=positions.device, dtype=positions.dtype).sum(), min=1.0)
-
-    if compute_training_loss_differentiable is not None:
-        proxy = compute_training_loss_differentiable(
-            positions,
-            inst.valid_b2b.to(device=positions.device, dtype=positions.dtype),
-            inst.valid_p2b.to(device=positions.device, dtype=positions.dtype),
-            inst.pins_pos.to(device=positions.device, dtype=positions.dtype),
-            inst.area_targets[: inst.block_count].to(device=positions.device, dtype=positions.dtype),
-            metrics.to(device=positions.device, dtype=positions.dtype),
-        )
-    else:
-        proxy = supervised
-
-    total = (
-        weights.get("supervised", 1.0) * supervised
-        + weights.get("proxy", 0.1) * proxy
-        + weights.get("overlap", 10.0) * overlap
-        + weights.get("snap", 1.0) * snap
-        + weights.get("boundary", 2.0) * boundary
-        + weights.get("group", 1.0) * group
-        + weights.get("mib", 1.0) * mib
-        + weights.get("area", 0.02) * area
+def fp_sol_soft_violations(
+    fp_sol: torch.Tensor,
+    area_targets: torch.Tensor,
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+    constraints: torch.Tensor,
+) -> tuple[int, int, int]:
+    block_count = int((area_targets.detach().flatten() != -1).sum().item())
+    inst = parse_instance(
+        block_count,
+        area_targets,
+        b2b_connectivity,
+        p2b_connectivity,
+        pins_pos,
+        constraints,
+        None,
     )
-    parts = {
-        "supervised": supervised.detach(),
-        "proxy": proxy.detach(),
-        "overlap": overlap.detach(),
-        "snap": snap.detach(),
-        "boundary": boundary.detach(),
-        "group": group.detach(),
-        "mib": mib.detach(),
-        "area": area.detach(),
+    return soft_violation_counts(inst, _placement_from_fp_sol(fp_sol, block_count))
+
+
+def is_constraint_clean_training_sample(
+    fp_sol: torch.Tensor,
+    area_targets: torch.Tensor,
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+    constraints: torch.Tensor,
+) -> bool:
+    return sum(
+        fp_sol_soft_violations(
+            fp_sol,
+            area_targets,
+            b2b_connectivity,
+            p2b_connectivity,
+            pins_pos,
+            constraints,
+        )
+    ) == 0
+
+
+def build_anchor_targets(
+    fp_sol: torch.Tensor, block_count: int, scale: float, device: torch.device
+) -> dict[str, torch.Tensor]:
+    gt = fp_sol[:block_count].float().to(device)
+    width = gt[:, 0].clamp_min(1e-6)
+    height = gt[:, 1].clamp_min(1e-6)
+    x = gt[:, 2]
+    y = gt[:, 3]
+    anchor = torch.stack([x + width / 2.0, y + height / 2.0], dim=1) / max(
+        float(scale), 1.0
+    )
+    log_aspect = torch.log(width / height).clamp(-2.5, 2.5)
+    center_sum = anchor.sum(dim=1)
+    span = (center_sum.max() - center_sum.min()).clamp_min(1e-6)
+    priority = 1.0 - (center_sum - center_sum.min()) / span
+    return {"anchor": anchor, "log_aspect": log_aspect, "priority": priority}
+
+
+def constraint_weights(
+    constraints: torch.Tensor, block_count: int, device: torch.device, args
+) -> torch.Tensor:
+    weights = torch.ones(block_count, device=device)
+    if constraints is None or constraints.dim() <= 1:
+        return weights
+    c = constraints[:block_count].to(device)
+    if c.shape[1] > 0:
+        weights = weights + 0.10 * (c[:, 0] != 0).float()
+    if c.shape[1] > 1:
+        weights = weights + 0.10 * (c[:, 1] != 0).float()
+    if c.shape[1] > 2:
+        weights = weights + args.mib_weight_boost * (c[:, 2] != 0).float()
+    if c.shape[1] > 3:
+        weights = weights + args.cluster_weight_boost * (c[:, 3] != 0).float()
+    if c.shape[1] > 4:
+        weights = weights + args.boundary_weight_boost * (c[:, 4] != 0).float()
+    return weights
+
+
+def weighted_smooth_l1(
+    pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    loss = F.smooth_l1_loss(pred, target, reduction="none")
+    if loss.dim() > 1:
+        loss = loss.sum(dim=1)
+    return (loss * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def sample_pairs(block_count: int, max_pairs: int, device: torch.device) -> torch.Tensor:
+    pairs = [(i, j) for i in range(block_count) for j in range(i + 1, block_count)]
+    if not pairs:
+        return torch.empty((0, 2), dtype=torch.long, device=device)
+    pair_tensor = torch.tensor(pairs, dtype=torch.long, device=device)
+    if max_pairs > 0 and pair_tensor.shape[0] > max_pairs:
+        pair_tensor = pair_tensor[
+            torch.randperm(pair_tensor.shape[0], device=device)[:max_pairs]
+        ]
+    return pair_tensor
+
+
+def order_aux_loss(
+    pred_anchor: torch.Tensor, target_anchor: torch.Tensor, args
+) -> tuple[torch.Tensor, float, float]:
+    device = pred_anchor.device
+    pairs = sample_pairs(pred_anchor.shape[0], args.order_pairs, device)
+    if pairs.numel() == 0:
+        return pred_anchor.sum() * 0.0, 0.0, 1.0
+    i = pairs[:, 0]
+    j = pairs[:, 1]
+    gt_delta = target_anchor[j] - target_anchor[i]
+    abs_dx = gt_delta[:, 0].abs()
+    abs_dy = gt_delta[:, 1].abs()
+    clear_x = (abs_dx > args.clear_ratio * abs_dy) & (abs_dx > args.min_order_gap)
+    clear_y = (abs_dy > args.clear_ratio * abs_dx) & (abs_dy > args.min_order_gap)
+
+    loss = pred_anchor.sum() * 0.0
+    used = 0
+    acc_sum = 0.0
+    acc_count = 0
+    if clear_x.any():
+        sign = torch.sign(gt_delta[clear_x, 0])
+        pred_delta = pred_anchor[j[clear_x], 0] - pred_anchor[i[clear_x], 0]
+        loss = loss + F.softplus(-sign * pred_delta / args.order_temp).mean()
+        used += int(clear_x.sum().item())
+        acc_sum += float(((pred_delta * sign) > 0).float().mean().item())
+        acc_count += 1
+    if clear_y.any():
+        sign = torch.sign(gt_delta[clear_y, 1])
+        pred_delta = pred_anchor[j[clear_y], 1] - pred_anchor[i[clear_y], 1]
+        loss = loss + F.softplus(-sign * pred_delta / args.order_temp).mean()
+        used += int(clear_y.sum().item())
+        acc_sum += float(((pred_delta * sign) > 0).float().mean().item())
+        acc_count += 1
+    return loss, used / max(float(pairs.shape[0]), 1.0), acc_sum / max(acc_count, 1)
+
+
+def build_pairwise_relation_targets(
+    fp_sol: torch.Tensor,
+    pairs: torch.Tensor,
+    min_gap: float,
+    clear_ratio: float,
+) -> dict[str, torch.Tensor]:
+    device = fp_sol.device
+    if pairs.numel() == 0:
+        empty = torch.empty((0,), dtype=torch.float32, device=device)
+        return {"x_label": empty, "y_label": empty, "mask": empty.bool()}
+    gt = fp_sol.float()
+    centers = torch.stack([gt[:, 2] + gt[:, 0] / 2.0, gt[:, 3] + gt[:, 1] / 2.0], dim=1)
+    i = pairs[:, 0].to(device)
+    j = pairs[:, 1].to(device)
+    delta = centers[j] - centers[i]
+    abs_dx = delta[:, 0].abs()
+    abs_dy = delta[:, 1].abs()
+    clear_x = (abs_dx > clear_ratio * abs_dy) & (abs_dx > min_gap)
+    clear_y = (abs_dy > clear_ratio * abs_dx) & (abs_dy > min_gap)
+    x_label = (delta[:, 0] > 0).float() * clear_x.float()
+    y_label = (delta[:, 1] > 0).float() * clear_y.float()
+    return {"x_label": x_label, "y_label": y_label, "mask": clear_x | clear_y}
+
+
+def pairwise_relation_loss(
+    pair_logits: torch.Tensor,
+    targets: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, float]:
+    mask = targets["mask"].to(pair_logits.device)
+    if mask.numel() == 0 or not mask.any():
+        return pair_logits.sum() * 0.0, 1.0
+    labels = torch.stack(
+        [targets["x_label"].to(pair_logits.device), targets["y_label"].to(pair_logits.device)],
+        dim=1,
+    )
+    loss = F.binary_cross_entropy_with_logits(pair_logits[mask], labels[mask])
+    pred = (pair_logits[mask] > 0).float()
+    acc = float((pred == labels[mask]).float().mean().item())
+    return loss, acc
+
+
+def edge_delta_loss(
+    pred_anchor: torch.Tensor, target_anchor: torch.Tensor, valid_b2b: torch.Tensor
+) -> torch.Tensor:
+    edges = []
+    weights = []
+    for i_f, j_f, weight_f in valid_b2b.tolist():
+        i = int(i_f)
+        j = int(j_f)
+        weight = max(float(weight_f), 0.0)
+        if 0 <= i < pred_anchor.shape[0] and 0 <= j < pred_anchor.shape[0] and i != j:
+            edges.append((i, j))
+            weights.append(weight)
+    if not edges:
+        return pred_anchor.sum() * 0.0
+    edge_t = torch.tensor(edges, dtype=torch.long, device=pred_anchor.device)
+    weight_t = torch.log1p(
+        torch.tensor(weights, dtype=torch.float32, device=pred_anchor.device)
+    )
+    weight_t = weight_t / weight_t.mean().clamp_min(1.0)
+    pred_delta = pred_anchor[edge_t[:, 1]] - pred_anchor[edge_t[:, 0]]
+    target_delta = target_anchor[edge_t[:, 1]] - target_anchor[edge_t[:, 0]]
+    per = F.smooth_l1_loss(pred_delta, target_delta, reduction="none").sum(dim=1)
+    return (per * weight_t).mean()
+
+
+def compute_anchor_losses(
+    pred: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    weights: torch.Tensor,
+    valid_b2b: torch.Tensor,
+    args,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+    anchor = weighted_smooth_l1(pred["anchor"], targets["anchor"], weights)
+    aspect = weighted_smooth_l1(pred["log_aspect"], targets["log_aspect"], weights)
+    priority = weighted_smooth_l1(pred["priority"], targets["priority"], weights)
+    order, ord_frac, ord_acc = order_aux_loss(pred["anchor"], targets["anchor"], args)
+    edge = edge_delta_loss(pred["anchor"], targets["anchor"], valid_b2b)
+    loss = (
+        args.anchor_weight * anchor
+        + args.aspect_weight * aspect
+        + args.priority_weight * priority
+        + args.order_weight * order
+        + args.edge_weight * edge
+    )
+    return loss, {
+        "anchor": anchor,
+        "aspect": aspect,
+        "priority": priority,
+        "order": order,
+        "edge": edge,
+        "ord_frac": ord_frac,
+        "ord_acc": ord_acc,
     }
-    if return_parts:
-        return total, parts
-    return total

@@ -1,5 +1,5 @@
-"""Architecture v2 components for the ICCAD 2026 FloorSet challenge."""
+"""Architecture v4 components for the ICCAD 2026 FloorSet challenge."""
 
-from floorset_arch.optimizer import ArchitectureV2Optimizer
+from floorset_arch.optimizer import ArchitectureV4Optimizer
 
-__all__ = ["ArchitectureV2Optimizer"]
+__all__ = ["ArchitectureV4Optimizer"]

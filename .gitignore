@@ -1,6 +1,7 @@
 # OS
 .DS_Store
 Thumbs.db
+.nfs*
 
 # Python
 __pycache__/
@@ -45,6 +46,7 @@ contest_venv/
 *.log
 LiteTensorDataTest/*
 smoke.*
+wandb/
 
 # Other
 test/
