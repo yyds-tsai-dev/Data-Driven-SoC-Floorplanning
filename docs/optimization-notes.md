@@ -5,8 +5,8 @@
 - Historical v3 runtime-aware baselines: `2.6509` immediately after the v3 rename, `2.5256` after removing runtime calibration, and `2.3262` to `2.3991` after local-proxy overlap repair (`100/100` feasible).
 - Those v3 totals used the local evaluator runtime factor, whose denominator is the solver's own validation-run median runtime. Treat them as runtime-aware risk signals, not as the primary architecture-quality metric.
 - Current architecture comparisons should report the no-runtime total beside the local runtime-aware total before accepting or rejecting a candidate path.
-- 2026-05-11 no-runtime promotion pass kept `checkpoints/gnn_best.pt` as default: `1.9848` no-runtime total versus `2.2768` for `gnn_best_0510_ns200000_ep10_h192_l6_acc32.pt` and `1.9953` for `gnn_best_0510_ns500000_ep4_h192_l6_acc32.pt`.
-- Rechecking `FLOORSET_ENABLE_LARGE_CASE_CANDIDATES=1` with `gnn_best.pt` tied the no-runtime total at `1.9848` and had zero no-runtime delta on IDs 95-99, so the matrix remains opt-in.
+- 2026-05-11 updated no-runtime promotion pass promotes `checkpoints/gnn_latest_0510_ns200000_ep10_h192_l6_acc32.pt`: `1.9560` no-runtime total versus `1.9848` for `gnn_best.pt`, `1.9953` for the 500k ep4 h192 checkpoints, and `2.2768` for `gnn_best_0510_ns200000_ep10_h192_l6_acc32.pt`.
+- Rechecking `FLOORSET_ENABLE_LARGE_CASE_CANDIDATES=1` with the promoted checkpoint tied the no-runtime total at `1.9560` and had zero no-runtime delta on IDs 95-99, so the matrix remains opt-in.
 - Score was dominated by validation IDs 99 and 98 because total score is exponentially weighted by block count.
 - ID 99 contributed about `1.76 / 2.65`; ID 98 contributed about `0.59 / 2.65`.
 
@@ -44,13 +44,13 @@
 - Do not use runtime calibration or artificial sleep. Score improvements after v4 must come from placement quality, repair quality, or learned ordering/ranking.
 - Keep pairwise-head plumbing checkpoint-compatible, but do not depend on it for local WSL optimization until remote training finishes.
 - Use local-proxy overlap relocation instead of first legal frontier relocation; it improves dominant tail quality without the full-HPWL runtime blow-up.
-- Keep `checkpoints/gnn_best.pt` as the default checkpoint. Metadata and tail-case proxy checks were better than the 0510 h192/l6 checkpoints under the current decoder/repair path.
+- Keep `checkpoints/gnn_latest_0510_ns200000_ep10_h192_l6_acc32.pt` as the default checkpoint because it currently has the best full-validation `total_score_no_runtime`. Do not promote future training outputs by supervised validation loss alone.
 - A sequential, sample-local relative-order candidate matrix is implemented behind `FLOORSET_ENABLE_LARGE_CASE_CANDIDATES=1`: adaptive profile plus the opposite forced `soft`/`compact` profile when it is not a duplicate, with normal repair by default. Full validation regressed when this ran by default, so the production default keeps the faster adaptive single-candidate path.
 - Large-boundary repair remains opt-in via `FLOORSET_LARGE_CASE_REPAIR_PROFILES=normal,large_boundary`; previous full validation showed defaulting it improved soft counts but regressed local runtime-aware score, so it needs no-runtime and raw-runtime review before becoming default.
 - Under no-runtime tuning, the adaptive single-profile default is reasonable as the submission-safe path, but it should not be treated as settled architecture. Re-run the large-case matrix and large-boundary profiles using `total_score_no_runtime` before rejecting them.
 - Boundary repair now skips already-satisfied boundary blocks only for `block_count >= 118` and widens the free cross-axis search for large edge-constrained boundary moves. This preserved the useful ID 99 boundary improvement without moving the whole default path to the expensive high-cap search.
 - Keep beam and no-guidance candidates opt-in through environment variables; do not enable them by default without a full-score win.
-- During supervised training, skip any `fp_sol` sample that violates boundary, grouping, or MIB constraints. Golden answers are geometry references, not guaranteed soft-constraint oracles.
+- During supervised training, do not fully trust any `fp_sol` sample that violates boundary, grouping, or MIB constraints. The measured clean ratio is too low for strict skipping as the default, so current training uses weighted dirty geometry samples while suppressing dirty order/pairwise supervision; use `CLEAN_SAMPLE_POLICY=strict` only for clean-only experiments.
 - Next deterministic optimization should target large-case boundary/group repair for `block_count >= 118` or similar constraint-stat triggers, not `test_id`-specific logic.
 - Large-case repair should report soft-count deltas first, then bbox/HPWL deltas, because `V_rel` enters score through exponential penalty.
 

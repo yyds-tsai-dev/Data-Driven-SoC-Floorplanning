@@ -4,6 +4,7 @@ import argparse
 import random
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -21,7 +22,7 @@ from floorset_arch.training.losses import (
     build_pairwise_relation_targets,
     compute_anchor_losses,
     constraint_weights,
-    is_constraint_clean_training_sample,
+    fp_sol_soft_violations,
     pairwise_relation_loss,
     sample_pairs,
 )
@@ -121,6 +122,8 @@ def run_epoch(
     }
     count = 0
     skipped = 0
+    clean_count = 0
+    dirty_count = 0
     accumulation_steps = max(1, int(args.accumulation_steps))
     if train:
         optimizer.zero_grad(set_to_none=True)
@@ -128,9 +131,17 @@ def run_epoch(
         area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = unpack_batch(
             batch
         )
-        if not is_constraint_clean_training_sample(fp_sol, area_targets, b2b, p2b, pins, constraints):
+        soft_violations = fp_sol_soft_violations(
+            fp_sol, area_targets, b2b, p2b, pins, constraints
+        )
+        is_clean = sum(soft_violations) == 0
+        if args.clean_sample_policy == "strict" and not is_clean:
             skipped += 1
             continue
+        if is_clean:
+            clean_count += 1
+        else:
+            dirty_count += 1
         block_count = valid_block_count(area_targets)
         inst = parse_instance(
             block_count, area_targets, b2b, p2b, pins, constraints, fp_sol
@@ -140,11 +151,19 @@ def run_epoch(
         targets = build_anchor_targets(fp_sol, block_count, scale, device)
         weights = constraint_weights(constraints, block_count, device, args)
         pairs = sample_pairs(block_count, args.pairwise_pairs, device)
+        loss_args = args
+        sample_weight = 1.0
+        order_weight_multiplier = 1.0
+        if args.clean_sample_policy == "weighted" and not is_clean:
+            sample_weight = args.dirty_sample_weight
+            order_weight_multiplier = args.dirty_order_weight
+            loss_args = SimpleNamespace(**vars(args))
+            loss_args.order_weight = args.order_weight * order_weight_multiplier
 
         with torch.set_grad_enabled(train):
             pred = model(node_feat, edge_index, edge_attr, pairs=pairs)
             loss, parts = compute_anchor_losses(
-                pred, targets, weights, inst.valid_b2b, args
+                pred, targets, weights, inst.valid_b2b, loss_args
             )
             pair_targets = build_pairwise_relation_targets(
                 fp_sol[:block_count].to(device),
@@ -153,7 +172,9 @@ def run_epoch(
                 clear_ratio=args.clear_ratio,
             )
             pair_loss, pair_acc = pairwise_relation_loss(pred["pair_logits"], pair_targets)
-            loss = loss + args.pairwise_weight * pair_loss
+            effective_pair_loss = order_weight_multiplier * pair_loss
+            loss = loss + args.pairwise_weight * effective_pair_loss
+            loss = loss * sample_weight
             if train:
                 (loss / accumulation_steps).backward()
                 if (count + 1) % accumulation_steps == 0:
@@ -172,7 +193,7 @@ def run_epoch(
         sums["edge"] += float(parts["edge"].item())
         sums["ord_frac"] += float(parts["ord_frac"])
         sums["ord_acc"] += float(parts["ord_acc"])
-        sums["pairwise"] += float(pair_loss.item())
+        sums["pairwise"] += float(effective_pair_loss.item())
         sums["pair_acc"] += float(pair_acc)
         count += 1
         if train and args.print_every > 0 and count % args.print_every == 0:
@@ -192,6 +213,8 @@ def run_epoch(
     stats = {key: value / max(count, 1) for key, value in sums.items()}
     stats["skipped"] = float(skipped)
     stats["used"] = float(count)
+    stats["clean"] = float(clean_count)
+    stats["dirty"] = float(dirty_count)
     return stats
 
 
@@ -365,7 +388,8 @@ def main(args) -> None:
             f"priority={train_stats['priority']:.5f} order={train_stats['order']:.5f} "
             f"edge={train_stats['edge']:.5f} pair={train_stats['pairwise']:.5f} "
             f"ord_acc={train_stats['ord_acc']:.3f} pair_acc={train_stats['pair_acc']:.3f} "
-            f"used={train_stats['used']:.0f} skipped={train_stats['skipped']:.0f}",
+            f"used={train_stats['used']:.0f} clean={train_stats['clean']:.0f} "
+            f"dirty={train_stats['dirty']:.0f} skipped={train_stats['skipped']:.0f}",
             flush=True,
         )
         print(
@@ -374,7 +398,8 @@ def main(args) -> None:
             f"priority={val_stats['priority']:.5f} order={val_stats['order']:.5f} "
             f"edge={val_stats['edge']:.5f} pair={val_stats['pairwise']:.5f} "
             f"ord_acc={val_stats['ord_acc']:.3f} pair_acc={val_stats['pair_acc']:.3f} "
-            f"used={val_stats['used']:.0f} skipped={val_stats['skipped']:.0f}",
+            f"used={val_stats['used']:.0f} clean={val_stats['clean']:.0f} "
+            f"dirty={val_stats['dirty']:.0f} skipped={val_stats['skipped']:.0f}",
             flush=True,
         )
         if wandb_run is not None:
@@ -458,6 +483,17 @@ def parse_args():
     parser.add_argument("--edge-weight", type=float, default=0.08)
     parser.add_argument("--pairwise-weight", type=float, default=0.20)
     parser.add_argument("--pairwise-pairs", type=int, default=4096)
+    parser.add_argument(
+        "--clean-sample-policy",
+        default="weighted",
+        choices=("weighted", "strict", "off"),
+        help=(
+            "weighted keeps dirty fp_sol samples as low-weight geometry data and "
+            "suppresses dirty order/pairwise supervision; strict skips them."
+        ),
+    )
+    parser.add_argument("--dirty-sample-weight", type=float, default=0.25)
+    parser.add_argument("--dirty-order-weight", type=float, default=0.0)
     parser.add_argument("--boundary-weight-boost", type=float, default=0.45)
     parser.add_argument("--cluster-weight-boost", type=float, default=0.20)
     parser.add_argument("--mib-weight-boost", type=float, default=0.25)

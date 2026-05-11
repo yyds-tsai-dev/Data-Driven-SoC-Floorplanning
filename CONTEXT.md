@@ -53,8 +53,8 @@ The provided `fp_sol` layout used as a supervised geometric reference. It is not
 _Avoid_: treating imitation learning as exact constraint satisfaction.
 
 **Constraint-Clean Training Sample**:
-A supervised training case whose `fp_sol` satisfies boundary, grouping, and MIB soft constraints, so it can safely teach geometry and constraint-sensitive layout priors. Soft-violating `fp_sol` samples are skipped completely during supervised training.
-_Avoid_: partially training on soft-violating `fp_sol` before measuring whether the clean-sample ratio is too low.
+A supervised training case whose `fp_sol` satisfies boundary, grouping, and MIB soft constraints, so it can safely teach geometry and constraint-sensitive layout priors. Clean-only training is available as `--clean-sample-policy strict`, but the default is weighted dirty-sample training because measured clean ratio is too low for reliable remote training.
+_Avoid_: treating soft-violating `fp_sol` as reliable order/pairwise supervision.
 
 ## Relationships
 
@@ -67,7 +67,7 @@ _Avoid_: partially training on soft-violating `fp_sol` before measuring whether 
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
 - **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
 - **Training Golden Answer** should teach geometric priors, while soft-constraint satisfaction remains the responsibility of constraint-aware decoding, repair, and scoring.
-- A **Constraint-Clean Training Sample** is eligible for full imitation training; soft-violating training samples are not used for anchor, aspect, priority, order, or pairwise supervised losses.
+- A **Constraint-Clean Training Sample** is eligible for full imitation training; soft-violating training samples are low-weight geometry references by default, with dirty order/pairwise supervision suppressed.
 
 ## Example Dialogue
 
