@@ -39,5 +39,5 @@ fi
 cd "$ROOT/FloorSet/iccad2026contest"
 
 uv run iccad2026_evaluate.py \
-  --evaluate "$ROOT/src/architecture_v3_optimizer.py" \
+  --evaluate "$ROOT/src/architecture_v4_optimizer.py" \
   --verbose

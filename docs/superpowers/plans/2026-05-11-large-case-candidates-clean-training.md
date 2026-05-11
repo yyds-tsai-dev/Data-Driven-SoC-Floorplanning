@@ -4,7 +4,7 @@
 
 **Goal:** Add large-case relative-order candidate search, clean-sample training skip, and visible `.env` defaults.
 
-**Architecture:** Keep `ArchitectureV3Optimizer` as the Production Solver Path. Introduce small candidate-spec helpers that can later be executed in parallel, but keep the verified production default on the faster adaptive path unless the large-case matrix is explicitly enabled. Reuse existing parser, placement, and repair violation logic for training sample filtering.
+**Architecture:** Keep `ArchitectureV4Optimizer` as the Production Solver Path. Introduce small candidate-spec helpers that can later be executed in parallel, but keep the verified production default on the faster adaptive path unless the large-case matrix is explicitly enabled. Reuse existing parser, placement, and repair violation logic for training sample filtering.
 
 **Tech Stack:** Python, PyTorch, pytest, shell scripts, repo-root `.env`.
 

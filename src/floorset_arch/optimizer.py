@@ -11,6 +11,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - dependency is present in local runs.
+    load_dotenv = None
+
 from floorset_arch.constructive import construct_beam_placement
 from floorset_arch.diagnostics import placement_metrics, repair_delta
 from floorset_arch.geometry import bbox, boundary_satisfied, edge_touch_length
@@ -26,6 +31,11 @@ ROOT = Path(__file__).resolve().parents[2]
 CONTEST_DIR = ROOT / "FloorSet" / "iccad2026contest"
 if CONTEST_DIR.exists() and str(CONTEST_DIR) not in sys.path:
     sys.path.insert(0, str(CONTEST_DIR))
+
+
+def _load_repo_dotenv() -> None:
+    if load_dotenv is not None:
+        load_dotenv(ROOT / ".env", override=False)
 
 try:
     from iccad2026_evaluate import FloorplanOptimizer
@@ -81,11 +91,12 @@ def _build_candidate_worker(inst, config: SolverConfig, spec: CandidateSpec) -> 
             inst.anchor_guidance = saved_guidance
 
 
-class ArchitectureV3Optimizer(FloorplanOptimizer):
+class ArchitectureV4Optimizer(FloorplanOptimizer):
     """Anchor-GNN guided hetero-graph beam solver."""
 
     def __init__(self, verbose: bool = False, config: Optional[SolverConfig] = None):
         super().__init__(verbose=verbose)
+        _load_repo_dotenv()
         self.config = config or SolverConfig()
         if os.environ.get("FLOORSET_BEAM_WIDTH"):
             try:
@@ -381,13 +392,14 @@ class ArchitectureV3Optimizer(FloorplanOptimizer):
         return raw.resolve() if raw.is_absolute() else (ROOT / raw).resolve()
 
     def _adaptive_profile_order(self, inst) -> list[str]:
-        """Pick one relative-order profile for runtime-heavy cases.
+        """Pick one relative-order profile from cheap instance statistics.
 
-        Computing both soft and compact profiles is useful for ablations, but the
-        official score applies a runtime factor and the 100+ block cases dominate
-        the weighted total.  The features below are cheap instance statistics that
-        separate pin-heavy compact wins from net-heavy / boundary-sensitive soft
-        wins without touching the evaluator loop.
+        Computing both soft and compact profiles is useful for ablations.  The
+        features below are cheap statistics that separate pin-heavy compact wins
+        from net-heavy / boundary-sensitive soft wins without touching the
+        evaluator loop.  Under no-runtime tuning, this heuristic should be
+        rechecked against `total_score_no_runtime` before it blocks a heavier
+        large-case candidate matrix.
         """
 
         if inst.block_count < 90:

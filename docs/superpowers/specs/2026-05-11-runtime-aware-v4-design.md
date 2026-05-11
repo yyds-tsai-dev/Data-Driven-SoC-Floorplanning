@@ -2,7 +2,7 @@
 
 ## Goal
 
-Make local architecture tuning reflect placement quality first, while preserving runtime-aware contest scoring for final risk checks, then rename the active contest wrapper generation from architecture v3 to architecture v4 and load repo-root `.env` through `python-dotenv`.
+Make local architecture tuning reflect placement quality first, while preserving runtime-aware contest scoring for final risk checks, then rename the active contest wrapper generation to architecture v4 and load repo-root `.env` through `python-dotenv`.
 
 ## Context
 
@@ -18,12 +18,12 @@ That local denominator mixes case-size effects into score. Large validation case
 4. Report both total scores in CLI/JSON output: local runtime-aware total remains the official-like local score, and no-runtime total becomes the primary architecture-tuning metric.
 5. Add raw runtime summary statistics, at least average, median, p90, max, and selected block-count tail cases when available.
 6. Treat `--score` saved-solution evaluation as no-runtime unless stored runtimes are intentionally supplied and recomputed later.
-7. Rename the active contest wrapper generation from architecture v3 to architecture v4 across wrapper file, optimizer class, tests, scripts, package export, training labels, `CONTEXT.md`, and current docs.
+7. Rename the active contest wrapper generation to architecture v4 across wrapper file, optimizer class, tests, scripts, package export, training labels, `CONTEXT.md`, and current docs.
 8. Add `python-dotenv` to project dependencies and load repo-root `.env` from Python entrypoints so local runs and scripts share one environment-default mechanism.
 
 ## Architecture
 
-`floorset_arch` remains the Production Solver Path. The version rename affects the contest-facing wrapper and active optimizer class name only: `ArchitectureV4Optimizer` replaces `ArchitectureV3Optimizer`, while reusable solver modules remain under the existing `floorset_arch` package.
+`floorset_arch` remains the Production Solver Path. The version rename affects the contest-facing wrapper and active optimizer class name only: `ArchitectureV4Optimizer` is the public active optimizer, while reusable solver modules remain under the existing `floorset_arch` package.
 
 The evaluator will carry two score channels:
 
@@ -39,7 +39,7 @@ This keeps final submission checks honest about runtime risk without allowing lo
 
 ## Documentation Updates
 
-`CONTEXT.md` should define Architecture v4 and no-runtime quality score as project language. Optimization notes should state that previous v3 runtime-weighted ablations are not sufficient evidence against large-case quality improvements unless no-runtime score and raw runtime are also reviewed.
+`CONTEXT.md` should define Architecture v4 and no-runtime quality score as project language. Optimization notes should state that previous runtime-aware ablations are not sufficient evidence against large-case quality improvements unless no-runtime score and raw runtime are also reviewed.
 
 Existing design and plan docs should be updated only where they describe the current active architecture or current scoring policy. Historical execution notes may keep v3 references when they clearly refer to past work.
 
@@ -49,7 +49,7 @@ Existing design and plan docs should be updated only where they describe the cur
 - Unit-test `--evaluate` result objects can carry both runtime-aware and no-runtime costs.
 - Unit-test total no-runtime score calculation uses `cost_no_runtime` values and the same exponential block-count weighting.
 - Unit-test dotenv loading through the v4 wrapper or optimizer entry path without requiring shell sourcing.
-- Update existing optimizer/tests imports from `ArchitectureV3Optimizer` to `ArchitectureV4Optimizer`.
+- Update existing optimizer/tests imports to `ArchitectureV4Optimizer`.
 - Run focused scoring/optimizer tests, then the full pytest suite.
 
 ## Success Criteria

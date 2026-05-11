@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python, PyTorch, pytest, JSONL diagnostics, existing FloorSet evaluator.
 
-**Execution Outcome:** Runtime calibration was removed, diagnostics and pairwise-head plumbing were implemented, and local-proxy overlap repair improved honest full evaluation from `2.5256` to the `2.3262`-`2.3991` range depending on runtime noise. The `< 1` target was not reached; next work should focus on removing remaining ID 99/98 soft violations and reducing bbox/HPWL, not on runtime tricks.
+**Execution Outcome:** Runtime calibration was removed, diagnostics and pairwise-head plumbing were implemented, and local-proxy overlap repair improved local runtime-aware evaluation from `2.5256` to the `2.3262`-`2.3991` range depending on runtime noise. The `< 1` target was not reached; next work should focus on removing remaining ID 99/98 soft violations and reducing bbox/HPWL, not on runtime tricks.
 
 ---
 
@@ -52,7 +52,7 @@ def test_runtime_calibration_env_does_not_sleep(monkeypatch):
     monkeypatch.setattr("time.sleep", fail_sleep)
     monkeypatch.setenv("FLOORSET_RUNTIME_CALIBRATION_SECONDS", "10")
 
-    optimizer = ArchitectureV3Optimizer()
+    optimizer = ArchitectureV4Optimizer()
 
     assert len(optimizer.solve(**problem)) == block_count
 ```
@@ -187,7 +187,7 @@ def test_optimizer_writes_repair_trace_jsonl(tmp_path, monkeypatch):
     trace_path = tmp_path / "trace.jsonl"
     monkeypatch.setenv("FLOORSET_REPAIR_TRACE_JSONL", str(trace_path))
 
-    optimizer = ArchitectureV3Optimizer(config=SolverConfig(checkpoint_repo_relative=False, default_checkpoint="missing.pt"))
+    optimizer = ArchitectureV4Optimizer(config=SolverConfig(checkpoint_repo_relative=False, default_checkpoint="missing.pt"))
     optimizer.solve(**_tiny_problem())
 
     rows = [json.loads(line) for line in trace_path.read_text().splitlines()]
@@ -206,7 +206,7 @@ Expected: FAIL because trace file is not created.
 
 - [ ] **Step 3: Implement trace writing**
 
-Add helper methods to `ArchitectureV3Optimizer`:
+Add helper methods to `ArchitectureV4Optimizer`:
 
 ```python
 def _repair_candidate(self, inst, placement, profile: str, kind: str) -> Placement:

@@ -2,11 +2,11 @@
 
 ## Goal
 
-Reduce `iccad2026_evaluate.py --evaluate` total score below 1 through real placement-quality improvements, not runtime calibration or artificial delay.
+Reduce local no-runtime quality score below 1 through real placement-quality improvements, not runtime calibration or artificial delay.
 
 ## Context
 
-The v3 wrapper and `ArchitectureV3Optimizer` are active. The previous `1.8528` score depended on runtime calibration, which has been removed. The honest baseline returns to the placement quality of the Anchor-GNN guided relative-order decoder plus repair path.
+The v4 wrapper and `ArchitectureV4Optimizer` are active. The previous `1.8528` score depended on runtime calibration, which has been removed. The honest baseline returns to the placement quality of the Anchor-GNN guided relative-order decoder plus repair path.
 
 Validation IDs 99 and 98 dominate the total score because the contest score uses exponential block-count weighting. Existing ablation notes show that enabling beam candidates, running both profiles, no-guidance candidates, naive external boundary moves, and tall-layout pair bias did not improve the dominant tail cases.
 
@@ -47,10 +47,10 @@ Slot ranking stays a later phase. It becomes worthwhile only after pairwise orde
 - No artificial sleeping or runtime calibration remains in production solver code.
 - Repair trace can explain before/after repair effects for IDs 97-99 and arbitrary cases.
 - Pairwise relation model is trainable from `fp_sol` and checkpoint-compatible through a clear version path.
-- Honest `--evaluate` score improves versus the non-calibrated v3 baseline.
+- No-runtime quality score improves versus the non-calibrated historical baseline.
 - Target outcome remains total score `< 1`, but intermediate work must report real HPWL, area, soft-violation, and runtime trade-offs.
 
-Execution note: the first implementation pass removed calibration and improved honest full score to the `2.3262`-`2.3991` range depending on runtime noise; target `< 1` remains open.
+Execution note: the first implementation pass removed calibration and improved local runtime-aware score to the `2.3262`-`2.3991` range depending on runtime noise; target `< 1` remains open and should now be tracked with no-runtime score first.
 
 ## Risks
 

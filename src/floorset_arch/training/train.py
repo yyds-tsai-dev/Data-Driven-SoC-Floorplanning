@@ -291,7 +291,7 @@ def main(args) -> None:
     wandb_run = maybe_init_wandb(args)
 
     print("=" * 72)
-    print("Architecture v3 Anchor-GNN training")
+    print("Architecture v4 Anchor-GNN training")
     print(f"  dataset samples  = {total}")
     print(f"  train per epoch  = {args.num_samples}")
     print(f"  val window       = {vs}..{ve}")
@@ -475,7 +475,7 @@ def parse_args():
     parser.add_argument("--resume-checkpoint", default="")
     parser.add_argument("--ignore-optimizer-state", action="store_true")
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", default="floorset-arch-v3")
+    parser.add_argument("--wandb-project", default="floorset-arch-v4")
     parser.add_argument("--wandb-entity", default="")
     parser.add_argument("--wandb-run-name", default="")
     parser.add_argument(

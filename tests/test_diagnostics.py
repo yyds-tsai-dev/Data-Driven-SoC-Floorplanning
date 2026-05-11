@@ -5,7 +5,7 @@ import torch
 from floorset_arch.diagnostics import placement_metrics, repair_delta
 from floorset_arch.models import Placement, Rect
 from floorset_arch.models import SolverConfig
-from floorset_arch.optimizer import ArchitectureV3Optimizer
+from floorset_arch.optimizer import ArchitectureV4Optimizer
 from floorset_arch.parser import parse_instance
 from floorset_arch.repair import repair_placement
 
@@ -58,7 +58,7 @@ def test_optimizer_writes_repair_trace_jsonl(tmp_path, monkeypatch):
         "constraints": torch.zeros(2, 5),
         "target_positions": torch.full((2, 4), -1.0),
     }
-    optimizer = ArchitectureV3Optimizer(
+    optimizer = ArchitectureV4Optimizer(
         config=SolverConfig(checkpoint_repo_relative=False, default_checkpoint="missing.pt")
     )
 

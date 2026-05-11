@@ -32,9 +32,17 @@ _Avoid_: arbitrary greedy coordinate.
 A constructive decoder that expands multiple partial placements by selecting a remaining block, shape, and legal slot at each step.
 _Avoid_: evaluator-in-loop reranking, single greedy placement.
 
-**Architecture v3**:
-The current production architecture generation that keeps `floorset_arch` as the active solver package while exposing a v3 contest wrapper.
+**Architecture v4**:
+The current production architecture generation that keeps `floorset_arch` as the active solver package while exposing a v4 contest wrapper.
 _Avoid_: architecture_v2, treating wrapper version names as separate solver packages.
+
+**No-Runtime Quality Score**:
+The local architecture-tuning score that uses official quality and soft-violation factors with runtime adjustment fixed to `1.0`.
+_Avoid_: treating local runtime-aware score as the primary architecture metric.
+
+**Local Runtime-Aware Score**:
+The local evaluator score that uses each validation runtime divided by the solver's own validation-run median runtime.
+_Avoid_: treating it as the official contest runtime factor.
 
 **Sample-Local Parallelism**:
 Parallel work that happens inside one `solve()` call for a single contest sample, such as independent candidate generation or repair profiles.
@@ -55,7 +63,8 @@ _Avoid_: partially training on soft-violating `fp_sol` before measuring whether 
 - A **Legacy Strategy** may donate geometry helper logic, but it is not a selectable **Production Solver Path**.
 - A **Reference Architecture** may be consulted while tuning `floorset_arch`, but it does not define the active solver architecture.
 - A **MER/Skyline Slot** must respect hard placement legality before repair is allowed to refine soft constraints.
-- **Architecture v3** names the contest-facing wrapper generation; the **Production Solver Path** remains `floorset_arch`.
+- **Architecture v4** names the contest-facing wrapper generation; the **Production Solver Path** remains `floorset_arch`.
+- **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
 - **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
 - **Training Golden Answer** should teach geometric priors, while soft-constraint satisfaction remains the responsibility of constraint-aware decoding, repair, and scoring.
 - A **Constraint-Clean Training Sample** is eligible for full imitation training; soft-violating training samples are not used for anchor, aspect, priority, order, or pairwise supervised losses.
@@ -68,4 +77,5 @@ _Avoid_: partially training on soft-violating `fp_sol` before measuring whether 
 ## Flagged Ambiguities
 
 - "Remove greedy/hint architecture" was resolved to mean removing `legacy`, `default`, and `model_first` as production solver branches while preserving reusable geometry helpers where needed by the beam decoder.
-- "Rename architecture_v2" was resolved to mean renaming the contest wrapper and active optimizer class to **Architecture v3**, not renaming the `floorset_arch` package.
+- "Rename architecture_v2" was resolved to mean renaming the contest wrapper and active optimizer class to a numbered **Architecture vN**, not renaming the `floorset_arch` package.
+- "Local score" was ambiguous between **No-Runtime Quality Score** and **Local Runtime-Aware Score**; resolved: tune architecture with no-runtime score first, then check raw runtime and local runtime-aware score before submission.

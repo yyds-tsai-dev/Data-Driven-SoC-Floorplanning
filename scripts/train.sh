@@ -50,7 +50,7 @@ uv run -m floorset_arch.training.train \
   --pairwise-pairs "$PAIRWISE_PAIRS" \
   --pairwise-weight "$PAIRWISE_WEIGHT" \
   --wandb \
-  --wandb-project floorset-arch-v3 \
+  --wandb-project floorset-arch-v4 \
   --wandb-run-name "$DEFAULT_TAG" \
   --print-every 500 \
-  "${EXTRA_ARGS[@]}" | tee "train_arch_v3_${LOG_TAG}.log"
+  "${EXTRA_ARGS[@]}" | tee "train_arch_v4_${LOG_TAG}.log"

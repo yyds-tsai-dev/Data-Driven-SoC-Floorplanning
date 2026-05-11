@@ -11,8 +11,8 @@ for path in (SRC, CONTEST_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from floorset_arch.optimizer import ArchitectureV3Optimizer  # noqa: E402
+from floorset_arch.optimizer import ArchitectureV4Optimizer  # noqa: E402
 
 
-MyOptimizer = ArchitectureV3Optimizer
-ContestOptimizer = ArchitectureV3Optimizer
+MyOptimizer = ArchitectureV4Optimizer
+ContestOptimizer = ArchitectureV4Optimizer

@@ -2,12 +2,20 @@
 
 ## Current Baseline
 
-- `iccad2026_evaluate.py --evaluate src/architecture_v3_optimizer.py` scored `2.6509` immediately after the v3 rename.
-- After removing runtime calibration, the honest v3 score was `2.5256` in the first full run.
-- After local-proxy overlap repair, honest full runs scored `2.3262` to `2.3991` (`100/100` feasible). The spread came from evaluator runtime noise, not artificial calibration.
-- Later default full runs with large-case repair experiments left opt-in scored `2.3689` to `2.4774`; no new default path beat the local-proxy baseline reliably.
+- Historical v3 runtime-aware baselines: `2.6509` immediately after the v3 rename, `2.5256` after removing runtime calibration, and `2.3262` to `2.3991` after local-proxy overlap repair (`100/100` feasible).
+- Those v3 totals used the local evaluator runtime factor, whose denominator is the solver's own validation-run median runtime. Treat them as runtime-aware risk signals, not as the primary architecture-quality metric.
+- Current architecture comparisons should report the no-runtime total beside the local runtime-aware total before accepting or rejecting a candidate path.
+- 2026-05-11 no-runtime promotion pass kept `checkpoints/gnn_best.pt` as default: `1.9848` no-runtime total versus `2.2768` for `gnn_best_0510_ns200000_ep10_h192_l6_acc32.pt` and `1.9953` for `gnn_best_0510_ns500000_ep4_h192_l6_acc32.pt`.
+- Rechecking `FLOORSET_ENABLE_LARGE_CASE_CANDIDATES=1` with `gnn_best.pt` tied the no-runtime total at `1.9848` and had zero no-runtime delta on IDs 95-99, so the matrix remains opt-in.
 - Score was dominated by validation IDs 99 and 98 because total score is exponentially weighted by block count.
 - ID 99 contributed about `1.76 / 2.65`; ID 98 contributed about `0.59 / 2.65`.
+
+## Local Score Policy
+
+- Use this tuning order: feasible count -> large-case no-runtime score -> total no-runtime score -> soft violations -> HPWL/area -> raw runtime -> local runtime-aware score.
+- Keep the official cost formula and runtime-aware total in the evaluator, but do not use the local runtime median artifact as the only decision-maker for beam, repair, or large-case candidate policy.
+- `--score` saved-solution evaluation is effectively no-runtime unless stored runtimes are deliberately reintroduced, because saved positions are scored with neutral runtime.
+- Checkpoint selection currently uses supervised validation loss, not no-runtime evaluator score. Treat it as a training health metric only; promote a checkpoint only after `--evaluate` or saved-solution scoring reports no-runtime improvements on dominant large cases.
 
 ## Ablation Results To Avoid Repeating
 
@@ -28,17 +36,18 @@
 - Large-case high-cap boundary pass/refine remains opt-in because default full evaluation regressed when the extra search ran on every large case.
 - Opt-in knobs kept for future remote/server ablation: `FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP`, `FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_PASS`, `FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_REFINE`, `FLOORSET_OVERLAP_REPAIR_CANDIDATES`.
 
-## Current v3 Strategy
+## Current v4 Strategy
 
 - Keep the active solver path in `floorset_arch`.
-- Rename the contest wrapper and optimizer class from v2 to v3.
+- Rename the contest wrapper and optimizer class from v3 to v4.
 - Preserve the current Anchor-GNN guided relative-order decoder for large cases.
-- Do not use runtime calibration or artificial sleep. Score improvements after v3 must come from placement quality, repair quality, or learned ordering/ranking.
+- Do not use runtime calibration or artificial sleep. Score improvements after v4 must come from placement quality, repair quality, or learned ordering/ranking.
 - Keep pairwise-head plumbing checkpoint-compatible, but do not depend on it for local WSL optimization until remote training finishes.
 - Use local-proxy overlap relocation instead of first legal frontier relocation; it improves dominant tail quality without the full-HPWL runtime blow-up.
 - Keep `checkpoints/gnn_best.pt` as the default checkpoint. Metadata and tail-case proxy checks were better than the 0510 h192/l6 checkpoints under the current decoder/repair path.
 - A sequential, sample-local relative-order candidate matrix is implemented behind `FLOORSET_ENABLE_LARGE_CASE_CANDIDATES=1`: adaptive profile plus the opposite forced `soft`/`compact` profile when it is not a duplicate, with normal repair by default. Full validation regressed when this ran by default, so the production default keeps the faster adaptive single-candidate path.
-- Large-boundary repair remains opt-in via `FLOORSET_LARGE_CASE_REPAIR_PROFILES=normal,large_boundary`; full validation showed defaulting it improved soft counts but regressed runtime-weighted score.
+- Large-boundary repair remains opt-in via `FLOORSET_LARGE_CASE_REPAIR_PROFILES=normal,large_boundary`; previous full validation showed defaulting it improved soft counts but regressed local runtime-aware score, so it needs no-runtime and raw-runtime review before becoming default.
+- Under no-runtime tuning, the adaptive single-profile default is reasonable as the submission-safe path, but it should not be treated as settled architecture. Re-run the large-case matrix and large-boundary profiles using `total_score_no_runtime` before rejecting them.
 - Boundary repair now skips already-satisfied boundary blocks only for `block_count >= 118` and widens the free cross-axis search for large edge-constrained boundary moves. This preserved the useful ID 99 boundary improvement without moving the whole default path to the expensive high-cap search.
 - Keep beam and no-guidance candidates opt-in through environment variables; do not enable them by default without a full-score win.
 - During supervised training, skip any `fp_sol` sample that violates boundary, grouping, or MIB constraints. Golden answers are geometry references, not guaranteed soft-constraint oracles.
@@ -48,5 +57,7 @@
 ## Review Notes
 
 - Runtime calibration was removed because it was a median-runtime exploit and would be fragile under official review or absolute-runtime scoring.
+- Local full-evaluate runtime factor is also median-based, so every ablation should report no-runtime score and raw runtime separately.
+- Evaluator runtime measurement uses monotonic `time.perf_counter()`; `time.time()` produced occasional negative runtimes in WSL and should not be used for solver timing.
 - Repair tracing is opt-in via `FLOORSET_REPAIR_TRACE_JSONL` and records before/after overlap, boundary, group, MIB, HPWL proxy, bbox area, and movement deltas.
 - Future score work should report both pre-repair and post-repair metrics so improvements are attributable to the model, decoder, or repair.

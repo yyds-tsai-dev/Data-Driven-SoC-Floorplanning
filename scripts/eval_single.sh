@@ -22,6 +22,6 @@ load_env_defaults "$ROOT/.env"
 export FLOORSET_GNN_CHECKPOINT="${FLOORSET_GNN_CHECKPOINT:-$ROOT/checkpoints/gnn_best.pt}"
 cd "$ROOT/FloorSet/iccad2026contest"
 uv run iccad2026_evaluate.py \
-  --evaluate "$ROOT/src/architecture_v3_optimizer.py" \
+  --evaluate "$ROOT/src/architecture_v4_optimizer.py" \
   --test-id $TESTID \
   --verbose
