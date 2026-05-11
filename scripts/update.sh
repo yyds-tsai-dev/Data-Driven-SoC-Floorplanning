@@ -2,7 +2,7 @@
 
 COMMIT_MSG="${1:-$(date +"%Y-%m-%d %H:%M:%S")}"
 REMOTE="${2:-origin}"
-BRANCH="${3:-arch-v3}"
+BRANCH="${3:-arch-v4}"
 
 git fetch
 git pull "$REMOTE" "$BRANCH"
