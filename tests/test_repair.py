@@ -137,6 +137,30 @@ def test_boundary_repair_tries_alternate_edge_slots_when_current_slot_overlaps()
     assert abs(repaired.rects[0].right - bounds.right) <= 1e-6
 
 
+def test_boundary_repair_keeps_already_satisfied_block_in_place():
+    areas = torch.tensor([4.0, 4.0])
+    constraints = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, 2.0],
+        ]
+    )
+    inst = parse_instance(
+        2,
+        areas,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        None,
+    )
+    placement = Placement({0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(4.0, 0.0, 2.0, 2.0)})
+
+    _repair_boundary(inst, placement)
+
+    assert placement.rects[0].as_tuple() == (0.0, 0.0, 2.0, 2.0)
+
+
 def test_guarded_repair_reduces_soft_violation_counts():
     areas = torch.tensor([4.0, 4.0, 4.0, 4.0])
     constraints = torch.tensor(
@@ -197,12 +221,43 @@ def test_large_case_boundary_repair_searches_wider_axis_candidates(monkeypatch):
             rects[block] = Rect(x, y, 1.0, 1.0)
     placement = Placement(rects)
     monkeypatch.setenv("FLOORSET_BOUNDARY_AXIS_CAP", "24")
+    monkeypatch.setenv("FLOORSET_BOUNDARY_CROSS_AXIS_CAP", "160")
 
     repaired = repair_placement(inst, placement)
     bounds = bbox(list(repaired.rects.values()))
 
     assert not has_overlaps(list(repaired.rects.values()))
     assert abs(repaired.rects[0].right - bounds.right) <= 1e-6
+
+
+def test_boundary_repair_searches_far_cross_axis_slot_for_large_edge_case(monkeypatch):
+    block_count = 100
+    areas = torch.full((block_count,), 1.0)
+    constraints = torch.zeros(block_count, 5)
+    constraints[0, 4] = 2.0
+    inst = parse_instance(
+        block_count,
+        areas,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        None,
+    )
+    rects = {0: Rect(0.0, 0.0, 1.0, 1.0)}
+    for block in range(1, 31):
+        rects[block] = Rect(10.0, float(block - 1), 1.0, 1.0)
+    for block in range(31, block_count):
+        rects[block] = Rect(0.0, 100.0 + float(block), 1.0, 1.0)
+    placement = Placement(rects)
+    monkeypatch.setenv("FLOORSET_BOUNDARY_AXIS_CAP", "24")
+
+    _repair_boundary(inst, placement)
+    bounds = bbox(list(placement.rects.values()))
+
+    assert abs(placement.rects[0].right - bounds.right) <= 1e-6
+    assert placement.rects[0].y >= 30.0
+    assert not has_overlaps(list(placement.rects.values()))
 
 
 def test_large_case_boundary_pass_can_override_axis_cap(monkeypatch):

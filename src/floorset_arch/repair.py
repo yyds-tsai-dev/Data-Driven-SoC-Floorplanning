@@ -147,6 +147,8 @@ def _repair_boundary(inst: Instance, placement: Placement, axis_cap: int | None 
         if block in inst.preplaced or block not in placement.rects:
             continue
         rect = placement.rects[block]
+        if len(placement.rects) >= 118 and boundary_satisfied_local(rect, bounds, code):
+            continue
         others = [r for i, r in placement.rects.items() if i != block]
         xs = {rect.x, bounds.x, max(bounds.x, bounds.right - rect.width)}
         ys = {rect.y, bounds.y, max(bounds.y, bounds.top - rect.height)}
@@ -162,8 +164,17 @@ def _repair_boundary(inst: Instance, placement: Placement, axis_cap: int | None 
         elif code & 4:
             ys = {max(bounds.y, bounds.top - rect.height)}
 
-        xs = set(_nearest_axis_values(xs, rect.x, axis_cap))
-        ys = set(_nearest_axis_values(ys, rect.y, axis_cap))
+        x_cap = axis_cap
+        y_cap = axis_cap
+        if len(placement.rects) >= 100:
+            cross_axis_cap = _boundary_cross_axis_cap(axis_cap)
+            if code & 3 and not (code & 12):
+                y_cap = cross_axis_cap
+            elif code & 12 and not (code & 3):
+                x_cap = cross_axis_cap
+
+        xs = set(_nearest_axis_values(xs, rect.x, x_cap))
+        ys = set(_nearest_axis_values(ys, rect.y, y_cap))
         candidates = []
         for x in sorted(xs, key=lambda value: abs(value - rect.x)):
             for y in sorted(ys, key=lambda value: abs(value - rect.y)):
@@ -194,6 +205,13 @@ def _boundary_axis_cap(block_count: int) -> int:
     if cap_override:
         return int(cap_override)
     return 24 if block_count >= 100 else 160
+
+
+def _boundary_cross_axis_cap(axis_cap: int) -> int:
+    override = os.environ.get("FLOORSET_BOUNDARY_CROSS_AXIS_CAP")
+    if override:
+        return max(axis_cap, int(override))
+    return max(axis_cap, 160)
 
 
 def _boundary_distance(rect: Rect, bounds: Rect, code: int) -> float:

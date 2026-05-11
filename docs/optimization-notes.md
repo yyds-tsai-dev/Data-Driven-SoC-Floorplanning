@@ -36,6 +36,12 @@
 - Do not use runtime calibration or artificial sleep. Score improvements after v3 must come from placement quality, repair quality, or learned ordering/ranking.
 - Keep pairwise-head plumbing checkpoint-compatible, but do not depend on it for local WSL optimization until remote training finishes.
 - Use local-proxy overlap relocation instead of first legal frontier relocation; it improves dominant tail quality without the full-HPWL runtime blow-up.
+- Keep `checkpoints/gnn_best.pt` as the default checkpoint. Metadata and tail-case proxy checks were better than the 0510 h192/l6 checkpoints under the current decoder/repair path.
+- A sequential, sample-local relative-order candidate matrix is implemented behind `FLOORSET_ENABLE_LARGE_CASE_CANDIDATES=1`: adaptive profile plus the opposite forced `soft`/`compact` profile when it is not a duplicate, with normal repair by default. Full validation regressed when this ran by default, so the production default keeps the faster adaptive single-candidate path.
+- Large-boundary repair remains opt-in via `FLOORSET_LARGE_CASE_REPAIR_PROFILES=normal,large_boundary`; full validation showed defaulting it improved soft counts but regressed runtime-weighted score.
+- Boundary repair now skips already-satisfied boundary blocks only for `block_count >= 118` and widens the free cross-axis search for large edge-constrained boundary moves. This preserved the useful ID 99 boundary improvement without moving the whole default path to the expensive high-cap search.
+- Keep beam and no-guidance candidates opt-in through environment variables; do not enable them by default without a full-score win.
+- During supervised training, skip any `fp_sol` sample that violates boundary, grouping, or MIB constraints. Golden answers are geometry references, not guaranteed soft-constraint oracles.
 - Next deterministic optimization should target large-case boundary/group repair for `block_count >= 118` or similar constraint-stat triggers, not `test_id`-specific logic.
 - Large-case repair should report soft-count deltas first, then bbox/HPWL deltas, because `V_rel` enters score through exponential penalty.
 

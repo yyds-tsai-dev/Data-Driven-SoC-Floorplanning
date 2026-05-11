@@ -36,6 +36,18 @@ _Avoid_: evaluator-in-loop reranking, single greedy placement.
 The current production architecture generation that keeps `floorset_arch` as the active solver package while exposing a v3 contest wrapper.
 _Avoid_: architecture_v2, treating wrapper version names as separate solver packages.
 
+**Sample-Local Parallelism**:
+Parallel work that happens inside one `solve()` call for a single contest sample, such as independent candidate generation or repair profiles.
+_Avoid_: cross-sample batching, assuming validation or hidden test cases can be processed together.
+
+**Training Golden Answer**:
+The provided `fp_sol` layout used as a supervised geometric reference. It is not a soft-constraint oracle because official QA confirms training golden answers may violate boundary, grouping, or MIB constraints.
+_Avoid_: treating imitation learning as exact constraint satisfaction.
+
+**Constraint-Clean Training Sample**:
+A supervised training case whose `fp_sol` satisfies boundary, grouping, and MIB soft constraints, so it can safely teach geometry and constraint-sensitive layout priors. Soft-violating `fp_sol` samples are skipped completely during supervised training.
+_Avoid_: partially training on soft-violating `fp_sol` before measuring whether the clean-sample ratio is too low.
+
 ## Relationships
 
 - The **Production Solver Path** uses **Anchor-GNN Guidance** as a prior, not as a complete floorplan.
@@ -44,6 +56,9 @@ _Avoid_: architecture_v2, treating wrapper version names as separate solver pack
 - A **Reference Architecture** may be consulted while tuning `floorset_arch`, but it does not define the active solver architecture.
 - A **MER/Skyline Slot** must respect hard placement legality before repair is allowed to refine soft constraints.
 - **Architecture v3** names the contest-facing wrapper generation; the **Production Solver Path** remains `floorset_arch`.
+- **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
+- **Training Golden Answer** should teach geometric priors, while soft-constraint satisfaction remains the responsibility of constraint-aware decoding, repair, and scoring.
+- A **Constraint-Clean Training Sample** is eligible for full imitation training; soft-violating training samples are not used for anchor, aspect, priority, order, or pairwise supervised losses.
 
 ## Example Dialogue
 

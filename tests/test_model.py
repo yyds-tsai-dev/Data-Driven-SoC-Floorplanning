@@ -4,7 +4,11 @@ from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_
 from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 from floorset_arch.nn.model import FloorplanGNN
 from floorset_arch.parser import parse_instance
-from floorset_arch.training.losses import build_pairwise_relation_targets
+from floorset_arch.training.losses import (
+    build_pairwise_relation_targets,
+    fp_sol_soft_violations,
+    is_constraint_clean_training_sample,
+)
 
 
 def test_anchor_gnn_forward_matches_runtime_features():
@@ -81,3 +85,60 @@ def test_pairwise_relation_targets_ignore_ambiguous_pairs():
     assert targets["x_label"].tolist() == [1.0, 0.0, 0.0]
     assert targets["y_label"].tolist() == [0.0, 1.0, 0.0]
     assert targets["mask"].tolist() == [True, True, False]
+
+
+def test_constraint_clean_training_sample_detects_boundary_group_and_mib():
+    constraints = torch.tensor(
+        [
+            [0.0, 0.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 2.0],
+        ]
+    )
+    clean_fp_sol = torch.tensor(
+        [
+            [2.0, 2.0, 0.0, 0.0],
+            [2.0, 2.0, 2.0, 0.0],
+            [2.0, 2.0, 4.0, 0.0],
+        ]
+    )
+    dirty_fp_sol = torch.tensor(
+        [
+            [2.0, 2.0, 5.0, 0.0],
+            [3.0, 3.0, 10.0, 0.0],
+            [2.0, 2.0, 0.0, 0.0],
+        ]
+    )
+
+    assert fp_sol_soft_violations(
+        clean_fp_sol,
+        torch.tensor([4.0, 4.0, 4.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+    ) == (0, 0, 0)
+    assert is_constraint_clean_training_sample(
+        clean_fp_sol,
+        torch.tensor([4.0, 4.0, 4.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+    )
+    assert fp_sol_soft_violations(
+        dirty_fp_sol,
+        torch.tensor([4.0, 4.0, 4.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+    ) == (2, 1, 1)
+    assert not is_constraint_clean_training_sample(
+        dirty_fp_sol,
+        torch.tensor([4.0, 4.0, 4.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+    )

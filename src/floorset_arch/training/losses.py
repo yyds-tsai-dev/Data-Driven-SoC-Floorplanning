@@ -3,6 +3,60 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from floorset_arch.models import Placement, Rect
+from floorset_arch.parser import parse_instance
+from floorset_arch.repair import soft_violation_counts
+
+
+def _placement_from_fp_sol(fp_sol: torch.Tensor, block_count: int) -> Placement:
+    gt = fp_sol[:block_count].detach().cpu().float()
+    rects = {}
+    for block in range(block_count):
+        width, height, x, y = [float(value) for value in gt[block].tolist()]
+        rects[block] = Rect(x, y, width, height)
+    return Placement(rects)
+
+
+def fp_sol_soft_violations(
+    fp_sol: torch.Tensor,
+    area_targets: torch.Tensor,
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+    constraints: torch.Tensor,
+) -> tuple[int, int, int]:
+    block_count = int((area_targets.detach().flatten() != -1).sum().item())
+    inst = parse_instance(
+        block_count,
+        area_targets,
+        b2b_connectivity,
+        p2b_connectivity,
+        pins_pos,
+        constraints,
+        None,
+    )
+    return soft_violation_counts(inst, _placement_from_fp_sol(fp_sol, block_count))
+
+
+def is_constraint_clean_training_sample(
+    fp_sol: torch.Tensor,
+    area_targets: torch.Tensor,
+    b2b_connectivity: torch.Tensor,
+    p2b_connectivity: torch.Tensor,
+    pins_pos: torch.Tensor,
+    constraints: torch.Tensor,
+) -> bool:
+    return sum(
+        fp_sol_soft_violations(
+            fp_sol,
+            area_targets,
+            b2b_connectivity,
+            p2b_connectivity,
+            pins_pos,
+            constraints,
+        )
+    ) == 0
+
 
 def build_anchor_targets(
     fp_sol: torch.Tensor, block_count: int, scale: float, device: torch.device

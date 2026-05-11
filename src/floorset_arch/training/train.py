@@ -21,6 +21,7 @@ from floorset_arch.training.losses import (
     build_pairwise_relation_targets,
     compute_anchor_losses,
     constraint_weights,
+    is_constraint_clean_training_sample,
     pairwise_relation_loss,
     sample_pairs,
 )
@@ -119,6 +120,7 @@ def run_epoch(
         )
     }
     count = 0
+    skipped = 0
     accumulation_steps = max(1, int(args.accumulation_steps))
     if train:
         optimizer.zero_grad(set_to_none=True)
@@ -126,6 +128,9 @@ def run_epoch(
         area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = unpack_batch(
             batch
         )
+        if not is_constraint_clean_training_sample(fp_sol, area_targets, b2b, p2b, pins, constraints):
+            skipped += 1
+            continue
         block_count = valid_block_count(area_targets)
         inst = parse_instance(
             block_count, area_targets, b2b, p2b, pins, constraints, fp_sol
@@ -184,7 +189,10 @@ def run_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-    return {key: value / max(count, 1) for key, value in sums.items()}
+    stats = {key: value / max(count, 1) for key, value in sums.items()}
+    stats["skipped"] = float(skipped)
+    stats["used"] = float(count)
+    return stats
 
 
 def load_resume_model(
@@ -356,7 +364,8 @@ def main(args) -> None:
             f"anchor={train_stats['anchor']:.5f} aspect={train_stats['aspect']:.5f} "
             f"priority={train_stats['priority']:.5f} order={train_stats['order']:.5f} "
             f"edge={train_stats['edge']:.5f} pair={train_stats['pairwise']:.5f} "
-            f"ord_acc={train_stats['ord_acc']:.3f} pair_acc={train_stats['pair_acc']:.3f}",
+            f"ord_acc={train_stats['ord_acc']:.3f} pair_acc={train_stats['pair_acc']:.3f} "
+            f"used={train_stats['used']:.0f} skipped={train_stats['skipped']:.0f}",
             flush=True,
         )
         print(
@@ -364,7 +373,8 @@ def main(args) -> None:
             f"anchor={val_stats['anchor']:.5f} aspect={val_stats['aspect']:.5f} "
             f"priority={val_stats['priority']:.5f} order={val_stats['order']:.5f} "
             f"edge={val_stats['edge']:.5f} pair={val_stats['pairwise']:.5f} "
-            f"ord_acc={val_stats['ord_acc']:.3f} pair_acc={val_stats['pair_acc']:.3f}",
+            f"ord_acc={val_stats['ord_acc']:.3f} pair_acc={val_stats['pair_acc']:.3f} "
+            f"used={val_stats['used']:.0f} skipped={val_stats['skipped']:.0f}",
             flush=True,
         )
         if wandb_run is not None:
