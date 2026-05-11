@@ -6,7 +6,14 @@ BRANCH="${3:-arch-v4}"
 
 git fetch
 git pull "$REMOTE" "$BRANCH"
+
+echo "Checking FloorSet submodule..."
+cd FloorSet || exit
+git add -A
+git commit -m "$COMMIT_MSG (submodule)" || echo "No changes in FloorSet to commit"
+cd ..
+
 git status
 git add -A
-git commit -m "$COMMIT_MSG" || echo "No changes to commit"
-git push -u "$REMOTE" "$BRANCH"
+git commit -m "$COMMIT_MSG" || echo "No changes to commit in main repo"
+git push --recurse-submodules=no -u "$REMOTE" "$BRANCH"
