@@ -73,7 +73,7 @@ def test_checkpoint_model_is_cached_between_solves(tmp_path, monkeypatch):
 
 def test_default_checkpoint_loads_root_anchor_gnn(monkeypatch):
     monkeypatch.delenv("FLOORSET_GNN_CHECKPOINT", raising=False)
-    checkpoint = Path("checkpoints/gnn_best.pt")
+    checkpoint = Path("checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt")
     if not checkpoint.exists():
         return
     problem = _tiny_problem()

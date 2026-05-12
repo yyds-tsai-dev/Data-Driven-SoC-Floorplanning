@@ -62,7 +62,7 @@ class SolverConfig:
     max_push_iters: int = 32
     coordinate_eps: float = 1e-6
     checkpoint_env: str = "FLOORSET_GNN_CHECKPOINT"
-    default_checkpoint: str = "checkpoints/gnn_best.pt"
+    default_checkpoint: str = "checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
     beam_width: int = 1
     shape_variant_count: int = 2
     local_search_moves: int = 64
