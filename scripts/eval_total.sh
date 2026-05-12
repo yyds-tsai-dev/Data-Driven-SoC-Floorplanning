@@ -20,21 +20,29 @@ load_env_defaults() {
 load_env_defaults "$ROOT/.env"
 
 # Usage:
-#   ./script.sh                 # default: gnn_best.pt
-#   ./script.sh gnn_epoch10.pt
-#   ./script.sh /path/to/model.pt
+#   bash scripts/eval_total.sh                         # use FLOORSET_GNN_CHECKPOINT/.env, else gnn_best.pt
+#   bash scripts/eval_total.sh gnn_epoch10.pt          # use checkpoints/gnn_epoch10.pt
+#   bash scripts/eval_total.sh checkpoints/model.pt    # use repo-relative checkpoint path
+#   bash scripts/eval_total.sh /path/to/model.pt       # use absolute checkpoint path
 
-CKPT_NAME="${1:-gnn_best.pt}"
+resolve_ckpt_path() {
+  local ckpt="$1"
+  if [[ "$ckpt" = /* ]]; then
+    printf '%s\n' "$ckpt"
+  elif [[ "$ckpt" = */* ]]; then
+    printf '%s\n' "$ROOT/$ckpt"
+  else
+    printf '%s\n' "$ROOT/checkpoints/$ckpt"
+  fi
+}
 
-if [[ "$CKPT_NAME" = /* ]]; then
-  CKPT_PATH="$CKPT_NAME"
-else
-  CKPT_PATH="$ROOT/checkpoints/$CKPT_NAME"
+if [ -n "${1:-}" ]; then
+  export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
+elif [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
+  export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best.pt"
 fi
 
-if [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ] || [ "${FLOORSET_GNN_CHECKPOINT:-}" = "checkpoints/gnn_best.pt" ]; then
-  export FLOORSET_GNN_CHECKPOINT="$CKPT_PATH"
-fi
+echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
 
 cd "$ROOT/FloorSet/iccad2026contest"
 
