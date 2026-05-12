@@ -30,7 +30,11 @@ def _shape_for_block(inst: Instance, block: int, guidance: AnchorGuidance | None
                 return target.width, target.height
 
     log_aspect = None
-    if profile != "compact":
+    if profile == "wide":
+        log_aspect = math.log(float(os.environ.get("FLOORSET_WIDE_PROFILE_ASPECT", "2.0")))
+    elif profile == "tall":
+        log_aspect = math.log(1.0 / float(os.environ.get("FLOORSET_TALL_PROFILE_ASPECT", "2.0")))
+    elif profile != "compact":
         if guidance is not None and block in guidance.log_aspect:
             log_aspect = max(-2.5, min(2.5, guidance.log_aspect[block]))
         elif guidance is not None and block in guidance.rect_priors:
