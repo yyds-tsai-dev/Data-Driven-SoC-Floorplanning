@@ -35,3 +35,23 @@ def test_relative_order_can_clamp_guidance_to_preplaced_frame(monkeypatch):
 
     assert placement.rects[1].right <= 10.0
     assert placement.rects[1].top <= 10.0
+
+
+def test_relative_order_supports_wide_and_tall_shape_profiles():
+    inst = parse_instance(
+        1,
+        torch.tensor([16.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.zeros(1, 5),
+        torch.full((1, 4), -1.0),
+    )
+
+    wide = construct_relative_order_placement(inst, profile="wide").rects[0]
+    tall = construct_relative_order_placement(inst, profile="tall").rects[0]
+
+    assert wide.width > wide.height
+    assert tall.height > tall.width
+    assert abs(wide.area - 16.0) <= 1e-6
+    assert abs(tall.area - 16.0) <= 1e-6

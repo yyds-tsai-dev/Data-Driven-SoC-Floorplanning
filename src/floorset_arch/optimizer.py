@@ -5,7 +5,7 @@ import math
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - dependency is present in local runs.
 
 from floorset_arch.constructive import construct_beam_placement
 from floorset_arch.diagnostics import placement_metrics, repair_delta
-from floorset_arch.geometry import bbox, boundary_satisfied, edge_touch_length
+from floorset_arch.geometry import bbox, candidate_frontier_points, first_non_overlapping
 from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 from floorset_arch.models import AnchorGuidance, Placement, Rect, SolverConfig
 from floorset_arch.parser import parse_instance
@@ -55,24 +55,62 @@ class CandidateSpec:
 
 
 def _repair_with_profile_worker(inst, placement: Placement, config: SolverConfig, repair_profile: str) -> Placement:
-    if repair_profile != "large_boundary":
-        return repair_placement(inst, placement, config)
+    profile_config = _repair_profile_config(config, repair_profile)
+    if repair_profile not in {"large_boundary", "boundary_first", "quality_refine"}:
+        return repair_placement(inst, placement, profile_config)
 
     saved_pass = os.environ.get("FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_PASS")
+    saved_refine = os.environ.get("FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_REFINE")
     saved_cap = os.environ.get("FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP")
-    os.environ["FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_PASS"] = "1"
-    os.environ.setdefault("FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP", "160")
+    saved_overlap = os.environ.get("FLOORSET_OVERLAP_REPAIR_CANDIDATES")
+    if repair_profile in {"large_boundary", "boundary_first"}:
+        os.environ["FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_PASS"] = "1"
+        os.environ.setdefault("FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP", "160")
+    if repair_profile == "quality_refine":
+        os.environ.setdefault("FLOORSET_OVERLAP_REPAIR_CANDIDATES", "64")
     try:
-        return repair_placement(inst, placement, config)
+        return repair_placement(inst, placement, profile_config)
     finally:
         if saved_pass is None:
             os.environ.pop("FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_PASS", None)
         else:
             os.environ["FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_PASS"] = saved_pass
+        if saved_refine is None:
+            os.environ.pop("FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_REFINE", None)
+        else:
+            os.environ["FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_REFINE"] = saved_refine
         if saved_cap is None:
             os.environ.pop("FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP", None)
         else:
             os.environ["FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP"] = saved_cap
+        if saved_overlap is None:
+            os.environ.pop("FLOORSET_OVERLAP_REPAIR_CANDIDATES", None)
+        else:
+            os.environ["FLOORSET_OVERLAP_REPAIR_CANDIDATES"] = saved_overlap
+
+
+def _repair_profile_config(config: SolverConfig, repair_profile: str) -> SolverConfig:
+    if repair_profile in {"large_boundary", "boundary_first"}:
+        return replace(
+            config,
+            max_boundary_component_snaps=max(config.max_boundary_component_snaps, 48),
+            max_repair_passes=max(config.max_repair_passes, 10),
+            soft_proxy_slack=max(config.soft_proxy_slack, 0.65),
+        )
+    if repair_profile == "grouping_first":
+        return replace(
+            config,
+            max_cluster_component_moves=max(config.max_cluster_component_moves, 56),
+            max_pair_candidates_per_component=max(config.max_pair_candidates_per_component, 96),
+            soft_proxy_slack=max(config.soft_proxy_slack, 0.62),
+        )
+    if repair_profile == "quality_refine":
+        return replace(
+            config,
+            equal_soft_proxy_slack=max(config.equal_soft_proxy_slack, 0.04),
+            max_repair_passes=max(config.max_repair_passes, 10),
+        )
+    return config
 
 
 def _build_candidate_worker(inst, config: SolverConfig, spec: CandidateSpec) -> Placement:
@@ -133,11 +171,16 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
         return best.to_position_list(block_count)
 
     def _build_candidates(self, inst, specs: list[CandidateSpec]) -> list[Placement]:
-        workers = self._candidate_workers(len(specs))
+        workers = self._candidate_worker_count_for_specs(specs)
         if workers <= 1:
             return [self._build_candidate(inst, spec) for spec in specs]
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return list(pool.map(self._build_candidate, [inst] * len(specs), specs))
+
+    def _candidate_worker_count_for_specs(self, specs: list[CandidateSpec]) -> int:
+        if any(spec.repair_profile != "normal" for spec in specs):
+            return 1
+        return self._candidate_workers(len(specs))
 
     def _candidate_workers(self, candidate_count: int) -> int:
         if candidate_count <= 1:
@@ -153,6 +196,7 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
         specs: list[CandidateSpec] = []
         profile_policy = os.environ.get("FLOORSET_PROFILE_POLICY", "adaptive").strip().lower()
         include_compact = os.environ.get("FLOORSET_INCLUDE_COMPACT_RELATIVE", "1") == "1"
+        high_risk_portfolio = self._uses_high_risk_portfolio(inst)
 
         if profile_policy == "compact":
             profile_order = ["compact"] if include_compact else []
@@ -160,6 +204,27 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
             profile_order = ["soft"]
         elif profile_policy == "both":
             profile_order = ["soft", "compact"] if include_compact else ["soft"]
+        elif high_risk_portfolio:
+            adaptive_profile = self._adaptive_profile_order(inst)[0]
+            profile_order = [adaptive_profile]
+            default_shape_profiles = "soft,compact,wide,tall" if self._uses_dense_shape_profiles(inst) else "soft,compact"
+            shape_profiles = os.environ.get("FLOORSET_HIGH_RISK_SHAPE_PROFILES", default_shape_profiles)
+            for profile in [part.strip() for part in shape_profiles.split(",") if part.strip()]:
+                if profile not in profile_order:
+                    profile_order.append(profile)
+            repair_profiles = self._high_risk_repair_profiles()
+            for repair_profile in repair_profiles:
+                for profile in profile_order:
+                    if profile == "compact" and not include_compact:
+                        continue
+                    specs.append(
+                        CandidateSpec(
+                            name=f"high_risk_{profile}_{repair_profile}",
+                            profile=profile,
+                            repair_profile=repair_profile,
+                        )
+                    )
+            return specs
         elif inst.block_count >= 118 and os.environ.get("FLOORSET_ENABLE_LARGE_CASE_CANDIDATES", "0") == "1":
             adaptive_profile = self._adaptive_profile_order(inst)[0]
             repair_profiles = self._large_case_repair_profiles()
@@ -225,6 +290,75 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
         filtered = [profile for profile in profiles if profile in allowed]
         return filtered or ["normal"]
 
+    def _high_risk_repair_profiles(self) -> list[str]:
+        raw = os.environ.get(
+            "FLOORSET_HIGH_RISK_REPAIR_PROFILES",
+            "normal,boundary_first,grouping_first,quality_refine",
+        )
+        profiles = [part.strip() for part in raw.split(",") if part.strip()]
+        allowed = {"normal", "boundary_first", "grouping_first", "quality_refine", "large_boundary"}
+        filtered = [profile for profile in profiles if profile in allowed]
+        return filtered or ["normal"]
+
+    def _uses_high_risk_portfolio(self, inst) -> bool:
+        mode = os.environ.get("FLOORSET_ENABLE_HIGH_RISK_PORTFOLIO", "auto").strip().lower()
+        if mode in {"0", "false", "off", "no"}:
+            return False
+        if mode in {"1", "true", "on", "yes"}:
+            return self._is_high_risk_case(inst)
+        return self._is_targeted_high_risk_case(inst)
+
+    def _is_targeted_high_risk_case(self, inst) -> bool:
+        if inst.block_count < int(os.environ.get("FLOORSET_HIGH_RISK_AUTO_MIN_BLOCKS", "110")):
+            return False
+
+        b2b_count = int(inst.valid_b2b.shape[0]) if inst.valid_b2b is not None else 0
+        p2b_count = int(inst.valid_p2b.shape[0]) if inst.valid_p2b is not None else 0
+        edge_density = (b2b_count + p2b_count) / max(inst.block_count, 1)
+
+        if edge_density >= float(os.environ.get("FLOORSET_HIGH_RISK_AUTO_EDGE_DENSITY", "80.0")):
+            return True
+        if (
+            p2b_count < int(os.environ.get("FLOORSET_HIGH_RISK_AUTO_LOW_PIN_MAX", "100"))
+            and b2b_count > int(os.environ.get("FLOORSET_HIGH_RISK_AUTO_LOW_PIN_B2B_MIN", "5000"))
+        ):
+            return True
+        return (
+            p2b_count > int(os.environ.get("FLOORSET_HIGH_RISK_AUTO_PIN_HEAVY_MIN", "2500"))
+            and b2b_count < int(os.environ.get("FLOORSET_HIGH_RISK_AUTO_PIN_HEAVY_B2B_MAX", "1000"))
+        )
+
+    def _is_high_risk_case(self, inst) -> bool:
+        if self._is_dense_medium_risk_case(inst):
+            return True
+
+        if inst.block_count < int(os.environ.get("FLOORSET_HIGH_RISK_MIN_BLOCKS", "110")):
+            return False
+
+        boundary_count = len(inst.boundary)
+        grouping_budget = sum(max(0, len(members) - 1) for members in inst.cluster_groups.values())
+        hard_shape_count = len(inst.fixed) + len(inst.preplaced)
+        edge_count = int(inst.valid_b2b.shape[0]) + int(inst.valid_p2b.shape[0])
+        edge_density = edge_count / max(inst.block_count, 1)
+
+        return (
+            boundary_count >= int(os.environ.get("FLOORSET_HIGH_RISK_BOUNDARY_COUNT", "12"))
+            or grouping_budget >= int(os.environ.get("FLOORSET_HIGH_RISK_GROUPING_BUDGET", "8"))
+            or hard_shape_count >= int(os.environ.get("FLOORSET_HIGH_RISK_HARD_SHAPES", "8"))
+            or edge_density >= float(os.environ.get("FLOORSET_HIGH_RISK_EDGE_DENSITY", "24.0"))
+        )
+
+    def _is_dense_medium_risk_case(self, inst) -> bool:
+        boundary_count = len(inst.boundary)
+        grouping_budget = sum(max(0, len(members) - 1) for members in inst.cluster_groups.values())
+        dense_min_blocks = int(os.environ.get("FLOORSET_HIGH_RISK_DENSE_MIN_BLOCKS", "90"))
+        dense_budget = int(os.environ.get("FLOORSET_HIGH_RISK_DENSE_CONSTRAINT_BUDGET", "50"))
+        return inst.block_count >= dense_min_blocks and boundary_count + grouping_budget >= dense_budget
+
+    def _uses_dense_shape_profiles(self, inst) -> bool:
+        dense_max_blocks = int(os.environ.get("FLOORSET_HIGH_RISK_DENSE_SHAPE_MAX_BLOCKS", "109"))
+        return self._is_dense_medium_risk_case(inst) and inst.block_count <= dense_max_blocks
+
     def _build_candidate(self, inst, spec: CandidateSpec) -> Placement:
         saved_guidance = inst.anchor_guidance
         if spec.disable_guidance:
@@ -243,6 +377,8 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
     def _repair_candidate(self, inst, placement: Placement, spec: CandidateSpec) -> Placement:
         before = placement
         after = self._repair_with_profile(inst, before, spec.repair_profile)
+        if spec.repair_profile == "quality_refine":
+            after = self._quality_refine_candidate(inst, after)
         self._trace_repair(
             inst,
             before,
@@ -262,12 +398,75 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
     def _select_best_candidate(self, inst, candidates: list[Placement]) -> Placement:
         return min(candidates, key=lambda placement: self._candidate_rank(inst, placement))
 
-    def _candidate_rank(self, inst, placement: Placement) -> tuple[int, int, int, float]:
-        metrics = placement_metrics(inst, placement)
-        boundary = int(metrics["boundary_violations"])
-        grouping = int(metrics["group_violations"])
-        mib = int(metrics["mib_violations"])
-        return boundary + grouping + mib, boundary, grouping, self._proxy_cost(inst, placement)
+    def _candidate_rank(self, inst, placement: Placement) -> tuple[int, float, int]:
+        metrics = self._placement_metrics(inst, placement)
+        soft = (
+            int(metrics["boundary_violations"])
+            + int(metrics["group_violations"])
+            + int(metrics["mib_violations"])
+        )
+        if os.environ.get("FLOORSET_CANDIDATE_RANK_POLICY", "soft_first") == "no_runtime_proxy":
+            return int(metrics["overlap_count"]), self._no_runtime_proxy_cost(inst, placement, metrics), soft
+        return (
+            int(metrics["overlap_count"]),
+            float(soft),
+            int(metrics["boundary_violations"]),
+            int(metrics["group_violations"]),
+            self._no_runtime_proxy_cost(inst, placement, metrics),
+        )
+
+    def _placement_metrics(self, inst, placement: Placement) -> dict[str, float | int]:
+        return placement_metrics(inst, placement)
+
+    def _quality_refine_candidate(self, inst, placement: Placement) -> Placement:
+        best = placement.copy()
+        best_metrics = self._placement_metrics(inst, best)
+        best_soft = self._soft_total(best_metrics)
+        best_score = self._no_runtime_proxy_cost(inst, best, best_metrics)
+        max_blocks = int(os.environ.get("FLOORSET_QUALITY_REFINE_MAX_BLOCKS", "32"))
+        max_slots = int(os.environ.get("FLOORSET_QUALITY_REFINE_MAX_SLOTS", "48"))
+        movable = [
+            block for block in best.rects
+            if block not in inst.preplaced
+        ]
+        movable.sort(
+            key=lambda block: (
+                -(len(inst.b2b_by_block.get(block, [])) + len(inst.p2b_by_block.get(block, []))),
+                block,
+            )
+        )
+
+        for block in movable[:max_blocks]:
+            rect = best.rects[block]
+            others = [other for idx, other in best.rects.items() if idx != block]
+            slot_points = candidate_frontier_points(others)[:max_slots]
+            for x, y in slot_points:
+                candidate = Rect(max(0.0, x), max(0.0, y), rect.width, rect.height)
+                if abs(candidate.x - rect.x) <= 1e-9 and abs(candidate.y - rect.y) <= 1e-9:
+                    continue
+                if not first_non_overlapping(candidate, others):
+                    continue
+                trial = best.copy()
+                trial.rects[block] = candidate
+                metrics = self._placement_metrics(inst, trial)
+                if int(metrics["overlap_count"]) > 0 or self._soft_total(metrics) > best_soft:
+                    continue
+                score = self._no_runtime_proxy_cost(inst, trial, metrics)
+                if score < best_score * (1.0 - 1e-4):
+                    best = trial
+                    best_metrics = metrics
+                    best_soft = self._soft_total(metrics)
+                    best_score = score
+                    rect = candidate
+                    others = [other for idx, other in best.rects.items() if idx != block]
+        return best
+
+    def _soft_total(self, metrics: dict[str, float | int]) -> int:
+        return (
+            int(metrics["boundary_violations"])
+            + int(metrics["group_violations"])
+            + int(metrics["mib_violations"])
+        )
 
     def _trace_repair(self, inst, before: Placement, after: Placement, candidate: dict[str, str]) -> None:
         trace_path = os.environ.get("FLOORSET_REPAIR_TRACE_JSONL")
@@ -413,6 +612,10 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
         preplaced_count = len(inst.preplaced)
         boundary_count = len(inst.boundary)
 
+        if p2b_count < 100 and b2b_count > 2000:
+            return ["compact"]
+        if p2b_count < 100:
+            return ["soft"]
         if p2b_count > 2500:
             return ["soft"] if b2b_count > 5000 else ["compact"]
         if b2b_count > 5000:
@@ -421,8 +624,6 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
             if p2b_count < 700 and b2b_count < 1300 and preplaced_count <= 3:
                 return ["soft"]
             return ["compact"]
-        if p2b_count < 100:
-            return ["soft"]
         if preplaced_count >= 5 and boundary_count <= 30:
             return ["soft"]
         if max_mib >= 7 and preplaced_count < 5:
@@ -434,43 +635,21 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
         return ["compact"]
 
     def _proxy_cost(self, inst, placement: Placement) -> float:
+        return self._no_runtime_proxy_cost(inst, placement, placement_metrics(inst, placement))
+
+    def _no_runtime_proxy_cost(self, inst, placement: Placement, metrics: dict[str, float | int]) -> float:
         rects = placement.rects
         bounds = bbox(list(rects.values()))
-        hpwl = hpwl_proxy(inst, rects)
         total_area = float(torch.clamp(inst.area_targets[: inst.block_count], min=1.0).sum().item())
         edge_weight = sum(float(w) for *_ij, w in inst.valid_b2b.tolist()) + sum(
             float(w) for *_ij, w in inst.valid_p2b.tolist()
         )
         hpwl_scale = max(1.0, edge_weight * max(1.0, total_area**0.5))
         area_score = bounds.area / max(total_area, 1.0)
-        hpwl_score = hpwl / hpwl_scale
-        boundary_violations = 0
-        for block, code in inst.boundary.items():
-            rect = rects.get(block)
-            if rect is None or not boundary_satisfied(rect, bounds, code):
-                boundary_violations += 1
-        group_violations = 0
-        for members in inst.cluster_groups.values():
-            present = [block for block in members if block in rects]
-            if len(present) <= 1:
-                continue
-            seen = {present[0]}
-            stack = [present[0]]
-            while stack:
-                cur = stack.pop()
-                for other in present:
-                    if other not in seen and edge_touch_length(rects[cur], rects[other]) > 0:
-                        seen.add(other)
-                        stack.append(other)
-            group_violations += len(present) - len(seen)
-        mib_violations = 0
-        for members in inst.mib_groups.values():
-            shapes = {
-                (round(rects[block].width, 4), round(rects[block].height, 4))
-                for block in members
-                if block in rects
-            }
-            mib_violations += max(0, len(shapes) - 1)
+        hpwl_score = float(metrics["hpwl_proxy"]) / hpwl_scale
+        boundary_violations = int(metrics["boundary_violations"])
+        group_violations = int(metrics["group_violations"])
+        mib_violations = int(metrics["mib_violations"])
         n_soft = max(1, len(inst.boundary))
         n_soft += sum(max(0, len(members) - 1) for members in inst.cluster_groups.values())
         n_soft += sum(max(0, len(members) - 1) for members in inst.mib_groups.values())

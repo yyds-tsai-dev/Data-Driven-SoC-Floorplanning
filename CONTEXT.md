@@ -56,6 +56,14 @@ _Avoid_: treating imitation learning as exact constraint satisfaction.
 A supervised training case whose `fp_sol` satisfies boundary, grouping, and MIB soft constraints, so it can safely teach geometry and constraint-sensitive layout priors. Clean-only training is available as `--clean-sample-policy strict`, but the default is weighted dirty-sample training because measured clean ratio is too low for reliable remote training.
 _Avoid_: treating soft-violating `fp_sol` as reliable order/pairwise supervision.
 
+**Validation Tail Diagnostics**:
+Using the highest weighted validation cases to identify score drivers and design generalized solver triggers based on instance statistics.
+_Avoid_: hard-coding validation `test_id` behavior into the Production Solver Path.
+
+**High-Risk Case**:
+A floorplanning instance whose general statistics predict outsized score risk, such as large block count, dense boundary/grouping constraints, difficult fixed/preplaced structure, or high net density.
+_Avoid_: using validation case IDs as the risk definition.
+
 ## Relationships
 
 - The **Production Solver Path** uses **Anchor-GNN Guidance** as a prior, not as a complete floorplan.
@@ -68,6 +76,8 @@ _Avoid_: treating soft-violating `fp_sol` as reliable order/pairwise supervision
 - **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
 - **Training Golden Answer** should teach geometric priors, while soft-constraint satisfaction remains the responsibility of constraint-aware decoding, repair, and scoring.
 - A **Constraint-Clean Training Sample** is eligible for full imitation training; soft-violating training samples are low-weight geometry references by default, with dirty order/pairwise supervision suppressed.
+- **Validation Tail Diagnostics** may guide optimization priorities, but production behavior must be triggered by reusable instance features such as block count, boundary/group density, fixed/preplaced structure, or net statistics.
+- **High-Risk Case** instances may spend extra sample-local candidate and repair effort; low-risk cases should keep the fast default path.
 
 ## Example Dialogue
 
@@ -79,3 +89,5 @@ _Avoid_: treating soft-violating `fp_sol` as reliable order/pairwise supervision
 - "Remove greedy/hint architecture" was resolved to mean removing `legacy`, `default`, and `model_first` as production solver branches while preserving reusable geometry helpers where needed by the beam decoder.
 - "Rename architecture_v2" was resolved to mean renaming the contest wrapper and active optimizer class to a numbered **Architecture vN**, not renaming the `floorset_arch` package.
 - "Local score" was ambiguous between **No-Runtime Quality Score** and **Local Runtime-Aware Score**; resolved: tune architecture with no-runtime score first, then check raw runtime and local runtime-aware score before submission.
+- "Use validation tail diagnostics" was resolved to allow validation-tail evidence for design direction, while prohibiting `test_id`-specific production logic.
+- "Only high-risk cases get heavier search" was resolved to mean generalized instance-stat triggers, not validation-tail IDs.
