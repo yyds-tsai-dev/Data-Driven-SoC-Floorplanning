@@ -141,7 +141,7 @@ bash scripts/validate.sh
 
 ### `scripts/train.sh`
 
-訓練 Anchor-GNN checkpoint。預設參數與目前 v4 方向一致：`hidden_dim=192`、`layers=6`、`num_samples=200000`、`epochs=10`、pairwise head 開啟，並使用 weighted dirty-sample training。
+訓練 Anchor-GNN checkpoint。預設參數與目前 v4 方向一致：`hidden_dim=192`、`layers=6`、`num_samples=800000`、`epochs=4`、`lr=3e-4`、`val_samples=10000`、pairwise head 開啟，並使用 weighted dirty-sample training。
 
 ```bash
 bash scripts/train.sh
@@ -150,7 +150,7 @@ bash scripts/train.sh
 常用 override：
 
 ```bash
-NUM_SAMPLES=500000 EPOCHS=4 bash scripts/train.sh
+NUM_SAMPLES=200000 EPOCHS=10 LR=4e-4 bash scripts/train.sh
 OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_run bash scripts/train.sh
 WANDB_MODE=offline WANDB=0 bash scripts/train.sh
 RESUME_CHECKPOINT=checkpoints/old.pt bash scripts/train.sh

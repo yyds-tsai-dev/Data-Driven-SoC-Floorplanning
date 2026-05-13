@@ -24,6 +24,8 @@ load_env_defaults "$ROOT/.env"
 #   bash scripts/eval_total.sh gnn_epoch10.pt          # use checkpoints/gnn_epoch10.pt
 #   bash scripts/eval_total.sh checkpoints/model.pt    # use repo-relative checkpoint path
 #   bash scripts/eval_total.sh /path/to/model.pt       # use absolute checkpoint path
+#   bash scripts/eval_total.sh gnn_epoch10.pt --output eval.json
+#   bash scripts/eval_total.sh --output eval.json      # use default checkpoint, custom output
 
 resolve_ckpt_path() {
   local ckpt="$1"
@@ -36,16 +38,27 @@ resolve_ckpt_path() {
   fi
 }
 
-if [ -n "${1:-}" ]; then
+if [ -n "${1:-}" ] && [[ "$1" == --* ]]; then
+  if [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
+    export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
+  fi
+  EXTRA_ARGS=("$@")
+elif [ -n "${1:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
+  EXTRA_ARGS=("${@:2}")
 elif [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
+  EXTRA_ARGS=()
+else
+  EXTRA_ARGS=()
 fi
 
 echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
+echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"
 
 cd "$ROOT/FloorSet/iccad2026contest"
 
 uv run iccad2026_evaluate.py \
   --evaluate "$ROOT/src/architecture_v4_optimizer.py" \
-  --verbose
+  --verbose \
+  "${EXTRA_ARGS[@]}"

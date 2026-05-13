@@ -23,6 +23,22 @@ def test_compute_cost_can_disable_runtime_adjustment():
     assert without_runtime == expected_quality * expected_violation
 
 
+def test_compute_cost_breakdown_exposes_formula_factors():
+    breakdown = evaluator.compute_cost_breakdown(0.1, -0.2, 0.25, 4.0, True)
+
+    assert breakdown["positive_hpwl_gap"] == 0.1
+    assert breakdown["positive_area_gap"] == 0
+    assert breakdown["quality_factor"] == 1 + evaluator.ALPHA * 0.1
+    assert breakdown["violation_factor"] == math.exp(evaluator.BETA * 0.25)
+    assert breakdown["runtime_factor"] == 4.0
+    assert breakdown["runtime_adjustment"] == math.pow(4.0, evaluator.GAMMA)
+    assert breakdown["cost"] == (
+        breakdown["quality_factor"]
+        * breakdown["violation_factor"]
+        * breakdown["runtime_adjustment"]
+    )
+
+
 def test_no_runtime_total_uses_no_runtime_costs():
     results = [
         evaluator.TestResult(0, 21, True, 0.0, 0.0, 0.0, 1.0, cost=2.0, cost_no_runtime=1.0),
@@ -35,6 +51,20 @@ def test_no_runtime_total_uses_no_runtime_costs():
     )
 
     assert total > 2.99
+
+
+def test_score_contributors_are_weighted_by_block_count():
+    results = [
+        evaluator.TestResult(0, 21, True, 0.0, 0.0, 0.0, 1.0, cost=10.0, cost_no_runtime=10.0),
+        evaluator.TestResult(1, 120, True, 0.0, 0.0, 0.0, 1.0, cost=2.0, cost_no_runtime=2.0),
+    ]
+
+    contributors = evaluator.summarize_score_contributors(results)
+
+    assert contributors[0]["test_id"] == 1
+    assert contributors[0]["cost"] == 2.0
+    assert contributors[0]["block_count"] == 120
+    assert contributors[0]["score_contribution"] > contributors[1]["score_contribution"]
 
 
 def test_evaluate_uses_monotonic_timer_for_runtime(monkeypatch):
