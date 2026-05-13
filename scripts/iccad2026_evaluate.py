@@ -688,6 +688,7 @@ def _result_diagnostic_row(
     result: TestResult,
     score_weight: float = 0.0,
     score_contribution: float = 0.0,
+    score_contribution_percent: float = 0.0,
     use_runtime: bool = True
 ) -> Dict[str, Any]:
     breakdown = result.cost_breakdown if use_runtime else result.cost_breakdown_no_runtime
@@ -701,6 +702,7 @@ def _result_diagnostic_row(
         'cost_no_runtime': result.cost_no_runtime,
         'score_weight': score_weight,
         'score_contribution': score_contribution,
+        'score_contribution_percent': score_contribution_percent,
         'score_share_percent': score_weight * 100.0,
         'hpwl_gap': result.hpwl_gap,
         'area_gap': result.area_gap,
@@ -745,14 +747,25 @@ def summarize_score_contributors(
     if total_weight <= 0:
         total_weight = 1.0
 
-    rows = []
+    weighted_rows = []
     for result, weight in zip(results, weights):
         score_weight = weight / total_weight
         cost = result.cost if use_runtime else result.cost_no_runtime
+        score_contribution = cost * score_weight
+        weighted_rows.append((result, score_weight, score_contribution))
+
+    total_score = sum(row[2] for row in weighted_rows)
+    rows = []
+    for result, score_weight, score_contribution in weighted_rows:
+        if total_score > 0:
+            score_contribution_percent = 100.0 * score_contribution / total_score
+        else:
+            score_contribution_percent = 0.0
         rows.append(_result_diagnostic_row(
             result,
             score_weight=score_weight,
-            score_contribution=cost * score_weight,
+            score_contribution=score_contribution,
+            score_contribution_percent=score_contribution_percent,
             use_runtime=use_runtime,
         ))
 
@@ -828,15 +841,17 @@ def print_ranked_diagnostics(title: str, rows: List[Dict[str, Any]]) -> None:
     """Print compact rows for the most useful evaluation diagnostics."""
     print(f"\n{title}")
     print("-" * 96)
-    print("test_id blocks cost cost_no_rt contrib hpwl_gap area_gap v_rel runtime q_factor v_factor r_adj")
+    print("test_id blocks cost cost_no_rt contrib pct_total hpwl_gap area_gap v_rel runtime q_factor v_factor r_adj")
     for row in rows:
         contrib = row.get('score_contribution', 0.0)
+        contrib_pct = row.get('score_contribution_percent', 0.0)
         print(
             f"{row['test_id']:>7} "
             f"{row['block_count']:>6} "
             f"{row['cost']:>7.4f} "
             f"{row['cost_no_runtime']:>10.4f} "
             f"{contrib:>7.4f} "
+            f"{contrib_pct:>9.2f}% "
             f"{row['hpwl_gap']:>8.4f} "
             f"{row['area_gap']:>8.4f} "
             f"{row['violations_relative']:>6.4f} "

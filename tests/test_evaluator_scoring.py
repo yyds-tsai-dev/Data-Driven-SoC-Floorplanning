@@ -65,6 +65,7 @@ def test_score_contributors_are_weighted_by_block_count():
     assert contributors[0]["cost"] == 2.0
     assert contributors[0]["block_count"] == 120
     assert contributors[0]["score_contribution"] > contributors[1]["score_contribution"]
+    assert contributors[0]["score_contribution_percent"] > 99.0
 
 
 def test_evaluate_uses_monotonic_timer_for_runtime(monkeypatch):

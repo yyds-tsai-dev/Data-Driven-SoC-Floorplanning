@@ -42,6 +42,7 @@ if [ -n "${1:-}" ] && [[ "$1" == --* ]]; then
   if [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
     export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
   fi
+  export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
   EXTRA_ARGS=("$@")
 elif [ -n "${1:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
@@ -50,6 +51,7 @@ elif [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
   EXTRA_ARGS=()
 else
+  export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
   EXTRA_ARGS=()
 fi
 
