@@ -28,7 +28,7 @@ load_env_defaults() {
     esac
     local key="${line%%=*}"
     local value="${line#*=}"
-    if [ -z "${!key+x}" ]; then
+    if [ "$key" = "FLOORSET_GNN_CHECKPOINT" ] || [ -z "${!key+x}" ]; then
       export "$key=$value"
     fi
   done < "$env_file"
@@ -38,6 +38,7 @@ load_env_defaults "$ROOT/.env"
 
 export FLOORSET_GNN_CHECKPOINT="${FLOORSET_GNN_CHECKPOINT:-$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt}"
 export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
+export FLOORSET_GNN_CHECKPOINT_SOURCE="${FLOORSET_GNN_CHECKPOINT_SOURCE:-dotenv}"
 cd "$ROOT/FloorSet/iccad2026contest"
 echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
 echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"

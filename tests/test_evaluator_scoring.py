@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,6 +67,19 @@ def test_score_contributors_are_weighted_by_block_count():
     assert contributors[0]["block_count"] == 120
     assert contributors[0]["score_contribution"] > contributors[1]["score_contribution"]
     assert contributors[0]["score_contribution_percent"] > 99.0
+
+
+def test_eval_env_loader_prefers_dotenv_checkpoint(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "FLOORSET_GNN_CHECKPOINT=checkpoints/from-dotenv.pt\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOORSET_GNN_CHECKPOINT", "checkpoints/stale-shell.pt")
+
+    evaluator.load_env_defaults(env_file, override_keys={"FLOORSET_GNN_CHECKPOINT"})
+
+    assert os.environ["FLOORSET_GNN_CHECKPOINT"] == "checkpoints/from-dotenv.pt"
 
 
 def test_evaluate_uses_monotonic_timer_for_runtime(monkeypatch):

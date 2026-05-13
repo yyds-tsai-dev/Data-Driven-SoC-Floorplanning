@@ -126,7 +126,8 @@ bash scripts/eval_total.sh /abs/path/to/checkpoint.pt
 
 checkpoint 解析規則：
 
-- 無參數：優先用 `.env` 或 `FLOORSET_GNN_CHECKPOINT`，否則用 production 預設 checkpoint。
+- 無參數：優先用 `.env` 的 `FLOORSET_GNN_CHECKPOINT`，否則用既有 shell 環境變數，再否則用 production 預設 checkpoint。
+- 傳入 checkpoint 參數時：該參數優先於 `.env` 與既有 shell 環境變數。
 - 只有檔名：視為 `checkpoints/<name>`。
 - repo-relative path：視為 repo root 下的相對路徑。
 - absolute path：直接使用。

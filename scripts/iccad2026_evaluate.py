@@ -76,6 +76,73 @@ M_PENALTY = 10.0  # Infeasibility penalty
 AREA_TOLERANCE = 0.01  # 1% area tolerance
 
 
+def find_repo_root(start: Optional[Path] = None) -> Path:
+    """Find the repository root from either evaluator copy."""
+    start_path = (start or Path(__file__).resolve()).resolve()
+    for parent in (start_path.parent, *start_path.parents):
+        if (parent / ".env").exists() and (parent / "src").exists():
+            return parent
+    return Path.cwd().resolve()
+
+
+def load_env_defaults(
+    env_file: str | Path,
+    override_keys: Optional[set[str]] = None,
+) -> None:
+    """Load simple KEY=VALUE entries from an env file.
+
+    Existing environment values are preserved except keys listed in
+    override_keys.  Evaluation treats FLOORSET_GNN_CHECKPOINT as an override
+    key so the repo .env can define the default checkpoint for local runs.
+    """
+    path = Path(env_file)
+    if not path.exists():
+        return
+    overrides = override_keys or set()
+    with path.open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if not key:
+                continue
+            if key in overrides or key not in os.environ:
+                os.environ[key] = value
+
+
+def resolve_repo_checkpoint_path(value: str, repo_root: Optional[Path] = None) -> str:
+    """Resolve checkpoint values the same way eval_*.sh does."""
+    root = repo_root or find_repo_root()
+    raw = Path(value).expanduser()
+    if raw.is_absolute():
+        return str(raw)
+    if len(raw.parts) > 1:
+        return str((root / raw).resolve())
+    return str((root / "checkpoints" / raw).resolve())
+
+
+def load_repo_env_defaults(verbose: bool = False) -> Optional[Path]:
+    """Load repo .env for evaluator runs and normalize checkpoint paths."""
+    root = find_repo_root()
+    env_file = root / ".env"
+    override_keys = set()
+    if os.environ.get("FLOORSET_GNN_CHECKPOINT_SOURCE") != "cli":
+        override_keys.add("FLOORSET_GNN_CHECKPOINT")
+    load_env_defaults(env_file, override_keys=override_keys)
+    checkpoint = os.environ.get("FLOORSET_GNN_CHECKPOINT")
+    if checkpoint:
+        os.environ["FLOORSET_GNN_CHECKPOINT"] = resolve_repo_checkpoint_path(
+            checkpoint, root)
+    if verbose and os.environ.get("FLOORSET_GNN_CHECKPOINT"):
+        print(f"Using checkpoint: {os.environ['FLOORSET_GNN_CHECKPOINT']}")
+    return env_file if env_file.exists() else None
+
+
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
@@ -2241,6 +2308,11 @@ def main():
     if args.info:
         print_contest_info()
         return
+
+    if args.evaluate:
+        load_repo_env_defaults(verbose=True)
+    else:
+        load_repo_env_defaults(verbose=False)
     
     if args.evaluate:
         evaluator = ContestEvaluator(args.data_path, verbose=True)

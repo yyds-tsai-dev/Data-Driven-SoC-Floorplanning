@@ -11,7 +11,7 @@ load_env_defaults() {
     esac
     local key="${line%%=*}"
     local value="${line#*=}"
-    if [ -z "${!key+x}" ]; then
+    if [ "$key" = "FLOORSET_GNN_CHECKPOINT" ] || [ -z "${!key+x}" ]; then
       export "$key=$value"
     fi
   done < "$env_file"
@@ -46,6 +46,7 @@ if [ -n "${1:-}" ] && [[ "$1" == --* ]]; then
   EXTRA_ARGS=("$@")
 elif [ -n "${1:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
+  export FLOORSET_GNN_CHECKPOINT_SOURCE="cli"
   EXTRA_ARGS=("${@:2}")
 elif [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
@@ -54,6 +55,7 @@ else
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
   EXTRA_ARGS=()
 fi
+export FLOORSET_GNN_CHECKPOINT_SOURCE="${FLOORSET_GNN_CHECKPOINT_SOURCE:-dotenv}"
 
 echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
 echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"
