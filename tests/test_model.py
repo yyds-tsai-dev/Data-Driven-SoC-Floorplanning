@@ -9,6 +9,7 @@ from floorset_arch.training.losses import (
     fp_sol_soft_violations,
     is_constraint_clean_training_sample,
 )
+from floorset_arch.training.checkpoint import anchor_checkpoint_payload
 
 
 def test_anchor_gnn_forward_matches_runtime_features():
@@ -42,6 +43,45 @@ def test_floorplan_gnn_pairwise_logits_shape():
     output = model(node_feat, edge_index, edge_attr, pairs=pairs)
 
     assert output["pair_logits"].shape == (2, 2)
+
+
+def test_floorplan_gnn_graph_transformer_encoder_matches_output_contract():
+    model = FloorplanGNN(
+        node_feat_dim=18,
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+        encoder_type="graph-transformer",
+        num_heads=4,
+    )
+    node_feat = torch.randn(4, 18)
+    edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+    edge_attr = torch.ones(3, 1)
+    pairs = torch.tensor([[0, 1], [2, 3]])
+
+    output = model(node_feat, edge_index, edge_attr, pairs=pairs)
+
+    assert model.encoder_type == "graph-transformer"
+    assert output["anchor"].shape == (4, 2)
+    assert output["priority"].shape == (4,)
+    assert output["log_aspect"].shape == (4,)
+    assert output["pair_logits"].shape == (2, 2)
+
+
+def test_anchor_checkpoint_payload_records_encoder_config():
+    model = FloorplanGNN(
+        node_feat_dim=18,
+        hidden_dim=16,
+        num_layers=2,
+        encoder_type="graph-transformer",
+        num_heads=4,
+    )
+    args = type("Args", (), {"example": "value"})()
+
+    payload = anchor_checkpoint_payload(model, args, epoch=1, train_stats={}, val_stats={})
+
+    assert payload["encoder_type"] == "graph-transformer"
+    assert payload["num_heads"] == 4
 
 
 def test_hetero_graph_keeps_constraints_as_first_class_nodes():

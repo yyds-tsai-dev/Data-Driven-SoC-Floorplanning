@@ -236,6 +236,8 @@ def load_resume_model(
     )
     layers = int(payload.get("layers", model_config.get("layers", args.layers)))
     dropout = float(payload.get("dropout", model_config.get("dropout", args.dropout)))
+    encoder_type = str(payload.get("encoder_type", model_config.get("encoder_type", "mpnn")))
+    num_heads = int(payload.get("num_heads", model_config.get("num_heads", 4)))
     if node_feat_dim <= 0:
         raise RuntimeError(
             f"Resume checkpoint has no node feature dimension: {checkpoint_path}"
@@ -249,13 +251,23 @@ def load_resume_model(
         )
         args.hidden_dim = hidden_dim
         args.layers = layers
+    if encoder_type != args.encoder or num_heads != args.num_heads:
+        print(
+            "Resume checkpoint encoder config overrides CLI: "
+            f"{args.encoder}/{args.num_heads} -> {encoder_type}/{num_heads}",
+            flush=True,
+        )
     args.dropout = dropout
+    args.encoder = encoder_type
+    args.num_heads = num_heads
 
     model = FloorplanGNN(
         node_feat_dim=node_feat_dim,
         hidden_dim=hidden_dim,
         num_layers=layers,
         dropout=dropout,
+        encoder_type=encoder_type,
+        num_heads=num_heads,
     ).to(device)
     model.load_state_dict(state, strict=False)
     resume_epoch = int(payload.get("epoch", 0))
@@ -314,12 +326,15 @@ def main(args) -> None:
     wandb_run = maybe_init_wandb(args)
 
     print("=" * 72)
-    print("Architecture v4 Anchor-GNN training")
+    print("Architecture v5 Anchor-GNN training")
     print(f"  dataset samples  = {total}")
     print(f"  train per epoch  = {args.num_samples}")
     print(f"  val window       = {vs}..{ve}")
     print(f"  device           = {device}")
+    print(f"  encoder          = {args.encoder}")
     print(f"  hidden/layers    = {args.hidden_dim}/{args.layers}")
+    if args.encoder == "graph-transformer":
+        print(f"  attention heads  = {args.num_heads}")
     print(f"  dropout          = {args.dropout}")
     print(f"  accumulation     = {max(1, args.accumulation_steps)}")
     print(f"  checkpoint tag   = {run_tag}")
@@ -362,6 +377,8 @@ def main(args) -> None:
                 hidden_dim=args.hidden_dim,
                 num_layers=args.layers,
                 dropout=args.dropout,
+                encoder_type=args.encoder,
+                num_heads=args.num_heads,
             ).to(device)
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -472,6 +489,8 @@ def parse_args():
     parser.add_argument("--hidden-dim", type=int, default=160)
     parser.add_argument("--layers", type=int, default=5)
     parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument("--encoder", choices=("mpnn", "graph-transformer"), default="mpnn")
+    parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -511,7 +530,7 @@ def parse_args():
     parser.add_argument("--resume-checkpoint", default="")
     parser.add_argument("--ignore-optimizer-state", action="store_true")
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", default="floorset-arch-v4")
+    parser.add_argument("--wandb-project", default="floorset-arch-v5")
     parser.add_argument("--wandb-entity", default="")
     parser.add_argument("--wandb-run-name", default="")
     parser.add_argument(

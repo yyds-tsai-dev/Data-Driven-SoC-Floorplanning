@@ -20,6 +20,10 @@ _Avoid_: treating reference wrappers as the active `floorset_arch` production en
 Block-level geometric priors produced by the trained Anchor-GNN checkpoint and consumed as guidance by the constructive decoder.
 _Avoid_: model hints, pure hint placement.
 
+**Selectable Anchor-GNN Encoder**:
+The training-time and checkpoint-time choice between the legacy MPNN encoder and a graph-transformer encoder while preserving the same anchor, priority, aspect, and pairwise guidance heads.
+_Avoid_: treating Graph Transformer as non-GNN, changing decoder behavior without evaluator evidence.
+
 **Heterogeneous Floorplan Graph**:
 A factor-style graph with block, pin, group, MIB, and boundary concepts represented separately so constraints are first-class solver inputs.
 _Avoid_: flat block-only graph.
@@ -35,6 +39,10 @@ _Avoid_: evaluator-in-loop reranking, single greedy placement.
 **Architecture v4**:
 The current production architecture generation that keeps `floorset_arch` as the active solver package while exposing a v4 contest wrapper.
 _Avoid_: architecture_v2, treating wrapper version names as separate solver packages.
+
+**Architecture v5**:
+The current experimental architecture generation that keeps `floorset_arch` as the active solver package while exposing a v5 contest wrapper and selectable Anchor-GNN encoder.
+_Avoid_: renaming the package, treating encoder experiments as a separate solver path.
 
 **No-Runtime Quality Score**:
 The local architecture-tuning score that uses official quality and soft-violation factors with runtime adjustment fixed to `1.0`.
@@ -72,6 +80,8 @@ _Avoid_: using validation case IDs as the risk definition.
 - A **Reference Architecture** may be consulted while tuning `floorset_arch`, but it does not define the active solver architecture.
 - A **MER/Skyline Slot** must respect hard placement legality before repair is allowed to refine soft constraints.
 - **Architecture v4** names the contest-facing wrapper generation; the **Production Solver Path** remains `floorset_arch`.
+- **Architecture v5** extends **Architecture v4** with a **Selectable Anchor-GNN Encoder** while preserving `floorset_arch` as the **Production Solver Path**.
+- A **Selectable Anchor-GNN Encoder** changes learned **Anchor-GNN Guidance** only; checkpoint promotion still requires evaluator evidence.
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
 - **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
 - **Training Golden Answer** should teach geometric priors, while soft-constraint satisfaction remains the responsibility of constraint-aware decoding, repair, and scoring.

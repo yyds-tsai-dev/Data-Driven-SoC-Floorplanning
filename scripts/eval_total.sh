@@ -63,6 +63,6 @@ echo "Evaluation diagnostics: cost factors, top score contributors, best/worst c
 cd "$ROOT/FloorSet/iccad2026contest"
 
 uv run iccad2026_evaluate.py \
-  --evaluate "$ROOT/src/architecture_v4_optimizer.py" \
+  --evaluate "$ROOT/src/architecture_v5_optimizer.py" \
   --verbose \
   "${EXTRA_ARGS[@]}"

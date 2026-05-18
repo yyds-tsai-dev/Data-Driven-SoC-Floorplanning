@@ -55,6 +55,12 @@
 - Next deterministic optimization should target large-case boundary/group repair for `block_count >= 118` or similar constraint-stat triggers, not `test_id`-specific logic.
 - Large-case repair should report soft-count deltas first, then bbox/HPWL deltas, because `V_rel` enters score through exponential penalty.
 
+## v5 Encoder Experiment
+
+- v5 keeps `floorset_arch` as the production package and adds `src/architecture_v5_optimizer.py` as the contest wrapper.
+- Training now supports `--encoder mpnn|graph-transformer`. The default 1M full-data run remains the lower-risk MPNN baseline with `hidden_dim=256`, `layers=6`, and `epochs=3`.
+- Graph Transformer checkpoints are still Anchor-GNN Guidance checkpoints. Promote them only after full evaluator evidence, especially `total_score_no_runtime`, because the decoder and repair path still determine final placement quality.
+
 ## Review Notes
 
 - Runtime calibration was removed because it was a median-runtime exploit and would be fragile under official review or absolute-runtime scoring.

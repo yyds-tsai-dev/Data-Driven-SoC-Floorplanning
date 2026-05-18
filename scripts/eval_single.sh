@@ -43,7 +43,7 @@ cd "$ROOT/FloorSet/iccad2026contest"
 echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
 echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"
 uv run iccad2026_evaluate.py \
-  --evaluate "$ROOT/src/architecture_v4_optimizer.py" \
+  --evaluate "$ROOT/src/architecture_v5_optimizer.py" \
   --test-id "$TESTID" \
   --verbose \
   "${EXTRA_ARGS[@]}"

@@ -129,8 +129,8 @@ def _build_candidate_worker(inst, config: SolverConfig, spec: CandidateSpec) -> 
             inst.anchor_guidance = saved_guidance
 
 
-class ArchitectureV4Optimizer(FloorplanOptimizer):
-    """Anchor-GNN guided hetero-graph beam solver."""
+class ArchitectureV5Optimizer(FloorplanOptimizer):
+    """Anchor-GNN guided hetero-graph beam solver with selectable checkpoint encoders."""
 
     def __init__(self, verbose: bool = False, config: Optional[SolverConfig] = None):
         super().__init__(verbose=verbose)
@@ -505,6 +505,8 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
                     hidden_dim=int(payload.get("hidden_dim", 160)),
                     num_layers=int(payload.get("layers", 5)),
                     dropout=float(payload.get("dropout", 0.05)),
+                    encoder_type=str(payload.get("encoder_type", "mpnn")),
+                    num_heads=int(payload.get("num_heads", 4)),
                 )
                 model.load_state_dict(payload["model_state_dict"], strict=False)
                 self._checkpoint_config = {
@@ -512,6 +514,8 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
                     "hidden_dim": int(payload.get("hidden_dim", 160)),
                     "layers": int(payload.get("layers", 5)),
                     "dropout": float(payload.get("dropout", 0.05)),
+                    "encoder_type": str(payload.get("encoder_type", "mpnn")),
+                    "num_heads": int(payload.get("num_heads", 4)),
                     "has_pair_head": bool(payload.get("has_pair_head", False)),
                 }
                 model.eval()
@@ -655,3 +659,6 @@ class ArchitectureV4Optimizer(FloorplanOptimizer):
         n_soft += sum(max(0, len(members) - 1) for members in inst.mib_groups.values())
         v_rel = (boundary_violations + group_violations + mib_violations) / n_soft
         return (1.0 + 0.5 * (hpwl_score + area_score)) * (2.718281828 ** (2.0 * v_rel))
+
+
+ArchitectureV4Optimizer = ArchitectureV5Optimizer

@@ -25,14 +25,18 @@ def save_checkpoint(
 
 def build_run_tag(args, when: datetime | None = None) -> str:
     stamp = (when or datetime.now()).strftime("%m%d")
+    encoder = str(getattr(args, "encoder", "mpnn")).replace("-", "_")
     parts = [
         stamp,
         f"ns{int(args.num_samples)}",
         f"ep{int(args.epochs)}",
+        f"enc{encoder}",
         f"h{int(args.hidden_dim)}",
         f"l{int(args.layers)}",
         f"acc{int(getattr(args, 'accumulation_steps', 1))}",
     ]
+    if encoder == "graph_transformer":
+        parts.append(f"heads{int(getattr(args, 'num_heads', 4))}")
     return "_".join(parts)
 
 
@@ -45,6 +49,8 @@ def anchor_checkpoint_payload(
         "hidden_dim": model.hidden_dim,
         "layers": model.num_layers,
         "dropout": getattr(model, "dropout_p", None),
+        "encoder_type": getattr(model, "encoder_type", "mpnn"),
+        "num_heads": getattr(model, "num_heads", 4),
         "has_pair_head": hasattr(model, "pair_head"),
         "epoch": epoch,
         "train_stats": train_stats,
