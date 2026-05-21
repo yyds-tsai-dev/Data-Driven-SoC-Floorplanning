@@ -16,7 +16,6 @@ else
   exit "$REMOTE_BRANCH_STATUS"
 fi
 
-git fetch
 git pull "$REMOTE" "$BRANCH"
 git status
 git add -A
