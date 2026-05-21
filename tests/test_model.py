@@ -1,5 +1,6 @@
 import torch
 
+from floorset_arch import features
 from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
 from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 from floorset_arch.nn.model import FloorplanGNN
@@ -68,6 +69,63 @@ def test_floorplan_gnn_graph_transformer_encoder_matches_output_contract():
     assert output["pair_logits"].shape == (2, 2)
 
 
+def test_graph_transformer_accepts_structural_and_edge_type_inputs():
+    model = FloorplanGNN(
+        node_feat_dim=18,
+        hidden_dim=16,
+        num_layers=1,
+        dropout=0.0,
+        encoder_type="graph-transformer",
+        num_heads=4,
+        structural_feat_dim=6,
+        edge_type_count=5,
+    )
+    node_feat = torch.randn(4, 18)
+    edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+    edge_attr = torch.ones(3, 1)
+    edge_type = torch.tensor([0, 2, 4], dtype=torch.long)
+    structural_feat = torch.randn(4, 6)
+
+    output = model(
+        node_feat,
+        edge_index,
+        edge_attr,
+        edge_type=edge_type,
+        structural_feat=structural_feat,
+        pairs=torch.tensor([[0, 3]]),
+    )
+
+    assert output["anchor"].shape == (4, 2)
+    assert output["pair_logits"].shape == (1, 2)
+
+
+def test_transformer_graph_inputs_project_hetero_context_to_anchor_encoder():
+    inst = parse_instance(
+        4,
+        torch.tensor([4.0, 9.0, 16.0, 25.0]),
+        torch.empty(0, 3),
+        torch.tensor([[0.0, 0.0, 2.0], [0.0, 1.0, 3.0]]),
+        torch.tensor([[10.0, 20.0]]),
+        torch.tensor(
+            [
+                [0.0, 0.0, 1.0, 7.0, 1.0],
+                [0.0, 0.0, 1.0, 7.0, 0.0],
+                [0.0, 0.0, 0.0, 7.0, 2.0],
+                [0.0, 0.0, 0.0, 0.0, 2.0],
+            ]
+        ),
+        None,
+    )
+
+    graph_inputs = features.build_anchor_transformer_graph_inputs(inst)
+
+    assert graph_inputs.node_structural_features.shape[0] == 4
+    assert graph_inputs.node_structural_features.shape[1] >= 6
+    assert graph_inputs.edge_index.shape[1] > 0
+    assert graph_inputs.edge_type.shape[0] == graph_inputs.edge_index.shape[1]
+    assert len(set(graph_inputs.edge_type.tolist())) >= 3
+
+
 def test_anchor_checkpoint_payload_records_encoder_config():
     model = FloorplanGNN(
         node_feat_dim=18,
@@ -82,6 +140,7 @@ def test_anchor_checkpoint_payload_records_encoder_config():
 
     assert payload["encoder_type"] == "graph-transformer"
     assert payload["num_heads"] == 4
+    assert payload["has_pair_head"] is True
 
 
 def test_hetero_graph_keeps_constraints_as_first_class_nodes():

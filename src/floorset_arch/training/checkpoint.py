@@ -51,6 +51,8 @@ def anchor_checkpoint_payload(
         "dropout": getattr(model, "dropout_p", None),
         "encoder_type": getattr(model, "encoder_type", "mpnn"),
         "num_heads": getattr(model, "num_heads", 4),
+        "structural_feat_dim": getattr(model, "structural_feat_dim", 0),
+        "edge_type_count": getattr(model, "edge_type_count", 1),
         "has_pair_head": hasattr(model, "pair_head"),
         "epoch": epoch,
         "train_stats": train_stats,

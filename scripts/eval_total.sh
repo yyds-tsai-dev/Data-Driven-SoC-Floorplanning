@@ -20,7 +20,7 @@ load_env_defaults() {
 load_env_defaults "$ROOT/.env"
 
 # Usage:
-#   bash scripts/eval_total.sh                         # use FLOORSET_GNN_CHECKPOINT/.env, else gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
+#   bash scripts/eval_total.sh                         # use FLOORSET_GNN_CHECKPOINT/.env, else gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
 #   bash scripts/eval_total.sh gnn_epoch10.pt          # use checkpoints/gnn_epoch10.pt
 #   bash scripts/eval_total.sh checkpoints/model.pt    # use repo-relative checkpoint path
 #   bash scripts/eval_total.sh /path/to/model.pt       # use absolute checkpoint path
@@ -40,7 +40,7 @@ resolve_ckpt_path() {
 
 if [ -n "${1:-}" ] && [[ "$1" == --* ]]; then
   if [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
-    export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
+    export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt"
   fi
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
   EXTRA_ARGS=("$@")
@@ -49,7 +49,7 @@ elif [ -n "${1:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT_SOURCE="cli"
   EXTRA_ARGS=("${@:2}")
 elif [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
-  export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
+  export FLOORSET_GNN_CHECKPOINT="$ROOT/checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt"
   EXTRA_ARGS=()
 else
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"

@@ -1,9 +1,16 @@
 import torch
 
 from floorset_arch.geometry import Rect, bbox, edge_touch_length, has_overlaps
-from floorset_arch.models import Placement
+from floorset_arch.models import Placement, SolverConfig
 from floorset_arch.parser import parse_instance
-from floorset_arch.repair import _overlap_repair_candidate_limit, _repair_boundary, repair_placement, soft_violation_counts
+from floorset_arch.repair import (
+    _geometry_preserving_refine,
+    _overlap_repair_candidate_limit,
+    _repair_boundary,
+    _shrink_satisfied_boundary_edges,
+    repair_placement,
+    soft_violation_counts,
+)
 
 
 def test_repair_does_not_move_preplaced_or_resize_fixed_blocks():
@@ -310,3 +317,72 @@ def test_overlap_repair_candidate_limit_is_env_controlled(monkeypatch):
     monkeypatch.setenv("FLOORSET_OVERLAP_REPAIR_CANDIDATES", "64")
 
     assert _overlap_repair_candidate_limit(inst) == 64
+
+
+def test_no_guidance_geometry_refine_moves_far_block_without_soft_regression(monkeypatch):
+    areas = torch.full((4,), 4.0)
+    inst = parse_instance(
+        4,
+        areas,
+        torch.tensor([[0.0, 3.0, 10.0], [1.0, 3.0, 10.0], [2.0, 3.0, 10.0]]),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.zeros(4, 5),
+        None,
+    )
+    placement = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(2.0, 0.0, 2.0, 2.0),
+            2: Rect(4.0, 0.0, 2.0, 2.0),
+            3: Rect(100.0, 100.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_GEOMETRY_REFINE_MAX_BLOCKS", "16")
+    before_bounds = bbox(list(placement.rects.values()))
+
+    refined = _geometry_preserving_refine(inst, placement, SolverConfig(local_search_moves=16))
+    after_bounds = bbox(list(refined.rects.values()))
+
+    assert not has_overlaps(list(refined.rects.values()))
+    assert soft_violation_counts(inst, refined) == soft_violation_counts(inst, placement)
+    assert after_bounds.area < before_bounds.area
+    assert refined.rects[3].x < placement.rects[3].x
+
+
+def test_boundary_edge_shrink_pulls_satisfied_right_edge_inward():
+    areas = torch.full((4,), 4.0)
+    constraints = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 2.0],
+            [0.0, 0.0, 0.0, 0.0, 2.0],
+        ]
+    )
+    inst = parse_instance(
+        4,
+        areas,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        None,
+    )
+    placement = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(98.0, 4.0, 2.0, 2.0),
+            3: Rect(98.0, 6.0, 2.0, 2.0),
+        }
+    )
+
+    refined = _shrink_satisfied_boundary_edges(inst, placement)
+    bounds = bbox(list(refined.rects.values()))
+
+    assert not has_overlaps(list(refined.rects.values()))
+    assert soft_violation_counts(inst, refined) == (0, 0, 0)
+    assert bounds.right < 100.0
+    assert abs(refined.rects[2].right - bounds.right) <= 1e-6
+    assert abs(refined.rects[3].right - bounds.right) <= 1e-6

@@ -416,6 +416,160 @@ def _area_soft_proxy(inst: Instance, placement: Placement) -> float:
     return 0.018 * area + 2500.0 * sum(soft_violation_counts(inst, placement))
 
 
+def _geometry_quality_proxy(inst: Instance, placement: Placement) -> float:
+    bounds = bbox(list(placement.rects.values()))
+    area = max(bounds.area, 1.0)
+    try:
+        hpwl = hpwl_proxy(inst, placement.rects)
+    except Exception:
+        hpwl = 0.0
+    return 0.018 * area + 0.0025 * hpwl
+
+
+def _block_connectivity_weight(inst: Instance, block: int) -> float:
+    return sum(weight for _other, weight in inst.b2b_by_block.get(block, [])) + sum(
+        weight for _pin, weight in inst.p2b_by_block.get(block, [])
+    )
+
+
+def _shrink_satisfied_boundary_edges(inst: Instance, placement: Placement) -> Placement:
+    best = placement.copy()
+    if not inst.boundary or not best.rects:
+        return best
+    best_soft = sum(soft_violation_counts(inst, best))
+    best_score = _geometry_quality_proxy(inst, best)
+
+    edge_specs = (
+        (2, "right"),
+        (4, "top"),
+        (1, "left"),
+        (8, "bottom"),
+    )
+    for bit, edge in edge_specs:
+        bounds = bbox(list(best.rects.values()))
+        edge_blocks = [
+            block
+            for block, code in inst.boundary.items()
+            if code & bit
+            and block in best.rects
+            and block not in inst.preplaced
+            and boundary_satisfied_local(best.rects[block], bounds, code)
+        ]
+        if not edge_blocks:
+            continue
+
+        if edge == "right":
+            current = bounds.right
+            targets = sorted(
+                {rect.right for block, rect in best.rects.items() if block not in edge_blocks and rect.right < current - 1e-6},
+                reverse=True,
+            )
+        elif edge == "top":
+            current = bounds.top
+            targets = sorted(
+                {rect.top for block, rect in best.rects.items() if block not in edge_blocks and rect.top < current - 1e-6},
+                reverse=True,
+            )
+        elif edge == "left":
+            current = bounds.x
+            targets = sorted(
+                {rect.x for block, rect in best.rects.items() if block not in edge_blocks and rect.x > current + 1e-6}
+            )
+        else:
+            current = bounds.y
+            targets = sorted(
+                {rect.y for block, rect in best.rects.items() if block not in edge_blocks and rect.y > current + 1e-6}
+            )
+
+        for target in targets[:32]:
+            trial_rects: dict[int, Rect] = {}
+            for block in edge_blocks:
+                rect = best.rects[block]
+                if edge == "right":
+                    moved = Rect(target - rect.width, rect.y, rect.width, rect.height)
+                elif edge == "top":
+                    moved = Rect(rect.x, target - rect.height, rect.width, rect.height)
+                elif edge == "left":
+                    moved = Rect(target, rect.y, rect.width, rect.height)
+                else:
+                    moved = Rect(rect.x, target, rect.width, rect.height)
+                if moved.x < -1e-8 or moved.y < -1e-8:
+                    trial_rects = {}
+                    break
+                trial_rects[block] = Rect(max(0.0, moved.x), max(0.0, moved.y), moved.width, moved.height)
+            if not trial_rects:
+                continue
+            if not _component_shift_is_legal(best, set(edge_blocks), trial_rects):
+                continue
+            trial = best.copy()
+            trial.rects.update(trial_rects)
+            if sum(soft_violation_counts(inst, trial)) > best_soft:
+                continue
+            score = _geometry_quality_proxy(inst, trial)
+            if score < best_score * (1.0 - 1e-4):
+                best = trial
+                best_soft = sum(soft_violation_counts(inst, best))
+                best_score = score
+                break
+    return best
+
+
+def _geometry_preserving_refine(inst: Instance, placement: Placement, config: SolverConfig) -> Placement:
+    if not placement.rects:
+        return placement
+    best = _shrink_satisfied_boundary_edges(inst, placement)
+    best_soft = sum(soft_violation_counts(inst, best))
+    best_score = _geometry_quality_proxy(inst, best)
+    max_blocks = max(0, int(os.environ.get("FLOORSET_GEOMETRY_REFINE_MAX_BLOCKS", "0")))
+    max_slots = max(0, int(os.environ.get("FLOORSET_GEOMETRY_REFINE_MAX_SLOTS", "32")))
+    if max_blocks == 0 or max_slots == 0:
+        return best
+
+    movable = [block for block in best.rects if block not in inst.preplaced]
+    movable.sort(
+        key=lambda block: (
+            -_block_connectivity_weight(inst, block),
+            -(abs(best.rects[block].center_x) + abs(best.rects[block].center_y)),
+            block,
+        )
+    )
+
+    for block in movable[:max_blocks]:
+        rect = best.rects[block]
+        others = [other for idx, other in best.rects.items() if idx != block]
+        for x, y in candidate_frontier_points(others)[:max_slots]:
+            candidate = Rect(max(0.0, x), max(0.0, y), rect.width, rect.height)
+            if abs(candidate.x - rect.x) <= 1e-9 and abs(candidate.y - rect.y) <= 1e-9:
+                continue
+            if not first_non_overlapping(candidate, others):
+                continue
+            trial = best.copy()
+            trial.rects[block] = candidate
+            if sum(soft_violation_counts(inst, trial)) > best_soft:
+                continue
+            score = _geometry_quality_proxy(inst, trial)
+            if score < best_score * (1.0 - 1e-4):
+                best = trial
+                best_soft = sum(soft_violation_counts(inst, best))
+                best_score = score
+                rect = candidate
+                others = [other for idx, other in best.rects.items() if idx != block]
+    return best
+
+
+def _should_run_no_guidance_geometry_refine(inst: Instance, placement: Placement) -> bool:
+    if inst.anchor_guidance is not None and inst.anchor_guidance.source != "surrogate":
+        return False
+    mode = os.environ.get("FLOORSET_ENABLE_NO_GUIDANCE_GEOMETRY_REFINE", "1").strip().lower()
+    if mode in {"0", "false", "off", "no"}:
+        return False
+    if mode in {"always", "force"}:
+        return True
+    min_blocks = int(os.environ.get("FLOORSET_NO_GUIDANCE_GEOMETRY_REFINE_MIN_BLOCKS", "118"))
+    min_soft = int(os.environ.get("FLOORSET_NO_GUIDANCE_GEOMETRY_REFINE_MIN_SOFT", "8"))
+    return inst.block_count >= min_blocks and sum(soft_violation_counts(inst, placement)) >= min_soft
+
+
 def _adjacent_positions(anchor: Rect, width: float, height: float) -> list[tuple[float, float]]:
     return [
         (anchor.right, anchor.y),
@@ -666,6 +820,8 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
     _repair_boundary(inst, repaired)
     repaired = _guarded_soft_repair(inst, repaired, config)
     repaired = _large_case_boundary_refine(inst, repaired, config)
+    if _should_run_no_guidance_geometry_refine(inst, repaired):
+        repaired = _geometry_preserving_refine(inst, repaired, config)
 
     for block in range(inst.block_count):
         if block not in repaired.rects:

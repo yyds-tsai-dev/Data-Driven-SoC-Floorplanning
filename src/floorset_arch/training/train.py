@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
+from floorset_arch.features import (
+    build_anchor_edge_tensors,
+    build_anchor_node_features,
+    build_anchor_transformer_graph_inputs,
+)
 from floorset_arch.nn.model import FloorplanGNN
 from floorset_arch.parser import parse_instance
 from floorset_arch.training.checkpoint import (
@@ -147,7 +151,16 @@ def run_epoch(
             block_count, area_targets, b2b, p2b, pins, constraints, fp_sol
         )
         node_feat, scale = build_anchor_node_features(inst, device=device)
-        edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
+        edge_type = None
+        structural_feat = None
+        if getattr(model, "encoder_type", args.encoder) == "graph-transformer":
+            graph_inputs = build_anchor_transformer_graph_inputs(inst, device=device)
+            edge_index = graph_inputs.edge_index
+            edge_attr = graph_inputs.edge_attr
+            edge_type = graph_inputs.edge_type
+            structural_feat = graph_inputs.node_structural_features
+        else:
+            edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
         targets = build_anchor_targets(fp_sol, block_count, scale, device)
         weights = constraint_weights(constraints, block_count, device, args)
         pairs = sample_pairs(block_count, args.pairwise_pairs, device)
@@ -161,7 +174,14 @@ def run_epoch(
             loss_args.order_weight = args.order_weight * order_weight_multiplier
 
         with torch.set_grad_enabled(train):
-            pred = model(node_feat, edge_index, edge_attr, pairs=pairs)
+            pred = model(
+                node_feat,
+                edge_index,
+                edge_attr,
+                edge_type=edge_type,
+                structural_feat=structural_feat,
+                pairs=pairs,
+            )
             loss, parts = compute_anchor_losses(
                 pred, targets, weights, inst.valid_b2b, loss_args
             )
@@ -238,6 +258,12 @@ def load_resume_model(
     dropout = float(payload.get("dropout", model_config.get("dropout", args.dropout)))
     encoder_type = str(payload.get("encoder_type", model_config.get("encoder_type", "mpnn")))
     num_heads = int(payload.get("num_heads", model_config.get("num_heads", 4)))
+    structural_feat_dim = int(
+        payload.get("structural_feat_dim", model_config.get("structural_feat_dim", 0))
+    )
+    edge_type_count = int(
+        payload.get("edge_type_count", model_config.get("edge_type_count", 1))
+    )
     if node_feat_dim <= 0:
         raise RuntimeError(
             f"Resume checkpoint has no node feature dimension: {checkpoint_path}"
@@ -268,6 +294,8 @@ def load_resume_model(
         dropout=dropout,
         encoder_type=encoder_type,
         num_heads=num_heads,
+        structural_feat_dim=structural_feat_dim,
+        edge_type_count=edge_type_count,
     ).to(device)
     model.load_state_dict(state, strict=False)
     resume_epoch = int(payload.get("epoch", 0))
@@ -372,6 +400,12 @@ def main(args) -> None:
                 None,
             )
             node_feat, _scale = build_anchor_node_features(inst, device=device)
+            structural_feat_dim = 0
+            edge_type_count = 1
+            if args.encoder == "graph-transformer":
+                graph_inputs = build_anchor_transformer_graph_inputs(inst, device=device)
+                structural_feat_dim = graph_inputs.node_structural_features.shape[1]
+                edge_type_count = graph_inputs.edge_type_count
             model = FloorplanGNN(
                 node_feat_dim=node_feat.shape[1],
                 hidden_dim=args.hidden_dim,
@@ -379,6 +413,8 @@ def main(args) -> None:
                 dropout=args.dropout,
                 encoder_type=args.encoder,
                 num_heads=args.num_heads,
+                structural_feat_dim=structural_feat_dim,
+                edge_type_count=edge_type_count,
             ).to(device)
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=args.lr, weight_decay=args.weight_decay

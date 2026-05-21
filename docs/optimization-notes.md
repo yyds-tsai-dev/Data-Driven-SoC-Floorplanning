@@ -6,8 +6,12 @@
 - Those v3 totals used the local evaluator runtime factor, whose denominator is the solver's own validation-run median runtime. Treat them as runtime-aware risk signals, not as the primary architecture-quality metric.
 - Current architecture comparisons should report the no-runtime total beside the local runtime-aware total before accepting or rejecting a candidate path.
 - 2026-05-11 updated no-runtime promotion pass promotes `checkpoints/gnn_latest_0510_ns200000_ep10_h192_l6_acc32.pt`: `1.9560` no-runtime total versus `1.9848` for `gnn_best.pt`, `1.9953` for the 500k ep4 h192 checkpoints, and `2.2768` for `gnn_best_0510_ns200000_ep10_h192_l6_acc32.pt`.
-- 2026-05-12 production default checkpoint is `checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt`; keep using evaluator evidence, especially `total_score_no_runtime`, before future default changes.
+- 2026-05-12 production default checkpoint is `checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt`; keep using evaluator evidence, especially `total_score_no_runtime`, before future default changes.
 - Rechecking `FLOORSET_ENABLE_LARGE_CASE_CANDIDATES=1` with the promoted checkpoint tied the no-runtime total at `1.9560` and had zero no-runtime delta on IDs 95-99, so the matrix remains opt-in.
+- 2026-05-21 No-Checkpoint Guidance Mode baseline remains feasible (`100/100`) but much worse than the configured GNN path: `4.6289` no-runtime total versus `2.0326` for `.env` checkpoint `gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt`. Repair removes all traced overlaps and sharply reduces soft violations, but no-GNN final HPWL/area gaps are still too large, especially ID 98.
+- 2026-05-21 no-guidance boundary-edge shrink improves No-Checkpoint Guidance Mode no-runtime total from `4.6289` to `4.5038`, mainly by improving ID 98 (`8.2411` to `7.7030`; area gap `6.3340` to `6.0228`). The local runtime-aware total worsened (`6.2174` to `6.5204`), so treat this as a no-runtime repair-ablation win, not a submission-safe default for runtime-aware scoring.
+- 2026-05-21 configured-checkpoint high-risk portfolio changed its default repair profiles to normal-only. Full validation improved local runtime-aware total from `3.2697` to `2.3086` while keeping no-runtime quality effectively flat (`2.0326` to `2.0362`), because ID 99 runtime dropped from `10.75s` to `2.15s` with cost-no-runtime only moving from `1.9983` to `2.0040`.
+- 2026-05-21 Sample-Local Quality Portfolio v1 is implemented but remains opt-in. It improved configured-checkpoint no-runtime total to `2.0311` by improving ID 99 HPWL, but local runtime-aware total regressed to `2.5615`; a lower-budget run still regressed total to `2.4574`.
 - Score was dominated by validation IDs 99 and 98 because total score is exponentially weighted by block count.
 - ID 99 contributed about `1.76 / 2.65`; ID 98 contributed about `0.59 / 2.65`.
 
@@ -17,6 +21,8 @@
 - Keep the official cost formula and runtime-aware total in the evaluator, but do not use the local runtime median artifact as the only decision-maker for beam, repair, or large-case candidate policy.
 - `--score` saved-solution evaluation is effectively no-runtime unless stored runtimes are deliberately reintroduced, because saved positions are scored with neutral runtime.
 - Checkpoint selection currently uses supervised validation loss, not no-runtime evaluator score. Treat it as a training health metric only; promote a checkpoint only after `--evaluate` or saved-solution scoring reports no-runtime improvements on dominant large cases.
+- No-Checkpoint Guidance Mode is the preferred ablation for isolating deterministic decoder and repair headroom. Run it with an intentionally missing checkpoint and repair tracing, then compare against the default checkpoint using the same evaluator settings.
+- Repair-only work should be accepted only when it improves No-Checkpoint Guidance Mode without materially regressing the default Anchor-GNN guided path. Report before-repair and after-repair metrics, final no-runtime score, raw runtime, and large-case tail deltas.
 
 ## Ablation Results To Avoid Repeating
 
@@ -35,6 +41,9 @@
 - Increasing `FLOORSET_BOUNDARY_AXIS_CAP` to `160` improved single-case ID 99 quality but added enough runtime risk that it should not become the default without a full-score win.
 - Sparse large-case overlap cap `64` improved ID 98 single-case quality but worsened full-score runtime trade-off; keep it as `FLOORSET_OVERLAP_REPAIR_CANDIDATES=64` only.
 - Large-case high-cap boundary pass/refine remains opt-in because default full evaluation regressed when the extra search ran on every large case.
+- High-risk portfolio repair profiles are now normal-only by default. The heavier `boundary_first`, `grouping_first`, `quality_refine`, and `large_boundary` profiles remain available through `FLOORSET_HIGH_RISK_REPAIR_PROFILES`, but full configured-checkpoint evaluation showed they were spending too much runtime on the weighted tail without improving no-runtime quality.
+- Surrogate guidance is opt-in through `FLOORSET_ENABLE_SURROGATE_GUIDANCE=1`. It can help individual no-checkpoint cases, but the current surrogate worsened ID 99 and must not shadow the clean No-Checkpoint Guidance Mode baseline by default.
+- Sample-Local Quality Portfolio is opt-in through `FLOORSET_ENABLE_QUALITY_PORTFOLIO=auto|1`. It is useful evidence for non-GNN HPWL headroom, but do not enable it by default until it beats both the configured-checkpoint total `2.3086` and no-runtime `2.0362`.
 - Opt-in knobs kept for future remote/server ablation: `FLOORSET_LARGE_CASE_BOUNDARY_AXIS_CAP`, `FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_PASS`, `FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_REFINE`, `FLOORSET_OVERLAP_REPAIR_CANDIDATES`.
 
 ## Current v4 Strategy
@@ -45,7 +54,7 @@
 - Do not use runtime calibration or artificial sleep. Score improvements after v4 must come from placement quality, repair quality, or learned ordering/ranking.
 - Keep pairwise-head plumbing checkpoint-compatible, but do not depend on it for local WSL optimization until remote training finishes.
 - Use local-proxy overlap relocation instead of first legal frontier relocation; it improves dominant tail quality without the full-HPWL runtime blow-up.
-- Keep `checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt` as the default checkpoint. Do not promote future training outputs by supervised validation loss alone; require evaluator evidence, especially `total_score_no_runtime`, before changing the production default.
+- Keep `checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt` as the default checkpoint. Do not promote future training outputs by supervised validation loss alone; require evaluator evidence, especially `total_score_no_runtime`, before changing the production default.
 - A sequential, sample-local relative-order candidate matrix is implemented behind `FLOORSET_ENABLE_LARGE_CASE_CANDIDATES=1`: adaptive profile plus the opposite forced `soft`/`compact` profile when it is not a duplicate, with normal repair by default. Full validation regressed when this ran by default, so the production default keeps the faster adaptive single-candidate path.
 - Large-boundary repair remains opt-in via `FLOORSET_LARGE_CASE_REPAIR_PROFILES=normal,large_boundary`; previous full validation showed defaulting it improved soft counts but regressed local runtime-aware score, so it needs no-runtime and raw-runtime review before becoming default.
 - Under no-runtime tuning, the adaptive single-profile default is reasonable as the submission-safe path, but it should not be treated as settled architecture. Re-run the large-case matrix and large-boundary profiles using `total_score_no_runtime` before rejecting them.

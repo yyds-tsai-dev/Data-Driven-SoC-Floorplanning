@@ -22,9 +22,11 @@ from floorset_arch.geometry import bbox, candidate_frontier_points, first_non_ov
 from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 from floorset_arch.models import AnchorGuidance, Placement, Rect, SolverConfig
 from floorset_arch.parser import parse_instance
+from floorset_arch.quality_portfolio import enabled_quality_profiles, is_quality_portfolio_case, refine_quality_candidate
 from floorset_arch.relative_order import construct_relative_order_placement
 from floorset_arch.repair import repair_placement
 from floorset_arch.scoring import hpwl_proxy
+from floorset_arch.surrogate_guidance import build_surrogate_guidance
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +54,7 @@ class CandidateSpec:
     kind: str = "relative_order"
     repair_profile: str = "normal"
     disable_guidance: bool = False
+    quality_profile: str = "default"
 
 
 def _repair_with_profile_worker(inst, placement: Placement, config: SolverConfig, repair_profile: str) -> Placement:
@@ -166,21 +169,42 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
             target_positions,
         )
         inst.anchor_guidance = self._try_anchor_guidance(inst)
+        if inst.anchor_guidance is None and self._uses_surrogate_guidance():
+            inst.anchor_guidance = build_surrogate_guidance(inst)
         candidates = self._build_candidates(inst, self._candidate_specs(inst))
         best = self._select_best_candidate(inst, candidates)
         return best.to_position_list(block_count)
 
+    def _uses_surrogate_guidance(self) -> bool:
+        mode = os.environ.get("FLOORSET_ENABLE_SURROGATE_GUIDANCE", "0").strip().lower()
+        return mode not in {"0", "false", "off", "no"}
+
     def _build_candidates(self, inst, specs: list[CandidateSpec]) -> list[Placement]:
         workers = self._candidate_worker_count_for_specs(specs)
         if workers <= 1:
-            return [self._build_candidate(inst, spec) for spec in specs]
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(self._build_candidate, [inst] * len(specs), specs))
+            candidates = [self._build_candidate(inst, spec) for spec in specs]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                candidates = list(pool.map(self._build_candidate, [inst] * len(specs), specs))
+        return self._with_quality_refined_candidates(inst, candidates)
 
     def _candidate_worker_count_for_specs(self, specs: list[CandidateSpec]) -> int:
         if any(spec.repair_profile != "normal" for spec in specs):
             return 1
         return self._candidate_workers(len(specs))
+
+    def _quality_refine_worker_count(self, job_count: int) -> int:
+        if job_count <= 1:
+            return 1
+        raw = os.environ.get("FLOORSET_QUALITY_PORTFOLIO_WORKERS", "auto").strip().lower()
+        if raw == "auto":
+            cpu_count = os.cpu_count() or 1
+            return max(1, min(job_count, 2, cpu_count))
+        try:
+            requested = int(raw)
+        except ValueError:
+            return 1
+        return max(1, min(requested, job_count, os.cpu_count() or 1))
 
     def _candidate_workers(self, candidate_count: int) -> int:
         if candidate_count <= 1:
@@ -283,6 +307,28 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                 )
         return specs
 
+    def _with_quality_refined_candidates(self, inst, candidates: list[Placement]) -> list[Placement]:
+        if not candidates or not self._uses_quality_portfolio(inst):
+            return candidates
+        profiles = [profile for profile in self._quality_profiles() if profile != "default"]
+        if not profiles:
+            return candidates
+        base_limit = max(1, int(os.environ.get("FLOORSET_QUALITY_PORTFOLIO_BASE_LIMIT", "1")))
+        seeds = sorted(candidates, key=lambda placement: self._candidate_rank(inst, placement))[:base_limit]
+        jobs = [(seed, profile) for seed in seeds for profile in profiles]
+        workers = self._quality_refine_worker_count(len(jobs))
+        if workers <= 1:
+            refined = [refine_quality_candidate(inst, seed, self.config, profile) for seed, profile in jobs]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                refined = list(
+                    pool.map(
+                        lambda item: refine_quality_candidate(inst, item[0], self.config, item[1]),
+                        jobs,
+                    )
+                )
+        return candidates + refined
+
     def _large_case_repair_profiles(self) -> list[str]:
         raw = os.environ.get("FLOORSET_LARGE_CASE_REPAIR_PROFILES", "normal")
         profiles = [part.strip() for part in raw.split(",") if part.strip()]
@@ -290,10 +336,16 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         filtered = [profile for profile in profiles if profile in allowed]
         return filtered or ["normal"]
 
+    def _uses_quality_portfolio(self, inst) -> bool:
+        return is_quality_portfolio_case(inst)
+
+    def _quality_profiles(self) -> list[str]:
+        return enabled_quality_profiles()
+
     def _high_risk_repair_profiles(self) -> list[str]:
         raw = os.environ.get(
             "FLOORSET_HIGH_RISK_REPAIR_PROFILES",
-            "normal,boundary_first,grouping_first,quality_refine",
+            "normal",
         )
         profiles = [part.strip() for part in raw.split(",") if part.strip()]
         allowed = {"normal", "boundary_first", "grouping_first", "quality_refine", "large_boundary"}
@@ -379,6 +431,7 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         after = self._repair_with_profile(inst, before, spec.repair_profile)
         if spec.repair_profile == "quality_refine":
             after = self._quality_refine_candidate(inst, after)
+        after = refine_quality_candidate(inst, after, self.config, spec.quality_profile)
         self._trace_repair(
             inst,
             before,
@@ -388,6 +441,7 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                 "profile": spec.profile,
                 "kind": spec.kind,
                 "repair_profile": spec.repair_profile,
+                "quality_profile": spec.quality_profile,
             },
         )
         return after
@@ -490,7 +544,11 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         if not checkpoint:
             return None
         try:
-            from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
+            from floorset_arch.features import (
+                build_anchor_edge_tensors,
+                build_anchor_node_features,
+                build_anchor_transformer_graph_inputs,
+            )
             from floorset_arch.nn.model import FloorplanGNN
 
             if self._checkpoint_key != checkpoint or self._checkpoint_model is None:
@@ -507,6 +565,8 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     dropout=float(payload.get("dropout", 0.05)),
                     encoder_type=str(payload.get("encoder_type", "mpnn")),
                     num_heads=int(payload.get("num_heads", 4)),
+                    structural_feat_dim=int(payload.get("structural_feat_dim", 0)),
+                    edge_type_count=int(payload.get("edge_type_count", 1)),
                 )
                 model.load_state_dict(payload["model_state_dict"], strict=False)
                 self._checkpoint_config = {
@@ -516,6 +576,8 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     "dropout": float(payload.get("dropout", 0.05)),
                     "encoder_type": str(payload.get("encoder_type", "mpnn")),
                     "num_heads": int(payload.get("num_heads", 4)),
+                    "structural_feat_dim": int(payload.get("structural_feat_dim", 0)),
+                    "edge_type_count": int(payload.get("edge_type_count", 1)),
                     "has_pair_head": bool(payload.get("has_pair_head", False)),
                 }
                 model.eval()
@@ -528,14 +590,30 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                 node_feat, scale = build_anchor_node_features(inst, device=torch.device("cpu"))
                 if node_feat.shape[1] != int(self._checkpoint_config.get("node_feat_dim", node_feat.shape[1])):
                     return None
-                edge_index, edge_attr = build_anchor_edge_tensors(inst, device=torch.device("cpu"))
+                edge_type = None
+                structural_feat = None
+                if self._checkpoint_config.get("encoder_type") == "graph-transformer":
+                    graph_inputs = build_anchor_transformer_graph_inputs(inst, device=torch.device("cpu"))
+                    edge_index = graph_inputs.edge_index
+                    edge_attr = graph_inputs.edge_attr
+                    edge_type = graph_inputs.edge_type
+                    structural_feat = graph_inputs.node_structural_features
+                else:
+                    edge_index, edge_attr = build_anchor_edge_tensors(inst, device=torch.device("cpu"))
                 pairs = None
                 if self._checkpoint_config.get("has_pair_head"):
                     pairs = torch.tensor(
                         [(i, j) for i in range(inst.block_count) for j in range(i + 1, inst.block_count)],
                         dtype=torch.long,
                     )
-                pred = model(node_feat, edge_index, edge_attr, pairs=pairs)
+                pred = model(
+                    node_feat,
+                    edge_index,
+                    edge_attr,
+                    edge_type=edge_type,
+                    structural_feat=structural_feat,
+                    pairs=pairs,
+                )
                 return self._anchor_predictions_to_guidance(inst, pred, scale, pairs)
         except Exception:
             return None
@@ -550,7 +628,7 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         anchors = pred["anchor"].detach().cpu() * max(float(scale), 1.0)
         priority_tensor = pred.get("priority")
         aspect_tensor = pred.get("log_aspect")
-        guidance = AnchorGuidance(scale=max(float(scale), 1.0))
+        guidance = AnchorGuidance(scale=max(float(scale), 1.0), source="anchor_gnn")
         for i in range(inst.block_count):
             target = inst.target_rects.get(i)
             if target is not None and i in inst.preplaced:

@@ -36,7 +36,7 @@ load_env_defaults() {
 
 load_env_defaults "$ROOT/.env"
 
-export FLOORSET_GNN_CHECKPOINT="${FLOORSET_GNN_CHECKPOINT:-$ROOT/checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt}"
+export FLOORSET_GNN_CHECKPOINT="${FLOORSET_GNN_CHECKPOINT:-$ROOT/checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt}"
 export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
 export FLOORSET_GNN_CHECKPOINT_SOURCE="${FLOORSET_GNN_CHECKPOINT_SOURCE:-dotenv}"
 cd "$ROOT/FloorSet/iccad2026contest"

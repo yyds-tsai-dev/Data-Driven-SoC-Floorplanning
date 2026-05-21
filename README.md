@@ -5,7 +5,7 @@
 目前 production 預設 checkpoint：
 
 ```bash
-checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
+checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
 ```
 
 若要覆蓋模型，可以設定 `.env` 或環境變數：
@@ -119,8 +119,8 @@ bash scripts/eval_single.sh 99
 
 ```bash
 bash scripts/eval_total.sh
-bash scripts/eval_total.sh gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
-bash scripts/eval_total.sh checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
+bash scripts/eval_total.sh gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
+bash scripts/eval_total.sh checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
 bash scripts/eval_total.sh /abs/path/to/checkpoint.pt
 ```
 
@@ -163,6 +163,17 @@ RESUME_CHECKPOINT=checkpoints/old.pt bash scripts/train.sh
 - dirty samples 仍可提供低權重 geometry reference。
 - dirty order/pairwise supervision 預設被抑制，避免把 soft-violating `fp_sol` 當成可靠 constraint oracle。
 - `WRITE_STABLE_CHECKPOINTS=1` 才會覆寫穩定檔名，例如 `gnn_best.pt`。
+
+### `scripts/train_transformer.sh`
+
+訓練 Graph Transformer encoder 版本的 Anchor-GNN。參數格式與 `scripts/train.sh` 相同，但預設 `ENCODER=graph-transformer`、`NUM_HEADS=8`、`CHECKPOINT_PREFIX=gnn_transformer`，log 檔名也會帶 `train_arch_v5_transformer`。
+
+```bash
+bash scripts/train_transformer.sh
+DEVICE=cpu WANDB=0 NUM_SAMPLES=2 VAL_SAMPLES=1 EPOCHS=1 HIDDEN_DIM=16 LAYERS=1 bash scripts/train_transformer.sh
+OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_transformer_run bash scripts/train_transformer.sh
+RESUME_CHECKPOINT=checkpoints/old_transformer.pt bash scripts/train_transformer.sh
+```
 
 ### `scripts/update.sh`
 
@@ -272,7 +283,7 @@ src/
 │   ├── test_diagnostics.py
 │   └── test_evaluator_scoring.py
 ├── checkpoints/
-│   ├── gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
+│   ├── gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
 │   └── other experiment checkpoints
 ├── docs/
 │   ├── optimization-notes.md
@@ -292,7 +303,7 @@ src/
 ## 最近更新
 
 - README 已改成中文專案入口文件，補上 problem 定義、no-runtime scoring、scripts、`src/` 架構、逐檔功能與 file tree。
-- Production 預設 checkpoint 已更新為 `checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt`。
+- Production 預設 checkpoint 已更新為 `checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt`。
 - `scripts/eval_single.sh`、`scripts/eval_total.sh` 與 `SolverConfig.default_checkpoint` 已同步使用新的 best checkpoint。
 - `tests/test_optimizer.py` 的預設 checkpoint 測試已同步更新。
 

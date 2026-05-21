@@ -62,7 +62,7 @@ class SolverConfig:
     max_push_iters: int = 32
     coordinate_eps: float = 1e-6
     checkpoint_env: str = "FLOORSET_GNN_CHECKPOINT"
-    default_checkpoint: str = "checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt"
+    default_checkpoint: str = "checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt"
     beam_width: int = 1
     shape_variant_count: int = 2
     local_search_moves: int = 64
@@ -92,6 +92,7 @@ class AnchorGuidance:
     log_aspect: Dict[int, float] = field(default_factory=dict)
     pairwise_axis: Dict[Tuple[int, int], Tuple[float, float]] = field(default_factory=dict)
     scale: float = 1.0
+    source: str = ""
 
 
 @dataclass

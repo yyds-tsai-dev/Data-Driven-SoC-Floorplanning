@@ -20,6 +20,10 @@ _Avoid_: treating reference wrappers as the active `floorset_arch` production en
 Block-level geometric priors produced by the trained Anchor-GNN checkpoint and consumed as guidance by the constructive decoder.
 _Avoid_: model hints, pure hint placement.
 
+**No-Checkpoint Guidance Mode**:
+A deliberate ablation mode where no Anchor-GNN checkpoint is loaded, so `AnchorGuidance` is absent while the same decoder, repair path, and candidate ranking still run.
+_Avoid_: calling this no-repair mode or treating it as a separate production solver.
+
 **Selectable Anchor-GNN Encoder**:
 The training-time and checkpoint-time choice between the legacy MPNN encoder and a graph-transformer encoder while preserving the same anchor, priority, aspect, and pairwise guidance heads.
 _Avoid_: treating Graph Transformer as non-GNN, changing decoder behavior without evaluator evidence.
@@ -56,6 +60,10 @@ _Avoid_: treating it as the official contest runtime factor.
 Parallel work that happens inside one `solve()` call for a single contest sample, such as independent candidate generation or repair profiles.
 _Avoid_: cross-sample batching, assuming validation or hidden test cases can be processed together.
 
+**Sample-Local Quality Portfolio**:
+An opt-in set of non-GNN post-processing candidates generated inside one `solve()` call for a high-impact sample, using the existing checkpoint guidance and deterministic decoder output as input.
+_Avoid_: treating it as a new production solver branch, retraining, or cross-sample batching.
+
 **Training Golden Answer**:
 The provided `fp_sol` layout used as a supervised geometric reference. It is not a soft-constraint oracle because official QA confirms training golden answers may violate boundary, grouping, or MIB constraints.
 _Avoid_: treating imitation learning as exact constraint satisfaction.
@@ -75,6 +83,7 @@ _Avoid_: using validation case IDs as the risk definition.
 ## Relationships
 
 - The **Production Solver Path** uses **Anchor-GNN Guidance** as a prior, not as a complete floorplan.
+- **No-Checkpoint Guidance Mode** isolates deterministic decoder and repair behavior by removing learned guidance only; repair remains active.
 - The **Beam Decoder** consumes **Heterogeneous Floorplan Graph** features and **MER/Skyline Slot** candidates.
 - A **Legacy Strategy** may donate geometry helper logic, but it is not a selectable **Production Solver Path**.
 - A **Reference Architecture** may be consulted while tuning `floorset_arch`, but it does not define the active solver architecture.
@@ -84,6 +93,7 @@ _Avoid_: using validation case IDs as the risk definition.
 - A **Selectable Anchor-GNN Encoder** changes learned **Anchor-GNN Guidance** only; checkpoint promotion still requires evaluator evidence.
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
 - **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
+- A **Sample-Local Quality Portfolio** may refine and rank multiple placements for one sample, but it must preserve the **Production Solver Path** and remain gated by reusable instance statistics and full evaluator evidence.
 - **Training Golden Answer** should teach geometric priors, while soft-constraint satisfaction remains the responsibility of constraint-aware decoding, repair, and scoring.
 - A **Constraint-Clean Training Sample** is eligible for full imitation training; soft-violating training samples are low-weight geometry references by default, with dirty order/pairwise supervision suppressed.
 - **Validation Tail Diagnostics** may guide optimization priorities, but production behavior must be triggered by reusable instance features such as block count, boundary/group density, fixed/preplaced structure, or net statistics.
@@ -101,3 +111,4 @@ _Avoid_: using validation case IDs as the risk definition.
 - "Local score" was ambiguous between **No-Runtime Quality Score** and **Local Runtime-Aware Score**; resolved: tune architecture with no-runtime score first, then check raw runtime and local runtime-aware score before submission.
 - "Use validation tail diagnostics" was resolved to allow validation-tail evidence for design direction, while prohibiting `test_id`-specific production logic.
 - "Only high-risk cases get heavier search" was resolved to mean generalized instance-stat triggers, not validation-tail IDs.
+- "No GNN model ckpt mode" was resolved to mean **No-Checkpoint Guidance Mode**: use the normal production path with `AnchorGuidance=None` to measure how much deterministic decoding and repair can achieve without learned priors.

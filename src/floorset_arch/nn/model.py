@@ -5,7 +5,7 @@ from torch import nn
 
 
 class GraphTransformerLayer(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float, edge_type_count: int = 1):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError(
@@ -13,6 +13,7 @@ class GraphTransformerLayer(nn.Module):
             )
         self.num_heads = num_heads
         self.edge_bias = nn.Linear(1, num_heads, bias=False)
+        self.edge_type_bias = nn.Embedding(max(1, edge_type_count), num_heads)
         self.attn = nn.MultiheadAttention(
             hidden_dim,
             num_heads,
@@ -30,7 +31,11 @@ class GraphTransformerLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(
-        self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor
+        self,
+        h: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        edge_type: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_mask = None
         if edge_index.numel() > 0:
@@ -38,6 +43,11 @@ class GraphTransformerLayer(nn.Module):
             src = edge_index[0]
             dst = edge_index[1]
             edge_bias = self.edge_bias(edge_attr).transpose(0, 1)
+            if edge_type is not None and edge_type.numel() == edge_attr.shape[0]:
+                type_bias = self.edge_type_bias(
+                    edge_type.to(device=h.device).clamp(0, self.edge_type_bias.num_embeddings - 1)
+                ).transpose(0, 1)
+                edge_bias = edge_bias + type_bias
             attn_mask = h.new_zeros((self.num_heads, n, n))
             attn_mask[:, dst, src] = edge_bias
         attn_out, _weights = self.attn(
@@ -63,6 +73,8 @@ class FloorplanGNN(nn.Module):
         dropout: float = 0.05,
         encoder_type: str = "mpnn",
         num_heads: int = 4,
+        structural_feat_dim: int = 0,
+        edge_type_count: int = 1,
     ):
         super().__init__()
         if encoder_type not in {"mpnn", "graph-transformer"}:
@@ -73,6 +85,8 @@ class FloorplanGNN(nn.Module):
         self.dropout_p = dropout
         self.encoder_type = encoder_type
         self.num_heads = num_heads
+        self.structural_feat_dim = structural_feat_dim
+        self.edge_type_count = max(1, edge_type_count)
 
         self.node_in = nn.Sequential(
             nn.Linear(node_feat_dim, hidden_dim),
@@ -104,8 +118,17 @@ class FloorplanGNN(nn.Module):
                 )
                 self.norms.append(nn.LayerNorm(hidden_dim))
         else:
+            self.structural_in = (
+                nn.Sequential(
+                    nn.Linear(structural_feat_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.SiLU(),
+                )
+                if structural_feat_dim > 0
+                else None
+            )
             self.transformer_layers = nn.ModuleList(
-                GraphTransformerLayer(hidden_dim, num_heads, dropout)
+                GraphTransformerLayer(hidden_dim, num_heads, dropout, self.edge_type_count)
                 for _ in range(num_layers)
             )
 
@@ -137,11 +160,22 @@ class FloorplanGNN(nn.Module):
             nn.Linear(hidden_dim // 2, 2),
         )
 
-    def encode(self, node_feat: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self,
+        node_feat: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        edge_type: torch.Tensor | None = None,
+        structural_feat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         h = self.node_in(node_feat)
         if self.encoder_type == "graph-transformer":
+            if self.structural_in is not None:
+                if structural_feat is None:
+                    structural_feat = h.new_zeros((h.shape[0], self.structural_feat_dim))
+                h = h + self.structural_in(structural_feat.to(device=h.device, dtype=h.dtype))
             for layer in self.transformer_layers:
-                h = layer(h, edge_index, edge_attr)
+                h = layer(h, edge_index, edge_attr, edge_type=edge_type)
             return h
         n = h.shape[0]
         if edge_index.numel() == 0:
@@ -165,9 +199,17 @@ class FloorplanGNN(nn.Module):
         node_feat: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        edge_type: torch.Tensor | None = None,
+        structural_feat: torch.Tensor | None = None,
         pairs: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        h = self.encode(node_feat, edge_index, edge_attr)
+        h = self.encode(
+            node_feat,
+            edge_index,
+            edge_attr,
+            edge_type=edge_type,
+            structural_feat=structural_feat,
+        )
         g = h.mean(dim=0, keepdim=True).expand_as(h)
         z = torch.cat([h, g, node_feat], dim=1)
         output = {
