@@ -69,6 +69,9 @@
 - v5 keeps `floorset_arch` as the production package and adds `src/architecture_v5_optimizer.py` as the contest wrapper.
 - Training now supports `--encoder mpnn|graph-transformer`. The default 1M full-data run remains the lower-risk MPNN baseline with `hidden_dim=256`, `layers=6`, and `epochs=3`.
 - Graph Transformer checkpoints are still Anchor-GNN Guidance checkpoints. Promote them only after full evaluator evidence, especially `total_score_no_runtime`, because the decoder and repair path still determine final placement quality.
+- 2026-05-26 Graph Transformer underperformed the `.env` GNN checkpoint `gnn_best_0512_ns500000_ep4_h192_l6_acc32.pt` on full validation: `2.5819` total and `2.2024` no-runtime versus GNN `2.3355` total and `2.0864` no-runtime. Treat this as evidence that the block-only transformer does not yet preserve enough b2b/p2b locality or decoder-aligned ranking signal.
+- Next encoder experiment is Local HGT: relation-specific typed local message passing over block, pin, cluster, MIB, and boundary nodes, with no global attention/refinement in v1. It should preserve the AnchorGuidance output contract and add only low-risk decoder-aware training losses such as tail-weighted order/pairwise loss and optional GNN teacher distillation.
+- Promote a Local HGT checkpoint only after full validation beats the `.env` GNN baseline's `2.0864` no-runtime total, then review runtime-aware total and raw runtime. Do not promote by supervised validation loss alone.
 
 ## Review Notes
 

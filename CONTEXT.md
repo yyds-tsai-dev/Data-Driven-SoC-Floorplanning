@@ -25,8 +25,12 @@ A deliberate ablation mode where no Anchor-GNN checkpoint is loaded, so `AnchorG
 _Avoid_: calling this no-repair mode or treating it as a separate production solver.
 
 **Selectable Anchor-GNN Encoder**:
-The training-time and checkpoint-time choice between the legacy MPNN encoder and a graph-transformer encoder while preserving the same anchor, priority, aspect, and pairwise guidance heads.
+The training-time and checkpoint-time choice between the legacy MPNN encoder, graph-transformer encoder, or Local HGT Encoder while preserving the same anchor, priority, aspect, and pairwise guidance heads.
 _Avoid_: treating Graph Transformer as non-GNN, changing decoder behavior without evaluator evidence.
+
+**Local HGT Encoder**:
+A planned Selectable Anchor-GNN Encoder that consumes the Heterogeneous Floorplan Graph with relation-specific local attention over typed block, pin, cluster, MIB, and boundary nodes, then emits the normal Anchor-GNN Guidance heads.
+_Avoid_: full block-to-block global attention, clique-expanding heterogeneous constraints, changing the Production Solver Path before evaluator evidence.
 
 **Heterogeneous Floorplan Graph**:
 A factor-style graph with block, pin, group, MIB, and boundary concepts represented separately so constraints are first-class solver inputs.
@@ -91,6 +95,7 @@ _Avoid_: using validation case IDs as the risk definition.
 - **Architecture v4** names the contest-facing wrapper generation; the **Production Solver Path** remains `floorset_arch`.
 - **Architecture v5** extends **Architecture v4** with a **Selectable Anchor-GNN Encoder** while preserving `floorset_arch` as the **Production Solver Path**.
 - A **Selectable Anchor-GNN Encoder** changes learned **Anchor-GNN Guidance** only; checkpoint promotion still requires evaluator evidence.
+- A **Local HGT Encoder** is a **Selectable Anchor-GNN Encoder** variant that preserves b2b/p2b locality and heterogeneous constraint factors instead of flattening them into a block-only graph.
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
 - **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
 - A **Sample-Local Quality Portfolio** may refine and rank multiple placements for one sample, but it must preserve the **Production Solver Path** and remain gated by reusable instance statistics and full evaluator evidence.
@@ -112,3 +117,4 @@ _Avoid_: using validation case IDs as the risk definition.
 - "Use validation tail diagnostics" was resolved to allow validation-tail evidence for design direction, while prohibiting `test_id`-specific production logic.
 - "Only high-risk cases get heavier search" was resolved to mean generalized instance-stat triggers, not validation-tail IDs.
 - "No GNN model ckpt mode" was resolved to mean **No-Checkpoint Guidance Mode**: use the normal production path with `AnchorGuidance=None` to measure how much deterministic decoding and repair can achieve without learned priors.
+- "Canonical HGT hetero graph encoder" was resolved to mean **Local HGT Encoder**: relation-specific typed local message passing over the **Heterogeneous Floorplan Graph**, no global refinement in v1, and no decoder path change before full evaluator evidence.
