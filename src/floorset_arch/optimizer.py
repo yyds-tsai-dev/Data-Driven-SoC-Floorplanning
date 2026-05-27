@@ -546,6 +546,7 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         try:
             from floorset_arch.features import (
                 build_anchor_edge_tensors,
+                build_anchor_hgt_graph_inputs,
                 build_anchor_node_features,
                 build_anchor_transformer_graph_inputs,
             )
@@ -567,6 +568,10 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     num_heads=int(payload.get("num_heads", 4)),
                     structural_feat_dim=int(payload.get("structural_feat_dim", 0)),
                     edge_type_count=int(payload.get("edge_type_count", 1)),
+                    hgt_node_feat_dims=payload.get("hgt_node_feat_dims", {}),
+                    hgt_relation_specs=tuple(
+                        tuple(relation) for relation in payload.get("hgt_relation_specs", ())
+                    ),
                 )
                 model.load_state_dict(payload["model_state_dict"], strict=False)
                 self._checkpoint_config = {
@@ -578,6 +583,10 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     "num_heads": int(payload.get("num_heads", 4)),
                     "structural_feat_dim": int(payload.get("structural_feat_dim", 0)),
                     "edge_type_count": int(payload.get("edge_type_count", 1)),
+                    "hgt_node_feat_dims": payload.get("hgt_node_feat_dims", {}),
+                    "hgt_relation_specs": tuple(
+                        tuple(relation) for relation in payload.get("hgt_relation_specs", ())
+                    ),
                     "has_pair_head": bool(payload.get("has_pair_head", False)),
                 }
                 model.eval()
@@ -592,12 +601,23 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     return None
                 edge_type = None
                 structural_feat = None
+                hgt_node_features = None
+                hgt_edge_index = None
+                hgt_edge_attr = None
                 if self._checkpoint_config.get("encoder_type") == "graph-transformer":
                     graph_inputs = build_anchor_transformer_graph_inputs(inst, device=torch.device("cpu"))
                     edge_index = graph_inputs.edge_index
                     edge_attr = graph_inputs.edge_attr
                     edge_type = graph_inputs.edge_type
                     structural_feat = graph_inputs.node_structural_features
+                elif self._checkpoint_config.get("encoder_type") == "hgt":
+                    graph_inputs = build_anchor_hgt_graph_inputs(inst, device=torch.device("cpu"))
+                    node_feat = graph_inputs.node_features["block"]
+                    edge_index = torch.empty((2, 0), dtype=torch.long)
+                    edge_attr = torch.empty((0, 1), dtype=torch.float32)
+                    hgt_node_features = graph_inputs.node_features
+                    hgt_edge_index = graph_inputs.edge_index
+                    hgt_edge_attr = graph_inputs.edge_attr
                 else:
                     edge_index, edge_attr = build_anchor_edge_tensors(inst, device=torch.device("cpu"))
                 pairs = None
@@ -612,6 +632,9 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     edge_attr,
                     edge_type=edge_type,
                     structural_feat=structural_feat,
+                    hgt_node_features=hgt_node_features,
+                    hgt_edge_index=hgt_edge_index,
+                    hgt_edge_attr=hgt_edge_attr,
                     pairs=pairs,
                 )
                 return self._anchor_predictions_to_guidance(inst, pred, scale, pairs)

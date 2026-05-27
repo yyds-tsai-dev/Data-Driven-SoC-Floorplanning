@@ -13,6 +13,17 @@ ANCHOR_EDGE_TYPE_CLUSTER = 2
 ANCHOR_EDGE_TYPE_MIB = 3
 ANCHOR_EDGE_TYPE_BOUNDARY = 4
 ANCHOR_EDGE_TYPE_COUNT = 5
+ANCHOR_HGT_RELATION_SPECS = (
+    ("block", "connects", "block"),
+    ("block", "member_of", "cluster"),
+    ("block", "pin_connects", "pin"),
+    ("block", "same_shape_as", "mib"),
+    ("block", "wants_boundary", "boundary"),
+    ("boundary", "has_member", "block"),
+    ("cluster", "has_member", "block"),
+    ("mib", "has_member", "block"),
+    ("pin", "pin_connects", "block"),
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +33,15 @@ class AnchorTransformerGraphInputs:
     edge_type: torch.Tensor
     node_structural_features: torch.Tensor
     edge_type_count: int = ANCHOR_EDGE_TYPE_COUNT
+
+
+@dataclass(frozen=True)
+class AnchorHGTGraphInputs:
+    node_features: dict[str, torch.Tensor]
+    edge_index: dict[tuple[str, str, str], torch.Tensor]
+    edge_attr: dict[tuple[str, str, str], torch.Tensor]
+    node_feat_dims: dict[str, int]
+    relation_specs: tuple[tuple[str, str, str], ...]
 
 
 def _safe_float(x) -> float:
@@ -326,4 +346,117 @@ def build_anchor_transformer_graph_inputs(
         edge_attr=edge_attr,
         edge_type=edge_type,
         node_structural_features=structural,
+    )
+
+
+def _empty_features(rows: int, cols: int, device: torch.device) -> torch.Tensor:
+    return torch.empty((rows, cols), dtype=torch.float32, device=device)
+
+
+def _factor_node_features(
+    groups: dict[int, list[int]],
+    inst: Instance,
+    device: torch.device,
+) -> torch.Tensor:
+    rows: list[list[float]] = []
+    total_area = max(float(inst.area_targets[: inst.block_count].clamp_min(0).sum().item()), 1.0)
+    for group_id in sorted(groups):
+        members = [block for block in groups[group_id] if 0 <= block < inst.block_count]
+        if members:
+            area = float(inst.area_targets[members].float().clamp_min(0).sum().item())
+            boundary_members = sum(1 for block in members if block in inst.boundary)
+            hard_members = sum(1 for block in members if block in inst.fixed or block in inst.preplaced)
+        else:
+            area = 0.0
+            boundary_members = 0
+            hard_members = 0
+        size = len(members)
+        rows.append(
+            [
+                float(size) / max(float(inst.block_count), 1.0),
+                area / total_area,
+                float(boundary_members) / max(float(size), 1.0),
+                float(hard_members) / max(float(size), 1.0),
+            ]
+        )
+    if not rows:
+        return _empty_features(0, 4, device)
+    return torch.tensor(rows, dtype=torch.float32, device=device)
+
+
+def _boundary_node_features(inst: Instance, device: torch.device) -> torch.Tensor:
+    rows = [
+        [1.0 if code & bit else 0.0 for bit in (1, 2, 4, 8)]
+        + [float(sum(1 for bit in (1, 2, 4, 8) if code & bit)) / 4.0]
+        for code in sorted(set(inst.boundary.values()))
+    ]
+    if not rows:
+        return _empty_features(0, 5, device)
+    return torch.tensor(rows, dtype=torch.float32, device=device)
+
+
+def build_anchor_hgt_graph_inputs(
+    inst: Instance, device: torch.device | None = None
+) -> AnchorHGTGraphInputs:
+    """Build local typed HGT inputs from the explicit hetero floorplan graph."""
+    from floorset_arch.hetero_graph import build_hetero_floorplan_graph
+
+    device = device or inst.area_targets.device
+    block_features, scale = build_anchor_node_features(inst, device=device)
+    if inst.pins_pos.numel() > 0:
+        pins = inst.pins_pos.float().to(device)
+        valid_pin = ((pins[:, 0] != -1.0) & (pins[:, 1] != -1.0)).float().view(-1, 1)
+        pin_features = torch.cat([pins / max(float(scale), 1.0), valid_pin], dim=1)
+    else:
+        pin_features = _empty_features(0, 3, device)
+
+    node_features = {
+        "block": block_features,
+        "pin": pin_features,
+        "cluster": _factor_node_features(inst.cluster_groups, inst, device),
+        "mib": _factor_node_features(inst.mib_groups, inst, device),
+        "boundary": _boundary_node_features(inst, device),
+    }
+
+    edge_src: dict[tuple[str, str, str], list[int]] = {}
+    edge_dst: dict[tuple[str, str, str], list[int]] = {}
+    edge_weight: dict[tuple[str, str, str], list[float]] = {}
+    graph = build_hetero_floorplan_graph(inst)
+    for edge in graph.edges:
+        relation = (edge.src_type, edge.edge_type, edge.dst_type)
+        if edge.src >= node_features[edge.src_type].shape[0]:
+            continue
+        if edge.dst >= node_features[edge.dst_type].shape[0]:
+            continue
+        edge_src.setdefault(relation, []).append(int(edge.src))
+        edge_dst.setdefault(relation, []).append(int(edge.dst))
+        weight = max(float(edge.weight), 0.0)
+        if edge.edge_type in {"connects", "pin_connects"}:
+            weight = float(torch.log1p(torch.tensor(weight)).item())
+        edge_weight.setdefault(relation, []).append(weight)
+
+    edge_index: dict[tuple[str, str, str], torch.Tensor] = {}
+    edge_attr: dict[tuple[str, str, str], torch.Tensor] = {}
+    for relation in ANCHOR_HGT_RELATION_SPECS:
+        if relation not in edge_src:
+            edge_index[relation] = torch.empty((2, 0), dtype=torch.long, device=device)
+            edge_attr[relation] = torch.empty((0, 1), dtype=torch.float32, device=device)
+            continue
+        weights = torch.tensor(edge_weight[relation], dtype=torch.float32, device=device).view(-1, 1)
+        weights = weights / weights.max().clamp_min(1.0)
+        edge_index[relation] = torch.tensor(
+            [edge_src[relation], edge_dst[relation]], dtype=torch.long, device=device
+        )
+        edge_attr[relation] = weights
+
+    node_feat_dims = {
+        node_type: int(features.shape[1]) for node_type, features in node_features.items()
+    }
+    relation_specs = ANCHOR_HGT_RELATION_SPECS
+    return AnchorHGTGraphInputs(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        node_feat_dims=node_feat_dims,
+        relation_specs=relation_specs,
     )

@@ -88,6 +88,7 @@ The base supervised losses remain:
 HGT v1 adds low-risk decoder-aware weighting:
 
 - Tail-like or high-risk samples receive higher order and pairwise weights.
+- The implemented low-risk hook is HGT-only high-risk order/pairwise loss multipliers, controlled by `--high-risk-order-multiplier`, `--high-risk-pairwise-multiplier`, `--high-risk-min-blocks`, and `--high-risk-min-constraints`.
 - Dirty training samples continue to suppress unreliable order/pairwise supervision according to the existing clean-sample policy.
 - Optional GNN teacher distillation may train HGT to match the currently stronger GNN checkpoint's anchor, order, and pairwise guidance on high-risk samples.
 

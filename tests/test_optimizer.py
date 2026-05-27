@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch
 
+from floorset_arch import features
 from floorset_arch.models import Placement, Rect
 from floorset_arch.models import AnchorGuidance, SolverConfig
 from floorset_arch.nn.model import FloorplanGNN
@@ -34,6 +35,49 @@ def _write_anchor_checkpoint(path: Path, node_feat_dim: int = 18):
     )
 
 
+def _write_hgt_anchor_checkpoint(path: Path):
+    problem = {
+        "block_count": 3,
+        "area_targets": torch.tensor([4.0, 9.0, 16.0]),
+        "b2b_connectivity": torch.tensor([[0.0, 1.0, 2.0]]),
+        "p2b_connectivity": torch.tensor([[0.0, 2.0, 1.5]]),
+        "pins_pos": torch.tensor([[10.0, 20.0]]),
+        "constraints": torch.tensor(
+            [
+                [0.0, 0.0, 1.0, 7.0, 1.0],
+                [0.0, 0.0, 1.0, 7.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 2.0],
+            ]
+        ),
+        "target_positions": torch.full((3, 4), -1.0),
+    }
+    inst = parse_instance(**problem)
+    graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
+    model = FloorplanGNN(
+        node_feat_dim=graph_inputs.node_features["block"].shape[1],
+        hidden_dim=16,
+        num_layers=1,
+        encoder_type="hgt",
+        num_heads=4,
+        hgt_node_feat_dims=graph_inputs.node_feat_dims,
+        hgt_relation_specs=graph_inputs.relation_specs,
+    )
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "node_feat_dim": graph_inputs.node_features["block"].shape[1],
+            "hidden_dim": 16,
+            "layers": 1,
+            "encoder_type": "hgt",
+            "num_heads": 4,
+            "hgt_node_feat_dims": graph_inputs.node_feat_dims,
+            "hgt_relation_specs": list(graph_inputs.relation_specs),
+            "has_pair_head": True,
+        },
+        path,
+    )
+
+
 def test_checkpoint_relative_path_resolves_from_repo_root(tmp_path, monkeypatch):
     checkpoint = tmp_path / "repo-relative.pt"
     _write_anchor_checkpoint(checkpoint)
@@ -45,6 +89,32 @@ def test_checkpoint_relative_path_resolves_from_repo_root(tmp_path, monkeypatch)
     optimizer = ArchitectureV4Optimizer()
 
     assert optimizer._try_anchor_guidance(inst) is not None
+
+
+def test_optimizer_loads_hgt_checkpoint_for_anchor_guidance(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "hgt.pt"
+    _write_hgt_anchor_checkpoint(checkpoint)
+    problem = _tiny_problem()
+    monkeypatch.setenv("FLOORSET_GNN_CHECKPOINT", str(checkpoint))
+    calls = 0
+    original_builder = features.build_anchor_hgt_graph_inputs
+
+    def counted_builder(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(features, "build_anchor_hgt_graph_inputs", counted_builder)
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**problem)
+
+    guidance = optimizer._try_anchor_guidance(inst)
+
+    assert guidance is not None
+    assert optimizer._checkpoint_config["encoder_type"] == "hgt"
+    assert optimizer._checkpoint_config["hgt_relation_specs"]
+    assert calls == 1
+    assert len(guidance.rect_priors) == problem["block_count"]
 
 
 def test_checkpoint_model_is_cached_between_solves(tmp_path, monkeypatch):

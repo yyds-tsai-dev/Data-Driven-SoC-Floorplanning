@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Subset
 
 from floorset_arch.features import (
     build_anchor_edge_tensors,
+    build_anchor_hgt_graph_inputs,
     build_anchor_node_features,
     build_anchor_transformer_graph_inputs,
 )
@@ -105,6 +106,30 @@ def unpack_batch(batch):
     )
 
 
+def decoder_constraint_count(inst) -> int:
+    constraint_count = len(inst.boundary) + sum(
+        1 for blocks in inst.cluster_groups.values() for block in blocks if 0 <= block < inst.block_count
+    )
+    constraint_count += sum(
+        1 for blocks in inst.mib_groups.values() for block in blocks if 0 <= block < inst.block_count
+    )
+    return constraint_count
+
+
+def decoder_ranking_multipliers(inst, args, encoder_type: str) -> tuple[float, float]:
+    if encoder_type != "hgt":
+        return 1.0, 1.0
+    min_blocks = int(getattr(args, "high_risk_min_blocks", 110))
+    min_constraints = int(getattr(args, "high_risk_min_constraints", 12))
+    constraint_count = decoder_constraint_count(inst)
+    if inst.block_count < min_blocks and constraint_count < min_constraints:
+        return 1.0, 1.0
+    return (
+        float(getattr(args, "high_risk_order_multiplier", 1.0)),
+        float(getattr(args, "high_risk_pairwise_multiplier", 1.0)),
+    )
+
+
 def run_epoch(
     model, optimizer, loader, device: torch.device, args, epoch: int, train: bool
 ) -> dict[str, float]:
@@ -153,12 +178,24 @@ def run_epoch(
         node_feat, scale = build_anchor_node_features(inst, device=device)
         edge_type = None
         structural_feat = None
-        if getattr(model, "encoder_type", args.encoder) == "graph-transformer":
+        hgt_node_features = None
+        hgt_edge_index = None
+        hgt_edge_attr = None
+        encoder_type = getattr(model, "encoder_type", args.encoder)
+        if encoder_type == "graph-transformer":
             graph_inputs = build_anchor_transformer_graph_inputs(inst, device=device)
             edge_index = graph_inputs.edge_index
             edge_attr = graph_inputs.edge_attr
             edge_type = graph_inputs.edge_type
             structural_feat = graph_inputs.node_structural_features
+        elif encoder_type == "hgt":
+            graph_inputs = build_anchor_hgt_graph_inputs(inst, device=device)
+            node_feat = graph_inputs.node_features["block"]
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+            edge_attr = torch.empty((0, 1), dtype=torch.float32, device=device)
+            hgt_node_features = graph_inputs.node_features
+            hgt_edge_index = graph_inputs.edge_index
+            hgt_edge_attr = graph_inputs.edge_attr
         else:
             edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
         targets = build_anchor_targets(fp_sol, block_count, scale, device)
@@ -167,9 +204,16 @@ def run_epoch(
         loss_args = args
         sample_weight = 1.0
         order_weight_multiplier = 1.0
+        decoder_order_multiplier, decoder_pairwise_multiplier = decoder_ranking_multipliers(
+            inst, args, encoder_type
+        )
+        pairwise_weight_multiplier = decoder_pairwise_multiplier
+        order_weight_multiplier *= decoder_order_multiplier
         if args.clean_sample_policy == "weighted" and not is_clean:
             sample_weight = args.dirty_sample_weight
-            order_weight_multiplier = args.dirty_order_weight
+            order_weight_multiplier *= args.dirty_order_weight
+            pairwise_weight_multiplier *= args.dirty_order_weight
+        if order_weight_multiplier != 1.0:
             loss_args = SimpleNamespace(**vars(args))
             loss_args.order_weight = args.order_weight * order_weight_multiplier
 
@@ -180,6 +224,9 @@ def run_epoch(
                 edge_attr,
                 edge_type=edge_type,
                 structural_feat=structural_feat,
+                hgt_node_features=hgt_node_features,
+                hgt_edge_index=hgt_edge_index,
+                hgt_edge_attr=hgt_edge_attr,
                 pairs=pairs,
             )
             loss, parts = compute_anchor_losses(
@@ -192,7 +239,7 @@ def run_epoch(
                 clear_ratio=args.clear_ratio,
             )
             pair_loss, pair_acc = pairwise_relation_loss(pred["pair_logits"], pair_targets)
-            effective_pair_loss = order_weight_multiplier * pair_loss
+            effective_pair_loss = pairwise_weight_multiplier * pair_loss
             loss = loss + args.pairwise_weight * effective_pair_loss
             loss = loss * sample_weight
             if train:
@@ -264,6 +311,13 @@ def load_resume_model(
     edge_type_count = int(
         payload.get("edge_type_count", model_config.get("edge_type_count", 1))
     )
+    hgt_node_feat_dims = payload.get(
+        "hgt_node_feat_dims", model_config.get("hgt_node_feat_dims", {})
+    )
+    hgt_relation_specs = payload.get(
+        "hgt_relation_specs", model_config.get("hgt_relation_specs", ())
+    )
+    hgt_relation_specs = tuple(tuple(relation) for relation in hgt_relation_specs)
     if node_feat_dim <= 0:
         raise RuntimeError(
             f"Resume checkpoint has no node feature dimension: {checkpoint_path}"
@@ -296,6 +350,8 @@ def load_resume_model(
         num_heads=num_heads,
         structural_feat_dim=structural_feat_dim,
         edge_type_count=edge_type_count,
+        hgt_node_feat_dims=hgt_node_feat_dims,
+        hgt_relation_specs=hgt_relation_specs,
     ).to(device)
     model.load_state_dict(state, strict=False)
     resume_epoch = int(payload.get("epoch", 0))
@@ -402,10 +458,17 @@ def main(args) -> None:
             node_feat, _scale = build_anchor_node_features(inst, device=device)
             structural_feat_dim = 0
             edge_type_count = 1
+            hgt_node_feat_dims = None
+            hgt_relation_specs = None
             if args.encoder == "graph-transformer":
                 graph_inputs = build_anchor_transformer_graph_inputs(inst, device=device)
                 structural_feat_dim = graph_inputs.node_structural_features.shape[1]
                 edge_type_count = graph_inputs.edge_type_count
+            elif args.encoder == "hgt":
+                graph_inputs = build_anchor_hgt_graph_inputs(inst, device=device)
+                node_feat = graph_inputs.node_features["block"]
+                hgt_node_feat_dims = graph_inputs.node_feat_dims
+                hgt_relation_specs = graph_inputs.relation_specs
             model = FloorplanGNN(
                 node_feat_dim=node_feat.shape[1],
                 hidden_dim=args.hidden_dim,
@@ -415,6 +478,8 @@ def main(args) -> None:
                 num_heads=args.num_heads,
                 structural_feat_dim=structural_feat_dim,
                 edge_type_count=edge_type_count,
+                hgt_node_feat_dims=hgt_node_feat_dims,
+                hgt_relation_specs=hgt_relation_specs,
             ).to(device)
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -525,7 +590,7 @@ def parse_args():
     parser.add_argument("--hidden-dim", type=int, default=160)
     parser.add_argument("--layers", type=int, default=5)
     parser.add_argument("--dropout", type=float, default=0.05)
-    parser.add_argument("--encoder", choices=("mpnn", "graph-transformer"), default="mpnn")
+    parser.add_argument("--encoder", choices=("mpnn", "graph-transformer", "hgt"), default="mpnn")
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -549,6 +614,10 @@ def parse_args():
     )
     parser.add_argument("--dirty-sample-weight", type=float, default=0.25)
     parser.add_argument("--dirty-order-weight", type=float, default=0.0)
+    parser.add_argument("--high-risk-order-multiplier", type=float, default=1.0)
+    parser.add_argument("--high-risk-pairwise-multiplier", type=float, default=1.0)
+    parser.add_argument("--high-risk-min-blocks", type=int, default=110)
+    parser.add_argument("--high-risk-min-constraints", type=int, default=12)
     parser.add_argument("--boundary-weight-boost", type=float, default=0.45)
     parser.add_argument("--cluster-weight-boost", type=float, default=0.20)
     parser.add_argument("--mib-weight-boost", type=float, default=0.25)

@@ -1,4 +1,5 @@
 import torch
+import sys
 
 from floorset_arch import features
 from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
@@ -11,6 +12,7 @@ from floorset_arch.training.losses import (
     is_constraint_clean_training_sample,
 )
 from floorset_arch.training.checkpoint import anchor_checkpoint_payload
+from floorset_arch.training import train as train_module
 
 
 def test_anchor_gnn_forward_matches_runtime_features():
@@ -126,6 +128,122 @@ def test_transformer_graph_inputs_project_hetero_context_to_anchor_encoder():
     assert len(set(graph_inputs.edge_type.tolist())) >= 3
 
 
+def _hgt_sample_instance():
+    return parse_instance(
+        4,
+        torch.tensor([4.0, 9.0, 16.0, 25.0]),
+        torch.tensor([[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]]),
+        torch.tensor([[0.0, 0.0, 2.0], [1.0, 3.0, 3.0]]),
+        torch.tensor([[10.0, 20.0], [30.0, 5.0]]),
+        torch.tensor(
+            [
+                [0.0, 0.0, 1.0, 7.0, 1.0],
+                [0.0, 0.0, 1.0, 7.0, 0.0],
+                [0.0, 0.0, 0.0, 7.0, 2.0],
+                [0.0, 0.0, 0.0, 0.0, 4.0],
+            ]
+        ),
+        None,
+    )
+
+
+def test_hgt_graph_inputs_keep_typed_local_relations():
+    inst = _hgt_sample_instance()
+
+    graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
+
+    assert {"block", "pin", "cluster", "mib", "boundary"} <= set(graph_inputs.node_features)
+    assert graph_inputs.node_features["block"].shape == (4, 18)
+    assert graph_inputs.node_feat_dims == {
+        node_type: feat.shape[1] for node_type, feat in graph_inputs.node_features.items()
+    }
+    relations = set(graph_inputs.relation_specs)
+    assert ("block", "connects", "block") in relations
+    assert ("pin", "pin_connects", "block") in relations
+    assert ("block", "pin_connects", "pin") in relations
+    assert ("cluster", "has_member", "block") in relations
+    assert ("mib", "has_member", "block") in relations
+    assert ("boundary", "has_member", "block") in relations
+    for relation in graph_inputs.relation_specs:
+        edge_index = graph_inputs.edge_index[relation]
+        edge_attr = graph_inputs.edge_attr[relation]
+        assert edge_index.shape[0] == 2
+        assert edge_attr.shape == (edge_index.shape[1], 1)
+
+
+def test_hgt_relation_specs_are_canonical_even_when_edges_are_absent():
+    inst = parse_instance(
+        2,
+        torch.tensor([4.0, 9.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.zeros(2, 5),
+        None,
+    )
+
+    graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
+
+    assert graph_inputs.relation_specs == features.ANCHOR_HGT_RELATION_SPECS
+    for relation in features.ANCHOR_HGT_RELATION_SPECS:
+        assert relation in graph_inputs.edge_index
+        assert graph_inputs.edge_index[relation].shape == (2, 0)
+        assert graph_inputs.edge_attr[relation].shape == (0, 1)
+
+
+def test_floorplan_gnn_hgt_encoder_matches_output_contract():
+    inst = _hgt_sample_instance()
+    graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
+    model = FloorplanGNN(
+        node_feat_dim=graph_inputs.node_features["block"].shape[1],
+        hidden_dim=32,
+        num_layers=2,
+        dropout=0.0,
+        encoder_type="hgt",
+        num_heads=4,
+        hgt_node_feat_dims=graph_inputs.node_feat_dims,
+        hgt_relation_specs=graph_inputs.relation_specs,
+    )
+    pairs = torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
+
+    output = model(
+        graph_inputs.node_features["block"],
+        torch.empty((2, 0), dtype=torch.long),
+        torch.empty((0, 1)),
+        hgt_node_features=graph_inputs.node_features,
+        hgt_edge_index=graph_inputs.edge_index,
+        hgt_edge_attr=graph_inputs.edge_attr,
+        pairs=pairs,
+    )
+
+    assert model.encoder_type == "hgt"
+    assert output["anchor"].shape == (inst.block_count, 2)
+    assert output["priority"].shape == (inst.block_count,)
+    assert output["log_aspect"].shape == (inst.block_count,)
+    assert output["pair_logits"].shape == (2, 2)
+
+
+def test_anchor_checkpoint_payload_records_hgt_config():
+    inst = _hgt_sample_instance()
+    graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
+    model = FloorplanGNN(
+        node_feat_dim=graph_inputs.node_features["block"].shape[1],
+        hidden_dim=32,
+        num_layers=2,
+        encoder_type="hgt",
+        num_heads=4,
+        hgt_node_feat_dims=graph_inputs.node_feat_dims,
+        hgt_relation_specs=graph_inputs.relation_specs,
+    )
+    args = type("Args", (), {"example": "value"})()
+
+    payload = anchor_checkpoint_payload(model, args, epoch=1, train_stats={}, val_stats={})
+
+    assert payload["encoder_type"] == "hgt"
+    assert payload["hgt_node_feat_dims"] == graph_inputs.node_feat_dims
+    assert payload["hgt_relation_specs"] == list(graph_inputs.relation_specs)
+
+
 def test_anchor_checkpoint_payload_records_encoder_config():
     model = FloorplanGNN(
         node_feat_dim=18,
@@ -141,6 +259,49 @@ def test_anchor_checkpoint_payload_records_encoder_config():
     assert payload["encoder_type"] == "graph-transformer"
     assert payload["num_heads"] == 4
     assert payload["has_pair_head"] is True
+
+
+def test_training_parser_accepts_hgt_encoder(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train.py", "--encoder", "hgt"])
+
+    args = train_module.parse_args()
+
+    assert args.encoder == "hgt"
+
+
+def test_hgt_decoder_ranking_multipliers_target_high_risk_samples():
+    constraints = torch.zeros(112, 5)
+    constraints[:16, 4] = torch.tensor([1.0, 2.0, 4.0, 8.0] * 4)
+    inst = parse_instance(
+        112,
+        torch.ones(112),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        None,
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "high_risk_order_multiplier": 1.7,
+            "high_risk_pairwise_multiplier": 1.6,
+            "high_risk_min_blocks": 110,
+            "high_risk_min_constraints": 12,
+        },
+    )()
+
+    order_multiplier, pairwise_multiplier = train_module.decoder_ranking_multipliers(
+        inst, args, encoder_type="hgt"
+    )
+    mpnn_order, mpnn_pairwise = train_module.decoder_ranking_multipliers(
+        inst, args, encoder_type="mpnn"
+    )
+
+    assert order_multiplier == 1.7
+    assert pairwise_multiplier == 1.6
+    assert (mpnn_order, mpnn_pairwise) == (1.0, 1.0)
 
 
 def test_hetero_graph_keeps_constraints_as_first_class_nodes():

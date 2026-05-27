@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -62,6 +64,115 @@ class GraphTransformerLayer(nn.Module):
         return h
 
 
+def _relation_key(relation: tuple[str, str, str]) -> str:
+    return "__".join(relation)
+
+
+def _edge_softmax_by_dst(scores: torch.Tensor, dst: torch.Tensor, dst_count: int) -> torch.Tensor:
+    if scores.numel() == 0:
+        return scores
+    alpha = torch.zeros_like(scores)
+    for node in torch.unique(dst).tolist():
+        if node < 0 or node >= dst_count:
+            continue
+        mask = dst == int(node)
+        alpha[mask] = torch.softmax(scores[mask], dim=0)
+    return alpha
+
+
+class HGTLayer(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        node_types: tuple[str, ...],
+        relation_specs: tuple[tuple[str, str, str], ...],
+    ):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.node_types = tuple(node_types)
+        self.relation_specs = tuple(relation_specs)
+        self.query = nn.ModuleDict(
+            {node_type: nn.Linear(hidden_dim, hidden_dim) for node_type in self.node_types}
+        )
+        self.rel_key = nn.ModuleDict(
+            {_relation_key(relation): nn.Linear(hidden_dim, hidden_dim) for relation in self.relation_specs}
+        )
+        self.rel_value = nn.ModuleDict(
+            {_relation_key(relation): nn.Linear(hidden_dim, hidden_dim) for relation in self.relation_specs}
+        )
+        self.rel_edge_bias = nn.ModuleDict(
+            {_relation_key(relation): nn.Linear(1, num_heads, bias=False) for relation in self.relation_specs}
+        )
+        self.attn_norm = nn.ModuleDict(
+            {node_type: nn.LayerNorm(hidden_dim) for node_type in self.node_types}
+        )
+        self.ff = nn.ModuleDict(
+            {
+                node_type: nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 2),
+                    nn.SiLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                )
+                for node_type in self.node_types
+            }
+        )
+        self.ff_norm = nn.ModuleDict(
+            {node_type: nn.LayerNorm(hidden_dim) for node_type in self.node_types}
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        states: dict[str, torch.Tensor],
+        edge_index: dict[tuple[str, str, str], torch.Tensor],
+        edge_attr: dict[tuple[str, str, str], torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        messages = {
+            node_type: states[node_type].new_zeros(states[node_type].shape)
+            for node_type in self.node_types
+        }
+        for relation in self.relation_specs:
+            if relation not in edge_index:
+                continue
+            src_type, _edge_type, dst_type = relation
+            edges = edge_index[relation]
+            if edges.numel() == 0:
+                continue
+            src = edges[0].to(device=states[src_type].device)
+            dst = edges[1].to(device=states[dst_type].device)
+            key = _relation_key(relation)
+            src_h = states[src_type][src]
+            dst_h = states[dst_type][dst]
+            q = self.query[dst_type](dst_h).view(-1, self.num_heads, self.head_dim)
+            k = self.rel_key[key](src_h).view(-1, self.num_heads, self.head_dim)
+            v = self.rel_value[key](src_h).view(-1, self.num_heads, self.head_dim)
+            scores = (q * k).sum(dim=-1) / math.sqrt(max(float(self.head_dim), 1.0))
+            attr = edge_attr.get(relation)
+            if attr is None:
+                attr = states[src_type].new_ones((src.numel(), 1))
+            attr = attr.to(device=states[src_type].device, dtype=states[src_type].dtype)
+            scores = scores + self.rel_edge_bias[key](attr)
+            alpha = _edge_softmax_by_dst(scores, dst, states[dst_type].shape[0])
+            msg = (alpha.unsqueeze(-1) * v).reshape(-1, self.hidden_dim)
+            messages[dst_type].index_add_(0, dst, msg)
+
+        updated: dict[str, torch.Tensor] = {}
+        for node_type in self.node_types:
+            h = self.attn_norm[node_type](states[node_type] + self.dropout(messages[node_type]))
+            h = self.ff_norm[node_type](h + self.dropout(self.ff[node_type](h)))
+            updated[node_type] = h
+        return updated
+
+
 class FloorplanGNN(nn.Module):
     """Anchor-GNN v2 compatible with the arch_new trained checkpoints."""
 
@@ -75,9 +186,11 @@ class FloorplanGNN(nn.Module):
         num_heads: int = 4,
         structural_feat_dim: int = 0,
         edge_type_count: int = 1,
+        hgt_node_feat_dims: dict[str, int] | None = None,
+        hgt_relation_specs: tuple[tuple[str, str, str], ...] | list[tuple[str, str, str]] | None = None,
     ):
         super().__init__()
-        if encoder_type not in {"mpnn", "graph-transformer"}:
+        if encoder_type not in {"mpnn", "graph-transformer", "hgt"}:
             raise ValueError(f"Unsupported encoder_type: {encoder_type}")
         self.node_feat_dim = node_feat_dim
         self.hidden_dim = hidden_dim
@@ -87,6 +200,8 @@ class FloorplanGNN(nn.Module):
         self.num_heads = num_heads
         self.structural_feat_dim = structural_feat_dim
         self.edge_type_count = max(1, edge_type_count)
+        self.hgt_node_feat_dims = dict(hgt_node_feat_dims or {"block": node_feat_dim})
+        self.hgt_relation_specs = tuple(tuple(relation) for relation in (hgt_relation_specs or ()))
 
         self.node_in = nn.Sequential(
             nn.Linear(node_feat_dim, hidden_dim),
@@ -117,7 +232,7 @@ class FloorplanGNN(nn.Module):
                     )
                 )
                 self.norms.append(nn.LayerNorm(hidden_dim))
-        else:
+        elif encoder_type == "graph-transformer":
             self.structural_in = (
                 nn.Sequential(
                     nn.Linear(structural_feat_dim, hidden_dim),
@@ -129,6 +244,27 @@ class FloorplanGNN(nn.Module):
             )
             self.transformer_layers = nn.ModuleList(
                 GraphTransformerLayer(hidden_dim, num_heads, dropout, self.edge_type_count)
+                for _ in range(num_layers)
+            )
+        else:
+            self.hgt_node_in = nn.ModuleDict(
+                {
+                    node_type: nn.Sequential(
+                        nn.Linear(feat_dim, hidden_dim),
+                        nn.LayerNorm(hidden_dim),
+                        nn.SiLU(),
+                    )
+                    for node_type, feat_dim in sorted(self.hgt_node_feat_dims.items())
+                }
+            )
+            self.hgt_layers = nn.ModuleList(
+                HGTLayer(
+                    hidden_dim,
+                    num_heads,
+                    dropout,
+                    tuple(sorted(self.hgt_node_feat_dims)),
+                    self.hgt_relation_specs,
+                )
                 for _ in range(num_layers)
             )
 
@@ -167,6 +303,9 @@ class FloorplanGNN(nn.Module):
         edge_attr: torch.Tensor,
         edge_type: torch.Tensor | None = None,
         structural_feat: torch.Tensor | None = None,
+        hgt_node_features: dict[str, torch.Tensor] | None = None,
+        hgt_edge_index: dict[tuple[str, str, str], torch.Tensor] | None = None,
+        hgt_edge_attr: dict[tuple[str, str, str], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         h = self.node_in(node_feat)
         if self.encoder_type == "graph-transformer":
@@ -177,6 +316,18 @@ class FloorplanGNN(nn.Module):
             for layer in self.transformer_layers:
                 h = layer(h, edge_index, edge_attr, edge_type=edge_type)
             return h
+        if self.encoder_type == "hgt":
+            if hgt_node_features is None:
+                hgt_node_features = {"block": node_feat}
+            states: dict[str, torch.Tensor] = {}
+            for node_type, projector in self.hgt_node_in.items():
+                features = hgt_node_features.get(node_type)
+                if features is None:
+                    features = node_feat.new_empty((0, self.hgt_node_feat_dims[node_type]))
+                states[node_type] = projector(features.to(device=node_feat.device, dtype=node_feat.dtype))
+            for layer in self.hgt_layers:
+                states = layer(states, hgt_edge_index or {}, hgt_edge_attr or {})
+            return states["block"]
         n = h.shape[0]
         if edge_index.numel() == 0:
             return h
@@ -201,6 +352,9 @@ class FloorplanGNN(nn.Module):
         edge_attr: torch.Tensor,
         edge_type: torch.Tensor | None = None,
         structural_feat: torch.Tensor | None = None,
+        hgt_node_features: dict[str, torch.Tensor] | None = None,
+        hgt_edge_index: dict[tuple[str, str, str], torch.Tensor] | None = None,
+        hgt_edge_attr: dict[tuple[str, str, str], torch.Tensor] | None = None,
         pairs: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         h = self.encode(
@@ -209,6 +363,9 @@ class FloorplanGNN(nn.Module):
             edge_attr,
             edge_type=edge_type,
             structural_feat=structural_feat,
+            hgt_node_features=hgt_node_features,
+            hgt_edge_index=hgt_edge_index,
+            hgt_edge_attr=hgt_edge_attr,
         )
         g = h.mean(dim=0, keepdim=True).expand_as(h)
         z = torch.cat([h, g, node_feat], dim=1)
