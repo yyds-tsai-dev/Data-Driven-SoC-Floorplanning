@@ -61,6 +61,7 @@ def anchor_checkpoint_payload(
         "epoch": epoch,
         "train_stats": train_stats,
         "val_stats": val_stats,
+        "selection_metric": "val_loss",
         "args": vars(args),
     }
     if optimizer is not None:

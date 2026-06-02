@@ -584,7 +584,7 @@ def main(args) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_tag = args.checkpoint_tag or build_run_tag(args)
     latest_path = out_dir / f"{args.checkpoint_prefix}_latest_{run_tag}.pt"
-    best_path = out_dir / f"{args.checkpoint_prefix}_best_{run_tag}.pt"
+    best_val_loss_path = out_dir / f"{args.checkpoint_prefix}_best_val_loss_{run_tag}.pt"
     wandb_run = maybe_init_wandb(args)
 
     print("=" * 72)
@@ -727,7 +727,7 @@ def main(args) -> None:
         if val_stats["loss"] < best_val:
             best_val = val_stats["loss"]
             save_anchor_checkpoint(
-                best_path,
+                best_val_loss_path,
                 model,
                 args,
                 epoch,
@@ -745,7 +745,7 @@ def main(args) -> None:
                     val_stats,
                     optimizer=optimizer,
                 )
-            print(f"Saved best checkpoint to {best_path}", flush=True)
+            print(f"Saved best checkpoint to {best_val_loss_path}", flush=True)
             if args.write_stable_checkpoints:
                 print(
                     f"Updated stable checkpoint at {out_dir / f'{args.checkpoint_prefix}_best.pt'}",
@@ -753,7 +753,7 @@ def main(args) -> None:
                 )
 
     print(f"Best val loss: {best_val:.5f}")
-    print(f"Best checkpoint: {best_path}")
+    print(f"Best val-loss checkpoint: {best_val_loss_path}")
     if wandb_run is not None:
         wandb_run.summary["best_val_loss"] = best_val
         wandb_run.finish()

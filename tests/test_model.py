@@ -15,6 +15,10 @@ from floorset_arch.training.losses import (
     is_constraint_clean_training_sample,
 )
 from floorset_arch.training.checkpoint import anchor_checkpoint_payload, build_run_tag
+from floorset_arch.training.selection import (
+    CheckpointMetricRecord,
+    better_checkpoint_metric,
+)
 from floorset_arch.training import train as train_module
 
 
@@ -365,6 +369,55 @@ def test_anchor_checkpoint_payload_records_encoder_config():
     assert payload["encoder_type"] == "graph-transformer"
     assert payload["num_heads"] == 4
     assert payload["has_pair_head"] is True
+
+
+def test_checkpoint_metric_prefers_no_runtime_over_val_loss():
+    low_val_loss_bad_eval = CheckpointMetricRecord(
+        checkpoint="bad_eval.pt",
+        epoch=3,
+        metric_source="tail_eval",
+        feasible=100,
+        val_loss=0.001,
+        total_score_no_runtime=2.70,
+        tail_weighted_no_runtime=2.70,
+        soft_violations=10,
+        avg_runtime=1.0,
+    )
+    higher_val_loss_good_eval = CheckpointMetricRecord(
+        checkpoint="good_eval.pt",
+        epoch=2,
+        metric_source="tail_eval",
+        feasible=100,
+        val_loss=0.010,
+        total_score_no_runtime=2.05,
+        tail_weighted_no_runtime=2.05,
+        soft_violations=4,
+        avg_runtime=1.2,
+    )
+
+    assert better_checkpoint_metric(higher_val_loss_good_eval, low_val_loss_bad_eval)
+    assert not better_checkpoint_metric(low_val_loss_bad_eval, higher_val_loss_good_eval)
+
+
+def test_checkpoint_metric_manifest_round_trips(tmp_path):
+    from floorset_arch.training.selection import append_metric_record, read_metric_records
+
+    manifest = tmp_path / "checkpoint_metrics.jsonl"
+    record = CheckpointMetricRecord(
+        checkpoint="ckpt.pt",
+        epoch=4,
+        metric_source="full_eval",
+        feasible=100,
+        val_loss=0.004,
+        total_score_no_runtime=2.01,
+        tail_weighted_no_runtime=2.03,
+        soft_violations=5,
+        avg_runtime=1.5,
+    )
+
+    append_metric_record(manifest, record)
+
+    assert read_metric_records(manifest) == [record]
 
 
 def test_hgt_run_tag_records_batch_size():
