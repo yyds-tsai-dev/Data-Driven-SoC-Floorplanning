@@ -18,6 +18,7 @@ from floorset_arch.training.pseudo_targets import (
     PseudoTargetConfig,
     TrainingTargetSource,
     build_training_target_record,
+    fp_sol_to_target_positions,
 )
 from floorset_arch.training.checkpoint import anchor_checkpoint_payload, build_run_tag
 from floorset_arch.training.selection import (
@@ -547,6 +548,41 @@ def test_repaired_clean_enough_target_enables_dirty_order_weight():
     assert record.sample_weight == 0.25
     assert record.order_weight_multiplier == 0.35
     assert record.pairwise_weight_multiplier == 0.35
+
+
+def test_repaired_pseudo_target_preserves_preplaced_training_fp_sol_order():
+    block_count = 2
+    area_targets = torch.tensor([4.0, 4.0])
+    constraints = torch.tensor(
+        [
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    fp_sol = torch.tensor(
+        [
+            [2.0, 2.0, 10.0, 20.0],
+            [2.0, 2.0, 30.0, 20.0],
+        ]
+    )
+    inst = parse_instance(
+        block_count,
+        area_targets,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        fp_sol_to_target_positions(fp_sol, block_count),
+    )
+
+    record = build_training_target_record(
+        inst,
+        fp_sol,
+        PseudoTargetConfig(enabled=True, clean_enough_soft_violations=0),
+    )
+
+    assert record.original_soft_violations[0] > 0
+    assert torch.equal(record.target_fp_sol[0], fp_sol[0])
 
 
 def test_hetero_graph_keeps_constraints_as_first_class_nodes():

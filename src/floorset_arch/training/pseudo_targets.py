@@ -41,6 +41,11 @@ def placement_to_fp_sol(placement: Placement, block_count: int) -> torch.Tensor:
     return torch.tensor(rows, dtype=torch.float32)
 
 
+def fp_sol_to_target_positions(fp_sol: torch.Tensor, block_count: int) -> torch.Tensor:
+    gt = fp_sol[:block_count].float()
+    return torch.stack([gt[:, 2], gt[:, 3], gt[:, 0], gt[:, 1]], dim=1)
+
+
 def build_training_target_record(
     inst: Instance,
     fp_sol: torch.Tensor,

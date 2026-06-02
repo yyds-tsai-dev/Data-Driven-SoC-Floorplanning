@@ -37,6 +37,7 @@ from floorset_arch.training.pseudo_targets import (
     PseudoTargetConfig,
     TrainingTargetSource,
     build_training_target_record,
+    fp_sol_to_target_positions,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -218,7 +219,13 @@ def _prepare_training_sample(sample, model, device: torch.device, args):
 
     block_count = valid_block_count(area_targets)
     inst = parse_instance(
-        block_count, area_targets, b2b, p2b, pins, constraints, fp_sol
+        block_count,
+        area_targets,
+        b2b,
+        p2b,
+        pins,
+        constraints,
+        fp_sol_to_target_positions(fp_sol, block_count),
     )
     target_record = build_training_target_record(
         inst, fp_sol, _pseudo_target_config(args)
