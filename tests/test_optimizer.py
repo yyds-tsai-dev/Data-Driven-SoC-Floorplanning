@@ -216,6 +216,54 @@ def test_anchor_guidance_can_store_pairwise_logits():
     assert guidance.pairwise_axis[(0, 1)] == (2.0, -1.0)
 
 
+def test_guidance_ablation_can_disable_pairwise_aspect_and_priority(monkeypatch):
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    pairs = torch.tensor([[0, 1]], dtype=torch.long)
+    pred = {
+        "anchor": torch.tensor([[0.5, 0.5], [2.5, 0.5]], dtype=torch.float32),
+        "priority": torch.tensor([0.75, 0.25], dtype=torch.float32),
+        "log_aspect": torch.tensor([0.4, -0.4], dtype=torch.float32),
+        "pair_logits": torch.tensor([[2.0, -1.0]], dtype=torch.float32),
+    }
+
+    monkeypatch.setenv("FLOORSET_GUIDANCE_DISABLE_PAIRWISE", "1")
+    monkeypatch.setenv("FLOORSET_GUIDANCE_DISABLE_ASPECT", "1")
+    monkeypatch.setenv("FLOORSET_GUIDANCE_DISABLE_PRIORITY", "1")
+
+    guidance = optimizer._anchor_predictions_to_guidance(
+        inst, pred, scale=1.0, pairs=pairs
+    )
+
+    assert guidance.rect_priors
+    assert guidance.pairwise_axis == {}
+    assert guidance.log_aspect == {}
+    assert guidance.priority == {}
+
+
+def test_guidance_anchor_only_keeps_rect_priors(monkeypatch):
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    pairs = torch.tensor([[0, 1]], dtype=torch.long)
+    pred = {
+        "anchor": torch.tensor([[0.5, 0.5], [2.5, 0.5]], dtype=torch.float32),
+        "priority": torch.tensor([0.75, 0.25], dtype=torch.float32),
+        "log_aspect": torch.tensor([0.4, -0.4], dtype=torch.float32),
+        "pair_logits": torch.tensor([[2.0, -1.0]], dtype=torch.float32),
+    }
+
+    monkeypatch.setenv("FLOORSET_GUIDANCE_ANCHOR_ONLY", "1")
+
+    guidance = optimizer._anchor_predictions_to_guidance(
+        inst, pred, scale=1.0, pairs=pairs
+    )
+
+    assert sorted(guidance.rect_priors) == [0, 1]
+    assert guidance.pairwise_axis == {}
+    assert guidance.log_aspect == {}
+    assert guidance.priority == {}
+
+
 def test_large_case_candidate_specs_include_relative_order_profiles(monkeypatch):
     monkeypatch.setenv("FLOORSET_ENABLE_LARGE_CASE_CANDIDATES", "1")
     monkeypatch.delenv("FLOORSET_INCLUDE_BEAM_CANDIDATES", raising=False)

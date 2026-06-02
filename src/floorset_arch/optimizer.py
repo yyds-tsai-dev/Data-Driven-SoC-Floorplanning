@@ -148,6 +148,11 @@ def _build_candidate_worker(
             inst.anchor_guidance = saved_guidance
 
 
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 class ArchitectureV5Optimizer(FloorplanOptimizer):
     """Anchor-GNN guided hetero-graph beam solver with selectable checkpoint encoders."""
 
@@ -783,6 +788,12 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         scale: float,
         pairs: torch.Tensor | None = None,
     ) -> AnchorGuidance:
+        anchor_only = _env_flag("FLOORSET_GUIDANCE_ANCHOR_ONLY")
+        disable_pairwise = anchor_only or _env_flag(
+            "FLOORSET_GUIDANCE_DISABLE_PAIRWISE"
+        )
+        disable_aspect = anchor_only or _env_flag("FLOORSET_GUIDANCE_DISABLE_ASPECT")
+        disable_priority = anchor_only or _env_flag("FLOORSET_GUIDANCE_DISABLE_PRIORITY")
         anchors = pred["anchor"].detach().cpu() * max(float(scale), 1.0)
         priority_tensor = pred.get("priority")
         aspect_tensor = pred.get("log_aspect")
@@ -799,7 +810,8 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                 width = math.sqrt(area)
                 height = math.sqrt(area)
             if (
-                aspect_tensor is not None
+                not disable_aspect
+                and aspect_tensor is not None
                 and i not in inst.fixed
                 and i not in inst.preplaced
             ):
@@ -818,10 +830,10 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     width,
                     height,
                 )
-            if priority_tensor is not None:
+            if not disable_priority and priority_tensor is not None:
                 guidance.priority[i] = float(priority_tensor.detach().cpu()[i])
         pair_logits = pred.get("pair_logits")
-        if pair_logits is not None and pairs is not None:
+        if not disable_pairwise and pair_logits is not None and pairs is not None:
             logits = pair_logits.detach().cpu()
             for pair, logit in zip(pairs.detach().cpu().tolist(), logits.tolist()):
                 guidance.pairwise_axis[(int(pair[0]), int(pair[1]))] = (
