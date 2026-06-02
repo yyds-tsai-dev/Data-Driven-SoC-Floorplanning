@@ -44,6 +44,12 @@ class AnchorHGTGraphInputs:
     relation_specs: tuple[tuple[str, str, str], ...]
 
 
+@dataclass(frozen=True)
+class BatchedAnchorHGTGraphInputs(AnchorHGTGraphInputs):
+    node_batch: dict[str, torch.Tensor]
+    sample_block_slices: list[tuple[int, int]]
+
+
 def _safe_float(x) -> float:
     try:
         return float(x)
@@ -396,13 +402,22 @@ def _boundary_node_features(inst: Instance, device: torch.device) -> torch.Tenso
 
 
 def build_anchor_hgt_graph_inputs(
-    inst: Instance, device: torch.device | None = None
+    inst: Instance,
+    device: torch.device | None = None,
+    block_features: torch.Tensor | None = None,
+    scale: float | None = None,
 ) -> AnchorHGTGraphInputs:
     """Build local typed HGT inputs from the explicit hetero floorplan graph."""
     from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 
     device = device or inst.area_targets.device
-    block_features, scale = build_anchor_node_features(inst, device=device)
+    if block_features is None:
+        block_features, scale = build_anchor_node_features(inst, device=device)
+    else:
+        block_features = block_features.to(device=device, dtype=torch.float32)
+        if scale is None:
+            area = torch.clamp(inst.area_targets[: inst.block_count].float(), min=1.0)
+            scale = float(torch.sqrt(torch.clamp(area.sum(), min=1.0)).item())
     if inst.pins_pos.numel() > 0:
         pins = inst.pins_pos.float().to(device)
         valid_pin = ((pins[:, 0] != -1.0) & (pins[:, 1] != -1.0)).float().view(-1, 1)
@@ -421,7 +436,7 @@ def build_anchor_hgt_graph_inputs(
     edge_src: dict[tuple[str, str, str], list[int]] = {}
     edge_dst: dict[tuple[str, str, str], list[int]] = {}
     edge_weight: dict[tuple[str, str, str], list[float]] = {}
-    graph = build_hetero_floorplan_graph(inst)
+    graph = build_hetero_floorplan_graph(inst, block_features=block_features.detach().cpu())
     for edge in graph.edges:
         relation = (edge.src_type, edge.edge_type, edge.dst_type)
         if edge.src >= node_features[edge.src_type].shape[0]:
@@ -459,4 +474,89 @@ def build_anchor_hgt_graph_inputs(
         edge_attr=edge_attr,
         node_feat_dims=node_feat_dims,
         relation_specs=relation_specs,
+    )
+
+
+def batch_anchor_hgt_graph_inputs(
+    graphs: list[AnchorHGTGraphInputs],
+) -> BatchedAnchorHGTGraphInputs:
+    if not graphs:
+        raise ValueError("batch_anchor_hgt_graph_inputs requires at least one graph")
+
+    node_types = tuple(graphs[0].node_features)
+    relation_specs = graphs[0].relation_specs
+    device = next(iter(graphs[0].node_features.values())).device
+
+    node_features: dict[str, torch.Tensor] = {}
+    node_batch: dict[str, torch.Tensor] = {}
+    node_offsets: list[dict[str, int]] = []
+    running_offsets = {node_type: 0 for node_type in node_types}
+    sample_block_slices: list[tuple[int, int]] = []
+
+    for sample_idx, graph in enumerate(graphs):
+        offsets_for_graph = dict(running_offsets)
+        node_offsets.append(offsets_for_graph)
+        block_start = running_offsets["block"]
+        block_count = graph.node_features["block"].shape[0]
+        sample_block_slices.append((block_start, block_start + block_count))
+        for node_type in node_types:
+            running_offsets[node_type] += graph.node_features[node_type].shape[0]
+
+    for node_type in node_types:
+        pieces = [graph.node_features[node_type] for graph in graphs]
+        if pieces:
+            node_features[node_type] = torch.cat(pieces, dim=0)
+        else:
+            node_features[node_type] = graphs[0].node_features[node_type]
+        batch_parts = [
+            torch.full(
+                (graph.node_features[node_type].shape[0],),
+                sample_idx,
+                dtype=torch.long,
+                device=device,
+            )
+            for sample_idx, graph in enumerate(graphs)
+        ]
+        node_batch[node_type] = (
+            torch.cat(batch_parts, dim=0)
+            if batch_parts
+            else torch.empty((0,), dtype=torch.long, device=device)
+        )
+
+    edge_index: dict[tuple[str, str, str], torch.Tensor] = {}
+    edge_attr: dict[tuple[str, str, str], torch.Tensor] = {}
+    for relation in relation_specs:
+        src_type, _edge_type, dst_type = relation
+        edge_parts = []
+        attr_parts = []
+        for graph, offsets in zip(graphs, node_offsets, strict=True):
+            edges = graph.edge_index[relation]
+            if edges.numel() == 0:
+                continue
+            offset = torch.tensor(
+                [[offsets[src_type]], [offsets[dst_type]]],
+                dtype=edges.dtype,
+                device=edges.device,
+            )
+            edge_parts.append(edges + offset)
+            attr_parts.append(graph.edge_attr[relation])
+        edge_index[relation] = (
+            torch.cat(edge_parts, dim=1)
+            if edge_parts
+            else torch.empty((2, 0), dtype=torch.long, device=device)
+        )
+        edge_attr[relation] = (
+            torch.cat(attr_parts, dim=0)
+            if attr_parts
+            else torch.empty((0, 1), dtype=torch.float32, device=device)
+        )
+
+    return BatchedAnchorHGTGraphInputs(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        node_feat_dims=graphs[0].node_feat_dims,
+        relation_specs=relation_specs,
+        node_batch=node_batch,
+        sample_block_slices=sample_block_slices,
     )

@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from floorset_arch.features import (
+    batch_anchor_hgt_graph_inputs,
     build_anchor_edge_tensors,
     build_anchor_hgt_graph_inputs,
     build_anchor_node_features,
@@ -75,7 +76,13 @@ def choose_window_start(
 
 
 def make_loader(
-    dataset, start: int, count: int, shuffle: bool, seed: int, num_workers: int
+    dataset,
+    start: int,
+    count: int,
+    shuffle: bool,
+    seed: int,
+    num_workers: int,
+    batch_size: int = 1,
 ):
     total = len(dataset)
     n = min(max(1, count), total)
@@ -85,7 +92,7 @@ def make_loader(
         random.Random(seed).shuffle(indices)
     loader = DataLoader(
         Subset(dataset, indices),
-        batch_size=1,
+        batch_size=max(1, int(batch_size)),
         shuffle=False,
         collate_fn=floorplan_collate,
         num_workers=num_workers,
@@ -104,6 +111,33 @@ def unpack_batch(batch):
         fp_sol.squeeze(0),
         metrics.squeeze(0),
     )
+
+
+def _batch_sample_count(batch) -> int:
+    area_targets = batch[0]
+    if area_targets.dim() == 1:
+        return 1
+    return int(area_targets.shape[0])
+
+
+def unpack_batch_sample(batch, index: int):
+    if _batch_sample_count(batch) == 1:
+        return unpack_batch(batch)
+    area_targets, b2b, p2b, pins, constraints, _tree_sol, fp_sol, metrics = batch
+    return (
+        area_targets[index],
+        b2b[index],
+        p2b[index],
+        pins[index],
+        constraints[index],
+        fp_sol[index],
+        metrics[index],
+    )
+
+
+def iter_batch_samples(batch):
+    for index in range(_batch_sample_count(batch)):
+        yield unpack_batch_sample(batch, index)
 
 
 def decoder_constraint_count(inst) -> int:
@@ -130,6 +164,125 @@ def decoder_ranking_multipliers(inst, args, encoder_type: str) -> tuple[float, f
     )
 
 
+def _prepare_training_sample(sample, model, device: torch.device, args):
+    area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = sample
+    soft_violations = fp_sol_soft_violations(
+        fp_sol, area_targets, b2b, p2b, pins, constraints
+    )
+    is_clean = sum(soft_violations) == 0
+    if args.clean_sample_policy == "strict" and not is_clean:
+        return None, is_clean
+
+    block_count = valid_block_count(area_targets)
+    inst = parse_instance(
+        block_count, area_targets, b2b, p2b, pins, constraints, fp_sol
+    )
+    node_feat, scale = build_anchor_node_features(inst, device=device)
+    edge_type = None
+    structural_feat = None
+    hgt_node_features = None
+    hgt_edge_index = None
+    hgt_edge_attr = None
+    hgt_graph_inputs = None
+    encoder_type = getattr(model, "encoder_type", args.encoder)
+    if encoder_type == "graph-transformer":
+        graph_inputs = build_anchor_transformer_graph_inputs(inst, device=device)
+        edge_index = graph_inputs.edge_index
+        edge_attr = graph_inputs.edge_attr
+        edge_type = graph_inputs.edge_type
+        structural_feat = graph_inputs.node_structural_features
+    elif encoder_type == "hgt":
+        graph_inputs = build_anchor_hgt_graph_inputs(
+            inst, device=device, block_features=node_feat, scale=scale
+        )
+        node_feat = graph_inputs.node_features["block"]
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        edge_attr = torch.empty((0, 1), dtype=torch.float32, device=device)
+        hgt_node_features = graph_inputs.node_features
+        hgt_edge_index = graph_inputs.edge_index
+        hgt_edge_attr = graph_inputs.edge_attr
+        hgt_graph_inputs = graph_inputs
+    else:
+        edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
+
+    targets = build_anchor_targets(fp_sol, block_count, scale, device)
+    weights = constraint_weights(constraints, block_count, device, args)
+    pairs = sample_pairs(block_count, args.pairwise_pairs, device)
+    loss_args = args
+    sample_weight = 1.0
+    order_weight_multiplier = 1.0
+    decoder_order_multiplier, decoder_pairwise_multiplier = decoder_ranking_multipliers(
+        inst, args, encoder_type
+    )
+    pairwise_weight_multiplier = decoder_pairwise_multiplier
+    order_weight_multiplier *= decoder_order_multiplier
+    if args.clean_sample_policy == "weighted" and not is_clean:
+        sample_weight = args.dirty_sample_weight
+        order_weight_multiplier *= args.dirty_order_weight
+        pairwise_weight_multiplier *= args.dirty_order_weight
+    if order_weight_multiplier != 1.0:
+        loss_args = SimpleNamespace(**vars(args))
+        loss_args.order_weight = args.order_weight * order_weight_multiplier
+
+    return {
+        "inst": inst,
+        "fp_sol": fp_sol,
+        "node_feat": node_feat,
+        "edge_index": edge_index,
+        "edge_attr": edge_attr,
+        "edge_type": edge_type,
+        "structural_feat": structural_feat,
+        "hgt_node_features": hgt_node_features,
+        "hgt_edge_index": hgt_edge_index,
+        "hgt_edge_attr": hgt_edge_attr,
+        "hgt_graph_inputs": hgt_graph_inputs,
+        "targets": targets,
+        "weights": weights,
+        "pairs": pairs,
+        "loss_args": loss_args,
+        "scale": scale,
+        "sample_weight": sample_weight,
+        "pairwise_weight_multiplier": pairwise_weight_multiplier,
+        "is_clean": is_clean,
+    }, is_clean
+
+
+def _loss_for_prepared_sample(pred, prepared, args):
+    inst = prepared["inst"]
+    pairs = prepared["pairs"]
+    loss, parts = compute_anchor_losses(
+        pred,
+        prepared["targets"],
+        prepared["weights"],
+        inst.valid_b2b,
+        prepared["loss_args"],
+    )
+    pair_targets = build_pairwise_relation_targets(
+        prepared["fp_sol"][: inst.block_count].to(pred["anchor"].device),
+        pairs,
+        min_gap=args.min_order_gap * max(float(prepared["scale"]), 1.0),
+        clear_ratio=args.clear_ratio,
+    )
+    pair_loss, pair_acc = pairwise_relation_loss(pred["pair_logits"], pair_targets)
+    effective_pair_loss = prepared["pairwise_weight_multiplier"] * pair_loss
+    loss = loss + args.pairwise_weight * effective_pair_loss
+    loss = loss * prepared["sample_weight"]
+    return loss, parts, effective_pair_loss, pair_acc
+
+
+def _add_sample_stats(sums, loss, parts, effective_pair_loss, pair_acc) -> None:
+    sums["loss"] += float(loss.item())
+    sums["anchor"] += float(parts["anchor"].item())
+    sums["aspect"] += float(parts["aspect"].item())
+    sums["priority"] += float(parts["priority"].item())
+    sums["order"] += float(parts["order"].item())
+    sums["edge"] += float(parts["edge"].item())
+    sums["ord_frac"] += float(parts["ord_frac"])
+    sums["ord_acc"] += float(parts["ord_acc"])
+    sums["pairwise"] += float(effective_pair_loss.item())
+    sums["pair_acc"] += float(pair_acc)
+
+
 def run_epoch(
     model, optimizer, loader, device: torch.device, args, epoch: int, train: bool
 ) -> dict[str, float]:
@@ -154,129 +307,148 @@ def run_epoch(
     clean_count = 0
     dirty_count = 0
     accumulation_steps = max(1, int(args.accumulation_steps))
+    pending_samples = 0
     if train:
         optimizer.zero_grad(set_to_none=True)
-    for batch in loader:
-        area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = unpack_batch(
-            batch
-        )
-        soft_violations = fp_sol_soft_violations(
-            fp_sol, area_targets, b2b, p2b, pins, constraints
-        )
-        is_clean = sum(soft_violations) == 0
-        if args.clean_sample_policy == "strict" and not is_clean:
-            skipped += 1
-            continue
-        if is_clean:
-            clean_count += 1
-        else:
-            dirty_count += 1
-        block_count = valid_block_count(area_targets)
-        inst = parse_instance(
-            block_count, area_targets, b2b, p2b, pins, constraints, fp_sol
-        )
-        node_feat, scale = build_anchor_node_features(inst, device=device)
-        edge_type = None
-        structural_feat = None
-        hgt_node_features = None
-        hgt_edge_index = None
-        hgt_edge_attr = None
-        encoder_type = getattr(model, "encoder_type", args.encoder)
-        if encoder_type == "graph-transformer":
-            graph_inputs = build_anchor_transformer_graph_inputs(inst, device=device)
-            edge_index = graph_inputs.edge_index
-            edge_attr = graph_inputs.edge_attr
-            edge_type = graph_inputs.edge_type
-            structural_feat = graph_inputs.node_structural_features
-        elif encoder_type == "hgt":
-            graph_inputs = build_anchor_hgt_graph_inputs(inst, device=device)
-            node_feat = graph_inputs.node_features["block"]
-            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-            edge_attr = torch.empty((0, 1), dtype=torch.float32, device=device)
-            hgt_node_features = graph_inputs.node_features
-            hgt_edge_index = graph_inputs.edge_index
-            hgt_edge_attr = graph_inputs.edge_attr
-        else:
-            edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
-        targets = build_anchor_targets(fp_sol, block_count, scale, device)
-        weights = constraint_weights(constraints, block_count, device, args)
-        pairs = sample_pairs(block_count, args.pairwise_pairs, device)
-        loss_args = args
-        sample_weight = 1.0
-        order_weight_multiplier = 1.0
-        decoder_order_multiplier, decoder_pairwise_multiplier = decoder_ranking_multipliers(
-            inst, args, encoder_type
-        )
-        pairwise_weight_multiplier = decoder_pairwise_multiplier
-        order_weight_multiplier *= decoder_order_multiplier
-        if args.clean_sample_policy == "weighted" and not is_clean:
-            sample_weight = args.dirty_sample_weight
-            order_weight_multiplier *= args.dirty_order_weight
-            pairwise_weight_multiplier *= args.dirty_order_weight
-        if order_weight_multiplier != 1.0:
-            loss_args = SimpleNamespace(**vars(args))
-            loss_args.order_weight = args.order_weight * order_weight_multiplier
 
-        with torch.set_grad_enabled(train):
-            pred = model(
-                node_feat,
-                edge_index,
-                edge_attr,
-                edge_type=edge_type,
-                structural_feat=structural_feat,
-                hgt_node_features=hgt_node_features,
-                hgt_edge_index=hgt_edge_index,
-                hgt_edge_attr=hgt_edge_attr,
-                pairs=pairs,
-            )
-            loss, parts = compute_anchor_losses(
-                pred, targets, weights, inst.valid_b2b, loss_args
-            )
-            pair_targets = build_pairwise_relation_targets(
-                fp_sol[:block_count].to(device),
-                pairs,
-                min_gap=args.min_order_gap * max(float(scale), 1.0),
-                clear_ratio=args.clear_ratio,
-            )
-            pair_loss, pair_acc = pairwise_relation_loss(pred["pair_logits"], pair_targets)
-            effective_pair_loss = pairwise_weight_multiplier * pair_loss
-            loss = loss + args.pairwise_weight * effective_pair_loss
-            loss = loss * sample_weight
-            if train:
-                (loss / accumulation_steps).backward()
-                if (count + 1) % accumulation_steps == 0:
-                    if args.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), args.grad_clip
-                        )
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-
-        sums["loss"] += float(loss.item())
-        sums["anchor"] += float(parts["anchor"].item())
-        sums["aspect"] += float(parts["aspect"].item())
-        sums["priority"] += float(parts["priority"].item())
-        sums["order"] += float(parts["order"].item())
-        sums["edge"] += float(parts["edge"].item())
-        sums["ord_frac"] += float(parts["ord_frac"])
-        sums["ord_acc"] += float(parts["ord_acc"])
-        sums["pairwise"] += float(effective_pair_loss.item())
-        sums["pair_acc"] += float(pair_acc)
-        count += 1
-        if train and args.print_every > 0 and count % args.print_every == 0:
-            print(
-                f"[epoch {epoch:03d} step {count:05d}] "
-                f"loss={loss.item():.5f} anchor={parts['anchor'].item():.5f} "
-                f"aspect={parts['aspect'].item():.5f} priority={parts['priority'].item():.5f} "
-                f"order={parts['order'].item():.5f} edge={parts['edge'].item():.5f} "
-                f"ord_acc={float(parts['ord_acc']):.3f} pair_acc={pair_acc:.3f}",
-                flush=True,
-            )
-    if train and count % accumulation_steps != 0:
+    def maybe_step(force: bool = False) -> None:
+        nonlocal pending_samples
+        if not train or pending_samples <= 0:
+            return
+        if not force and pending_samples < accumulation_steps:
+            return
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        pending_samples = 0
+
+    for batch in loader:
+        encoder_type = getattr(model, "encoder_type", args.encoder)
+        prepared_samples = []
+        for sample in iter_batch_samples(batch):
+            prepared, is_clean = _prepare_training_sample(sample, model, device, args)
+            if prepared is None:
+                skipped += 1
+                continue
+            if is_clean:
+                clean_count += 1
+            else:
+                dirty_count += 1
+            prepared_samples.append(prepared)
+
+        if not prepared_samples:
+            continue
+
+        if encoder_type == "hgt" and len(prepared_samples) > 1:
+            hgt_batch = batch_anchor_hgt_graph_inputs(
+                [prepared["hgt_graph_inputs"] for prepared in prepared_samples]
+            )
+            pair_parts = []
+            pair_slices = []
+            pair_start = 0
+            for prepared, (block_start, _block_end) in zip(
+                prepared_samples, hgt_batch.sample_block_slices, strict=True
+            ):
+                pairs = prepared["pairs"]
+                if pairs.numel() > 0:
+                    pair_parts.append(pairs + int(block_start))
+                pair_slices.append((pair_start, pair_start + pairs.shape[0]))
+                pair_start += pairs.shape[0]
+            batched_pairs = (
+                torch.cat(pair_parts, dim=0)
+                if pair_parts
+                else torch.empty((0, 2), dtype=torch.long, device=device)
+            )
+            if train and pending_samples + len(prepared_samples) > accumulation_steps:
+                maybe_step(force=True)
+            with torch.set_grad_enabled(train):
+                pred = model(
+                    hgt_batch.node_features["block"],
+                    torch.empty((2, 0), dtype=torch.long, device=device),
+                    torch.empty((0, 1), dtype=torch.float32, device=device),
+                    hgt_node_features=hgt_batch.node_features,
+                    hgt_edge_index=hgt_batch.edge_index,
+                    hgt_edge_attr=hgt_batch.edge_attr,
+                    pairs=batched_pairs,
+                    block_batch=hgt_batch.node_batch["block"],
+                )
+                batch_loss = pred["anchor"].sum() * 0.0
+                last_loss = None
+                last_parts = None
+                last_pair_acc = 0.0
+                for prepared, block_slice, pair_slice in zip(
+                    prepared_samples,
+                    hgt_batch.sample_block_slices,
+                    pair_slices,
+                    strict=True,
+                ):
+                    block_start, block_end = block_slice
+                    pair_start, pair_end = pair_slice
+                    sample_pred = {
+                        "anchor": pred["anchor"][block_start:block_end],
+                        "priority": pred["priority"][block_start:block_end],
+                        "log_aspect": pred["log_aspect"][block_start:block_end],
+                        "pair_logits": pred["pair_logits"][pair_start:pair_end],
+                    }
+                    loss, parts, effective_pair_loss, pair_acc = _loss_for_prepared_sample(
+                        sample_pred, prepared, args
+                    )
+                    batch_loss = batch_loss + loss
+                    _add_sample_stats(sums, loss, parts, effective_pair_loss, pair_acc)
+                    last_loss = loss
+                    last_parts = parts
+                    last_pair_acc = pair_acc
+                if train:
+                    (batch_loss / accumulation_steps).backward()
+                    pending_samples += len(prepared_samples)
+                    maybe_step(force=False)
+            count += len(prepared_samples)
+            if train and args.print_every > 0 and count % args.print_every == 0 and last_loss is not None:
+                print(
+                    f"[epoch {epoch:03d} step {count:05d}] "
+                    f"loss={last_loss.item():.5f} anchor={last_parts['anchor'].item():.5f} "
+                    f"aspect={last_parts['aspect'].item():.5f} priority={last_parts['priority'].item():.5f} "
+                    f"order={last_parts['order'].item():.5f} edge={last_parts['edge'].item():.5f} "
+                    f"ord_acc={float(last_parts['ord_acc']):.3f} pair_acc={last_pair_acc:.3f}",
+                    flush=True,
+                )
+            continue
+
+        for prepared in prepared_samples:
+            if train:
+                maybe_step(force=False)
+            with torch.set_grad_enabled(train):
+                pred = model(
+                    prepared["node_feat"],
+                    prepared["edge_index"],
+                    prepared["edge_attr"],
+                    edge_type=prepared["edge_type"],
+                    structural_feat=prepared["structural_feat"],
+                    hgt_node_features=prepared["hgt_node_features"],
+                    hgt_edge_index=prepared["hgt_edge_index"],
+                    hgt_edge_attr=prepared["hgt_edge_attr"],
+                    pairs=prepared["pairs"],
+                )
+                loss, parts, effective_pair_loss, pair_acc = _loss_for_prepared_sample(
+                    pred, prepared, args
+                )
+                if train:
+                    (loss / accumulation_steps).backward()
+                    pending_samples += 1
+                    maybe_step(force=False)
+            _add_sample_stats(sums, loss, parts, effective_pair_loss, pair_acc)
+            count += 1
+            if train and args.print_every > 0 and count % args.print_every == 0:
+                print(
+                    f"[epoch {epoch:03d} step {count:05d}] "
+                    f"loss={loss.item():.5f} anchor={parts['anchor'].item():.5f} "
+                    f"aspect={parts['aspect'].item():.5f} priority={parts['priority'].item():.5f} "
+                    f"order={parts['order'].item():.5f} edge={parts['edge'].item():.5f} "
+                    f"ord_acc={float(parts['ord_acc']):.3f} pair_acc={pair_acc:.3f}",
+                    flush=True,
+                )
+    maybe_step(force=True)
     stats = {key: value / max(count, 1) for key, value in sums.items()}
     stats["skipped"] = float(skipped)
     stats["used"] = float(count)
@@ -378,7 +550,13 @@ def main(args) -> None:
         total, args.val_samples, args.seed + 777, 0, args.val_start
     )
     val_loader, vs, ve = make_loader(
-        dataset, val_start, args.val_samples, False, args.seed, args.num_workers
+        dataset,
+        val_start,
+        args.val_samples,
+        False,
+        args.seed,
+        args.num_workers,
+        args.batch_size if args.encoder == "hgt" else 1,
     )
 
     model = None
@@ -421,6 +599,7 @@ def main(args) -> None:
         print(f"  attention heads  = {args.num_heads}")
     print(f"  dropout          = {args.dropout}")
     print(f"  accumulation     = {max(1, args.accumulation_steps)}")
+    print(f"  batch size       = {max(1, args.batch_size)}")
     print(f"  checkpoint tag   = {run_tag}")
     if args.resume_checkpoint:
         print(f"  resume checkpoint= {args.resume_checkpoint}")
@@ -438,13 +617,14 @@ def main(args) -> None:
             True,
             args.seed + epoch,
             args.num_workers,
+            args.batch_size,
         )
         print(f"Epoch {epoch:03d}: train window {ts}..{te}", flush=True)
 
         if model is None:
             first = next(iter(train_loader))
-            area_targets, b2b, p2b, pins, constraints, _fp_sol, _metrics = unpack_batch(
-                first
+            area_targets, b2b, p2b, pins, constraints, _fp_sol, _metrics = (
+                unpack_batch_sample(first, 0)
             )
             inst = parse_instance(
                 valid_block_count(area_targets),
@@ -491,6 +671,7 @@ def main(args) -> None:
                 True,
                 args.seed + epoch,
                 args.num_workers,
+                args.batch_size,
             )
             print(f"Created model with node_feat_dim={node_feat.shape[1]}", flush=True)
 
@@ -596,6 +777,7 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--accumulation-steps", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--anchor-weight", type=float, default=1.0)
     parser.add_argument("--aspect-weight", type=float, default=0.12)
     parser.add_argument("--priority-weight", type=float, default=0.08)

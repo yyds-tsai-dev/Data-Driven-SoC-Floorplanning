@@ -71,12 +71,23 @@ def _relation_key(relation: tuple[str, str, str]) -> str:
 def _edge_softmax_by_dst(scores: torch.Tensor, dst: torch.Tensor, dst_count: int) -> torch.Tensor:
     if scores.numel() == 0:
         return scores
+    if dst_count <= 0:
+        return torch.zeros_like(scores)
+    valid = (dst >= 0) & (dst < dst_count)
+    if not valid.any():
+        return torch.zeros_like(scores)
     alpha = torch.zeros_like(scores)
-    for node in torch.unique(dst).tolist():
-        if node < 0 or node >= dst_count:
-            continue
-        mask = dst == int(node)
-        alpha[mask] = torch.softmax(scores[mask], dim=0)
+    safe_dst = dst[valid].to(device=scores.device)
+    valid_scores = scores[valid]
+    expanded_dst = safe_dst[:, None].expand(-1, scores.shape[1])
+    max_per_dst = scores.new_full((dst_count, scores.shape[1]), -torch.inf)
+    max_per_dst.scatter_reduce_(
+        0, expanded_dst, valid_scores, reduce="amax", include_self=True
+    )
+    exp_scores = torch.exp(valid_scores - max_per_dst[safe_dst])
+    denom = scores.new_zeros((dst_count, scores.shape[1]))
+    denom.scatter_add_(0, expanded_dst, exp_scores)
+    alpha[valid] = exp_scores / denom[safe_dst].clamp_min(1e-12)
     return alpha
 
 
@@ -356,6 +367,7 @@ class FloorplanGNN(nn.Module):
         hgt_edge_index: dict[tuple[str, str, str], torch.Tensor] | None = None,
         hgt_edge_attr: dict[tuple[str, str, str], torch.Tensor] | None = None,
         pairs: torch.Tensor | None = None,
+        block_batch: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         h = self.encode(
             node_feat,
@@ -367,7 +379,20 @@ class FloorplanGNN(nn.Module):
             hgt_edge_index=hgt_edge_index,
             hgt_edge_attr=hgt_edge_attr,
         )
-        g = h.mean(dim=0, keepdim=True).expand_as(h)
+        if block_batch is None:
+            g = h.mean(dim=0, keepdim=True).expand_as(h)
+        else:
+            batch = block_batch.to(device=h.device, dtype=torch.long)
+            graph_count = int(batch.max().item()) + 1 if batch.numel() > 0 else 0
+            graph_sum = h.new_zeros((graph_count, h.shape[1]))
+            graph_sum.index_add_(0, batch, h)
+            graph_count_t = h.new_zeros((graph_count, 1))
+            graph_count_t.index_add_(
+                0,
+                batch,
+                torch.ones((h.shape[0], 1), dtype=h.dtype, device=h.device),
+            )
+            g = graph_sum[batch] / graph_count_t[batch].clamp_min(1.0)
         z = torch.cat([h, g, node_feat], dim=1)
         output = {
             "anchor": self.anchor_head(z),

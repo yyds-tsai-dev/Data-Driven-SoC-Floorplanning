@@ -35,7 +35,9 @@ def build_run_tag(args, when: datetime | None = None) -> str:
         f"l{int(args.layers)}",
         f"acc{int(getattr(args, 'accumulation_steps', 1))}",
     ]
-    if encoder == "graph_transformer":
+    if encoder == "hgt":
+        parts.append(f"bs{int(getattr(args, 'batch_size', 1))}")
+    if encoder in {"graph_transformer", "hgt"}:
         parts.append(f"heads{int(getattr(args, 'num_heads', 4))}")
     return "_".join(parts)
 

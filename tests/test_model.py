@@ -1,8 +1,11 @@
-import torch
 import sys
+
+import pytest
+import torch
 
 from floorset_arch import features
 from floorset_arch.features import build_anchor_edge_tensors, build_anchor_node_features
+from floorset_arch.nn import model as model_module
 from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 from floorset_arch.nn.model import FloorplanGNN
 from floorset_arch.parser import parse_instance
@@ -11,7 +14,7 @@ from floorset_arch.training.losses import (
     fp_sol_soft_violations,
     is_constraint_clean_training_sample,
 )
-from floorset_arch.training.checkpoint import anchor_checkpoint_payload
+from floorset_arch.training.checkpoint import anchor_checkpoint_payload, build_run_tag
 from floorset_arch.training import train as train_module
 
 
@@ -191,6 +194,68 @@ def test_hgt_relation_specs_are_canonical_even_when_edges_are_absent():
         assert graph_inputs.edge_attr[relation].shape == (0, 1)
 
 
+def test_hgt_graph_inputs_reuse_precomputed_block_features(monkeypatch):
+    inst = _hgt_sample_instance()
+    block_features, scale = build_anchor_node_features(inst)
+
+    def fail_recompute(*_args, **_kwargs):
+        raise AssertionError("block features should be reused")
+
+    monkeypatch.setattr(features, "build_anchor_node_features", fail_recompute)
+    import floorset_arch.hetero_graph as hetero_graph
+
+    monkeypatch.setattr(hetero_graph, "build_anchor_node_features", fail_recompute)
+
+    graph_inputs = features.build_anchor_hgt_graph_inputs(
+        inst, block_features=block_features, scale=scale
+    )
+
+    assert torch.equal(graph_inputs.node_features["block"], block_features)
+
+
+def test_hgt_edge_softmax_does_not_require_torch_unique(monkeypatch):
+    scores = torch.tensor(
+        [[1.0, 0.0], [2.0, 1.0], [0.5, 0.5], [0.0, 2.0]], dtype=torch.float32
+    )
+    dst = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    def fail_unique(*_args, **_kwargs):
+        raise AssertionError("edge softmax should use vectorized scatter ops")
+
+    monkeypatch.setattr(torch, "unique", fail_unique)
+
+    alpha = model_module._edge_softmax_by_dst(scores, dst, dst_count=2)
+
+    expected = torch.stack(
+        [
+            torch.softmax(scores[:2, 0], dim=0),
+            torch.softmax(scores[:2, 1], dim=0),
+            torch.softmax(scores[2:, 0], dim=0),
+            torch.softmax(scores[2:, 1], dim=0),
+        ]
+    )
+    assert torch.allclose(alpha[:, 0], torch.cat([expected[0], expected[2]]))
+    assert torch.allclose(alpha[:, 1], torch.cat([expected[1], expected[3]]))
+
+
+def test_batch_anchor_hgt_graph_inputs_offsets_nodes_and_edges():
+    left = features.build_anchor_hgt_graph_inputs(_hgt_sample_instance())
+    right = features.build_anchor_hgt_graph_inputs(_hgt_sample_instance())
+
+    batch = features.batch_anchor_hgt_graph_inputs([left, right])
+
+    assert batch.node_features["block"].shape[0] == 8
+    assert batch.node_batch["block"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+    relation = ("block", "connects", "block")
+    left_edges = left.edge_index[relation].shape[1]
+    assert torch.equal(batch.edge_index[relation][:, :left_edges], left.edge_index[relation])
+    assert torch.equal(
+        batch.edge_index[relation][:, left_edges:],
+        right.edge_index[relation] + left.node_features["block"].shape[0],
+    )
+    assert batch.sample_block_slices == [(0, 4), (4, 8)]
+
+
 def test_floorplan_gnn_hgt_encoder_matches_output_contract():
     inst = _hgt_sample_instance()
     graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
@@ -221,6 +286,47 @@ def test_floorplan_gnn_hgt_encoder_matches_output_contract():
     assert output["priority"].shape == (inst.block_count,)
     assert output["log_aspect"].shape == (inst.block_count,)
     assert output["pair_logits"].shape == (2, 2)
+
+
+def test_floorplan_gnn_hgt_batched_forward_matches_separate_graphs():
+    inst = _hgt_sample_instance()
+    first = features.build_anchor_hgt_graph_inputs(inst)
+    second = features.build_anchor_hgt_graph_inputs(inst)
+    batch = features.batch_anchor_hgt_graph_inputs([first, second])
+    model = FloorplanGNN(
+        node_feat_dim=first.node_features["block"].shape[1],
+        hidden_dim=32,
+        num_layers=2,
+        dropout=0.0,
+        encoder_type="hgt",
+        num_heads=4,
+        hgt_node_feat_dims=first.node_feat_dims,
+        hgt_relation_specs=first.relation_specs,
+    )
+    model.eval()
+    edge_index = torch.empty((2, 0), dtype=torch.long)
+    edge_attr = torch.empty((0, 1))
+
+    separate = model(
+        first.node_features["block"],
+        edge_index,
+        edge_attr,
+        hgt_node_features=first.node_features,
+        hgt_edge_index=first.edge_index,
+        hgt_edge_attr=first.edge_attr,
+    )
+    batched = model(
+        batch.node_features["block"],
+        edge_index,
+        edge_attr,
+        hgt_node_features=batch.node_features,
+        hgt_edge_index=batch.edge_index,
+        hgt_edge_attr=batch.edge_attr,
+        block_batch=batch.node_batch["block"],
+    )
+
+    assert torch.allclose(batched["anchor"][:4], separate["anchor"], atol=1e-6)
+    assert torch.allclose(batched["anchor"][4:], separate["anchor"], atol=1e-6)
 
 
 def test_anchor_checkpoint_payload_records_hgt_config():
@@ -261,12 +367,35 @@ def test_anchor_checkpoint_payload_records_encoder_config():
     assert payload["has_pair_head"] is True
 
 
+def test_hgt_run_tag_records_batch_size():
+    args = type(
+        "Args",
+        (),
+        {
+            "num_samples": 500000,
+            "epochs": 3,
+            "encoder": "hgt",
+            "hidden_dim": 256,
+            "layers": 4,
+            "accumulation_steps": 32,
+            "batch_size": 8,
+            "num_heads": 4,
+        },
+    )()
+
+    tag = build_run_tag(args)
+
+    assert "_bs8_" in tag
+    assert tag.endswith("_heads4")
+
+
 def test_training_parser_accepts_hgt_encoder(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["train.py", "--encoder", "hgt"])
+    monkeypatch.setattr(sys, "argv", ["train.py", "--encoder", "hgt", "--batch-size", "8"])
 
     args = train_module.parse_args()
 
     assert args.encoder == "hgt"
+    assert args.batch_size == 8
 
 
 def test_hgt_decoder_ranking_multipliers_target_high_risk_samples():

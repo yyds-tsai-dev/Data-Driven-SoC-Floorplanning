@@ -177,11 +177,12 @@ RESUME_CHECKPOINT=checkpoints/old_transformer.pt bash scripts/train_transformer.
 
 ### `scripts/train_hgt.sh`
 
-訓練 Local HGT encoder 版本的 Anchor-GNN。HGT 會保留 block、pin、cluster、MIB 與 boundary typed nodes，並只沿 heterogeneous factor graph 的 typed local edges 做 relation-specific attention；v1 不加入 global attention/refinement layer。參數格式與 `scripts/train_transformer.sh` 相同，但預設 `ENCODER=hgt`、`NUM_HEADS=4`、`CHECKPOINT_PREFIX=gnn_hgt`，log 檔名會帶 `train_arch_v5_hgt`。HGT script 也預設對高風險樣本啟用低風險 decoder-aware ranking 權重：`HIGH_RISK_ORDER_MULTIPLIER=1.5`、`HIGH_RISK_PAIRWISE_MULTIPLIER=1.5`，只加強 order/pairwise 訓練 loss，不改 decoder/repair。
+訓練 Local HGT encoder 版本的 Anchor-GNN。HGT 會保留 block、pin、cluster、MIB 與 boundary typed nodes，並只沿 heterogeneous factor graph 的 typed local edges 做 relation-specific attention；v1 不加入 global attention/refinement layer。參數格式與 `scripts/train_transformer.sh` 相同，但預設 `ENCODER=hgt`、`NUM_HEADS=4`、`BATCH_SIZE=8`、`CHECKPOINT_PREFIX=gnn_hgt`，log 檔名會帶 `train_arch_v5_hgt`。HGT script 也預設對高風險樣本啟用低風險 decoder-aware ranking 權重：`HIGH_RISK_ORDER_MULTIPLIER=1.5`、`HIGH_RISK_PAIRWISE_MULTIPLIER=1.5`，只加強 order/pairwise 訓練 loss，不改 decoder/repair。
 
 ```bash
 bash scripts/train_hgt.sh
 DEVICE=cpu WANDB=0 NUM_SAMPLES=2 VAL_SAMPLES=1 EPOCHS=1 HIDDEN_DIM=16 LAYERS=1 bash scripts/train_hgt.sh
+BATCH_SIZE=4 bash scripts/train_hgt.sh
 OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_hgt_run bash scripts/train_hgt.sh
 RESUME_CHECKPOINT=checkpoints/old_hgt.pt bash scripts/train_hgt.sh
 ```
