@@ -14,6 +14,11 @@ from floorset_arch.training.losses import (
     fp_sol_soft_violations,
     is_constraint_clean_training_sample,
 )
+from floorset_arch.training.pseudo_targets import (
+    PseudoTargetConfig,
+    TrainingTargetSource,
+    build_training_target_record,
+)
 from floorset_arch.training.checkpoint import anchor_checkpoint_payload, build_run_tag
 from floorset_arch.training.selection import (
     CheckpointMetricRecord,
@@ -484,6 +489,64 @@ def test_hgt_decoder_ranking_multipliers_target_high_risk_samples():
     assert order_multiplier == 1.7
     assert pairwise_multiplier == 1.6
     assert (mpnn_order, mpnn_pairwise) == (1.0, 1.0)
+
+
+def test_dirty_sample_builds_repaired_pseudo_target():
+    block_count = 2
+    area_targets = torch.tensor([4.0, 4.0])
+    constraints = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    fp_sol = torch.tensor(
+        [
+            [2.0, 2.0, 0.0, 0.0],
+            [2.0, 2.0, 8.0, 8.0],
+        ]
+    )
+    inst = parse_instance(
+        block_count,
+        area_targets,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        fp_sol,
+    )
+
+    record = build_training_target_record(
+        inst,
+        fp_sol,
+        PseudoTargetConfig(enabled=True, clean_enough_soft_violations=0),
+    )
+
+    assert record.source in {
+        TrainingTargetSource.DIRTY_REPAIRED,
+        TrainingTargetSource.DIRTY_REPAIRED_CLEAN_ENOUGH,
+    }
+    assert record.target_fp_sol.shape == (block_count, 4)
+    assert record.original_soft_violations[1] > 0
+
+
+def test_repaired_clean_enough_target_enables_dirty_order_weight():
+    config = PseudoTargetConfig(
+        enabled=True,
+        dirty_pseudo_order_weight=0.25,
+        dirty_pseudo_clean_enough_order_weight=0.35,
+        clean_enough_soft_violations=0,
+    )
+    record = train_module._target_weight_policy(
+        is_clean=False,
+        target_source=TrainingTargetSource.DIRTY_REPAIRED_CLEAN_ENOUGH,
+        config=config,
+        existing_dirty_sample_weight=0.25,
+    )
+
+    assert record.sample_weight == 0.25
+    assert record.order_weight_multiplier == 0.35
+    assert record.pairwise_weight_multiplier == 0.35
 
 
 def test_hetero_graph_keeps_constraints_as_first_class_nodes():

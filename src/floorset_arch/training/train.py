@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +32,11 @@ from floorset_arch.training.losses import (
     fp_sol_soft_violations,
     pairwise_relation_loss,
     sample_pairs,
+)
+from floorset_arch.training.pseudo_targets import (
+    PseudoTargetConfig,
+    TrainingTargetSource,
+    build_training_target_record,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -164,6 +170,43 @@ def decoder_ranking_multipliers(inst, args, encoder_type: str) -> tuple[float, f
     )
 
 
+@dataclass(frozen=True)
+class TargetWeightPolicy:
+    sample_weight: float
+    order_weight_multiplier: float
+    pairwise_weight_multiplier: float
+
+
+def _pseudo_target_config(args) -> PseudoTargetConfig:
+    return PseudoTargetConfig(
+        enabled=bool(getattr(args, "enable_repaired_pseudo_targets", False)),
+        clean_enough_soft_violations=int(
+            getattr(args, "pseudo_target_clean_enough_soft", 0)
+        ),
+        dirty_pseudo_order_weight=float(getattr(args, "dirty_pseudo_order_weight", 0.20)),
+        dirty_pseudo_clean_enough_order_weight=float(
+            getattr(args, "dirty_pseudo_clean_enough_order_weight", 0.35)
+        ),
+    )
+
+
+def _target_weight_policy(
+    is_clean: bool,
+    target_source: TrainingTargetSource,
+    config: PseudoTargetConfig,
+    existing_dirty_sample_weight: float,
+) -> TargetWeightPolicy:
+    if is_clean:
+        return TargetWeightPolicy(1.0, 1.0, 1.0)
+    if target_source == TrainingTargetSource.DIRTY_REPAIRED_CLEAN_ENOUGH:
+        weight = config.dirty_pseudo_clean_enough_order_weight
+        return TargetWeightPolicy(existing_dirty_sample_weight, weight, weight)
+    if target_source == TrainingTargetSource.DIRTY_REPAIRED:
+        weight = config.dirty_pseudo_order_weight
+        return TargetWeightPolicy(existing_dirty_sample_weight, weight, weight)
+    return TargetWeightPolicy(existing_dirty_sample_weight, 0.0, 0.0)
+
+
 def _prepare_training_sample(sample, model, device: torch.device, args):
     area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = sample
     soft_violations = fp_sol_soft_violations(
@@ -177,6 +220,10 @@ def _prepare_training_sample(sample, model, device: torch.device, args):
     inst = parse_instance(
         block_count, area_targets, b2b, p2b, pins, constraints, fp_sol
     )
+    target_record = build_training_target_record(
+        inst, fp_sol, _pseudo_target_config(args)
+    )
+    target_fp_sol = target_record.target_fp_sol.to(device=fp_sol.device)
     node_feat, scale = build_anchor_node_features(inst, device=device)
     edge_type = None
     structural_feat = None
@@ -205,7 +252,7 @@ def _prepare_training_sample(sample, model, device: torch.device, args):
     else:
         edge_index, edge_attr = build_anchor_edge_tensors(inst, device=device)
 
-    targets = build_anchor_targets(fp_sol, block_count, scale, device)
+    targets = build_anchor_targets(target_fp_sol, block_count, scale, device)
     weights = constraint_weights(constraints, block_count, device, args)
     pairs = sample_pairs(block_count, args.pairwise_pairs, device)
     loss_args = args
@@ -216,17 +263,26 @@ def _prepare_training_sample(sample, model, device: torch.device, args):
     )
     pairwise_weight_multiplier = decoder_pairwise_multiplier
     order_weight_multiplier *= decoder_order_multiplier
-    if args.clean_sample_policy == "weighted" and not is_clean:
-        sample_weight = args.dirty_sample_weight
-        order_weight_multiplier *= args.dirty_order_weight
-        pairwise_weight_multiplier *= args.dirty_order_weight
+    if args.clean_sample_policy == "weighted":
+        policy = _target_weight_policy(
+            is_clean=is_clean,
+            target_source=target_record.source,
+            config=_pseudo_target_config(args),
+            existing_dirty_sample_weight=args.dirty_sample_weight,
+        )
+        sample_weight = policy.sample_weight
+        order_weight_multiplier *= policy.order_weight_multiplier
+        pairwise_weight_multiplier *= policy.pairwise_weight_multiplier
     if order_weight_multiplier != 1.0:
         loss_args = SimpleNamespace(**vars(args))
         loss_args.order_weight = args.order_weight * order_weight_multiplier
 
     return {
         "inst": inst,
-        "fp_sol": fp_sol,
+        "fp_sol": target_fp_sol,
+        "target_source": str(target_record.source),
+        "original_soft_violations": target_record.original_soft_violations,
+        "repaired_soft_violations": target_record.repaired_soft_violations,
         "node_feat": node_feat,
         "edge_index": edge_index,
         "edge_attr": edge_attr,
@@ -796,6 +852,12 @@ def parse_args():
     )
     parser.add_argument("--dirty-sample-weight", type=float, default=0.25)
     parser.add_argument("--dirty-order-weight", type=float, default=0.0)
+    parser.add_argument("--enable-repaired-pseudo-targets", action="store_true")
+    parser.add_argument("--pseudo-target-clean-enough-soft", type=int, default=0)
+    parser.add_argument("--dirty-pseudo-order-weight", type=float, default=0.20)
+    parser.add_argument(
+        "--dirty-pseudo-clean-enough-order-weight", type=float, default=0.35
+    )
     parser.add_argument("--high-risk-order-multiplier", type=float, default=1.0)
     parser.add_argument("--high-risk-pairwise-multiplier", type=float, default=1.0)
     parser.add_argument("--high-risk-min-blocks", type=int, default=110)
