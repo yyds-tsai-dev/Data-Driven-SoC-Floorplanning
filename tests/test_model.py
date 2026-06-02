@@ -298,6 +298,29 @@ def test_floorplan_gnn_hgt_encoder_matches_output_contract():
     assert output["pair_logits"].shape == (2, 2)
 
 
+def test_hgt_layers_create_identity_relation_gates():
+    inst = _hgt_sample_instance()
+    graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
+    model = FloorplanGNN(
+        node_feat_dim=graph_inputs.node_features["block"].shape[1],
+        hidden_dim=16,
+        num_layers=2,
+        dropout=0.0,
+        encoder_type="hgt",
+        num_heads=4,
+        hgt_node_feat_dims=graph_inputs.node_feat_dims,
+        hgt_relation_specs=graph_inputs.relation_specs,
+    )
+
+    assert model.hgt_layers
+    first_layer = model.hgt_layers[0]
+    assert set(first_layer.rel_gate) == {
+        model_module._relation_key(relation) for relation in graph_inputs.relation_specs
+    }
+    for parameter in first_layer.rel_gate.values():
+        assert torch.allclose(parameter.detach(), torch.ones_like(parameter))
+
+
 def test_floorplan_gnn_hgt_batched_forward_matches_separate_graphs():
     inst = _hgt_sample_instance()
     first = features.build_anchor_hgt_graph_inputs(inst)
@@ -358,6 +381,32 @@ def test_anchor_checkpoint_payload_records_hgt_config():
     assert payload["encoder_type"] == "hgt"
     assert payload["hgt_node_feat_dims"] == graph_inputs.node_feat_dims
     assert payload["hgt_relation_specs"] == list(graph_inputs.relation_specs)
+
+
+def test_checkpoint_payload_records_hgt_relation_gates():
+    inst = _hgt_sample_instance()
+    graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
+    model = FloorplanGNN(
+        node_feat_dim=graph_inputs.node_features["block"].shape[1],
+        hidden_dim=16,
+        num_layers=1,
+        encoder_type="hgt",
+        num_heads=4,
+        hgt_node_feat_dims=graph_inputs.node_feat_dims,
+        hgt_relation_specs=graph_inputs.relation_specs,
+    )
+    args = type(
+        "Args",
+        (),
+        {"encoder": "hgt", "num_heads": 4, "hidden_dim": 16, "layers": 1, "dropout": 0.0},
+    )()
+
+    payload = anchor_checkpoint_payload(model, args, 1, {}, {})
+
+    assert payload["hgt_relation_gates"]
+    assert set(payload["hgt_relation_gates"][0]) == {
+        model_module._relation_key(relation) for relation in graph_inputs.relation_specs
+    }
 
 
 def test_anchor_checkpoint_payload_records_encoder_config():

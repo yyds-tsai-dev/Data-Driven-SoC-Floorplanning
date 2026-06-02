@@ -57,6 +57,11 @@ def anchor_checkpoint_payload(
         "edge_type_count": getattr(model, "edge_type_count", 1),
         "hgt_node_feat_dims": getattr(model, "hgt_node_feat_dims", {}),
         "hgt_relation_specs": [tuple(relation) for relation in getattr(model, "hgt_relation_specs", ())],
+        "hgt_relation_gates": (
+            model.hgt_relation_gate_values()
+            if hasattr(model, "hgt_relation_gate_values")
+            else []
+        ),
         "has_pair_head": hasattr(model, "pair_head"),
         "epoch": epoch,
         "train_stats": train_stats,

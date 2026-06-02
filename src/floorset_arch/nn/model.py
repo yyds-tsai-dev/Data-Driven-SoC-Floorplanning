@@ -122,6 +122,12 @@ class HGTLayer(nn.Module):
         self.rel_edge_bias = nn.ModuleDict(
             {_relation_key(relation): nn.Linear(1, num_heads, bias=False) for relation in self.relation_specs}
         )
+        self.rel_gate = nn.ParameterDict(
+            {
+                _relation_key(relation): nn.Parameter(torch.ones(1))
+                for relation in self.relation_specs
+            }
+        )
         self.attn_norm = nn.ModuleDict(
             {node_type: nn.LayerNorm(hidden_dim) for node_type in self.node_types}
         )
@@ -174,6 +180,7 @@ class HGTLayer(nn.Module):
             scores = scores + self.rel_edge_bias[key](attr)
             alpha = _edge_softmax_by_dst(scores, dst, states[dst_type].shape[0])
             msg = (alpha.unsqueeze(-1) * v).reshape(-1, self.hidden_dim)
+            msg = msg * self.rel_gate[key].to(device=msg.device, dtype=msg.dtype)
             messages[dst_type].index_add_(0, dst, msg)
 
         updated: dict[str, torch.Tensor] = {}
@@ -355,6 +362,19 @@ class FloorplanGNN(nn.Module):
             upd = upd_mlp(torch.cat([h, aggr], dim=1))
             h = norm(h + upd)
         return h
+
+    def hgt_relation_gate_values(self) -> list[dict[str, float]]:
+        if self.encoder_type != "hgt":
+            return []
+        values = []
+        for layer in self.hgt_layers:
+            values.append(
+                {
+                    key: float(param.detach().cpu().item())
+                    for key, param in layer.rel_gate.items()
+                }
+            )
+        return values
 
     def forward(
         self,
