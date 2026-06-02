@@ -637,11 +637,31 @@ def test_repaired_clean_enough_target_enables_dirty_order_weight():
         target_source=TrainingTargetSource.DIRTY_REPAIRED_CLEAN_ENOUGH,
         config=config,
         existing_dirty_sample_weight=0.25,
+        existing_dirty_order_weight=0.0,
     )
 
     assert record.sample_weight == 0.25
     assert record.order_weight_multiplier == 0.35
     assert record.pairwise_weight_multiplier == 0.35
+
+
+def test_dirty_original_target_preserves_legacy_dirty_order_weight():
+    config = PseudoTargetConfig(
+        enabled=False,
+        dirty_pseudo_order_weight=0.25,
+        dirty_pseudo_clean_enough_order_weight=0.35,
+    )
+    record = train_module._target_weight_policy(
+        is_clean=False,
+        target_source=TrainingTargetSource.DIRTY_ORIGINAL,
+        config=config,
+        existing_dirty_sample_weight=0.25,
+        existing_dirty_order_weight=0.15,
+    )
+
+    assert record.sample_weight == 0.25
+    assert record.order_weight_multiplier == 0.15
+    assert record.pairwise_weight_multiplier == 0.15
 
 
 def test_repaired_pseudo_target_preserves_preplaced_training_fp_sol_order():

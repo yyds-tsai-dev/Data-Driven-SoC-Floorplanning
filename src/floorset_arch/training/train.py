@@ -196,6 +196,7 @@ def _target_weight_policy(
     target_source: TrainingTargetSource,
     config: PseudoTargetConfig,
     existing_dirty_sample_weight: float,
+    existing_dirty_order_weight: float,
 ) -> TargetWeightPolicy:
     if is_clean:
         return TargetWeightPolicy(1.0, 1.0, 1.0)
@@ -205,7 +206,11 @@ def _target_weight_policy(
     if target_source == TrainingTargetSource.DIRTY_REPAIRED:
         weight = config.dirty_pseudo_order_weight
         return TargetWeightPolicy(existing_dirty_sample_weight, weight, weight)
-    return TargetWeightPolicy(existing_dirty_sample_weight, 0.0, 0.0)
+    return TargetWeightPolicy(
+        existing_dirty_sample_weight,
+        existing_dirty_order_weight,
+        existing_dirty_order_weight,
+    )
 
 
 def _prepare_training_sample(sample, model, device: torch.device, args):
@@ -276,6 +281,7 @@ def _prepare_training_sample(sample, model, device: torch.device, args):
             target_source=target_record.source,
             config=_pseudo_target_config(args),
             existing_dirty_sample_weight=args.dirty_sample_weight,
+            existing_dirty_order_weight=args.dirty_order_weight,
         )
         sample_weight = policy.sample_weight
         order_weight_multiplier *= policy.order_weight_multiplier
