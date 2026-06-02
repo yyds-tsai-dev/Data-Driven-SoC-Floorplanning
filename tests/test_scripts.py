@@ -43,4 +43,10 @@ def test_train_hgt_script_exposes_pseudo_target_knobs():
     assert 'PSEUDO_TARGET_CLEAN_ENOUGH_SOFT="${PSEUDO_TARGET_CLEAN_ENOUGH_SOFT:-0}"' in text
     assert 'DIRTY_PSEUDO_ORDER_WEIGHT="${DIRTY_PSEUDO_ORDER_WEIGHT:-0.20}"' in text
     assert 'DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT="${DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT:-0.35}"' in text
+    assert 'PSEUDO_ARGS=()' in text
+    assert 'if [ "$ENABLE_REPAIRED_PSEUDO_TARGETS" = "1" ]; then' in text
+    assert 'PSEUDO_ARGS+=(--enable-repaired-pseudo-targets)' in text
+    assert '--pseudo-target-clean-enough-soft "$PSEUDO_TARGET_CLEAN_ENOUGH_SOFT"' in text
     assert '--dirty-pseudo-order-weight "$DIRTY_PSEUDO_ORDER_WEIGHT"' in text
+    assert '--dirty-pseudo-clean-enough-order-weight "$DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT"' in text
+    assert '"${PSEUDO_ARGS[@]}"' in text
