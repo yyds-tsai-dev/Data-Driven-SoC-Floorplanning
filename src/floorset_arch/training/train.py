@@ -600,6 +600,32 @@ def load_resume_model(
     return model, resume_epoch, payload.get("optimizer_state_dict")
 
 
+def _load_optimizer_state_if_compatible(
+    optimizer,
+    optimizer_state,
+    ignore_optimizer_state: bool = False,
+) -> bool:
+    if optimizer_state is None:
+        print(
+            "Resume checkpoint has no optimizer state; using fresh AdamW",
+            flush=True,
+        )
+        return False
+    if ignore_optimizer_state:
+        return False
+    try:
+        optimizer.load_state_dict(optimizer_state)
+    except ValueError:
+        print(
+            "Resume optimizer state is incompatible with current model parameters; "
+            "using fresh AdamW",
+            flush=True,
+        )
+        return False
+    print("Loaded optimizer state from resume checkpoint", flush=True)
+    return True
+
+
 def main(args) -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -633,14 +659,11 @@ def main(args) -> None:
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=args.lr, weight_decay=args.weight_decay
         )
-        if optimizer_state is not None and not args.ignore_optimizer_state:
-            optimizer.load_state_dict(optimizer_state)
-            print("Loaded optimizer state from resume checkpoint", flush=True)
-        elif optimizer_state is None:
-            print(
-                "Resume checkpoint has no optimizer state; using fresh AdamW",
-                flush=True,
-            )
+        _load_optimizer_state_if_compatible(
+            optimizer,
+            optimizer_state,
+            ignore_optimizer_state=args.ignore_optimizer_state,
+        )
 
     best_val = float("inf")
     out_dir = Path(args.output_dir)

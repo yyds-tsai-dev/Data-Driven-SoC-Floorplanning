@@ -506,6 +506,51 @@ def test_training_parser_accepts_hgt_encoder(monkeypatch):
     assert args.batch_size == 8
 
 
+def test_resume_optimizer_state_skips_incompatible_param_groups(capsys):
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    incompatible_state = optimizer.state_dict()
+    incompatible_state["param_groups"][0]["params"] = incompatible_state["param_groups"][0][
+        "params"
+    ][:-1]
+
+    loaded = train_module._load_optimizer_state_if_compatible(
+        optimizer, incompatible_state
+    )
+
+    assert loaded is False
+    captured = capsys.readouterr()
+    assert "Resume optimizer state is incompatible" in captured.out
+
+
+def test_resume_optimizer_state_loads_compatible_state():
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    compatible_state = optimizer.state_dict()
+
+    loaded = train_module._load_optimizer_state_if_compatible(
+        optimizer, compatible_state
+    )
+
+    assert loaded is True
+
+
+def test_resume_optimizer_state_respects_ignore_flag(capsys):
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    incompatible_state = optimizer.state_dict()
+    incompatible_state["param_groups"][0]["params"] = incompatible_state["param_groups"][0][
+        "params"
+    ][:-1]
+
+    loaded = train_module._load_optimizer_state_if_compatible(
+        optimizer, incompatible_state, ignore_optimizer_state=True
+    )
+
+    assert loaded is False
+    assert capsys.readouterr().out == ""
+
+
 def test_hgt_decoder_ranking_multipliers_target_high_risk_samples():
     constraints = torch.zeros(112, 5)
     constraints[:16, 4] = torch.tensor([1.0, 2.0, 4.0, 8.0] * 4)
