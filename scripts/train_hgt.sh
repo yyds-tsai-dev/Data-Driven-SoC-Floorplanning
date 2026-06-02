@@ -37,6 +37,10 @@ GRAD_CLIP="${GRAD_CLIP:-1.0}"
 CLEAN_SAMPLE_POLICY="${CLEAN_SAMPLE_POLICY:-weighted}"
 DIRTY_SAMPLE_WEIGHT="${DIRTY_SAMPLE_WEIGHT:-0.25}"
 DIRTY_ORDER_WEIGHT="${DIRTY_ORDER_WEIGHT:-0.0}"
+ENABLE_REPAIRED_PSEUDO_TARGETS="${ENABLE_REPAIRED_PSEUDO_TARGETS:-0}"
+PSEUDO_TARGET_CLEAN_ENOUGH_SOFT="${PSEUDO_TARGET_CLEAN_ENOUGH_SOFT:-0}"
+DIRTY_PSEUDO_ORDER_WEIGHT="${DIRTY_PSEUDO_ORDER_WEIGHT:-0.20}"
+DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT="${DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT:-0.35}"
 HIGH_RISK_ORDER_MULTIPLIER="${HIGH_RISK_ORDER_MULTIPLIER:-1.5}"
 HIGH_RISK_PAIRWISE_MULTIPLIER="${HIGH_RISK_PAIRWISE_MULTIPLIER:-1.5}"
 HIGH_RISK_MIN_BLOCKS="${HIGH_RISK_MIN_BLOCKS:-110}"
@@ -84,6 +88,11 @@ if [ "$IGNORE_OPTIMIZER_STATE" = "1" ]; then
   EXTRA_ARGS+=(--ignore-optimizer-state)
 fi
 
+PSEUDO_ARGS=()
+if [ "$ENABLE_REPAIRED_PSEUDO_TARGETS" = "1" ]; then
+  PSEUDO_ARGS+=(--enable-repaired-pseudo-targets)
+fi
+
 mkdir -p "$LOG_DIR"
 
 uv run -m floorset_arch.training.train \
@@ -122,6 +131,9 @@ uv run -m floorset_arch.training.train \
   --clean-sample-policy "$CLEAN_SAMPLE_POLICY" \
   --dirty-sample-weight "$DIRTY_SAMPLE_WEIGHT" \
   --dirty-order-weight "$DIRTY_ORDER_WEIGHT" \
+  --pseudo-target-clean-enough-soft "$PSEUDO_TARGET_CLEAN_ENOUGH_SOFT" \
+  --dirty-pseudo-order-weight "$DIRTY_PSEUDO_ORDER_WEIGHT" \
+  --dirty-pseudo-clean-enough-order-weight "$DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT" \
   --high-risk-order-multiplier "$HIGH_RISK_ORDER_MULTIPLIER" \
   --high-risk-pairwise-multiplier "$HIGH_RISK_PAIRWISE_MULTIPLIER" \
   --high-risk-min-blocks "$HIGH_RISK_MIN_BLOCKS" \
@@ -129,4 +141,5 @@ uv run -m floorset_arch.training.train \
   --num-workers "$NUM_WORKERS" \
   --checkpoint-prefix "$CHECKPOINT_PREFIX" \
   --print-every "$PRINT_EVERY" \
+  "${PSEUDO_ARGS[@]}" \
   "${EXTRA_ARGS[@]}" | tee "$LOG_DIR/train_arch_v5_hgt_${LOG_TAG}.log"

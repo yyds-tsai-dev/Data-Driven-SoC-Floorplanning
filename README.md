@@ -187,6 +187,20 @@ OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_hgt_run bash scripts/train_hgt.sh
 RESUME_CHECKPOINT=checkpoints/old_hgt.pt bash scripts/train_hgt.sh
 ```
 
+HGT dirty-sample experiments can enable repaired pseudo targets:
+
+```bash
+ENABLE_REPAIRED_PSEUDO_TARGETS=1 bash scripts/train_hgt.sh
+DIRTY_PSEUDO_ORDER_WEIGHT=0.20 DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT=0.35 ENABLE_REPAIRED_PSEUDO_TARGETS=1 bash scripts/train_hgt.sh
+```
+
+Guidance ablations are evaluator-time knobs:
+
+```bash
+FLOORSET_GUIDANCE_ANCHOR_ONLY=1 bash scripts/eval_total.sh checkpoints/model.pt
+FLOORSET_GUIDANCE_DISABLE_PAIRWISE=1 bash scripts/eval_total.sh checkpoints/model.pt
+```
+
 ### `scripts/update.sh`
 
 自動 `fetch/pull/status/add/commit/push`，預設推到 `origin arch-v4`。適合個人工作流，但在 reviewer 會檢查輸出時建議先手動看 diff。

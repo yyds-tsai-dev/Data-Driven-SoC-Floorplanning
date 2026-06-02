@@ -32,3 +32,14 @@ def test_train_hgt_script_defaults_to_hgt_encoder():
     assert '--high-risk-order-multiplier "$HIGH_RISK_ORDER_MULTIPLIER"' in text
     assert '--high-risk-pairwise-multiplier "$HIGH_RISK_PAIRWISE_MULTIPLIER"' in text
     assert 'train_arch_v5_hgt_${LOG_TAG}.log' in text
+
+
+def test_train_hgt_script_exposes_pseudo_target_knobs():
+    script = Path("scripts/train_hgt.sh")
+
+    text = script.read_text(encoding="utf-8")
+
+    assert 'ENABLE_REPAIRED_PSEUDO_TARGETS="${ENABLE_REPAIRED_PSEUDO_TARGETS:-0}"' in text
+    assert 'DIRTY_PSEUDO_ORDER_WEIGHT="${DIRTY_PSEUDO_ORDER_WEIGHT:-0.20}"' in text
+    assert 'DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT="${DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT:-0.35}"' in text
+    assert '--dirty-pseudo-order-weight "$DIRTY_PSEUDO_ORDER_WEIGHT"' in text
