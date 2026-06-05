@@ -33,6 +33,7 @@ from floorset_arch.quality_portfolio import (
 )
 from floorset_arch.relative_order import construct_relative_order_placement
 from floorset_arch.repair import repair_placement
+from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.surrogate_guidance import build_surrogate_guidance
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -430,58 +431,12 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         return self._is_targeted_high_risk_case(inst)
 
     def _is_targeted_high_risk_case(self, inst) -> bool:
-        if inst.block_count < int(
-            os.environ.get("FLOORSET_HIGH_RISK_AUTO_MIN_BLOCKS", "110")
-        ):
-            return False
-
-        b2b_count = int(inst.valid_b2b.shape[0]) if inst.valid_b2b is not None else 0
-        p2b_count = int(inst.valid_p2b.shape[0]) if inst.valid_p2b is not None else 0
-        edge_density = (b2b_count + p2b_count) / max(inst.block_count, 1)
-
-        if edge_density >= float(
-            os.environ.get("FLOORSET_HIGH_RISK_AUTO_EDGE_DENSITY", "80.0")
-        ):
-            return True
-        if p2b_count < int(
-            os.environ.get("FLOORSET_HIGH_RISK_AUTO_LOW_PIN_MAX", "100")
-        ) and b2b_count > int(
-            os.environ.get("FLOORSET_HIGH_RISK_AUTO_LOW_PIN_B2B_MIN", "5000")
-        ):
-            return True
-        return p2b_count > int(
-            os.environ.get("FLOORSET_HIGH_RISK_AUTO_PIN_HEAVY_MIN", "2500")
-        ) and b2b_count < int(
-            os.environ.get("FLOORSET_HIGH_RISK_AUTO_PIN_HEAVY_B2B_MAX", "1000")
-        )
+        budget = instance_risk_budget(inst)
+        return budget.tier in {BudgetTier.MEDIUM, BudgetTier.HEAVY}
 
     def _is_high_risk_case(self, inst) -> bool:
-        if self._is_dense_medium_risk_case(inst):
-            return True
-
-        if inst.block_count < int(
-            os.environ.get("FLOORSET_HIGH_RISK_MIN_BLOCKS", "110")
-        ):
-            return False
-
-        boundary_count = len(inst.boundary)
-        grouping_budget = sum(
-            max(0, len(members) - 1) for members in inst.cluster_groups.values()
-        )
-        hard_shape_count = len(inst.fixed) + len(inst.preplaced)
-        edge_count = int(inst.valid_b2b.shape[0]) + int(inst.valid_p2b.shape[0])
-        edge_density = edge_count / max(inst.block_count, 1)
-
-        return (
-            boundary_count
-            >= int(os.environ.get("FLOORSET_HIGH_RISK_BOUNDARY_COUNT", "12"))
-            or grouping_budget
-            >= int(os.environ.get("FLOORSET_HIGH_RISK_GROUPING_BUDGET", "8"))
-            or hard_shape_count
-            >= int(os.environ.get("FLOORSET_HIGH_RISK_HARD_SHAPES", "8"))
-            or edge_density
-            >= float(os.environ.get("FLOORSET_HIGH_RISK_EDGE_DENSITY", "24.0"))
-        )
+        budget = instance_risk_budget(inst)
+        return budget.tier is not BudgetTier.NONE
 
     def _is_dense_medium_risk_case(self, inst) -> bool:
         boundary_count = len(inst.boundary)

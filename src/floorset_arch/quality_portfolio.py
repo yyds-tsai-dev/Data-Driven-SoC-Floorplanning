@@ -5,6 +5,7 @@ import os
 from floorset_arch.geometry import Rect, bbox, candidate_frontier_points, first_non_overlapping
 from floorset_arch.models import Instance, Placement, SolverConfig
 from floorset_arch.repair import soft_violation_counts
+from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.scoring import hpwl_proxy
 
 
@@ -28,24 +29,8 @@ def is_quality_portfolio_case(inst: Instance) -> bool:
     if mode in {"1", "true", "on", "yes", "always", "force"}:
         return True
 
-    b2b_count = int(inst.valid_b2b.shape[0]) if inst.valid_b2b is not None else 0
-    p2b_count = int(inst.valid_p2b.shape[0]) if inst.valid_p2b is not None else 0
-    boundary_count = len(inst.boundary)
-    grouping_budget = sum(max(0, len(members) - 1) for members in inst.cluster_groups.values())
-    mib_budget = sum(max(0, len(members) - 1) for members in inst.mib_groups.values())
-    edge_density = (b2b_count + p2b_count) / max(inst.block_count, 1)
-
-    min_blocks = int(os.environ.get("FLOORSET_QUALITY_PORTFOLIO_MIN_BLOCKS", "116"))
-    extreme_density = float(os.environ.get("FLOORSET_QUALITY_PORTFOLIO_EDGE_DENSITY", "80.0"))
-    pin_heavy_min = int(os.environ.get("FLOORSET_QUALITY_PORTFOLIO_PIN_HEAVY_MIN", "3000"))
-    b2b_heavy_min = int(os.environ.get("FLOORSET_QUALITY_PORTFOLIO_B2B_HEAVY_MIN", "5000"))
-    if inst.block_count >= min_blocks and edge_density >= extreme_density:
-        return True
-    if inst.block_count >= min_blocks and p2b_count >= pin_heavy_min and b2b_count >= b2b_heavy_min:
-        return True
-    if inst.block_count >= 90 and boundary_count + grouping_budget + mib_budget >= 70 and edge_density >= 60.0:
-        return True
-    return False
+    budget = instance_risk_budget(inst)
+    return budget.tier in {BudgetTier.MEDIUM, BudgetTier.HEAVY}
 
 
 def _edge_weight(inst: Instance, block: int) -> float:
