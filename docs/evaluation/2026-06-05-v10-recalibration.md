@@ -103,6 +103,8 @@ global-best Graph Transformer 0521 checkpoint regressed:
 | Graph Transformer 0521 baseline | `2.1194` | `2.6641` | `100/100` | `1.23s` | `2.23s` | `6.80s` |
 | Graph Transformer 0521 + `FLOORSET_ENABLE_QUALITY_PORTFOLIO=auto` | `2.2446` | `2.9168` | `100/100` | `1.24s` | `2.53s` | `5.97s` |
 | Graph Transformer 0521 + `FLOORSET_ENABLE_V10_SOFT_REPAIR=1` | `2.1082` | `2.7881` | `100/100` | `1.40s` | `2.54s` | `9.47s` |
+| Graph Transformer 0521 + soft repair + `FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP=1` | `2.2741` | `3.0120` | `100/100` | `1.24s` | `1.89s` | `8.11s` |
+| Graph Transformer 0521 + soft repair + runtime clamp + `FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS=1` | `2.4989` | `3.3102` | `100/100` | `1.24s` | `1.95s` | `8.65s` |
 
 This is a `+0.1252` no-runtime regression and a `+0.2527` total-score
 regression, so keep `FLOORSET_ENABLE_QUALITY_PORTFOLIO=auto` opt-in only.
@@ -118,6 +120,26 @@ on IDs 95, 96, 98, and 99. The worst runtime regression was ID 88, rising from
 `FLOORSET_ENABLE_V10_SOFT_REPAIR=1` opt-in and do not combine it with production
 submission defaults until runtime-tail budget clamp is in place. The artifact is
 `artifacts/eval_v10/v10_soft_repair_graph_transformer_0521_v10.json`.
+
+The first runtime-tail clamp reduced tail runtime but over-clamped quality. With
+soft repair enabled, p90 improved from `2.54s` to `1.89s` and max runtime
+improved from `9.47s` to `8.11s`, but no-runtime score regressed to `2.2741`
+and runtime-aware total regressed to `3.0120`. The largest bucket did not recover:
+IDs 95, 96, 98, and 99 were worse than baseline on no-runtime cost. Keep
+`FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP=1` opt-in and revise it from hard caps to
+per-case conditional caps before another promotion attempt. The artifact is
+`artifacts/eval_v10/runtime_clamp_graph_transformer_0521_v10.json`.
+
+The first decoder-side grouping adjacency bias was also not submission-safe.
+Combined with soft repair and runtime clamp, no-runtime score regressed to
+`2.4989` and total score regressed to `3.3102`. Runtime stayed bounded, but many
+mid/large cases gained soft violations; the largest no-runtime regressions
+included IDs 81, 82, 49, 64, 68, and 92. Keep
+`FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS=1` opt-in only. The next version should
+avoid globally compacting cluster keys and instead apply a narrower bias only
+when grouping soft pressure is high and the local order gap is ambiguous. The
+artifact is
+`artifacts/eval_v10/runtime_clamp_grouping_bias_graph_transformer_0521_v10.json`.
 
 Large-case candidates still have no measured v10 gain. No-Checkpoint Guidance
 Mode remains useful for deterministic repair diagnosis but is not competitive
