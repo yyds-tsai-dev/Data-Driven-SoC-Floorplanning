@@ -44,6 +44,10 @@ _Avoid_: arbitrary greedy coordinate.
 A constructive decoder that expands multiple partial placements by selecting a remaining block, shape, and legal slot at each step.
 _Avoid_: evaluator-in-loop reranking, single greedy placement.
 
+**Decoder-Side Grouping Adjacency Bias**:
+A later decoder-ranking preference that encourages grouped blocks to become adjacent before repair runs.
+_Avoid_: treating grouping repair as the only source of group satisfaction, hard-coding validation IDs.
+
 **Architecture v4**:
 The current production architecture generation that keeps `floorset_arch` as the active solver package while exposing a v4 contest wrapper.
 _Avoid_: architecture_v2, treating wrapper version names as separate solver packages.
@@ -59,6 +63,14 @@ _Avoid_: treating local runtime-aware score as the primary architecture metric.
 **Local Runtime-Aware Score**:
 The local evaluator score that uses each validation runtime divided by the solver's own validation-run median runtime.
 _Avoid_: treating it as the official contest runtime factor.
+
+**Conservative Runtime Budget**:
+The submission-oriented policy that permits extra sample-local search only when reusable v10 risk signals justify the raw runtime cost.
+_Avoid_: ignoring runtime after a no-runtime score win, enabling every opt-in portfolio by default.
+
+**Runtime-Tail Budget Clamp**:
+A follow-up policy that reduces expensive candidate or repair work on cases whose runtime tail is not buying v10 score improvement.
+_Avoid_: global timeouts, disabling repair on every large instance.
 
 **Sample-Local Parallelism**:
 Parallel work that happens inside one `solve()` call for a single contest sample, such as independent candidate generation or repair profiles.
@@ -97,8 +109,11 @@ _Avoid_: using validation case IDs as the risk definition.
 - A **Selectable Anchor-GNN Encoder** changes learned **Anchor-GNN Guidance** only; checkpoint promotion still requires evaluator evidence.
 - A **Local HGT Encoder** is a **Selectable Anchor-GNN Encoder** variant that preserves b2b/p2b locality and heterogeneous constraint factors instead of flattening them into a block-only graph.
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
+- A **Conservative Runtime Budget** gates **Sample-Local Parallelism** and **Sample-Local Quality Portfolio** so no-runtime wins do not automatically become submission defaults.
+- A **Runtime-Tail Budget Clamp** is considered only after v10 risk-gated repair acceptance, so runtime reductions do not preempt soft-feasibility improvements.
 - **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
 - A **Sample-Local Quality Portfolio** may refine and rank multiple placements for one sample, but it must preserve the **Production Solver Path** and remain gated by reusable instance statistics and full evaluator evidence.
+- A **Decoder-Side Grouping Adjacency Bias** is considered only after repair acceptance and runtime-tail budget work, because it changes pre-repair placement behavior.
 - **Training Golden Answer** should teach geometric priors, while soft-constraint satisfaction remains the responsibility of constraint-aware decoding, repair, and scoring.
 - A **Constraint-Clean Training Sample** is eligible for full imitation training; soft-violating training samples are low-weight geometry references by default, with dirty order/pairwise supervision suppressed.
 - **Validation Tail Diagnostics** may guide optimization priorities, but production behavior must be triggered by reusable instance features such as block count, boundary/group density, fixed/preplaced structure, or net statistics.
@@ -114,6 +129,8 @@ _Avoid_: using validation case IDs as the risk definition.
 - "Remove greedy/hint architecture" was resolved to mean removing `legacy`, `default`, and `model_first` as production solver branches while preserving reusable geometry helpers where needed by the beam decoder.
 - "Rename architecture_v2" was resolved to mean renaming the contest wrapper and active optimizer class to a numbered **Architecture vN**, not renaming the `floorset_arch` package.
 - "Local score" was ambiguous between **No-Runtime Quality Score** and **Local Runtime-Aware Score**; resolved: tune architecture with no-runtime score first, then check raw runtime and local runtime-aware score before submission.
+- "ICCAD submission score first" was resolved to require a **Conservative Runtime Budget**: keep the fast Graph Transformer default unless v10 risk signals and full-score evidence justify extra sample-local search.
+- "Do runtime-tail and grouping-decoder work next" was resolved as ordering, not scope expansion: first v10 risk-gated repair acceptance, then **Runtime-Tail Budget Clamp**, then **Decoder-Side Grouping Adjacency Bias**.
 - "Use validation tail diagnostics" was resolved to allow validation-tail evidence for design direction, while prohibiting `test_id`-specific production logic.
 - "Only high-risk cases get heavier search" was resolved to mean generalized instance-stat triggers, not validation-tail IDs.
 - "No GNN model ckpt mode" was resolved to mean **No-Checkpoint Guidance Mode**: use the normal production path with `AnchorGuidance=None` to measure how much deterministic decoding and repair can achieve without learned priors.
