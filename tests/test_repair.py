@@ -328,6 +328,64 @@ def test_v10_soft_repair_skips_none_risk_tier(monkeypatch):
     assert not _v10_soft_repair_eligible(inst, placement)
 
 
+def test_runtime_tail_clamp_is_opt_in(monkeypatch):
+    config = SolverConfig(
+        max_repair_passes=8,
+        max_boundary_component_snaps=30,
+        max_cluster_component_moves=26,
+        max_pair_candidates_per_component=40,
+    )
+    monkeypatch.delenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", raising=False)
+
+    clamped = repair_module._runtime_tail_clamped_config(_soft_test_instance(), config)
+
+    assert clamped is config
+
+
+def test_runtime_tail_clamp_lowers_heavy_budget_knobs(monkeypatch):
+    config = SolverConfig(
+        max_repair_passes=8,
+        max_boundary_component_snaps=30,
+        max_cluster_component_moves=26,
+        max_pair_candidates_per_component=40,
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", "1")
+    monkeypatch.setattr(
+        repair_module,
+        "instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
+    )
+
+    clamped = repair_module._runtime_tail_clamped_config(_soft_test_instance(), config)
+
+    assert clamped.max_repair_passes == 2
+    assert clamped.max_boundary_component_snaps == 20
+    assert clamped.max_cluster_component_moves == 18
+    assert clamped.max_pair_candidates_per_component == 24
+
+
+def test_runtime_tail_clamp_never_increases_existing_caps(monkeypatch):
+    config = SolverConfig(
+        max_repair_passes=1,
+        max_boundary_component_snaps=7,
+        max_cluster_component_moves=6,
+        max_pair_candidates_per_component=5,
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", "1")
+    monkeypatch.setattr(
+        repair_module,
+        "instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
+    )
+
+    clamped = repair_module._runtime_tail_clamped_config(_soft_test_instance(), config)
+
+    assert clamped.max_repair_passes == 1
+    assert clamped.max_boundary_component_snaps == 7
+    assert clamped.max_cluster_component_moves == 6
+    assert clamped.max_pair_candidates_per_component == 5
+
+
 def test_v10_soft_accepts_grouping_improvement_with_grouping_slack(monkeypatch):
     inst = _soft_test_instance()
     current = Placement(

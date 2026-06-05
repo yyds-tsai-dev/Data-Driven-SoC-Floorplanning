@@ -1,8 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
 from floorset_arch import features
+import floorset_arch.optimizer as optimizer_module
+import floorset_arch.repair as repair_module
 from floorset_arch.models import Placement, Rect
 from floorset_arch.models import AnchorGuidance, SolverConfig
 from floorset_arch.nn.model import FloorplanGNN
@@ -340,6 +343,29 @@ def test_high_risk_repair_profiles_are_configurable(monkeypatch):
     assert {"normal", "boundary_first", "grouping_first", "quality_refine"}.issubset(
         {spec.repair_profile for spec in specs}
     )
+
+
+def test_runtime_tail_clamp_applies_after_heavy_repair_profile(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", "1")
+    monkeypatch.setattr(
+        repair_module,
+        "instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
+    )
+    inst = parse_instance(
+        4,
+        torch.full((4,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.zeros(4, 5),
+        torch.full((4, 4), -1.0),
+    )
+
+    config = optimizer_module._repair_profile_config(SolverConfig(), "grouping_first", inst)
+
+    assert config.max_cluster_component_moves == 18
+    assert config.max_pair_candidates_per_component == 24
 
 
 def test_auto_high_risk_portfolio_targets_extreme_tail_cases(monkeypatch):

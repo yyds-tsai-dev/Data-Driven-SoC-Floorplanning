@@ -32,7 +32,7 @@ from floorset_arch.quality_portfolio import (
     refine_quality_candidate,
 )
 from floorset_arch.relative_order import construct_relative_order_placement
-from floorset_arch.repair import repair_placement
+from floorset_arch.repair import _runtime_tail_clamped_config, repair_placement
 from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.surrogate_guidance import build_surrogate_guidance
 
@@ -69,7 +69,7 @@ class CandidateSpec:
 def _repair_with_profile_worker(
     inst, placement: Placement, config: SolverConfig, repair_profile: str
 ) -> Placement:
-    profile_config = _repair_profile_config(config, repair_profile)
+    profile_config = _repair_profile_config(config, repair_profile, inst)
     if repair_profile not in {"large_boundary", "boundary_first", "quality_refine"}:
         return repair_placement(inst, placement, profile_config)
 
@@ -103,16 +103,16 @@ def _repair_with_profile_worker(
             os.environ["FLOORSET_OVERLAP_REPAIR_CANDIDATES"] = saved_overlap
 
 
-def _repair_profile_config(config: SolverConfig, repair_profile: str) -> SolverConfig:
+def _repair_profile_config(config: SolverConfig, repair_profile: str, inst=None) -> SolverConfig:
     if repair_profile in {"large_boundary", "boundary_first"}:
-        return replace(
+        profile_config = replace(
             config,
             max_boundary_component_snaps=max(config.max_boundary_component_snaps, 48),
             max_repair_passes=max(config.max_repair_passes, 10),
             soft_proxy_slack=max(config.soft_proxy_slack, 0.65),
         )
-    if repair_profile == "grouping_first":
-        return replace(
+    elif repair_profile == "grouping_first":
+        profile_config = replace(
             config,
             max_cluster_component_moves=max(config.max_cluster_component_moves, 56),
             max_pair_candidates_per_component=max(
@@ -120,13 +120,17 @@ def _repair_profile_config(config: SolverConfig, repair_profile: str) -> SolverC
             ),
             soft_proxy_slack=max(config.soft_proxy_slack, 0.62),
         )
-    if repair_profile == "quality_refine":
-        return replace(
+    elif repair_profile == "quality_refine":
+        profile_config = replace(
             config,
             equal_soft_proxy_slack=max(config.equal_soft_proxy_slack, 0.04),
             max_repair_passes=max(config.max_repair_passes, 10),
         )
-    return config
+    else:
+        profile_config = config
+    if inst is None:
+        return profile_config
+    return _runtime_tail_clamped_config(inst, profile_config)
 
 
 def _build_candidate_worker(
