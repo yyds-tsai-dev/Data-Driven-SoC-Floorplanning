@@ -5,7 +5,7 @@
 目前 production 預設 checkpoint：
 
 ```bash
-checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
+checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
 ```
 
 若要覆蓋模型，可以設定 `.env` 或環境變數：
@@ -119,14 +119,15 @@ bash scripts/eval_single.sh 99
 
 ```bash
 bash scripts/eval_total.sh
-bash scripts/eval_total.sh gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
-bash scripts/eval_total.sh checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
+bash scripts/eval_total.sh gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
+bash scripts/eval_total.sh checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
 bash scripts/eval_total.sh /abs/path/to/checkpoint.pt
 ```
 
 checkpoint 解析規則：
 
-- 無參數：優先用 `.env` 或 `FLOORSET_GNN_CHECKPOINT`，否則用 production 預設 checkpoint。
+- 無參數：優先用 `.env` 的 `FLOORSET_GNN_CHECKPOINT`，否則用既有 shell 環境變數，再否則用 production 預設 checkpoint。
+- 傳入 checkpoint 參數時：該參數優先於 `.env` 與既有 shell 環境變數。
 - 只有檔名：視為 `checkpoints/<name>`。
 - repo-relative path：視為 repo root 下的相對路徑。
 - absolute path：直接使用。
@@ -141,7 +142,7 @@ bash scripts/validate.sh
 
 ### `scripts/train.sh`
 
-訓練 Anchor-GNN checkpoint。預設參數與目前 v4 方向一致：`hidden_dim=192`、`layers=6`、`num_samples=200000`、`epochs=10`、pairwise head 開啟，並使用 weighted dirty-sample training。
+訓練 Anchor-GNN checkpoint。預設參數與目前 v4 方向一致：`hidden_dim=192`、`layers=6`、`num_samples=800000`、`epochs=4`、`lr=3e-4`、`val_samples=10000`、pairwise head 開啟，並使用 weighted dirty-sample training。
 
 ```bash
 bash scripts/train.sh
@@ -150,7 +151,7 @@ bash scripts/train.sh
 常用 override：
 
 ```bash
-NUM_SAMPLES=500000 EPOCHS=4 bash scripts/train.sh
+NUM_SAMPLES=200000 EPOCHS=10 LR=4e-4 bash scripts/train.sh
 OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_run bash scripts/train.sh
 WANDB_MODE=offline WANDB=0 bash scripts/train.sh
 RESUME_CHECKPOINT=checkpoints/old.pt bash scripts/train.sh
@@ -162,6 +163,43 @@ RESUME_CHECKPOINT=checkpoints/old.pt bash scripts/train.sh
 - dirty samples 仍可提供低權重 geometry reference。
 - dirty order/pairwise supervision 預設被抑制，避免把 soft-violating `fp_sol` 當成可靠 constraint oracle。
 - `WRITE_STABLE_CHECKPOINTS=1` 才會覆寫穩定檔名，例如 `gnn_best.pt`。
+
+### `scripts/train_transformer.sh`
+
+訓練 Graph Transformer encoder 版本的 Anchor-GNN。參數格式與 `scripts/train.sh` 相同，但預設 `ENCODER=graph-transformer`、`NUM_HEADS=8`、`CHECKPOINT_PREFIX=gnn_transformer`，log 檔名也會帶 `train_arch_v5_transformer`。
+
+```bash
+bash scripts/train_transformer.sh
+DEVICE=cpu WANDB=0 NUM_SAMPLES=2 VAL_SAMPLES=1 EPOCHS=1 HIDDEN_DIM=16 LAYERS=1 bash scripts/train_transformer.sh
+OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_transformer_run bash scripts/train_transformer.sh
+RESUME_CHECKPOINT=checkpoints/old_transformer.pt bash scripts/train_transformer.sh
+```
+
+### `scripts/train_hgt.sh`
+
+訓練 Local HGT encoder 版本的 Anchor-GNN。HGT 會保留 block、pin、cluster、MIB 與 boundary typed nodes，並只沿 heterogeneous factor graph 的 typed local edges 做 relation-specific attention；v1 不加入 global attention/refinement layer。參數格式與 `scripts/train_transformer.sh` 相同，但預設 `ENCODER=hgt`、`NUM_HEADS=4`、`BATCH_SIZE=8`、`CHECKPOINT_PREFIX=gnn_hgt`，log 檔名會帶 `train_arch_v5_hgt`。HGT script 也預設對高風險樣本啟用低風險 decoder-aware ranking 權重：`HIGH_RISK_ORDER_MULTIPLIER=1.5`、`HIGH_RISK_PAIRWISE_MULTIPLIER=1.5`，只加強 order/pairwise 訓練 loss，不改 decoder/repair。
+
+```bash
+bash scripts/train_hgt.sh
+DEVICE=cpu WANDB=0 NUM_SAMPLES=2 VAL_SAMPLES=1 EPOCHS=1 HIDDEN_DIM=16 LAYERS=1 bash scripts/train_hgt.sh
+BATCH_SIZE=4 bash scripts/train_hgt.sh
+OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_hgt_run bash scripts/train_hgt.sh
+RESUME_CHECKPOINT=checkpoints/old_hgt.pt bash scripts/train_hgt.sh
+```
+
+HGT dirty-sample experiments can enable repaired pseudo targets:
+
+```bash
+ENABLE_REPAIRED_PSEUDO_TARGETS=1 bash scripts/train_hgt.sh
+DIRTY_PSEUDO_ORDER_WEIGHT=0.20 DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT=0.35 ENABLE_REPAIRED_PSEUDO_TARGETS=1 bash scripts/train_hgt.sh
+```
+
+Guidance ablations are evaluator-time knobs:
+
+```bash
+FLOORSET_GUIDANCE_ANCHOR_ONLY=1 bash scripts/eval_total.sh checkpoints/model.pt
+FLOORSET_GUIDANCE_DISABLE_PAIRWISE=1 bash scripts/eval_total.sh checkpoints/model.pt
+```
 
 ### `scripts/update.sh`
 
@@ -271,7 +309,7 @@ src/
 │   ├── test_diagnostics.py
 │   └── test_evaluator_scoring.py
 ├── checkpoints/
-│   ├── gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt
+│   ├── gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
 │   └── other experiment checkpoints
 ├── docs/
 │   ├── optimization-notes.md
@@ -291,7 +329,7 @@ src/
 ## 最近更新
 
 - README 已改成中文專案入口文件，補上 problem 定義、no-runtime scoring、scripts、`src/` 架構、逐檔功能與 file tree。
-- Production 預設 checkpoint 已更新為 `checkpoints/gnn_best_0512_ns200000_ep10_h192_l6_acc32.pt`。
+- Production 預設 checkpoint 已更新為 `checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt`。
 - `scripts/eval_single.sh`、`scripts/eval_total.sh` 與 `SolverConfig.default_checkpoint` 已同步使用新的 best checkpoint。
 - `tests/test_optimizer.py` 的預設 checkpoint 測試已同步更新。
 

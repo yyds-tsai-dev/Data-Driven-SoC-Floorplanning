@@ -76,6 +76,73 @@ M_PENALTY = 10.0  # Infeasibility penalty
 AREA_TOLERANCE = 0.01  # 1% area tolerance
 
 
+def find_repo_root(start: Optional[Path] = None) -> Path:
+    """Find the repository root from either evaluator copy."""
+    start_path = (start or Path(__file__).resolve()).resolve()
+    for parent in (start_path.parent, *start_path.parents):
+        if (parent / ".env").exists() and (parent / "src").exists():
+            return parent
+    return Path.cwd().resolve()
+
+
+def load_env_defaults(
+    env_file: str | Path,
+    override_keys: Optional[set[str]] = None,
+) -> None:
+    """Load simple KEY=VALUE entries from an env file.
+
+    Existing environment values are preserved except keys listed in
+    override_keys.  Evaluation treats FLOORSET_GNN_CHECKPOINT as an override
+    key so the repo .env can define the default checkpoint for local runs.
+    """
+    path = Path(env_file)
+    if not path.exists():
+        return
+    overrides = override_keys or set()
+    with path.open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if not key:
+                continue
+            if key in overrides or key not in os.environ:
+                os.environ[key] = value
+
+
+def resolve_repo_checkpoint_path(value: str, repo_root: Optional[Path] = None) -> str:
+    """Resolve checkpoint values the same way eval_*.sh does."""
+    root = repo_root or find_repo_root()
+    raw = Path(value).expanduser()
+    if raw.is_absolute():
+        return str(raw)
+    if len(raw.parts) > 1:
+        return str((root / raw).resolve())
+    return str((root / "checkpoints" / raw).resolve())
+
+
+def load_repo_env_defaults(verbose: bool = False) -> Optional[Path]:
+    """Load repo .env for evaluator runs and normalize checkpoint paths."""
+    root = find_repo_root()
+    env_file = root / ".env"
+    override_keys = set()
+    if os.environ.get("FLOORSET_GNN_CHECKPOINT_SOURCE") != "cli":
+        override_keys.add("FLOORSET_GNN_CHECKPOINT")
+    load_env_defaults(env_file, override_keys=override_keys)
+    checkpoint = os.environ.get("FLOORSET_GNN_CHECKPOINT")
+    if checkpoint:
+        os.environ["FLOORSET_GNN_CHECKPOINT"] = resolve_repo_checkpoint_path(
+            checkpoint, root)
+    if verbose and os.environ.get("FLOORSET_GNN_CHECKPOINT"):
+        print(f"Using checkpoint: {os.environ['FLOORSET_GNN_CHECKPOINT']}")
+    return env_file if env_file.exists() else None
+
+
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
@@ -121,6 +188,8 @@ class SolutionMetrics:
     runtime_seconds: float
     cost: float
     cost_no_runtime: float = M_PENALTY
+    cost_breakdown: Dict[str, Any] = field(default_factory=dict)
+    cost_breakdown_no_runtime: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -137,6 +206,24 @@ class TestResult:
     cost_no_runtime: float = M_PENALTY
     positions: Optional[List[Tuple[float, float, float, float]]] = None
     error: Optional[str] = None
+    hpwl_b2b: float = 0.0
+    hpwl_p2b: float = 0.0
+    hpwl_total: float = 0.0
+    hpwl_baseline: float = 0.0
+    bbox_area: float = 0.0
+    bbox_area_baseline: float = 0.0
+    overlap_violations: int = 0
+    area_violations: int = 0
+    dimension_violations: int = 0
+    fixed_violations: int = 0
+    preplaced_violations: int = 0
+    boundary_violations: int = 0
+    grouping_violations: int = 0
+    mib_violations: int = 0
+    total_soft_violations: int = 0
+    max_possible_violations: int = 0
+    cost_breakdown: Dict[str, Any] = field(default_factory=dict)
+    cost_breakdown_no_runtime: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass 
@@ -306,6 +393,56 @@ def check_dimension_hard_constraints(
     return violations
 
 
+def compute_cost_breakdown(
+    hpwl_gap: float,
+    area_gap: float,
+    violations_relative: float,
+    runtime_factor: float,
+    is_feasible: bool,
+    use_runtime: bool = True,
+) -> Dict[str, Any]:
+    """
+    Compute the official contest cost factors.
+    
+    Cost = (1 + α·(HPWL_gap + Area_gap)) × exp(β·V_rel) × max(0.7, R^γ)
+         = M (10.0) if infeasible
+
+    Infeasible means any hard constraint is violated: block overlap, soft-block
+    area tolerance, fixed-shape dimension immutability, or preplaced
+    location/dimension immutability.
+
+    Feasible costs are capped at M−ε (9.999999) so every feasible solution
+    scores strictly better than an infeasible one.
+    """
+    positive_hpwl_gap = max(0, hpwl_gap)
+    positive_area_gap = max(0, area_gap)
+    quality_factor = 1 + ALPHA * (positive_hpwl_gap + positive_area_gap)
+    violation_factor = math.exp(BETA * violations_relative)
+    if use_runtime:
+        runtime_adjustment = max(0.7, math.pow(max(0.01, runtime_factor), GAMMA))
+    else:
+        runtime_adjustment = 1.0
+
+    formula_cost = quality_factor * violation_factor * runtime_adjustment
+    cost = M_PENALTY if not is_feasible else min(formula_cost, M_PENALTY - 1e-6)
+    return {
+        'hpwl_gap': hpwl_gap,
+        'area_gap': area_gap,
+        'positive_hpwl_gap': positive_hpwl_gap,
+        'positive_area_gap': positive_area_gap,
+        'violations_relative': violations_relative,
+        'runtime_factor': runtime_factor,
+        'quality_factor': quality_factor,
+        'violation_factor': violation_factor,
+        'runtime_adjustment': runtime_adjustment,
+        'formula_cost': formula_cost,
+        'infeasibility_penalty': M_PENALTY if not is_feasible else 0.0,
+        'cost': cost,
+        'use_runtime': use_runtime,
+        'is_feasible': is_feasible,
+    }
+
+
 def compute_cost(
     hpwl_gap: float,
     area_gap: float,
@@ -314,23 +451,15 @@ def compute_cost(
     is_feasible: bool,
     use_runtime: bool = True,
 ) -> float:
-    """
-    Compute the official contest cost.
-    
-    Cost = (1 + α·(HPWL_gap + Area_gap)) × exp(β·V_rel) × max(0.7, R^γ)
-         = M (10.0) if infeasible
-    """
-    if not is_feasible:
-        return M_PENALTY
-    
-    quality_factor = 1 + ALPHA * (max(0, hpwl_gap) + max(0, area_gap))
-    violation_factor = math.exp(BETA * violations_relative)
-    if use_runtime:
-        runtime_adjustment = max(0.7, math.pow(max(0.01, runtime_factor), GAMMA))
-    else:
-        runtime_adjustment = 1.0
-    
-    return quality_factor * violation_factor * runtime_adjustment
+    """Compute the official contest cost."""
+    return compute_cost_breakdown(
+        hpwl_gap,
+        area_gap,
+        violations_relative,
+        runtime_factor,
+        is_feasible,
+        use_runtime=use_runtime,
+    )['cost']
 
 
 def evaluate_solution(
@@ -541,8 +670,9 @@ def evaluate_solution(
     
     # Compute cost
     runtime_factor = runtime / max(median_runtime, 0.01)
-    cost = compute_cost(hpwl_gap, area_gap, violations_relative, runtime_factor, is_feasible)
-    cost_no_runtime = compute_cost(
+    cost_breakdown = compute_cost_breakdown(
+        hpwl_gap, area_gap, violations_relative, runtime_factor, is_feasible)
+    cost_no_runtime_breakdown = compute_cost_breakdown(
         hpwl_gap,
         area_gap,
         violations_relative,
@@ -550,6 +680,8 @@ def evaluate_solution(
         is_feasible,
         use_runtime=False,
     )
+    cost = cost_breakdown['cost']
+    cost_no_runtime = cost_no_runtime_breakdown['cost']
     
     return SolutionMetrics(
         is_feasible=is_feasible,
@@ -575,6 +707,8 @@ def evaluate_solution(
         runtime_seconds=runtime,
         cost=cost,
         cost_no_runtime=cost_no_runtime,
+        cost_breakdown=cost_breakdown,
+        cost_breakdown_no_runtime=cost_no_runtime_breakdown,
     )
 
 
@@ -582,10 +716,11 @@ def compute_total_score(costs: List[float], block_counts: List[int]) -> float:
     """
     Compute exponentially weighted average score.
     
-    Total Score = Σ Cost[i] · e^{n_i} / Σ e^{n_j}
+    Total Score = Σ Cost[i] · e^{n_i/12} / Σ e^{n_j/12}
     
-    where n_i is the block count for test case i. Larger instances
-    contribute exponentially more to the final score.
+    where n_i is the block count for test case i. The /12 scaling keeps
+    larger instances weighted more heavily while avoiding the old exp(n)
+    behavior where the single largest case dominated the total score.
     """
     if not costs:
         return 0.0
@@ -593,7 +728,7 @@ def compute_total_score(costs: List[float], block_counts: List[int]) -> float:
         return sum(costs) / len(costs)
     
     max_n = max(block_counts)
-    weights = [math.exp(n - max_n) for n in block_counts]
+    weights = [math.exp((n - max_n) / 12) for n in block_counts]
     total_weight = sum(weights)
     return sum(c * w for c, w in zip(costs, weights)) / total_weight
 
@@ -623,6 +758,210 @@ def summarize_runtimes(runtimes: List[float], results: Optional[List[TestResult]
         'max_runtime': sorted_runtimes[-1],
         'tail_runtimes': tail_runtimes,
     }
+
+
+def _result_diagnostic_row(
+    result: TestResult,
+    score_weight: float = 0.0,
+    score_contribution: float = 0.0,
+    score_contribution_percent: float = 0.0,
+    use_runtime: bool = True
+) -> Dict[str, Any]:
+    breakdown = result.cost_breakdown if use_runtime else result.cost_breakdown_no_runtime
+    cost = result.cost if use_runtime else result.cost_no_runtime
+    return {
+        'test_id': result.test_id,
+        'block_count': result.block_count,
+        'is_feasible': result.is_feasible,
+        'cost': cost,
+        'cost_with_runtime': result.cost,
+        'cost_no_runtime': result.cost_no_runtime,
+        'score_weight': score_weight,
+        'score_contribution': score_contribution,
+        'score_contribution_percent': score_contribution_percent,
+        'score_share_percent': score_weight * 100.0,
+        'hpwl_gap': result.hpwl_gap,
+        'area_gap': result.area_gap,
+        'violations_relative': result.violations_relative,
+        'runtime_seconds': result.runtime_seconds,
+        'quality_factor': breakdown.get('quality_factor'),
+        'violation_factor': breakdown.get('violation_factor'),
+        'runtime_factor': breakdown.get('runtime_factor'),
+        'runtime_adjustment': breakdown.get('runtime_adjustment'),
+        'formula_cost': breakdown.get('formula_cost'),
+        'infeasibility_penalty': breakdown.get('infeasibility_penalty'),
+        'hard_violations': {
+            'overlap': result.overlap_violations,
+            'area': result.area_violations,
+            'dimension': result.dimension_violations,
+            'fixed_info': result.fixed_violations,
+            'preplaced_info': result.preplaced_violations,
+        },
+        'soft_violations': {
+            'boundary': result.boundary_violations,
+            'grouping': result.grouping_violations,
+            'mib': result.mib_violations,
+            'total': result.total_soft_violations,
+            'max_possible': result.max_possible_violations,
+        },
+        'error': result.error,
+    }
+
+
+def summarize_score_contributors(
+    results: List[TestResult],
+    limit: int = 5,
+    use_runtime: bool = True
+) -> List[Dict[str, Any]]:
+    """Return cases with the largest weighted contribution to total score."""
+    if not results:
+        return []
+
+    max_n = max((r.block_count for r in results), default=0)
+    weights = [math.exp((r.block_count - max_n) / 12) for r in results]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        total_weight = 1.0
+
+    weighted_rows = []
+    for result, weight in zip(results, weights):
+        score_weight = weight / total_weight
+        cost = result.cost if use_runtime else result.cost_no_runtime
+        score_contribution = cost * score_weight
+        weighted_rows.append((result, score_weight, score_contribution))
+
+    total_score = sum(row[2] for row in weighted_rows)
+    rows = []
+    for result, score_weight, score_contribution in weighted_rows:
+        if total_score > 0:
+            score_contribution_percent = 100.0 * score_contribution / total_score
+        else:
+            score_contribution_percent = 0.0
+        rows.append(_result_diagnostic_row(
+            result,
+            score_weight=score_weight,
+            score_contribution=score_contribution,
+            score_contribution_percent=score_contribution_percent,
+            use_runtime=use_runtime,
+        ))
+
+    rows.sort(key=lambda row: row['score_contribution'], reverse=True)
+    return rows[:limit]
+
+
+def _rank_results(
+    results: List[TestResult],
+    key: Callable[[TestResult], float],
+    limit: int = 5,
+    reverse: bool = True,
+    use_runtime: bool = True
+) -> List[Dict[str, Any]]:
+    ranked = sorted(results, key=key, reverse=reverse)
+    return [_result_diagnostic_row(result, use_runtime=use_runtime)
+            for result in ranked[:limit]]
+
+
+def summarize_cost_factor_averages(results: List[TestResult]) -> Dict[str, float]:
+    """Average the exposed score factors for quick run-to-run comparison."""
+    breakdowns = [r.cost_breakdown for r in results if r.cost_breakdown]
+    if not breakdowns:
+        return {}
+
+    keys = [
+        'positive_hpwl_gap',
+        'positive_area_gap',
+        'violations_relative',
+        'runtime_factor',
+        'quality_factor',
+        'violation_factor',
+        'runtime_adjustment',
+        'formula_cost',
+        'cost',
+    ]
+    return {
+        key: sum(float(b.get(key, 0.0)) for b in breakdowns) / len(breakdowns)
+        for key in keys
+    }
+
+
+def summarize_evaluation_diagnostics(
+    results: List[TestResult],
+    limit: int = 5
+) -> Dict[str, Any]:
+    """Build diagnostic rankings for validation-tail analysis."""
+    return {
+        'cost_factor_averages': summarize_cost_factor_averages(results),
+        'top_score_contributors': summarize_score_contributors(results, limit=limit),
+        'top_score_contributors_no_runtime': summarize_score_contributors(
+            results, limit=limit, use_runtime=False),
+        'best_by_cost': _rank_results(results, lambda r: r.cost, limit, reverse=False),
+        'worst_by_cost': _rank_results(results, lambda r: r.cost, limit, reverse=True),
+        'worst_by_cost_no_runtime': _rank_results(
+            results, lambda r: r.cost_no_runtime, limit, reverse=True, use_runtime=False),
+        'worst_hpwl_gap': _rank_results(results, lambda r: r.hpwl_gap, limit, reverse=True),
+        'worst_area_gap': _rank_results(results, lambda r: r.area_gap, limit, reverse=True),
+        'worst_soft_violations': _rank_results(
+            results, lambda r: r.violations_relative, limit, reverse=True),
+        'slowest_runtimes': _rank_results(
+            results, lambda r: r.runtime_seconds, limit, reverse=True),
+        'infeasible_cases': [
+            _result_diagnostic_row(r) for r in results if not r.is_feasible
+        ][:limit],
+        'error_cases': [
+            _result_diagnostic_row(r) for r in results if r.error is not None
+        ][:limit],
+    }
+
+
+def print_ranked_diagnostics(title: str, rows: List[Dict[str, Any]]) -> None:
+    """Print compact rows for the most useful evaluation diagnostics."""
+    print(f"\n{title}")
+    print("-" * 96)
+    print("test_id blocks cost cost_no_rt contrib pct_total hpwl_gap area_gap v_rel runtime q_factor v_factor r_adj")
+    for row in rows:
+        contrib = row.get('score_contribution', 0.0)
+        contrib_pct = row.get('score_contribution_percent', 0.0)
+        print(
+            f"{row['test_id']:>7} "
+            f"{row['block_count']:>6} "
+            f"{row['cost']:>7.4f} "
+            f"{row['cost_no_runtime']:>10.4f} "
+            f"{contrib:>7.4f} "
+            f"{contrib_pct:>9.2f}% "
+            f"{row['hpwl_gap']:>8.4f} "
+            f"{row['area_gap']:>8.4f} "
+            f"{row['violations_relative']:>6.4f} "
+            f"{row['runtime_seconds']:>7.2f} "
+            f"{(row['quality_factor'] or 0):>8.4f} "
+            f"{(row['violation_factor'] or 0):>8.4f} "
+            f"{(row['runtime_adjustment'] or 0):>6.4f}"
+        )
+
+
+def print_evaluation_diagnostics(diagnostics: Dict[str, Any]) -> None:
+    """Print the diagnostics most useful during local evaluation."""
+    factor_avgs = diagnostics.get('cost_factor_averages', {})
+    if factor_avgs:
+        print("\nCost Factor Averages")
+        print("-" * 60)
+        print(f"Quality Factor: {factor_avgs.get('quality_factor', 0):.4f}")
+        print(f"Violation Factor: {factor_avgs.get('violation_factor', 0):.4f}")
+        print(f"Runtime Factor: {factor_avgs.get('runtime_factor', 0):.4f}")
+        print(f"Runtime Adjustment: {factor_avgs.get('runtime_adjustment', 0):.4f}")
+        print(f"Formula Cost: {factor_avgs.get('formula_cost', 0):.4f}")
+
+    print_ranked_diagnostics(
+        "Top 5 Total-Score Contributors",
+        diagnostics.get('top_score_contributors', []),
+    )
+    print_ranked_diagnostics(
+        "Best 5 by Cost",
+        diagnostics.get('best_by_cost', []),
+    )
+    print_ranked_diagnostics(
+        "Worst 5 by Cost",
+        diagnostics.get('worst_by_cost', []),
+    )
 
 
 # =============================================================================
@@ -934,7 +1273,25 @@ class ContestEvaluator:
                     runtime_seconds=runtime,
                     cost=metrics.cost,
                     cost_no_runtime=metrics.cost_no_runtime,
-                    positions=positions
+                    positions=positions,
+                    hpwl_b2b=metrics.hpwl_b2b,
+                    hpwl_p2b=metrics.hpwl_p2b,
+                    hpwl_total=metrics.hpwl_total,
+                    hpwl_baseline=metrics.hpwl_baseline,
+                    bbox_area=metrics.bbox_area,
+                    bbox_area_baseline=metrics.bbox_area_baseline,
+                    overlap_violations=metrics.overlap_violations,
+                    area_violations=metrics.area_violations,
+                    dimension_violations=metrics.dimension_violations,
+                    fixed_violations=metrics.fixed_violations,
+                    preplaced_violations=metrics.preplaced_violations,
+                    boundary_violations=metrics.boundary_violations,
+                    grouping_violations=metrics.grouping_violations,
+                    mib_violations=metrics.mib_violations,
+                    total_soft_violations=metrics.total_soft_violations,
+                    max_possible_violations=metrics.max_possible_violations,
+                    cost_breakdown=metrics.cost_breakdown,
+                    cost_breakdown_no_runtime=metrics.cost_breakdown_no_runtime,
                 ))
                 
             except Exception as e:
@@ -951,9 +1308,10 @@ class ContestEvaluator:
             for r in results:
                 if r.error is None:
                     rt_factor = r.runtime_seconds / max(median_rt, 0.01)
-                    r.cost = compute_cost(r.hpwl_gap, r.area_gap, r.violations_relative,
-                                         rt_factor, r.is_feasible)
-                    r.cost_no_runtime = compute_cost(
+                    r.cost_breakdown = compute_cost_breakdown(
+                        r.hpwl_gap, r.area_gap, r.violations_relative,
+                        rt_factor, r.is_feasible)
+                    r.cost_breakdown_no_runtime = compute_cost_breakdown(
                         r.hpwl_gap,
                         r.area_gap,
                         r.violations_relative,
@@ -961,6 +1319,8 @@ class ContestEvaluator:
                         r.is_feasible,
                         use_runtime=False,
                     )
+                    r.cost = r.cost_breakdown['cost']
+                    r.cost_no_runtime = r.cost_breakdown_no_runtime['cost']
         
         costs = [r.cost for r in results]
         costs_no_runtime = [r.cost_no_runtime for r in results]
@@ -968,6 +1328,7 @@ class ContestEvaluator:
         total_score = compute_total_score(costs, blocks)
         total_score_no_runtime = compute_total_score(costs_no_runtime, blocks)
         runtime_summary = summarize_runtimes(runtimes, results)
+        diagnostics = summarize_evaluation_diagnostics(results)
         
         return EvaluationResult(
             submission_name=Path(optimizer_path).stem,
@@ -981,6 +1342,7 @@ class ContestEvaluator:
                 'avg_cost': sum(costs) / len(costs) if costs else 0,
                 'avg_cost_no_runtime': sum(costs_no_runtime) / len(costs_no_runtime) if costs_no_runtime else 0,
                 **runtime_summary,
+                'diagnostics': diagnostics,
             }
         )
 
@@ -1789,12 +2151,23 @@ def score_saved_solutions(
             'is_feasible': solution_metrics.is_feasible,
             'hpwl_gap': solution_metrics.hpwl_gap,
             'area_gap': solution_metrics.area_gap,
+            'violations_relative': solution_metrics.violations_relative,
             'cost': solution_metrics.cost,
             'cost_no_runtime': solution_metrics.cost_no_runtime,
+            'cost_breakdown': solution_metrics.cost_breakdown,
+            'cost_breakdown_no_runtime': solution_metrics.cost_breakdown_no_runtime,
             'hpwl_total': solution_metrics.hpwl_total,
+            'hpwl_baseline': solution_metrics.hpwl_baseline,
             'bbox_area': solution_metrics.bbox_area,
+            'bbox_area_baseline': solution_metrics.bbox_area_baseline,
             'overlaps': solution_metrics.overlap_violations,
-            'area_violations': solution_metrics.area_violations
+            'area_violations': solution_metrics.area_violations,
+            'dimension_violations': solution_metrics.dimension_violations,
+            'boundary_violations': solution_metrics.boundary_violations,
+            'grouping_violations': solution_metrics.grouping_violations,
+            'mib_violations': solution_metrics.mib_violations,
+            'total_soft_violations': solution_metrics.total_soft_violations,
+            'max_possible_violations': solution_metrics.max_possible_violations,
         })
     
     # Compute total score
@@ -1814,13 +2187,45 @@ def score_saved_solutions(
     print(f"Feasible: {sum(1 for r in results if r['is_feasible'])}")
     print(f"Avg Cost: {sum(costs)/len(costs):.4f}")
     print(f"Avg Cost (No Runtime): {sum(costs_no_runtime)/len(costs_no_runtime):.4f}")
+
+    diagnostic_results = [
+        TestResult(
+            test_id=r['test_id'],
+            block_count=r['block_count'],
+            is_feasible=r['is_feasible'],
+            hpwl_gap=r['hpwl_gap'],
+            area_gap=r['area_gap'],
+            violations_relative=r['violations_relative'],
+            runtime_seconds=1.0,
+            cost=r['cost'],
+            cost_no_runtime=r['cost_no_runtime'],
+            hpwl_total=r['hpwl_total'],
+            hpwl_baseline=r['hpwl_baseline'],
+            bbox_area=r['bbox_area'],
+            bbox_area_baseline=r['bbox_area_baseline'],
+            overlap_violations=r['overlaps'],
+            area_violations=r['area_violations'],
+            dimension_violations=r['dimension_violations'],
+            boundary_violations=r['boundary_violations'],
+            grouping_violations=r['grouping_violations'],
+            mib_violations=r['mib_violations'],
+            total_soft_violations=r['total_soft_violations'],
+            max_possible_violations=r['max_possible_violations'],
+            cost_breakdown=r['cost_breakdown'],
+            cost_breakdown_no_runtime=r['cost_breakdown_no_runtime'],
+        )
+        for r in results
+    ]
+    diagnostics = summarize_evaluation_diagnostics(diagnostic_results)
+    print_evaluation_diagnostics(diagnostics)
     
     output = {
         'source': solutions_path,
         'timestamp': datetime.now().isoformat(),
         'total_score': total_score,
         'total_score_no_runtime': total_score_no_runtime,
-        'results': results
+        'results': results,
+        'diagnostics': diagnostics,
     }
     
     # Save if output path provided
@@ -1912,6 +2317,11 @@ def main():
     if args.info:
         print_contest_info()
         return
+
+    if args.evaluate:
+        load_repo_env_defaults(verbose=True)
+    else:
+        load_repo_env_defaults(verbose=False)
     
     if args.evaluate:
         evaluator = ContestEvaluator(args.data_path, verbose=True)
@@ -1933,6 +2343,7 @@ def main():
         print(f"Median Runtime: {result.summary['median_runtime']:.2f}s")
         print(f"P90 Runtime: {result.summary['p90_runtime']:.2f}s")
         print(f"Max Runtime: {result.summary['max_runtime']:.2f}s")
+        print_evaluation_diagnostics(result.summary.get('diagnostics', {}))
         
         # Save results
         output = args.output or f"{result.submission_name}_results.json"

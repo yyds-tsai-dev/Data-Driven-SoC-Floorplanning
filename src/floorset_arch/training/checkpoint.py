@@ -25,14 +25,20 @@ def save_checkpoint(
 
 def build_run_tag(args, when: datetime | None = None) -> str:
     stamp = (when or datetime.now()).strftime("%m%d")
+    encoder = str(getattr(args, "encoder", "mpnn")).replace("-", "_")
     parts = [
         stamp,
         f"ns{int(args.num_samples)}",
         f"ep{int(args.epochs)}",
+        f"enc{encoder}",
         f"h{int(args.hidden_dim)}",
         f"l{int(args.layers)}",
         f"acc{int(getattr(args, 'accumulation_steps', 1))}",
     ]
+    if encoder == "hgt":
+        parts.append(f"bs{int(getattr(args, 'batch_size', 1))}")
+    if encoder in {"graph_transformer", "hgt"}:
+        parts.append(f"heads{int(getattr(args, 'num_heads', 4))}")
     return "_".join(parts)
 
 
@@ -45,10 +51,22 @@ def anchor_checkpoint_payload(
         "hidden_dim": model.hidden_dim,
         "layers": model.num_layers,
         "dropout": getattr(model, "dropout_p", None),
+        "encoder_type": getattr(model, "encoder_type", "mpnn"),
+        "num_heads": getattr(model, "num_heads", 4),
+        "structural_feat_dim": getattr(model, "structural_feat_dim", 0),
+        "edge_type_count": getattr(model, "edge_type_count", 1),
+        "hgt_node_feat_dims": getattr(model, "hgt_node_feat_dims", {}),
+        "hgt_relation_specs": [tuple(relation) for relation in getattr(model, "hgt_relation_specs", ())],
+        "hgt_relation_gates": (
+            model.hgt_relation_gate_values()
+            if hasattr(model, "hgt_relation_gate_values")
+            else []
+        ),
         "has_pair_head": hasattr(model, "pair_head"),
         "epoch": epoch,
         "train_stats": train_stats,
         "val_stats": val_stats,
+        "selection_metric": "val_loss",
         "args": vars(args),
     }
     if optimizer is not None:

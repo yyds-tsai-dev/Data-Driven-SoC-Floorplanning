@@ -36,14 +36,17 @@ class HeteroFloorplanGraph:
         return total
 
 
-def build_hetero_floorplan_graph(inst: Instance) -> HeteroFloorplanGraph:
+def build_hetero_floorplan_graph(
+    inst: Instance, block_features: torch.Tensor | None = None
+) -> HeteroFloorplanGraph:
     """Build the runtime factor graph used by the beam decoder.
 
     The arch_new checkpoint still consumes the compact block graph in
     ``features.py``. This hetero graph is the solver-side representation that
     keeps pins and constraints explicit for masking and scoring decisions.
     """
-    block_features, _scale = build_anchor_node_features(inst)
+    if block_features is None:
+        block_features, _scale = build_anchor_node_features(inst)
     graph = HeteroFloorplanGraph(node_features={"block": block_features})
 
     if inst.pins_pos.numel() > 0:

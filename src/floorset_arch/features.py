@@ -1,8 +1,53 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from floorset_arch.models import Instance
+
+
+ANCHOR_EDGE_TYPE_B2B = 0
+ANCHOR_EDGE_TYPE_PIN = 1
+ANCHOR_EDGE_TYPE_CLUSTER = 2
+ANCHOR_EDGE_TYPE_MIB = 3
+ANCHOR_EDGE_TYPE_BOUNDARY = 4
+ANCHOR_EDGE_TYPE_COUNT = 5
+ANCHOR_HGT_RELATION_SPECS = (
+    ("block", "connects", "block"),
+    ("block", "member_of", "cluster"),
+    ("block", "pin_connects", "pin"),
+    ("block", "same_shape_as", "mib"),
+    ("block", "wants_boundary", "boundary"),
+    ("boundary", "has_member", "block"),
+    ("cluster", "has_member", "block"),
+    ("mib", "has_member", "block"),
+    ("pin", "pin_connects", "block"),
+)
+
+
+@dataclass(frozen=True)
+class AnchorTransformerGraphInputs:
+    edge_index: torch.Tensor
+    edge_attr: torch.Tensor
+    edge_type: torch.Tensor
+    node_structural_features: torch.Tensor
+    edge_type_count: int = ANCHOR_EDGE_TYPE_COUNT
+
+
+@dataclass(frozen=True)
+class AnchorHGTGraphInputs:
+    node_features: dict[str, torch.Tensor]
+    edge_index: dict[tuple[str, str, str], torch.Tensor]
+    edge_attr: dict[tuple[str, str, str], torch.Tensor]
+    node_feat_dims: dict[str, int]
+    relation_specs: tuple[tuple[str, str, str], ...]
+
+
+@dataclass(frozen=True)
+class BatchedAnchorHGTGraphInputs(AnchorHGTGraphInputs):
+    node_batch: dict[str, torch.Tensor]
+    sample_block_slices: list[tuple[int, int]]
 
 
 def _safe_float(x) -> float:
@@ -137,3 +182,381 @@ def build_anchor_edge_tensors(inst: Instance, device: torch.device | None = None
     edge_attr = torch.tensor(weights, dtype=torch.float32, device=device).view(-1, 1)
     edge_attr = edge_attr / edge_attr.max().clamp_min(1.0)
     return edge_index, edge_attr
+
+
+def _append_bidirectional_context_edges(
+    src: list[int],
+    dst: list[int],
+    weights: list[float],
+    edge_types: list[int],
+    blocks: list[int],
+    edge_type: int,
+    weight: float,
+) -> None:
+    unique_blocks = sorted({int(block) for block in blocks})
+    for i, block_i in enumerate(unique_blocks):
+        for block_j in unique_blocks[i + 1 :]:
+            if block_i == block_j:
+                continue
+            src.extend([block_i, block_j])
+            dst.extend([block_j, block_i])
+            weights.extend([weight, weight])
+            edge_types.extend([edge_type, edge_type])
+
+
+def _spectral_positional_features(
+    n: int,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    device: torch.device,
+    dims: int = 2,
+) -> torch.Tensor:
+    if n == 0 or dims <= 0:
+        return torch.empty((n, 0), dtype=torch.float32, device=device)
+    if n == 1 or edge_index.numel() == 0:
+        return torch.zeros((n, dims), dtype=torch.float32, device=device)
+
+    adjacency = torch.zeros((n, n), dtype=torch.float32, device=device)
+    src = edge_index[0]
+    dst = edge_index[1]
+    weight = edge_attr.flatten().float().clamp_min(0.0)
+    adjacency[dst, src] = torch.maximum(adjacency[dst, src], weight)
+    adjacency = torch.maximum(adjacency, adjacency.T)
+    degree = adjacency.sum(dim=1)
+    deg_inv_sqrt = degree.clamp_min(1e-6).rsqrt()
+    normalized = deg_inv_sqrt[:, None] * adjacency * deg_inv_sqrt[None, :]
+    laplacian = torch.eye(n, dtype=torch.float32, device=device) - normalized
+    try:
+        eigvec = torch.linalg.eigh(laplacian).eigenvectors[:, 1 : dims + 1]
+    except RuntimeError:
+        return torch.zeros((n, dims), dtype=torch.float32, device=device)
+    if eigvec.shape[1] < dims:
+        eigvec = torch.cat(
+            [eigvec, torch.zeros((n, dims - eigvec.shape[1]), dtype=eigvec.dtype, device=device)],
+            dim=1,
+        )
+    return eigvec.float()
+
+
+def build_anchor_transformer_graph_inputs(
+    inst: Instance, device: torch.device | None = None
+) -> AnchorTransformerGraphInputs:
+    """Build graph-transformer-only structural inputs from the hetero floorplan graph.
+
+    Existing MPNN checkpoints keep using ``build_anchor_edge_tensors``. The
+    transformer encoder gets additional factor-derived block context so pins,
+    grouping, MIB, and boundary constraints influence attention without changing
+    the block-level output contract.
+    """
+    from floorset_arch.hetero_graph import build_hetero_floorplan_graph
+
+    n = inst.block_count
+    device = device or inst.area_targets.device
+    base_edge_index, base_edge_attr = build_anchor_edge_tensors(inst, device=device)
+    src = base_edge_index[0].detach().cpu().tolist()
+    dst = base_edge_index[1].detach().cpu().tolist()
+    weights = base_edge_attr.flatten().detach().cpu().tolist()
+    edge_types = [ANCHOR_EDGE_TYPE_B2B for _ in weights]
+
+    graph = build_hetero_floorplan_graph(inst)
+    factor_members: dict[tuple[str, int], list[int]] = {}
+    for edge in graph.edges:
+        if edge.src_type == "block" and edge.dst_type in {"pin", "cluster", "mib", "boundary"}:
+            factor_members.setdefault((edge.dst_type, edge.dst), []).append(edge.src)
+        elif edge.dst_type == "block" and edge.src_type in {"pin", "cluster", "mib", "boundary"}:
+            factor_members.setdefault((edge.src_type, edge.src), []).append(edge.dst)
+
+    factor_type = {
+        "pin": ANCHOR_EDGE_TYPE_PIN,
+        "cluster": ANCHOR_EDGE_TYPE_CLUSTER,
+        "mib": ANCHOR_EDGE_TYPE_MIB,
+        "boundary": ANCHOR_EDGE_TYPE_BOUNDARY,
+    }
+    factor_weight = {
+        "pin": 0.75,
+        "cluster": 0.85,
+        "mib": 0.80,
+        "boundary": 0.65,
+    }
+    for (factor, _local_id), blocks in factor_members.items():
+        _append_bidirectional_context_edges(
+            src,
+            dst,
+            weights,
+            edge_types,
+            blocks,
+            factor_type[factor],
+            factor_weight[factor],
+        )
+
+    if src:
+        edge_index = torch.tensor([src, dst], dtype=torch.long, device=device)
+        edge_attr = torch.tensor(weights, dtype=torch.float32, device=device).view(-1, 1)
+        edge_attr = edge_attr / edge_attr.max().clamp_min(1.0)
+        edge_type = torch.tensor(edge_types, dtype=torch.long, device=device)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        edge_attr = torch.empty((0, 1), dtype=torch.float32, device=device)
+        edge_type = torch.empty((0,), dtype=torch.long, device=device)
+
+    b2b_degree = torch.zeros(n, dtype=torch.float32, device=device)
+    pin_degree = torch.zeros(n, dtype=torch.float32, device=device)
+    context_degree = torch.zeros(n, dtype=torch.float32, device=device)
+    for i_f, j_f, weight_f in inst.valid_b2b.tolist():
+        i = int(i_f)
+        j = int(j_f)
+        weight = max(_safe_float(weight_f), 0.0)
+        if 0 <= i < n and 0 <= j < n:
+            b2b_degree[i] += weight
+            b2b_degree[j] += weight
+    for _pin_f, block_f, weight_f in inst.valid_p2b.tolist():
+        block = int(block_f)
+        if 0 <= block < n:
+            pin_degree[block] += max(_safe_float(weight_f), 0.0)
+    if edge_index.numel() > 0:
+        context_degree.index_add_(0, edge_index[1], edge_attr.flatten())
+
+    cluster_size = torch.zeros(n, dtype=torch.float32, device=device)
+    for blocks in inst.cluster_groups.values():
+        size = float(len(blocks))
+        for block in blocks:
+            if 0 <= block < n:
+                cluster_size[block] = size
+    mib_size = torch.zeros(n, dtype=torch.float32, device=device)
+    for blocks in inst.mib_groups.values():
+        size = float(len(blocks))
+        for block in blocks:
+            if 0 <= block < n:
+                mib_size[block] = size
+    boundary_count = torch.zeros(n, dtype=torch.float32, device=device)
+    for block, code in inst.boundary.items():
+        if 0 <= block < n:
+            boundary_count[block] = float(sum(1 for bit in (1, 2, 4, 8) if int(code) & bit))
+
+    structural = torch.stack(
+        [
+            b2b_degree / b2b_degree.max().clamp_min(1.0),
+            pin_degree / pin_degree.max().clamp_min(1.0),
+            context_degree / context_degree.max().clamp_min(1.0),
+            cluster_size / max(float(n), 1.0),
+            mib_size / max(float(n), 1.0),
+            boundary_count / 4.0,
+        ],
+        dim=1,
+    )
+    spectral = _spectral_positional_features(n, edge_index, edge_attr, device=device, dims=2)
+    structural = torch.cat([structural, spectral], dim=1).float()
+
+    return AnchorTransformerGraphInputs(
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        edge_type=edge_type,
+        node_structural_features=structural,
+    )
+
+
+def _empty_features(rows: int, cols: int, device: torch.device) -> torch.Tensor:
+    return torch.empty((rows, cols), dtype=torch.float32, device=device)
+
+
+def _factor_node_features(
+    groups: dict[int, list[int]],
+    inst: Instance,
+    device: torch.device,
+) -> torch.Tensor:
+    rows: list[list[float]] = []
+    total_area = max(float(inst.area_targets[: inst.block_count].clamp_min(0).sum().item()), 1.0)
+    for group_id in sorted(groups):
+        members = [block for block in groups[group_id] if 0 <= block < inst.block_count]
+        if members:
+            area = float(inst.area_targets[members].float().clamp_min(0).sum().item())
+            boundary_members = sum(1 for block in members if block in inst.boundary)
+            hard_members = sum(1 for block in members if block in inst.fixed or block in inst.preplaced)
+        else:
+            area = 0.0
+            boundary_members = 0
+            hard_members = 0
+        size = len(members)
+        rows.append(
+            [
+                float(size) / max(float(inst.block_count), 1.0),
+                area / total_area,
+                float(boundary_members) / max(float(size), 1.0),
+                float(hard_members) / max(float(size), 1.0),
+            ]
+        )
+    if not rows:
+        return _empty_features(0, 4, device)
+    return torch.tensor(rows, dtype=torch.float32, device=device)
+
+
+def _boundary_node_features(inst: Instance, device: torch.device) -> torch.Tensor:
+    rows = [
+        [1.0 if code & bit else 0.0 for bit in (1, 2, 4, 8)]
+        + [float(sum(1 for bit in (1, 2, 4, 8) if code & bit)) / 4.0]
+        for code in sorted(set(inst.boundary.values()))
+    ]
+    if not rows:
+        return _empty_features(0, 5, device)
+    return torch.tensor(rows, dtype=torch.float32, device=device)
+
+
+def build_anchor_hgt_graph_inputs(
+    inst: Instance,
+    device: torch.device | None = None,
+    block_features: torch.Tensor | None = None,
+    scale: float | None = None,
+) -> AnchorHGTGraphInputs:
+    """Build local typed HGT inputs from the explicit hetero floorplan graph."""
+    from floorset_arch.hetero_graph import build_hetero_floorplan_graph
+
+    device = device or inst.area_targets.device
+    if block_features is None:
+        block_features, scale = build_anchor_node_features(inst, device=device)
+    else:
+        block_features = block_features.to(device=device, dtype=torch.float32)
+        if scale is None:
+            area = torch.clamp(inst.area_targets[: inst.block_count].float(), min=1.0)
+            scale = float(torch.sqrt(torch.clamp(area.sum(), min=1.0)).item())
+    if inst.pins_pos.numel() > 0:
+        pins = inst.pins_pos.float().to(device)
+        valid_pin = ((pins[:, 0] != -1.0) & (pins[:, 1] != -1.0)).float().view(-1, 1)
+        pin_features = torch.cat([pins / max(float(scale), 1.0), valid_pin], dim=1)
+    else:
+        pin_features = _empty_features(0, 3, device)
+
+    node_features = {
+        "block": block_features,
+        "pin": pin_features,
+        "cluster": _factor_node_features(inst.cluster_groups, inst, device),
+        "mib": _factor_node_features(inst.mib_groups, inst, device),
+        "boundary": _boundary_node_features(inst, device),
+    }
+
+    edge_src: dict[tuple[str, str, str], list[int]] = {}
+    edge_dst: dict[tuple[str, str, str], list[int]] = {}
+    edge_weight: dict[tuple[str, str, str], list[float]] = {}
+    graph = build_hetero_floorplan_graph(inst, block_features=block_features.detach().cpu())
+    for edge in graph.edges:
+        relation = (edge.src_type, edge.edge_type, edge.dst_type)
+        if edge.src >= node_features[edge.src_type].shape[0]:
+            continue
+        if edge.dst >= node_features[edge.dst_type].shape[0]:
+            continue
+        edge_src.setdefault(relation, []).append(int(edge.src))
+        edge_dst.setdefault(relation, []).append(int(edge.dst))
+        weight = max(float(edge.weight), 0.0)
+        if edge.edge_type in {"connects", "pin_connects"}:
+            weight = float(torch.log1p(torch.tensor(weight)).item())
+        edge_weight.setdefault(relation, []).append(weight)
+
+    edge_index: dict[tuple[str, str, str], torch.Tensor] = {}
+    edge_attr: dict[tuple[str, str, str], torch.Tensor] = {}
+    for relation in ANCHOR_HGT_RELATION_SPECS:
+        if relation not in edge_src:
+            edge_index[relation] = torch.empty((2, 0), dtype=torch.long, device=device)
+            edge_attr[relation] = torch.empty((0, 1), dtype=torch.float32, device=device)
+            continue
+        weights = torch.tensor(edge_weight[relation], dtype=torch.float32, device=device).view(-1, 1)
+        weights = weights / weights.max().clamp_min(1.0)
+        edge_index[relation] = torch.tensor(
+            [edge_src[relation], edge_dst[relation]], dtype=torch.long, device=device
+        )
+        edge_attr[relation] = weights
+
+    node_feat_dims = {
+        node_type: int(features.shape[1]) for node_type, features in node_features.items()
+    }
+    relation_specs = ANCHOR_HGT_RELATION_SPECS
+    return AnchorHGTGraphInputs(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        node_feat_dims=node_feat_dims,
+        relation_specs=relation_specs,
+    )
+
+
+def batch_anchor_hgt_graph_inputs(
+    graphs: list[AnchorHGTGraphInputs],
+) -> BatchedAnchorHGTGraphInputs:
+    if not graphs:
+        raise ValueError("batch_anchor_hgt_graph_inputs requires at least one graph")
+
+    node_types = tuple(graphs[0].node_features)
+    relation_specs = graphs[0].relation_specs
+    device = next(iter(graphs[0].node_features.values())).device
+
+    node_features: dict[str, torch.Tensor] = {}
+    node_batch: dict[str, torch.Tensor] = {}
+    node_offsets: list[dict[str, int]] = []
+    running_offsets = {node_type: 0 for node_type in node_types}
+    sample_block_slices: list[tuple[int, int]] = []
+
+    for sample_idx, graph in enumerate(graphs):
+        offsets_for_graph = dict(running_offsets)
+        node_offsets.append(offsets_for_graph)
+        block_start = running_offsets["block"]
+        block_count = graph.node_features["block"].shape[0]
+        sample_block_slices.append((block_start, block_start + block_count))
+        for node_type in node_types:
+            running_offsets[node_type] += graph.node_features[node_type].shape[0]
+
+    for node_type in node_types:
+        pieces = [graph.node_features[node_type] for graph in graphs]
+        if pieces:
+            node_features[node_type] = torch.cat(pieces, dim=0)
+        else:
+            node_features[node_type] = graphs[0].node_features[node_type]
+        batch_parts = [
+            torch.full(
+                (graph.node_features[node_type].shape[0],),
+                sample_idx,
+                dtype=torch.long,
+                device=device,
+            )
+            for sample_idx, graph in enumerate(graphs)
+        ]
+        node_batch[node_type] = (
+            torch.cat(batch_parts, dim=0)
+            if batch_parts
+            else torch.empty((0,), dtype=torch.long, device=device)
+        )
+
+    edge_index: dict[tuple[str, str, str], torch.Tensor] = {}
+    edge_attr: dict[tuple[str, str, str], torch.Tensor] = {}
+    for relation in relation_specs:
+        src_type, _edge_type, dst_type = relation
+        edge_parts = []
+        attr_parts = []
+        for graph, offsets in zip(graphs, node_offsets, strict=True):
+            edges = graph.edge_index[relation]
+            if edges.numel() == 0:
+                continue
+            offset = torch.tensor(
+                [[offsets[src_type]], [offsets[dst_type]]],
+                dtype=edges.dtype,
+                device=edges.device,
+            )
+            edge_parts.append(edges + offset)
+            attr_parts.append(graph.edge_attr[relation])
+        edge_index[relation] = (
+            torch.cat(edge_parts, dim=1)
+            if edge_parts
+            else torch.empty((2, 0), dtype=torch.long, device=device)
+        )
+        edge_attr[relation] = (
+            torch.cat(attr_parts, dim=0)
+            if attr_parts
+            else torch.empty((0, 1), dtype=torch.float32, device=device)
+        )
+
+    return BatchedAnchorHGTGraphInputs(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        node_feat_dims=graphs[0].node_feat_dims,
+        relation_specs=relation_specs,
+        node_batch=node_batch,
+        sample_block_slices=sample_block_slices,
+    )
