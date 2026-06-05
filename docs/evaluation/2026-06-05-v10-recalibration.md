@@ -102,11 +102,22 @@ global-best Graph Transformer 0521 checkpoint regressed:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Graph Transformer 0521 baseline | `2.1194` | `2.6641` | `100/100` | `1.23s` | `2.23s` | `6.80s` |
 | Graph Transformer 0521 + `FLOORSET_ENABLE_QUALITY_PORTFOLIO=auto` | `2.2446` | `2.9168` | `100/100` | `1.24s` | `2.53s` | `5.97s` |
+| Graph Transformer 0521 + `FLOORSET_ENABLE_V10_SOFT_REPAIR=1` | `2.1082` | `2.7881` | `100/100` | `1.40s` | `2.54s` | `9.47s` |
 
 This is a `+0.1252` no-runtime regression and a `+0.2527` total-score
 regression, so keep `FLOORSET_ENABLE_QUALITY_PORTFOLIO=auto` opt-in only.
 The artifact is
 `artifacts/eval_v10/quality_auto_graph_transformer_0521_v10.json`.
+
+The first v10 risk-gated soft-repair run produced a small no-runtime gain
+against the Graph Transformer 0521 baseline (`-0.0112`), but it regressed the
+runtime-aware total by `+0.1240`. The largest diagnostic bucket did not benefit:
+IDs 95-99 each had flat or worse no-runtime cost, and the runtime tail worsened
+on IDs 95, 96, 98, and 99. The worst runtime regression was ID 88, rising from
+`6.02s` to `9.47s` while also worsening total cost. Keep
+`FLOORSET_ENABLE_V10_SOFT_REPAIR=1` opt-in and do not combine it with production
+submission defaults until runtime-tail budget clamp is in place. The artifact is
+`artifacts/eval_v10/v10_soft_repair_graph_transformer_0521_v10.json`.
 
 Large-case candidates still have no measured v10 gain. No-Checkpoint Guidance
 Mode remains useful for deterministic repair diagnosis but is not competitive
