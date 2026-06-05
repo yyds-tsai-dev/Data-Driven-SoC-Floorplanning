@@ -6,6 +6,7 @@ import os
 from floorset_arch.constructive import block_dimensions
 from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
+from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.scoring import candidate_hpwl_proxy, hpwl_proxy
 
 
@@ -424,6 +425,128 @@ def _geometry_quality_proxy(inst: Instance, placement: Placement) -> float:
     except Exception:
         hpwl = 0.0
     return 0.018 * area + 0.0025 * hpwl
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return float(raw)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return int(raw)
+
+
+def _overlap_count(placement: Placement) -> int:
+    rects = list(placement.rects.values())
+    count = 0
+    for idx, rect in enumerate(rects):
+        for other in rects[idx + 1 :]:
+            if overlaps(rect, other):
+                count += 1
+    return count
+
+
+def _soft_capacity(inst: Instance) -> int:
+    boundary_budget = len(inst.boundary)
+    grouping_budget = sum(
+        max(0, len(members) - 1) for members in inst.cluster_groups.values()
+    )
+    mib_budget = sum(max(0, len(members) - 1) for members in inst.mib_groups.values())
+    return max(boundary_budget + grouping_budget + mib_budget, 1)
+
+
+def _hard_or_overlap_regressed(
+    inst: Instance,
+    candidate: Placement,
+    current: Placement,
+) -> bool:
+    if _overlap_count(candidate) > _overlap_count(current):
+        return True
+    for block in range(inst.block_count):
+        if block not in candidate.rects:
+            return True
+    for block in inst.fixed | inst.preplaced:
+        target = inst.target_rects.get(block)
+        rect = candidate.rects.get(block)
+        if target is None or rect is None:
+            return True
+        if block in inst.preplaced and (
+            abs(rect.x - target.x) > 1e-6 or abs(rect.y - target.y) > 1e-6
+        ):
+            return True
+        if abs(rect.width - target.width) > 1e-6 or abs(rect.height - target.height) > 1e-6:
+            return True
+    return False
+
+
+def _v10_soft_repair_eligible(inst: Instance, placement: Placement) -> bool:
+    if not _env_flag("FLOORSET_ENABLE_V10_SOFT_REPAIR"):
+        return False
+    try:
+        budget = instance_risk_budget(inst)
+    except Exception:
+        return False
+
+    if budget.tier in {BudgetTier.MEDIUM, BudgetTier.HEAVY}:
+        return True
+    if budget.tier is not BudgetTier.LIGHT:
+        return False
+
+    soft_total = sum(soft_violation_counts(inst, placement))
+    soft_relative = soft_total / _soft_capacity(inst)
+    min_soft = _env_int("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_SOFT", 6)
+    min_relative = _env_float("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_RELATIVE", 0.12)
+    return soft_total >= min_soft or soft_relative >= min_relative
+
+
+def _score_better_v10_soft(
+    inst: Instance,
+    config: SolverConfig,
+    candidate: Placement,
+    current: Placement,
+) -> bool:
+    del config
+    if _hard_or_overlap_regressed(inst, candidate, current):
+        return False
+
+    cand_counts = soft_violation_counts(inst, candidate)
+    cur_counts = soft_violation_counts(inst, current)
+    cand_soft = sum(cand_counts)
+    cur_soft = sum(cur_counts)
+    try:
+        cand_proxy = _geometry_quality_proxy(inst, candidate)
+        cur_proxy = _geometry_quality_proxy(inst, current)
+    except Exception:
+        return False
+
+    if cand_soft < cur_soft:
+        if cand_counts[1] < cur_counts[1]:
+            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_GROUPING_SLACK", 0.12)
+        elif cand_counts[1] > cur_counts[1]:
+            return False
+        elif cand_counts[0] < cur_counts[0] and cand_counts[2] >= cur_counts[2]:
+            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_BOUNDARY_SLACK", 0.06)
+        else:
+            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_GENERAL_SLACK", 0.08)
+        return cand_proxy <= cur_proxy * (1.0 + slack)
+
+    if cand_soft == cur_soft:
+        min_improvement = _env_float(
+            "FLOORSET_V10_SOFT_REPAIR_MIN_GEOMETRY_IMPROVEMENT",
+            0.0001,
+        )
+        return cand_proxy <= cur_proxy * (1.0 - min_improvement)
+
+    return False
 
 
 def _block_connectivity_weight(inst: Instance, block: int) -> float:

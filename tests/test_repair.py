@@ -297,6 +297,7 @@ def test_v10_soft_repair_light_tier_requires_soft_pressure(monkeypatch):
     )
     monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
     monkeypatch.setenv("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_SOFT", "3")
+    monkeypatch.setenv("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_RELATIVE", "1.0")
     monkeypatch.setattr(
         repair_module,
         "instance_risk_budget",
