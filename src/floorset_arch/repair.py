@@ -888,6 +888,27 @@ def _guarded_soft_repair(inst: Instance, placement: Placement, config: SolverCon
     return best
 
 
+def _v10_soft_repair(inst: Instance, placement: Placement, config: SolverConfig) -> Placement:
+    if not _v10_soft_repair_eligible(inst, placement):
+        return placement
+
+    best = placement.copy()
+    max_passes = max(1, min(config.max_repair_passes, 3))
+    for _ in range(max_passes):
+        trial = best.copy()
+        _repair_boundary(inst, trial)
+        _connect_clusters(inst, trial, config)
+        _resolve_overlaps(inst, trial, config)
+        _snap_boundary_components(inst, trial, config)
+        _repair_boundary(inst, trial)
+        _snap_hard(inst, trial)
+        if _score_better_v10_soft(inst, config, trial, best):
+            best = trial
+        else:
+            break
+    return best
+
+
 def _large_case_boundary_refine(inst: Instance, placement: Placement, config: SolverConfig) -> Placement:
     if inst.block_count < 118 or os.environ.get("FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_REFINE") != "1":
         return placement
@@ -942,6 +963,8 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
     _snap_boundary_components(inst, repaired, config)
     _repair_boundary(inst, repaired)
     repaired = _guarded_soft_repair(inst, repaired, config)
+    if _env_flag("FLOORSET_ENABLE_V10_SOFT_REPAIR"):
+        repaired = _v10_soft_repair(inst, repaired, config)
     repaired = _large_case_boundary_refine(inst, repaired, config)
     if _should_run_no_guidance_geometry_refine(inst, repaired):
         repaired = _geometry_preserving_refine(inst, repaired, config)

@@ -443,6 +443,42 @@ def test_v10_soft_requires_geometry_improvement_when_soft_does_not_improve(monke
     assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
 
 
+def test_v10_soft_repair_path_runs_only_when_opted_in(monkeypatch):
+    inst = _soft_test_instance()
+    placement = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    marker = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(2.0, 0.0, 2.0, 2.0),
+            2: Rect(4.0, 0.0, 2.0, 2.0),
+            3: Rect(6.0, 0.0, 2.0, 2.0),
+        }
+    )
+
+    def fake_v10_repair(_inst, _placement, _config):
+        return marker
+
+    monkeypatch.setattr(repair_module, "_v10_soft_repair", fake_v10_repair)
+    monkeypatch.delenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", raising=False)
+
+    repaired_without_flag = repair_placement(inst, placement, SolverConfig())
+
+    assert repaired_without_flag is not marker
+
+    monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
+
+    repaired_with_flag = repair_placement(inst, placement, SolverConfig())
+
+    assert repaired_with_flag is marker
+
+
 def test_large_case_boundary_repair_searches_wider_axis_candidates(monkeypatch):
     block_count = 118
     areas = torch.full((block_count,), 1.0)
