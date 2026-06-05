@@ -1,3 +1,4 @@
+import importlib.util
 import math
 import os
 import sys
@@ -5,12 +6,29 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import pytest
 
-CONTEST_DIR = Path(__file__).resolve().parents[1] / "FloorSet" / "iccad2026contest"
-if str(CONTEST_DIR) not in sys.path:
-    sys.path.insert(0, str(CONTEST_DIR))
+ROOT = Path(__file__).resolve().parents[1]
+FLOORSET_ROOT = ROOT / "FloorSet"
+SCRIPTS_EVALUATOR = ROOT / "scripts" / "iccad2026_evaluate.py"
 
-import iccad2026_evaluate as evaluator  # noqa: E402
+
+def _load_scripts_evaluator():
+    if str(FLOORSET_ROOT) not in sys.path:
+        sys.path.insert(0, str(FLOORSET_ROOT))
+    spec = importlib.util.spec_from_file_location(
+        "scripts_iccad2026_evaluate",
+        SCRIPTS_EVALUATOR,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+evaluator = _load_scripts_evaluator()
 
 
 def test_compute_cost_can_disable_runtime_adjustment():
@@ -40,7 +58,14 @@ def test_compute_cost_breakdown_exposes_formula_factors():
     )
 
 
-def test_no_runtime_total_uses_no_runtime_costs():
+def test_feasible_cost_is_capped_below_infeasible_penalty():
+    cost = evaluator.compute_cost(100.0, 100.0, 1.0, 100.0, True)
+
+    assert cost == evaluator.M_PENALTY - 1e-6
+    assert cost < evaluator.compute_cost(0.0, 0.0, 0.0, 1.0, False)
+
+
+def test_no_runtime_total_uses_v10_exp_n_over_12_weighting():
     results = [
         evaluator.TestResult(0, 21, True, 0.0, 0.0, 0.0, 1.0, cost=2.0, cost_no_runtime=1.0),
         evaluator.TestResult(1, 120, True, 0.0, 0.0, 0.0, 8.0, cost=8.0, cost_no_runtime=3.0),
@@ -50,23 +75,29 @@ def test_no_runtime_total_uses_no_runtime_costs():
         [r.cost_no_runtime for r in results],
         [r.block_count for r in results],
     )
+    weights = [math.exp((21 - 120) / 12), math.exp((120 - 120) / 12)]
+    expected = (1.0 * weights[0] + 3.0 * weights[1]) / sum(weights)
 
-    assert total > 2.99
+    assert total == expected
 
 
 def test_score_contributors_are_weighted_by_block_count():
     results = [
-        evaluator.TestResult(0, 21, True, 0.0, 0.0, 0.0, 1.0, cost=10.0, cost_no_runtime=10.0),
-        evaluator.TestResult(1, 120, True, 0.0, 0.0, 0.0, 1.0, cost=2.0, cost_no_runtime=2.0),
+        evaluator.TestResult(i - 21, i, True, 0.0, 0.0, 0.0, 1.0, cost=1.0, cost_no_runtime=1.0)
+        for i in range(21, 121)
     ]
 
-    contributors = evaluator.summarize_score_contributors(results)
+    contributors = evaluator.summarize_score_contributors(results, limit=100)
+    weights = [math.exp((i - 120) / 12) for i in range(21, 121)]
+    expected_weight_120 = weights[-1] / sum(weights)
+    expected_weight_116_120 = sum(weights[-5:]) / sum(weights)
 
-    assert contributors[0]["test_id"] == 1
-    assert contributors[0]["cost"] == 2.0
+    assert contributors[0]["test_id"] == 99
     assert contributors[0]["block_count"] == 120
-    assert contributors[0]["score_contribution"] > contributors[1]["score_contribution"]
-    assert contributors[0]["score_contribution_percent"] > 99.0
+    assert contributors[0]["score_weight"] == expected_weight_120
+    assert 0.079 < contributors[0]["score_weight"] < 0.081
+    assert sum(row["score_weight"] for row in contributors[:5]) == pytest.approx(expected_weight_116_120)
+    assert 0.34 < expected_weight_116_120 < 0.342
 
 
 def test_eval_env_loader_prefers_dotenv_checkpoint(monkeypatch, tmp_path):

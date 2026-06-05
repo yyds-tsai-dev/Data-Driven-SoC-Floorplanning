@@ -406,6 +406,13 @@ def compute_cost_breakdown(
     
     Cost = (1 + α·(HPWL_gap + Area_gap)) × exp(β·V_rel) × max(0.7, R^γ)
          = M (10.0) if infeasible
+
+    Infeasible means any hard constraint is violated: block overlap, soft-block
+    area tolerance, fixed-shape dimension immutability, or preplaced
+    location/dimension immutability.
+
+    Feasible costs are capped at M−ε (9.999999) so every feasible solution
+    scores strictly better than an infeasible one.
     """
     positive_hpwl_gap = max(0, hpwl_gap)
     positive_area_gap = max(0, area_gap)
@@ -417,6 +424,7 @@ def compute_cost_breakdown(
         runtime_adjustment = 1.0
 
     formula_cost = quality_factor * violation_factor * runtime_adjustment
+    cost = M_PENALTY if not is_feasible else min(formula_cost, M_PENALTY - 1e-6)
     return {
         'hpwl_gap': hpwl_gap,
         'area_gap': area_gap,
@@ -429,7 +437,7 @@ def compute_cost_breakdown(
         'runtime_adjustment': runtime_adjustment,
         'formula_cost': formula_cost,
         'infeasibility_penalty': M_PENALTY if not is_feasible else 0.0,
-        'cost': M_PENALTY if not is_feasible else formula_cost,
+        'cost': cost,
         'use_runtime': use_runtime,
         'is_feasible': is_feasible,
     }
@@ -708,10 +716,11 @@ def compute_total_score(costs: List[float], block_counts: List[int]) -> float:
     """
     Compute exponentially weighted average score.
     
-    Total Score = Σ Cost[i] · e^{n_i} / Σ e^{n_j}
+    Total Score = Σ Cost[i] · e^{n_i/12} / Σ e^{n_j/12}
     
-    where n_i is the block count for test case i. Larger instances
-    contribute exponentially more to the final score.
+    where n_i is the block count for test case i. The /12 scaling keeps
+    larger instances weighted more heavily while avoiding the old exp(n)
+    behavior where the single largest case dominated the total score.
     """
     if not costs:
         return 0.0
@@ -719,7 +728,7 @@ def compute_total_score(costs: List[float], block_counts: List[int]) -> float:
         return sum(costs) / len(costs)
     
     max_n = max(block_counts)
-    weights = [math.exp(n - max_n) for n in block_counts]
+    weights = [math.exp((n - max_n) / 12) for n in block_counts]
     total_weight = sum(weights)
     return sum(c * w for c, w in zip(costs, weights)) / total_weight
 
@@ -809,7 +818,7 @@ def summarize_score_contributors(
         return []
 
     max_n = max((r.block_count for r in results), default=0)
-    weights = [math.exp(r.block_count - max_n) for r in results]
+    weights = [math.exp((r.block_count - max_n) / 12) for r in results]
     total_weight = sum(weights)
     if total_weight <= 0:
         total_weight = 1.0
