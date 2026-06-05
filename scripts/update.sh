@@ -9,4 +9,4 @@ git status
 git add -A
 git commit -m "$COMMIT_MSG" || echo "No changes to commit"
 git push -u "$REMOTE" "$BRANCH"
-cp scripts/iccad2026_evaluate.py FloorSet/iccad2026contest/iccad2026_evaluate.py
+# cp scripts/iccad2026_evaluate.py FloorSet/iccad2026contest/iccad2026_evaluate.py
