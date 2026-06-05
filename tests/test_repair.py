@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 import torch
 
+import floorset_arch.repair as repair_module
 from floorset_arch.geometry import Rect, bbox, edge_touch_length, has_overlaps
 from floorset_arch.models import Placement, SolverConfig
 from floorset_arch.parser import parse_instance
@@ -7,10 +10,33 @@ from floorset_arch.repair import (
     _geometry_preserving_refine,
     _overlap_repair_candidate_limit,
     _repair_boundary,
+    _score_better_v10_soft,
     _shrink_satisfied_boundary_edges,
+    _v10_soft_repair_eligible,
     repair_placement,
     soft_violation_counts,
 )
+
+
+def _soft_test_instance():
+    areas = torch.full((4,), 4.0)
+    constraints = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 2.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    return parse_instance(
+        4,
+        areas,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        None,
+    )
 
 
 def test_repair_does_not_move_preplaced_or_resize_fixed_blocks():
@@ -202,6 +228,218 @@ def test_guarded_repair_reduces_soft_violation_counts():
 
     assert not has_overlaps(list(repaired.rects.values()))
     assert after < before
+
+
+def test_v10_soft_repair_is_disabled_by_default(monkeypatch):
+    inst = _soft_test_instance()
+    placement = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.delenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", raising=False)
+    monkeypatch.setattr(
+        repair_module,
+        "instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
+    )
+
+    assert not _v10_soft_repair_eligible(inst, placement)
+
+
+def test_v10_soft_repair_allows_medium_and_heavy_when_enabled(monkeypatch):
+    inst = _soft_test_instance()
+    placement = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
+
+    monkeypatch.setattr(
+        repair_module,
+        "instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.MEDIUM),
+    )
+    assert _v10_soft_repair_eligible(inst, placement)
+
+    monkeypatch.setattr(
+        repair_module,
+        "instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
+    )
+    assert _v10_soft_repair_eligible(inst, placement)
+
+
+def test_v10_soft_repair_light_tier_requires_soft_pressure(monkeypatch):
+    inst = _soft_test_instance()
+    low_soft = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(2.0, 0.0, 2.0, 2.0),
+            2: Rect(4.0, 0.0, 2.0, 2.0),
+            3: Rect(6.0, 0.0, 2.0, 2.0),
+        }
+    )
+    high_soft = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
+    monkeypatch.setenv("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_SOFT", "3")
+    monkeypatch.setattr(
+        repair_module,
+        "instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.LIGHT),
+    )
+
+    assert not _v10_soft_repair_eligible(inst, low_soft)
+    assert _v10_soft_repair_eligible(inst, high_soft)
+
+
+def test_v10_soft_repair_skips_none_risk_tier(monkeypatch):
+    inst = _soft_test_instance()
+    placement = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
+    monkeypatch.setattr(
+        repair_module,
+        "instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.NONE),
+    )
+
+    assert not _v10_soft_repair_eligible(inst, placement)
+
+
+def test_v10_soft_accepts_grouping_improvement_with_grouping_slack(monkeypatch):
+    inst = _soft_test_instance()
+    current = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    candidate = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(7.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    scores = {id(current): 100.0, id(candidate): 111.0}
+    monkeypatch.setattr(
+        repair_module,
+        "_geometry_quality_proxy",
+        lambda _inst, placement: scores[id(placement)],
+    )
+
+    assert _score_better_v10_soft(inst, SolverConfig(), candidate, current)
+
+
+def test_v10_soft_rejects_boundary_only_improvement_beyond_boundary_slack(monkeypatch):
+    inst = _soft_test_instance()
+    current = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(7.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    candidate = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(2.0, 0.0, 2.0, 2.0),
+            2: Rect(4.0, 0.0, 2.0, 2.0),
+            3: Rect(6.0, 0.0, 2.0, 2.0),
+        }
+    )
+    scores = {id(current): 100.0, id(candidate): 107.0}
+    monkeypatch.setattr(
+        repair_module,
+        "_geometry_quality_proxy",
+        lambda _inst, placement: scores[id(placement)],
+    )
+
+    assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
+
+
+def test_v10_soft_rejects_overlap_regression_even_when_soft_improves(monkeypatch):
+    inst = _soft_test_instance()
+    current = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    candidate = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(4.0, 0.0, 2.0, 2.0),
+            3: Rect(6.0, 0.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setattr(
+        repair_module,
+        "_geometry_quality_proxy",
+        lambda _inst, _placement: 1.0,
+    )
+
+    assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
+
+
+def test_v10_soft_requires_geometry_improvement_when_soft_does_not_improve(monkeypatch):
+    inst = _soft_test_instance()
+    current = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(2.0, 0.0, 2.0, 2.0),
+            2: Rect(4.0, 0.0, 2.0, 2.0),
+            3: Rect(6.0, 0.0, 2.0, 2.0),
+        }
+    )
+    candidate = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(2.0, 0.0, 2.0, 2.0),
+            2: Rect(4.0, 0.0, 2.0, 2.0),
+            3: Rect(8.0, 0.0, 2.0, 2.0),
+        }
+    )
+    scores = {id(current): 100.0, id(candidate): 99.98}
+    monkeypatch.setattr(
+        repair_module,
+        "_geometry_quality_proxy",
+        lambda _inst, placement: scores[id(placement)],
+    )
+
+    assert _score_better_v10_soft(inst, SolverConfig(), candidate, current)
+
+    scores[id(candidate)] = 99.995
+
+    assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
 
 
 def test_large_case_boundary_repair_searches_wider_axis_candidates(monkeypatch):
