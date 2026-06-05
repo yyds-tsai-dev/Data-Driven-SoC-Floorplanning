@@ -454,6 +454,34 @@ def test_checkpoint_metric_prefers_no_runtime_over_val_loss():
     assert not better_checkpoint_metric(low_val_loss_bad_eval, higher_val_loss_good_eval)
 
 
+def test_checkpoint_metric_prefers_full_no_runtime_over_tail_only():
+    full_eval = CheckpointMetricRecord(
+        checkpoint="full.pt",
+        epoch=2,
+        metric_source="full_eval",
+        feasible=100,
+        val_loss=0.5,
+        total_score_no_runtime=2.05,
+        tail_weighted_no_runtime=2.20,
+        soft_violations=8,
+        avg_runtime=1.2,
+    )
+    tail_better_but_full_worse = CheckpointMetricRecord(
+        checkpoint="tail.pt",
+        epoch=3,
+        metric_source="full_eval",
+        feasible=100,
+        val_loss=0.4,
+        total_score_no_runtime=2.10,
+        tail_weighted_no_runtime=2.00,
+        soft_violations=4,
+        avg_runtime=1.0,
+    )
+
+    assert better_checkpoint_metric(full_eval, tail_better_but_full_worse)
+    assert not better_checkpoint_metric(tail_better_but_full_worse, full_eval)
+
+
 def test_checkpoint_metric_manifest_round_trips(tmp_path):
     from floorset_arch.training.selection import append_metric_record, read_metric_records
 
