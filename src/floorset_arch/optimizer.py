@@ -19,7 +19,6 @@ except ImportError:  # pragma: no cover - dependency is present in local runs.
 from floorset_arch.constructive import construct_beam_placement
 from floorset_arch.diagnostics import placement_metrics, repair_delta
 from floorset_arch.geometry import (
-    bbox,
     candidate_frontier_points,
     first_non_overlapping,
 )
@@ -35,6 +34,7 @@ from floorset_arch.relative_order import construct_relative_order_placement
 from floorset_arch.repair import _runtime_tail_clamped_config, repair_placement
 from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.surrogate_guidance import build_surrogate_guidance
+from floorset_arch.v10_proxy import v10_proxy_better, v10_proxy_cost, v10_proxy_rank
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTEST_DIR = ROOT / "FloorSet" / "iccad2026contest"
@@ -516,29 +516,18 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
             candidates, key=lambda placement: self._candidate_rank(inst, placement)
         )
 
-    def _candidate_rank(self, inst, placement: Placement) -> tuple[int, float, int]:
+    def _candidate_rank(self, inst, placement: Placement) -> tuple:
         metrics = self._placement_metrics(inst, placement)
-        soft = (
-            int(metrics["boundary_violations"])
-            + int(metrics["group_violations"])
-            + int(metrics["mib_violations"])
-        )
-        if (
-            os.environ.get("FLOORSET_CANDIDATE_RANK_POLICY", "soft_first")
-            == "no_runtime_proxy"
-        ):
+        if os.environ.get("FLOORSET_CANDIDATE_RANK_POLICY", "v10_proxy") == "soft_first":
+            soft = self._soft_total(metrics)
             return (
                 int(metrics["overlap_count"]),
-                self._no_runtime_proxy_cost(inst, placement, metrics),
-                soft,
+                float(soft),
+                int(metrics["boundary_violations"]),
+                int(metrics["group_violations"]),
+                v10_proxy_cost(inst, placement, metrics),
             )
-        return (
-            int(metrics["overlap_count"]),
-            float(soft),
-            int(metrics["boundary_violations"]),
-            int(metrics["group_violations"]),
-            self._no_runtime_proxy_cost(inst, placement, metrics),
-        )
+        return v10_proxy_rank(inst, placement, metrics)
 
     def _placement_metrics(self, inst, placement: Placement) -> dict[str, float | int]:
         return placement_metrics(inst, placement)
@@ -582,12 +571,19 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     or self._soft_total(metrics) > best_soft
                 ):
                     continue
-                score = self._no_runtime_proxy_cost(inst, trial, metrics)
-                if score < best_score * (1.0 - 1e-4):
+                if v10_proxy_better(
+                    inst,
+                    trial,
+                    best,
+                    candidate_metrics=metrics,
+                    current_metrics=best_metrics,
+                    allow_tie_soft=True,
+                    allow_proxy_regression=False,
+                ):
                     best = trial
                     best_metrics = metrics
                     best_soft = self._soft_total(metrics)
-                    best_score = score
+                    best_score = v10_proxy_cost(inst, best, best_metrics)
                     rect = candidate
                     others = [
                         other for idx, other in best.rects.items() if idx != block
@@ -858,34 +854,12 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         return ["compact"]
 
     def _proxy_cost(self, inst, placement: Placement) -> float:
-        return self._no_runtime_proxy_cost(
-            inst, placement, placement_metrics(inst, placement)
-        )
+        return v10_proxy_cost(inst, placement, placement_metrics(inst, placement))
 
     def _no_runtime_proxy_cost(
         self, inst, placement: Placement, metrics: dict[str, float | int]
     ) -> float:
-        rects = placement.rects
-        bounds = bbox(list(rects.values()))
-        total_area = float(
-            torch.clamp(inst.area_targets[: inst.block_count], min=1.0).sum().item()
-        )
-        edge_weight = sum(float(w) for *_ij, w in inst.valid_b2b.tolist()) + sum(
-            float(w) for *_ij, w in inst.valid_p2b.tolist()
-        )
-        hpwl_scale = max(1.0, edge_weight * max(1.0, total_area**0.5))
-        area_score = bounds.area / max(total_area, 1.0)
-        hpwl_score = float(metrics["hpwl_proxy"]) / hpwl_scale
-        boundary_violations = int(metrics["boundary_violations"])
-        group_violations = int(metrics["group_violations"])
-        mib_violations = int(metrics["mib_violations"])
-        n_soft = max(1, len(inst.boundary))
-        n_soft += sum(
-            max(0, len(members) - 1) for members in inst.cluster_groups.values()
-        )
-        n_soft += sum(max(0, len(members) - 1) for members in inst.mib_groups.values())
-        v_rel = (boundary_violations + group_violations + mib_violations) / n_soft
-        return (1.0 + 0.5 * (hpwl_score + area_score)) * (2.718281828 ** (2.0 * v_rel))
+        return v10_proxy_cost(inst, placement, metrics)
 
 
 ArchitectureV4Optimizer = ArchitectureV5Optimizer

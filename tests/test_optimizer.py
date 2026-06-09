@@ -703,46 +703,7 @@ def test_candidate_selection_prefers_fewer_soft_violations():
     assert best is larger_clean
 
 
-def test_default_candidate_selection_keeps_soft_first_policy():
-    constraints = torch.tensor(
-        [
-            [0.0, 0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 0.0],
-        ]
-    )
-    inst = parse_instance(
-        3,
-        torch.tensor([4.0, 4.0, 4.0]),
-        torch.empty(0, 3),
-        torch.empty(0, 3),
-        torch.empty(0, 2),
-        constraints,
-        torch.full((3, 4), -1.0),
-    )
-    compact_dirty = Placement(
-        {
-            0: Rect(4.0, 0.0, 2.0, 2.0),
-            1: Rect(0.0, 0.0, 2.0, 2.0),
-            2: Rect(2.0, 0.0, 2.0, 2.0),
-        }
-    )
-    huge_clean = Placement(
-        {
-            0: Rect(0.0, 0.0, 2.0, 2.0),
-            1: Rect(200.0, 0.0, 2.0, 2.0),
-            2: Rect(202.0, 0.0, 2.0, 2.0),
-        }
-    )
-    optimizer = ArchitectureV4Optimizer()
-
-    best = optimizer._select_best_candidate(inst, [compact_dirty, huge_clean])
-
-    assert best is huge_clean
-
-
-def test_no_runtime_proxy_candidate_selection_is_opt_in(monkeypatch):
-    monkeypatch.setenv("FLOORSET_CANDIDATE_RANK_POLICY", "no_runtime_proxy")
+def test_default_candidate_selection_uses_v10_proxy_policy():
     constraints = torch.tensor(
         [
             [0.0, 0.0, 0.0, 0.0, 1.0],
@@ -780,6 +741,45 @@ def test_no_runtime_proxy_candidate_selection_is_opt_in(monkeypatch):
     assert best is compact_dirty
 
 
+def test_soft_first_candidate_selection_is_legacy_opt_in(monkeypatch):
+    monkeypatch.setenv("FLOORSET_CANDIDATE_RANK_POLICY", "soft_first")
+    constraints = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    inst = parse_instance(
+        3,
+        torch.tensor([4.0, 4.0, 4.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        torch.full((3, 4), -1.0),
+    )
+    compact_dirty = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    huge_clean = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(200.0, 0.0, 2.0, 2.0),
+            2: Rect(202.0, 0.0, 2.0, 2.0),
+        }
+    )
+    optimizer = ArchitectureV4Optimizer()
+
+    best = optimizer._select_best_candidate(inst, [compact_dirty, huge_clean])
+
+    assert best is huge_clean
+
+
 def test_quality_refine_moves_block_to_better_frontier_without_soft_regression():
     inst = parse_instance(
         3,
@@ -805,3 +805,39 @@ def test_quality_refine_moves_block_to_better_frontier_without_soft_regression()
 
     assert after < before
     assert refined.rects != placement.rects
+
+
+def test_candidate_rank_defaults_to_v10_proxy(monkeypatch):
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]]),
+        torch.full((3, 4), -1.0),
+    )
+    compact_dirty = Placement({0: Rect(4.0, 0.0, 2.0, 2.0), 1: Rect(0.0, 0.0, 2.0, 2.0), 2: Rect(2.0, 0.0, 2.0, 2.0)})
+    huge_clean = Placement({0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(200.0, 0.0, 2.0, 2.0), 2: Rect(202.0, 0.0, 2.0, 2.0)})
+    monkeypatch.delenv("FLOORSET_CANDIDATE_RANK_POLICY", raising=False)
+    optimizer = ArchitectureV4Optimizer()
+
+    assert optimizer._candidate_rank(inst, compact_dirty) < optimizer._candidate_rank(inst, huge_clean)
+
+
+def test_candidate_rank_can_restore_soft_first(monkeypatch):
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]]),
+        torch.full((3, 4), -1.0),
+    )
+    compact_dirty = Placement({0: Rect(4.0, 0.0, 2.0, 2.0), 1: Rect(0.0, 0.0, 2.0, 2.0), 2: Rect(2.0, 0.0, 2.0, 2.0)})
+    huge_clean = Placement({0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(200.0, 0.0, 2.0, 2.0), 2: Rect(202.0, 0.0, 2.0, 2.0)})
+    monkeypatch.setenv("FLOORSET_CANDIDATE_RANK_POLICY", "soft_first")
+    optimizer = ArchitectureV4Optimizer()
+
+    assert optimizer._candidate_rank(inst, huge_clean) < optimizer._candidate_rank(inst, compact_dirty)
