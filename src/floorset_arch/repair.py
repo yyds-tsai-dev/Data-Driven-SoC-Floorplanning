@@ -5,10 +5,16 @@ import math
 import os
 
 from floorset_arch.constructive import block_dimensions
+from floorset_arch.budget_layer import (
+    runtime_tail_clamp_enabled,
+    runtime_tail_clamp_limits,
+    v10_soft_repair_allowed,
+)
 from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
 from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.scoring import candidate_hpwl_proxy, hpwl_proxy
+from floorset_arch.v10_proxy import v10_proxy_better
 
 
 def _snap_hard(inst: Instance, placement: Placement) -> None:
@@ -490,47 +496,29 @@ def _hard_or_overlap_regressed(
 
 
 def _v10_soft_repair_eligible(inst: Instance, placement: Placement) -> bool:
-    if not _env_flag("FLOORSET_ENABLE_V10_SOFT_REPAIR"):
-        return False
     try:
         budget = instance_risk_budget(inst)
     except Exception:
         return False
-
-    if budget.tier in {BudgetTier.MEDIUM, BudgetTier.HEAVY}:
-        return True
-    if budget.tier is not BudgetTier.LIGHT:
-        return False
-
-    soft_total = sum(soft_violation_counts(inst, placement))
-    soft_relative = soft_total / _soft_capacity(inst)
-    min_soft = _env_int("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_SOFT", 6)
-    min_relative = _env_float("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_RELATIVE", 0.12)
-    return soft_total >= min_soft or soft_relative >= min_relative
-
-
-def _runtime_tail_clamp_limits(tier: BudgetTier) -> tuple[int, int, int, int]:
-    if tier is BudgetTier.HEAVY:
-        defaults = (2, 20, 18, 24)
-    elif tier is BudgetTier.MEDIUM:
-        defaults = (2, 16, 14, 20)
-    else:
-        defaults = (1, 10, 8, 12)
-    return (
-        _env_int("FLOORSET_RUNTIME_CLAMP_MAX_REPAIR_PASSES", defaults[0]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_BOUNDARY_SNAPS", defaults[1]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_CLUSTER_MOVES", defaults[2]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_PAIR_CANDIDATES", defaults[3]),
+    return v10_soft_repair_allowed(
+        inst,
+        soft_counts=soft_violation_counts(inst, placement),
+        budget=budget,
     )
 
 
+def _runtime_tail_clamp_limits(tier: BudgetTier) -> tuple[int, int, int, int]:
+    return runtime_tail_clamp_limits(tier)
+
+
 def _runtime_tail_clamped_config(inst: Instance, config: SolverConfig) -> SolverConfig:
-    if not _env_flag("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP"):
+    if not runtime_tail_clamp_enabled():
         return config
     try:
-        tier = instance_risk_budget(inst).tier
+        budget = instance_risk_budget(inst)
     except Exception:
-        tier = BudgetTier.LIGHT
+        budget = None
+    tier = budget.tier if budget is not None else BudgetTier.LIGHT
     max_passes, boundary_snaps, cluster_moves, pair_candidates = _runtime_tail_clamp_limits(tier)
     return replace(
         config,
@@ -551,38 +539,16 @@ def _score_better_v10_soft(
     current: Placement,
 ) -> bool:
     del config
-    if _hard_or_overlap_regressed(inst, candidate, current):
-        return False
-
-    cand_counts = soft_violation_counts(inst, candidate)
-    cur_counts = soft_violation_counts(inst, current)
-    cand_soft = sum(cand_counts)
-    cur_soft = sum(cur_counts)
     try:
-        cand_proxy = _geometry_quality_proxy(inst, candidate)
-        cur_proxy = _geometry_quality_proxy(inst, current)
+        return v10_proxy_better(
+            inst,
+            candidate,
+            current,
+            allow_tie_soft=True,
+            allow_proxy_regression=False,
+        )
     except Exception:
         return False
-
-    if cand_soft < cur_soft:
-        if cand_counts[1] < cur_counts[1]:
-            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_GROUPING_SLACK", 0.12)
-        elif cand_counts[1] > cur_counts[1]:
-            return False
-        elif cand_counts[0] < cur_counts[0] and cand_counts[2] >= cur_counts[2]:
-            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_BOUNDARY_SLACK", 0.06)
-        else:
-            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_GENERAL_SLACK", 0.08)
-        return cand_proxy <= cur_proxy * (1.0 + slack)
-
-    if cand_soft == cur_soft:
-        min_improvement = _env_float(
-            "FLOORSET_V10_SOFT_REPAIR_MIN_GEOMETRY_IMPROVEMENT",
-            0.0001,
-        )
-        return cand_proxy <= cur_proxy * (1.0 - min_improvement)
-
-    return False
 
 
 def _block_connectivity_weight(inst: Instance, block: int) -> float:
@@ -928,7 +894,6 @@ def _v10_soft_repair(inst: Instance, placement: Placement, config: SolverConfig)
     if not _v10_soft_repair_eligible(inst, placement):
         return placement
 
-    config = _runtime_tail_clamped_config(inst, config)
     best = placement.copy()
     max_passes = max(1, min(config.max_repair_passes, 3))
     for _ in range(max_passes):

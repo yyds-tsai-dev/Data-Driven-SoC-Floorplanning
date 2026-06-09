@@ -414,7 +414,34 @@ def test_v10_soft_accepts_grouping_improvement_with_grouping_slack(monkeypatch):
     assert _score_better_v10_soft(inst, SolverConfig(), candidate, current)
 
 
-def test_v10_soft_rejects_boundary_only_improvement_beyond_boundary_slack(monkeypatch):
+def test_v10_soft_acceptance_uses_shared_no_runtime_proxy(monkeypatch):
+    inst = _soft_test_instance()
+    current = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(10.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    candidate = Placement(
+        {
+            0: Rect(5.0, 0.0, 2.0, 2.0),
+            1: Rect(7.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 4.0, 2.0, 2.0),
+            3: Rect(0.0, 0.0, 2.0, 2.0),
+        }
+    )
+    scores = {id(current): 100.0, id(candidate): 200.0}
+    monkeypatch.setattr(
+        "floorset_arch.v10_proxy.v10_proxy_cost",
+        lambda _inst, placement, metrics=None: scores[id(placement)],
+    )
+
+    assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
+
+
+def test_v10_soft_rejects_boundary_only_improvement_with_proxy_regression(monkeypatch):
     inst = _soft_test_instance()
     current = Placement(
         {
@@ -434,9 +461,8 @@ def test_v10_soft_rejects_boundary_only_improvement_beyond_boundary_slack(monkey
     )
     scores = {id(current): 100.0, id(candidate): 107.0}
     monkeypatch.setattr(
-        repair_module,
-        "_geometry_quality_proxy",
-        lambda _inst, placement: scores[id(placement)],
+        "floorset_arch.v10_proxy.v10_proxy_cost",
+        lambda _inst, placement, metrics=None: scores[id(placement)],
     )
 
     assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
@@ -469,7 +495,7 @@ def test_v10_soft_rejects_overlap_regression_even_when_soft_improves(monkeypatch
     assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
 
 
-def test_v10_soft_requires_geometry_improvement_when_soft_does_not_improve(monkeypatch):
+def test_v10_soft_requires_proxy_improvement_when_soft_does_not_improve(monkeypatch):
     inst = _soft_test_instance()
     current = Placement(
         {
@@ -487,11 +513,10 @@ def test_v10_soft_requires_geometry_improvement_when_soft_does_not_improve(monke
             3: Rect(8.0, 0.0, 2.0, 2.0),
         }
     )
-    scores = {id(current): 100.0, id(candidate): 99.98}
+    scores = {id(current): 100.0, id(candidate): 99.8}
     monkeypatch.setattr(
-        repair_module,
-        "_geometry_quality_proxy",
-        lambda _inst, placement: scores[id(placement)],
+        "floorset_arch.v10_proxy.v10_proxy_cost",
+        lambda _inst, placement, metrics=None: scores[id(placement)],
     )
 
     assert _score_better_v10_soft(inst, SolverConfig(), candidate, current)
@@ -719,3 +744,72 @@ def test_boundary_edge_shrink_pulls_satisfied_right_edge_inward():
     assert bounds.right < 100.0
     assert abs(refined.rects[2].right - bounds.right) <= 1e-6
     assert abs(refined.rects[3].right - bounds.right) <= 1e-6
+
+
+def test_v10_soft_acceptance_rejects_proxy_regression_even_when_soft_improves(monkeypatch):
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        ),
+        torch.full((3, 4), -1.0),
+    )
+    current = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    huge_clean = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(200.0, 0.0, 2.0, 2.0),
+            2: Rect(202.0, 0.0, 2.0, 2.0),
+        }
+    )
+
+    assert not _score_better_v10_soft(inst, SolverConfig(), huge_clean, current)
+
+
+def test_v10_soft_acceptance_allows_soft_tie_when_proxy_is_equal(monkeypatch):
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        ),
+        torch.full((3, 4), -1.0),
+    )
+    current = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    soft_better = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 3.0, 2.0, 2.0),
+            2: Rect(2.0, 3.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setattr("floorset_arch.v10_proxy.v10_proxy_cost", lambda _inst, placement, metrics=None: 1.0)
+
+    assert _score_better_v10_soft(inst, SolverConfig(), soft_better, current)
