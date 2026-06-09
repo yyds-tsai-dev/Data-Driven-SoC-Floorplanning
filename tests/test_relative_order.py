@@ -84,3 +84,65 @@ def test_grouping_adjacency_bias_can_chain_compact_profile(monkeypatch):
     placement = construct_relative_order_placement(inst, profile="compact")
 
     assert edge_touch_length(placement.rects[0], placement.rects[1]) > 0.0
+
+
+def test_narrow_grouping_pair_bias_does_not_enable_global_key_blend(monkeypatch):
+    constraints = torch.zeros(3, 5)
+    constraints[0, 3] = 1.0
+    constraints[1, 3] = 1.0
+    constraints[2, 3] = 1.0
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        torch.full((3, 4), -1.0),
+    )
+    inst.anchor_guidance = AnchorGuidance(
+        rect_priors={
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(30.0, 0.0, 2.0, 2.0),
+            2: Rect(60.0, 0.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS", "0")
+
+    placement = construct_relative_order_placement(inst, profile="compact")
+
+    assert placement.rects[2].x >= placement.rects[1].right
+
+
+def test_narrow_grouping_pair_bias_only_applies_to_ambiguous_same_cluster_pairs(monkeypatch):
+    constraints = torch.zeros(4, 5)
+    constraints[0, 3] = 1.0
+    constraints[1, 3] = 1.0
+    constraints[2, 3] = 2.0
+    constraints[3, 3] = 2.0
+    inst = parse_instance(
+        4,
+        torch.full((4,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        torch.full((4, 4), -1.0),
+    )
+    inst.anchor_guidance = AnchorGuidance(
+        rect_priors={
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(2.1, 2.0, 2.0, 2.0),
+            2: Rect(20.0, 0.0, 2.0, 2.0),
+            3: Rect(80.0, 20.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1")
+    monkeypatch.setenv("FLOORSET_NARROW_GROUPING_MIN_MEMBERS", "2")
+    monkeypatch.setenv("FLOORSET_NARROW_GROUPING_AMBIGUITY_MARGIN", "0.30")
+
+    placement = construct_relative_order_placement(inst, profile="compact")
+
+    assert edge_touch_length(placement.rects[0], placement.rects[1]) > 0.0
+    assert edge_touch_length(placement.rects[2], placement.rects[3]) == 0.0
