@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+
 import torch
 
 from floorset_arch.models import Placement, Rect
@@ -196,6 +198,28 @@ def test_v10_proxy_better_rejects_proxy_regression_even_when_soft_improves():
     assert not v10_proxy_better(inst, huge_clean, current)
 
 
+def test_v10_proxy_better_rejects_huge_proxy_regression_even_when_allowed():
+    inst = _inst(3, boundary=1)
+    current = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    huge_clean = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(200.0, 0.0, 2.0, 2.0),
+            2: Rect(202.0, 0.0, 2.0, 2.0),
+        }
+    )
+
+    assert not v10_proxy_better(
+        inst, huge_clean, current, allow_proxy_regression=True
+    )
+
+
 def test_v10_proxy_better_allows_soft_tie_within_tolerance(monkeypatch):
     inst = _inst(3, boundary=1)
     current = Placement(
@@ -213,6 +237,41 @@ def test_v10_proxy_better_allows_soft_tie_within_tolerance(monkeypatch):
         }
     )
 
+    monkeypatch.setattr(
+        "floorset_arch.v10_proxy.v10_proxy_cost",
+        lambda _inst, placement, metrics=None: 1.0,
+    )
+
+    assert v10_proxy_better(inst, soft_better, current)
+
+
+def test_v10_proxy_imports_cleanly_with_repair_in_either_order():
+    import floorset_arch.repair
+    import floorset_arch.v10_proxy
+
+    importlib.reload(floorset_arch.v10_proxy)
+    importlib.reload(floorset_arch.repair)
+    assert not hasattr(floorset_arch.v10_proxy, "soft_violation_counts")
+    assert not hasattr(floorset_arch.v10_proxy, "placement_metrics")
+
+
+def test_v10_proxy_invalid_tie_tolerance_env_falls_back(monkeypatch):
+    inst = _inst(3, boundary=1)
+    current = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    soft_better = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 3.0, 2.0, 2.0),
+            2: Rect(2.0, 3.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_V10_PROXY_TIE_TOLERANCE", "not-a-number")
     monkeypatch.setattr(
         "floorset_arch.v10_proxy.v10_proxy_cost",
         lambda _inst, placement, metrics=None: 1.0,
