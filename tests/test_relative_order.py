@@ -102,17 +102,18 @@ def test_narrow_grouping_pair_bias_does_not_enable_global_key_blend(monkeypatch)
     )
     inst.anchor_guidance = AnchorGuidance(
         rect_priors={
-            0: Rect(0.0, 0.0, 2.0, 2.0),
+            0: Rect(60.0, 0.0, 2.0, 2.0),
             1: Rect(30.0, 0.0, 2.0, 2.0),
-            2: Rect(60.0, 0.0, 2.0, 2.0),
+            2: Rect(0.0, 0.0, 2.0, 2.0),
         }
     )
     monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1")
-    monkeypatch.setenv("FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS", "0")
+    monkeypatch.setenv("FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS", "1")
+    monkeypatch.setenv("FLOORSET_GROUPING_ADJACENCY_KEY_BLEND", "1.0")
 
     placement = construct_relative_order_placement(inst, profile="compact")
 
-    assert placement.rects[2].x >= placement.rects[1].right
+    assert placement.rects[0].x >= placement.rects[1].right
 
 
 def test_narrow_grouping_pair_bias_only_applies_to_ambiguous_same_cluster_pairs(monkeypatch):
@@ -133,9 +134,9 @@ def test_narrow_grouping_pair_bias_only_applies_to_ambiguous_same_cluster_pairs(
     inst.anchor_guidance = AnchorGuidance(
         rect_priors={
             0: Rect(0.0, 0.0, 2.0, 2.0),
-            1: Rect(2.1, 2.0, 2.0, 2.0),
+            1: Rect(3.0, 3.0, 2.0, 2.0),
             2: Rect(20.0, 0.0, 2.0, 2.0),
-            3: Rect(80.0, 20.0, 2.0, 2.0),
+            3: Rect(0.0, 20.0, 2.0, 2.0),
         }
     )
     monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1")

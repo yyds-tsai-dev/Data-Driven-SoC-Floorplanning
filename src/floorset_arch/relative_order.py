@@ -300,7 +300,6 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
                 v_score += 0.25
             ci = _constraint_id(inst, i, 3)
             cj = _constraint_id(inst, j, 3)
-            skip_pair = False
             if ci and ci == cj:
                 if narrow_enabled and cluster_pressure.get(ci, False):
                     if abs(h_score - v_score) <= ambiguity_margin:
@@ -308,14 +307,10 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
                             h_score += narrow_bonus
                         else:
                             v_score += narrow_bonus
-                    elif min(h_score, v_score) > ambiguity_margin:
-                        skip_pair = True
                 elif orient.get(ci, "H") == "H":
                     h_score += 0.45 if _grouping_adjacency_bias_enabled(profile) else 0.0
                 else:
                     v_score += 0.45 if _grouping_adjacency_bias_enabled(profile) else 0.0
-            if skip_pair:
-                continue
             if guidance is not None and guidance.pairwise_axis:
                 key = (i, j) if i < j else (j, i)
                 pair_logits = guidance.pairwise_axis.get(key)
