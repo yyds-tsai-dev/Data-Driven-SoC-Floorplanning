@@ -536,7 +536,6 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         best = placement.copy()
         best_metrics = self._placement_metrics(inst, best)
         best_soft = self._soft_total(best_metrics)
-        best_score = self._no_runtime_proxy_cost(inst, best, best_metrics)
         max_blocks = int(os.environ.get("FLOORSET_QUALITY_REFINE_MAX_BLOCKS", "32"))
         max_slots = int(os.environ.get("FLOORSET_QUALITY_REFINE_MAX_SLOTS", "48"))
         movable = [block for block in best.rects if block not in inst.preplaced]
@@ -583,7 +582,6 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     best = trial
                     best_metrics = metrics
                     best_soft = self._soft_total(metrics)
-                    best_score = v10_proxy_cost(inst, best, best_metrics)
                     rect = candidate
                     others = [
                         other for idx, other in best.rects.items() if idx != block

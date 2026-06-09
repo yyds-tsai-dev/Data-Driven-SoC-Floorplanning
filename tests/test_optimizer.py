@@ -703,7 +703,8 @@ def test_candidate_selection_prefers_fewer_soft_violations():
     assert best is larger_clean
 
 
-def test_default_candidate_selection_uses_v10_proxy_policy():
+def test_default_candidate_selection_uses_v10_proxy_policy(monkeypatch):
+    monkeypatch.delenv("FLOORSET_CANDIDATE_RANK_POLICY", raising=False)
     constraints = torch.tensor(
         [
             [0.0, 0.0, 0.0, 0.0, 1.0],
@@ -821,7 +822,11 @@ def test_candidate_rank_defaults_to_v10_proxy(monkeypatch):
     huge_clean = Placement({0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(200.0, 0.0, 2.0, 2.0), 2: Rect(202.0, 0.0, 2.0, 2.0)})
     monkeypatch.delenv("FLOORSET_CANDIDATE_RANK_POLICY", raising=False)
     optimizer = ArchitectureV4Optimizer()
+    metrics = optimizer._placement_metrics(inst, compact_dirty)
 
+    assert optimizer._candidate_rank(
+        inst, compact_dirty
+    ) == optimizer_module.v10_proxy_rank(inst, compact_dirty, metrics)
     assert optimizer._candidate_rank(inst, compact_dirty) < optimizer._candidate_rank(inst, huge_clean)
 
 
