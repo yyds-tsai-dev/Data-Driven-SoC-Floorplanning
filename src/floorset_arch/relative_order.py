@@ -227,16 +227,14 @@ def _cluster_orientations(inst: Instance, raw_x: list[float], raw_y: list[float]
 
 
 def _cluster_grouping_pressure(
-    inst: Instance,
-    cluster: int,
     members: list[int],
     raw_x: list[float],
     raw_y: list[float],
     widths: list[float],
     heights: list[float],
 ) -> bool:
-    del inst, cluster
-    if len(members) < _env_int("FLOORSET_NARROW_GROUPING_MIN_MEMBERS", 3):
+    min_members = max(1, _env_int("FLOORSET_NARROW_GROUPING_MIN_MEMBERS", 3))
+    if len(members) < min_members:
         return False
     span_x = max(raw_x[i] for i in members) - min(raw_x[i] for i in members)
     span_y = max(raw_y[i] for i in members) - min(raw_y[i] for i in members)
@@ -269,10 +267,14 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
     v_adj = {block: [] for block in movable}
     orient = _cluster_orientations(inst, raw_x, raw_y)
     narrow_enabled = _narrow_grouping_pair_bias_enabled()
-    cluster_pressure = {
-        cluster: _cluster_grouping_pressure(inst, cluster, members, raw_x, raw_y, widths, heights)
-        for cluster, members in inst.cluster_groups.items()
-    }
+    cluster_pressure = (
+        {
+            cluster: _cluster_grouping_pressure(members, raw_x, raw_y, widths, heights)
+            for cluster, members in inst.cluster_groups.items()
+        }
+        if narrow_enabled
+        else {}
+    )
     narrow_bonus = _env_float("FLOORSET_NARROW_GROUPING_AXIS_BONUS", 0.12)
     ambiguity_margin = _env_float("FLOORSET_NARROW_GROUPING_AMBIGUITY_MARGIN", 0.15)
 

@@ -136,7 +136,7 @@ def test_narrow_grouping_pair_bias_only_applies_to_ambiguous_same_cluster_pairs(
             0: Rect(0.0, 0.0, 2.0, 2.0),
             1: Rect(3.0, 3.0, 2.0, 2.0),
             2: Rect(20.0, 0.0, 2.0, 2.0),
-            3: Rect(0.0, 20.0, 2.0, 2.0),
+            3: Rect(20.0, 80.0, 2.0, 2.0),
         }
     )
     monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1")
