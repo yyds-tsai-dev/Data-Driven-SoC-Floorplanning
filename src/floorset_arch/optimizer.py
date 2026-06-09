@@ -611,6 +611,9 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
             "after_repair": after_metrics,
             "delta": repair_delta(before, after, before_metrics, after_metrics),
         }
+        runtime_budget = getattr(after, "runtime_budget_trace", None)
+        if runtime_budget is not None:
+            row["runtime_budget"] = runtime_budget
         with open(trace_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 

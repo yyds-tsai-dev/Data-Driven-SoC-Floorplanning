@@ -16,6 +16,7 @@ from floorset_arch.repair import (
     repair_placement,
     soft_violation_counts,
 )
+from floorset_arch.risk_budget import BudgetTier
 
 
 def _soft_test_instance():
@@ -533,6 +534,35 @@ def test_v10_soft_repair_path_runs_only_when_opted_in(monkeypatch):
     repaired_with_flag = repair_placement(inst, placement, SolverConfig())
 
     assert repaired_with_flag is marker
+
+
+def test_v10_soft_repair_records_conditional_runtime_budget(monkeypatch):
+    inst = _soft_test_instance()
+    placement = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(8.0, 0.0, 2.0, 2.0),
+            3: Rect(12.0, 0.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", "1")
+    monkeypatch.setattr(
+        "floorset_arch.repair.instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=BudgetTier.MEDIUM),
+    )
+
+    repaired = repair_placement(inst, placement, SolverConfig(max_repair_passes=2))
+
+    trace = getattr(repaired, "runtime_budget_trace", None)
+    assert trace is not None
+    assert trace["extra_path"] == "v10_soft_repair"
+    assert "attempts" in trace
+    assert "accepted" in trace
+    assert "elapsed_ms" in trace
+    assert "stop_reason" in trace
+    assert trace["tier"] == "medium"
 
 
 def test_large_case_boundary_repair_searches_wider_axis_candidates(monkeypatch):

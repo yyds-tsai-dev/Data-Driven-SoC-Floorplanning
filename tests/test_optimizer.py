@@ -211,6 +211,27 @@ def test_runtime_calibration_env_does_not_sleep(monkeypatch):
     assert len(optimizer.solve(**problem)) == block_count
 
 
+def test_repair_trace_includes_runtime_budget_metadata(tmp_path, monkeypatch):
+    trace = tmp_path / "repair.jsonl"
+    monkeypatch.setenv("FLOORSET_REPAIR_TRACE_JSONL", str(trace))
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    before = Placement({0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)})
+    after = before.copy()
+    after.runtime_budget_trace = {
+        "extra_path": "v10_soft_repair",
+        "attempts": 1,
+        "accepted": 0,
+        "elapsed_ms": 1.25,
+        "stop_reason": "rejected_attempts",
+        "tier": "medium",
+    }
+
+    optimizer._trace_repair(inst, before, after, {"name": "unit"})
+
+    assert '"runtime_budget"' in trace.read_text(encoding="utf-8")
+
+
 def test_anchor_guidance_can_store_pairwise_logits():
     guidance = AnchorGuidance()
 

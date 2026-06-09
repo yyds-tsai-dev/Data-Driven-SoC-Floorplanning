@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 import os
+import time
 
+from floorset_arch.budget_layer import (
+    conditional_runtime_budget_enabled,
+    conditional_runtime_budget_limits,
+)
 from floorset_arch.constructive import block_dimensions
 from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
@@ -564,6 +569,24 @@ def _score_better_v10_soft(
         return False
 
 
+def _runtime_budget_trace(
+    extra_path: str,
+    attempts: int,
+    accepted: int,
+    elapsed_ms: float,
+    stop_reason: str,
+    tier: str,
+) -> dict[str, object]:
+    return {
+        "extra_path": extra_path,
+        "attempts": attempts,
+        "accepted": accepted,
+        "elapsed_ms": round(float(elapsed_ms), 3),
+        "stop_reason": stop_reason,
+        "tier": tier,
+    }
+
+
 def _block_connectivity_weight(inst: Instance, block: int) -> float:
     return sum(weight for _other, weight in inst.b2b_by_block.get(block, [])) + sum(
         weight for _pin, weight in inst.p2b_by_block.get(block, [])
@@ -908,8 +931,28 @@ def _v10_soft_repair(inst: Instance, placement: Placement, config: SolverConfig)
         return placement
 
     best = placement.copy()
+    attempts = 0
+    accepted = 0
+    rejected = 0
+    stop_reason = "max_passes"
+    started = time.perf_counter()
+    try:
+        budget = instance_risk_budget(inst)
+        tier = budget.tier
+    except Exception:
+        tier = BudgetTier.LIGHT
+    limits = conditional_runtime_budget_limits(tier)
     max_passes = max(1, min(config.max_repair_passes, 3))
     for _ in range(max_passes):
+        if conditional_runtime_budget_enabled():
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if elapsed_ms >= limits.max_elapsed_ms:
+                stop_reason = "elapsed_budget"
+                break
+            if rejected >= limits.max_rejected_attempts:
+                stop_reason = "rejected_attempts"
+                break
+        attempts += 1
         trial = best.copy()
         _repair_boundary(inst, trial)
         _connect_clusters(inst, trial, config)
@@ -919,8 +962,22 @@ def _v10_soft_repair(inst: Instance, placement: Placement, config: SolverConfig)
         _snap_hard(inst, trial)
         if _score_better_v10_soft(inst, config, trial, best):
             best = trial
+            accepted += 1
+            rejected = 0
         else:
-            break
+            rejected += 1
+            if not conditional_runtime_budget_enabled():
+                stop_reason = "rejected"
+                break
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    best.runtime_budget_trace = _runtime_budget_trace(
+        "v10_soft_repair",
+        attempts,
+        accepted,
+        elapsed_ms,
+        stop_reason,
+        tier.value,
+    )
     return best
 
 
