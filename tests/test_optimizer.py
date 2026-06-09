@@ -336,6 +336,61 @@ def test_conditional_runtime_budget_does_not_infer_rejected_stop_from_max_passes
     assert calls == ["baseline", "extra"]
 
 
+def test_conditional_runtime_budget_stop_skips_quality_portfolio(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "1")
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    specs = [CandidateSpec(name="baseline", profile="soft")]
+
+    def fake_build_candidate(_inst, _spec):
+        placement = Placement(
+            {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+        )
+        placement.runtime_budget_trace = {
+            "extra_path": "v10_soft_repair",
+            "attempts": 1,
+            "accepted": 0,
+            "elapsed_ms": 0.25,
+            "stop_reason": "rejected_attempts",
+            "tier": "light",
+        }
+        return placement
+
+    def fail_refine(_inst, _candidates):
+        raise AssertionError("budget-stopped candidates must skip quality refinement")
+
+    monkeypatch.setattr(optimizer, "_build_candidate", fake_build_candidate)
+    monkeypatch.setattr(optimizer, "_with_quality_refined_candidates", fail_refine)
+
+    candidates = optimizer._build_candidates(inst, specs)
+
+    assert len(candidates) == 1
+
+
+def test_quality_refine_preserves_runtime_budget_trace(monkeypatch):
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    placement = Placement(
+        {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+    )
+    trace = {
+        "extra_path": "v10_soft_repair",
+        "attempts": 1,
+        "accepted": 0,
+        "elapsed_ms": 0.25,
+        "stop_reason": "rejected_attempts",
+        "tier": "light",
+    }
+    placement.runtime_budget_trace = trace
+    monkeypatch.setenv("FLOORSET_QUALITY_REFINE_MAX_BLOCKS", "1")
+    monkeypatch.setenv("FLOORSET_QUALITY_REFINE_MAX_SLOTS", "1")
+
+    refined = optimizer._quality_refine_candidate(inst, placement)
+
+    assert getattr(refined, "runtime_budget_trace", None) == trace
+
+
 def test_anchor_guidance_can_store_pairwise_logits():
     guidance = AnchorGuidance()
 

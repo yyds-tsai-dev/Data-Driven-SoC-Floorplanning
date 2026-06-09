@@ -207,18 +207,22 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
 
     def _build_candidates(self, inst, specs: list[CandidateSpec]) -> list[Placement]:
         workers = self._candidate_worker_count_for_specs(specs)
+        budget_stopped = False
         if workers <= 1:
             candidates = []
             for spec in specs:
                 candidate = self._build_candidate(inst, spec)
                 candidates.append(candidate)
                 if self._conditional_runtime_budget_stops_expansion(candidate):
+                    budget_stopped = True
                     break
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 candidates = list(
                     pool.map(self._build_candidate, [inst] * len(specs), specs)
                 )
+        if budget_stopped:
+            return candidates
         return self._with_quality_refined_candidates(inst, candidates)
 
     def _conditional_runtime_budget_stops_expansion(self, placement: Placement) -> bool:
@@ -411,20 +415,34 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         workers = self._quality_refine_worker_count(len(jobs))
         if workers <= 1:
             refined = [
-                refine_quality_candidate(inst, seed, self.config, profile)
+                self._preserve_runtime_budget_trace(
+                    seed,
+                    refine_quality_candidate(inst, seed, self.config, profile),
+                )
                 for seed, profile in jobs
             ]
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 refined = list(
                     pool.map(
-                        lambda item: refine_quality_candidate(
-                            inst, item[0], self.config, item[1]
+                        lambda item: self._preserve_runtime_budget_trace(
+                            item[0],
+                            refine_quality_candidate(
+                                inst, item[0], self.config, item[1]
+                            ),
                         ),
                         jobs,
                     )
                 )
         return candidates + refined
+
+    def _preserve_runtime_budget_trace(
+        self, source: Placement, target: Placement
+    ) -> Placement:
+        trace = getattr(source, "runtime_budget_trace", None)
+        if trace is not None and getattr(target, "runtime_budget_trace", None) is None:
+            target.runtime_budget_trace = trace
+        return target
 
     def _large_case_repair_profiles(self) -> list[str]:
         raw = os.environ.get("FLOORSET_LARGE_CASE_REPAIR_PROFILES", "normal")
@@ -523,8 +541,14 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         before = placement
         after = self._repair_with_profile(inst, before, spec.repair_profile)
         if spec.repair_profile == "quality_refine":
-            after = self._quality_refine_candidate(inst, after)
-        after = refine_quality_candidate(inst, after, self.config, spec.quality_profile)
+            after = self._preserve_runtime_budget_trace(
+                after,
+                self._quality_refine_candidate(inst, after),
+            )
+        after = self._preserve_runtime_budget_trace(
+            after,
+            refine_quality_candidate(inst, after, self.config, spec.quality_profile),
+        )
         self._trace_repair(
             inst,
             before,
@@ -567,6 +591,7 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
 
     def _quality_refine_candidate(self, inst, placement: Placement) -> Placement:
         best = placement.copy()
+        self._preserve_runtime_budget_trace(placement, best)
         best_metrics = self._placement_metrics(inst, best)
         best_soft = self._soft_total(best_metrics)
         max_blocks = int(os.environ.get("FLOORSET_QUALITY_REFINE_MAX_BLOCKS", "32"))
