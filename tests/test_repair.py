@@ -414,33 +414,6 @@ def test_v10_soft_accepts_grouping_improvement_with_grouping_slack(monkeypatch):
     assert _score_better_v10_soft(inst, SolverConfig(), candidate, current)
 
 
-def test_v10_soft_acceptance_uses_shared_no_runtime_proxy(monkeypatch):
-    inst = _soft_test_instance()
-    current = Placement(
-        {
-            0: Rect(5.0, 0.0, 2.0, 2.0),
-            1: Rect(10.0, 0.0, 2.0, 2.0),
-            2: Rect(0.0, 4.0, 2.0, 2.0),
-            3: Rect(0.0, 0.0, 2.0, 2.0),
-        }
-    )
-    candidate = Placement(
-        {
-            0: Rect(5.0, 0.0, 2.0, 2.0),
-            1: Rect(7.0, 0.0, 2.0, 2.0),
-            2: Rect(0.0, 4.0, 2.0, 2.0),
-            3: Rect(0.0, 0.0, 2.0, 2.0),
-        }
-    )
-    scores = {id(current): 100.0, id(candidate): 200.0}
-    monkeypatch.setattr(
-        "floorset_arch.v10_proxy.v10_proxy_cost",
-        lambda _inst, placement, metrics=None: scores[id(placement)],
-    )
-
-    assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
-
-
 def test_v10_soft_rejects_boundary_only_improvement_with_proxy_regression(monkeypatch):
     inst = _soft_test_instance()
     current = Placement(

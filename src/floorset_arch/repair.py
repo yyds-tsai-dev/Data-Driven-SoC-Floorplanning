@@ -5,11 +5,6 @@ import math
 import os
 
 from floorset_arch.constructive import block_dimensions
-from floorset_arch.budget_layer import (
-    runtime_tail_clamp_enabled,
-    runtime_tail_clamp_limits,
-    v10_soft_repair_allowed,
-)
 from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
 from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
@@ -496,29 +491,47 @@ def _hard_or_overlap_regressed(
 
 
 def _v10_soft_repair_eligible(inst: Instance, placement: Placement) -> bool:
+    if not _env_flag("FLOORSET_ENABLE_V10_SOFT_REPAIR"):
+        return False
     try:
         budget = instance_risk_budget(inst)
     except Exception:
         return False
-    return v10_soft_repair_allowed(
-        inst,
-        soft_counts=soft_violation_counts(inst, placement),
-        budget=budget,
-    )
+
+    if budget.tier in {BudgetTier.MEDIUM, BudgetTier.HEAVY}:
+        return True
+    if budget.tier is not BudgetTier.LIGHT:
+        return False
+
+    soft_total = sum(soft_violation_counts(inst, placement))
+    soft_relative = soft_total / _soft_capacity(inst)
+    min_soft = _env_int("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_SOFT", 6)
+    min_relative = _env_float("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_RELATIVE", 0.12)
+    return soft_total >= min_soft or soft_relative >= min_relative
 
 
 def _runtime_tail_clamp_limits(tier: BudgetTier) -> tuple[int, int, int, int]:
-    return runtime_tail_clamp_limits(tier)
+    if tier is BudgetTier.HEAVY:
+        defaults = (2, 20, 18, 24)
+    elif tier is BudgetTier.MEDIUM:
+        defaults = (2, 16, 14, 20)
+    else:
+        defaults = (1, 10, 8, 12)
+    return (
+        _env_int("FLOORSET_RUNTIME_CLAMP_MAX_REPAIR_PASSES", defaults[0]),
+        _env_int("FLOORSET_RUNTIME_CLAMP_BOUNDARY_SNAPS", defaults[1]),
+        _env_int("FLOORSET_RUNTIME_CLAMP_CLUSTER_MOVES", defaults[2]),
+        _env_int("FLOORSET_RUNTIME_CLAMP_PAIR_CANDIDATES", defaults[3]),
+    )
 
 
 def _runtime_tail_clamped_config(inst: Instance, config: SolverConfig) -> SolverConfig:
-    if not runtime_tail_clamp_enabled():
+    if not _env_flag("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP"):
         return config
     try:
-        budget = instance_risk_budget(inst)
+        tier = instance_risk_budget(inst).tier
     except Exception:
-        budget = None
-    tier = budget.tier if budget is not None else BudgetTier.LIGHT
+        tier = BudgetTier.LIGHT
     max_passes, boundary_snaps, cluster_moves, pair_candidates = _runtime_tail_clamp_limits(tier)
     return replace(
         config,
