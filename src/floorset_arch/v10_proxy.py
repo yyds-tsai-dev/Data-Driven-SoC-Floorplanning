@@ -15,6 +15,7 @@ from floorset_arch.repair import soft_violation_counts
 MetricMap = Mapping[str, float | int]
 
 _DEFAULT_TIE_TOLERANCE = 0.001
+_AREA_REL_TOLERANCE = 0.010001
 _DIMENSION_EPS = 1e-6
 _POSITION_EPS = 1e-6
 
@@ -66,7 +67,7 @@ def hard_legality(
                 fixed_violations += 1
             continue
         target_area = _target_area(inst, block)
-        if target_area > 0.0 and abs(rect.area - target_area) > _DIMENSION_EPS:
+        if target_area > 0.0 and _relative_area_error(rect, target_area) > _AREA_REL_TOLERANCE:
             area_violations += 1
 
     return HardLegality(
@@ -101,11 +102,18 @@ def v10_proxy_cost(
 
 def v10_proxy_rank(
     inst: Instance, placement: Placement, metrics: MetricMap | None = None
-) -> tuple[tuple[int, int, int, int, int], float]:
+) -> tuple[
+    tuple[int, int, int, int, int],
+    float,
+    tuple[int, int, int, int],
+    tuple[float, float],
+]:
     metrics = metrics if metrics is not None else placement_metrics(inst, placement)
     return (
         hard_legality_rank(inst, placement, metrics=metrics),
         v10_proxy_cost(inst, placement, metrics=metrics),
+        _soft_key(inst, placement, metrics),
+        _quality_key(metrics),
     )
 
 
@@ -175,6 +183,10 @@ def _target_area(inst: Instance, block: int) -> float:
     if block >= inst.area_targets.shape[0]:
         return 0.0
     return float(inst.area_targets[block].item())
+
+
+def _relative_area_error(rect: Rect, target_area: float) -> float:
+    return abs(rect.area - target_area) / target_area
 
 
 def _total_area(inst: Instance) -> float:

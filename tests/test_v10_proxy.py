@@ -86,6 +86,16 @@ def test_hard_legality_rank_penalizes_missing_overlap_fixed_and_preplaced():
     )
 
 
+def test_hard_legality_rank_allows_soft_area_within_one_percent_tolerance():
+    inst = _inst(1)
+    within_tolerance = Placement({0: Rect(0.0, 0.0, 2.0, 2.01)})
+    over_tolerance = Placement({0: Rect(0.0, 0.0, 2.0, 2.03)})
+
+    assert hard_legality_rank(inst, within_tolerance) < hard_legality_rank(
+        inst, over_tolerance
+    )
+
+
 def test_v10_proxy_cost_balances_quality_and_soft_penalty():
     inst = _inst(3, boundary=1)
     compact_dirty = Placement(
@@ -105,6 +115,65 @@ def test_v10_proxy_cost_balances_quality_and_soft_penalty():
 
     assert v10_proxy_cost(inst, compact_dirty) < v10_proxy_cost(inst, huge_clean)
     assert v10_proxy_rank(inst, compact_dirty) < v10_proxy_rank(inst, huge_clean)
+
+
+def test_v10_proxy_rank_uses_soft_tie_break_when_proxy_cost_is_tied(monkeypatch):
+    inst = _inst(3, boundary=1)
+    soft_worse = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    soft_better = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 3.0, 2.0, 2.0),
+            2: Rect(2.0, 3.0, 2.0, 2.0),
+        }
+    )
+
+    monkeypatch.setattr(
+        "floorset_arch.v10_proxy.v10_proxy_cost",
+        lambda _inst, placement, metrics=None: 1.0,
+    )
+
+    assert v10_proxy_rank(inst, soft_better) < v10_proxy_rank(inst, soft_worse)
+
+
+def test_v10_proxy_rank_uses_quality_tie_break_when_proxy_and_soft_are_tied(
+    monkeypatch,
+):
+    inst = _inst(2)
+    placement = Placement(
+        {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+    )
+    better_metrics = {
+        "overlap_count": 0,
+        "boundary_violations": 0,
+        "group_violations": 0,
+        "mib_violations": 0,
+        "hpwl_proxy": 5.0,
+        "bbox_area": 10.0,
+    }
+    worse_metrics = {
+        "overlap_count": 0,
+        "boundary_violations": 0,
+        "group_violations": 0,
+        "mib_violations": 0,
+        "hpwl_proxy": 6.0,
+        "bbox_area": 10.0,
+    }
+
+    monkeypatch.setattr(
+        "floorset_arch.v10_proxy.v10_proxy_cost",
+        lambda _inst, placement, metrics=None: 1.0,
+    )
+
+    assert v10_proxy_rank(inst, placement, better_metrics) < v10_proxy_rank(
+        inst, placement, worse_metrics
+    )
 
 
 def test_v10_proxy_better_rejects_proxy_regression_even_when_soft_improves():
