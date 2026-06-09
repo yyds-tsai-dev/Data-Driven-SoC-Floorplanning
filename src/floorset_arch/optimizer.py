@@ -208,13 +208,50 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
     def _build_candidates(self, inst, specs: list[CandidateSpec]) -> list[Placement]:
         workers = self._candidate_worker_count_for_specs(specs)
         if workers <= 1:
-            candidates = [self._build_candidate(inst, spec) for spec in specs]
+            candidates = []
+            for spec in specs:
+                candidate = self._build_candidate(inst, spec)
+                candidates.append(candidate)
+                if self._conditional_runtime_budget_stops_expansion(candidate):
+                    break
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 candidates = list(
                     pool.map(self._build_candidate, [inst] * len(specs), specs)
                 )
         return self._with_quality_refined_candidates(inst, candidates)
+
+    def _conditional_runtime_budget_stops_expansion(self, placement: Placement) -> bool:
+        from floorset_arch.budget_layer import (
+            conditional_runtime_budget_enabled,
+            conditional_runtime_budget_limits,
+        )
+
+        if not conditional_runtime_budget_enabled():
+            return False
+        trace = getattr(placement, "runtime_budget_trace", None)
+        if not isinstance(trace, dict):
+            return False
+        try:
+            attempts = int(trace.get("attempts", 0))
+            accepted = int(trace.get("accepted", 0))
+            elapsed_ms = float(trace.get("elapsed_ms", 0.0))
+        except (TypeError, ValueError):
+            return False
+        stop_reason = str(trace.get("stop_reason", ""))
+        if stop_reason == "elapsed_budget":
+            return True
+        try:
+            tier = BudgetTier(str(trace.get("tier", BudgetTier.LIGHT.value)))
+        except ValueError:
+            tier = BudgetTier.LIGHT
+        limits = conditional_runtime_budget_limits(tier)
+        rejected = max(0, attempts - accepted)
+        return (
+            stop_reason == "rejected_attempts"
+            or rejected >= limits.max_rejected_attempts
+            or elapsed_ms >= limits.max_elapsed_ms
+        )
 
     def _candidate_worker_count_for_specs(self, specs: list[CandidateSpec]) -> int:
         if any(spec.repair_profile != "normal" for spec in specs):

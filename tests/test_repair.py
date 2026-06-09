@@ -565,6 +565,46 @@ def test_v10_soft_repair_records_conditional_runtime_budget(monkeypatch):
     assert trace["tier"] == "medium"
 
 
+def test_runtime_budget_trace_survives_post_v10_refine_copy(monkeypatch):
+    inst = _soft_test_instance()
+    placement = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(8.0, 0.0, 2.0, 2.0),
+            3: Rect(12.0, 0.0, 2.0, 2.0),
+        }
+    )
+    expected_trace = {
+        "extra_path": "v10_soft_repair",
+        "attempts": 1,
+        "accepted": 0,
+        "elapsed_ms": 0.5,
+        "stop_reason": "rejected_attempts",
+        "tier": "light",
+    }
+
+    def fake_v10_repair(_inst, input_placement, _config):
+        repaired = input_placement.copy()
+        repaired.runtime_budget_trace = expected_trace
+        return repaired
+
+    def fake_large_case_boundary_refine(_inst, input_placement, _config):
+        return input_placement.copy()
+
+    monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
+    monkeypatch.setattr(repair_module, "_v10_soft_repair", fake_v10_repair)
+    monkeypatch.setattr(
+        repair_module,
+        "_large_case_boundary_refine",
+        fake_large_case_boundary_refine,
+    )
+
+    repaired = repair_placement(inst, placement, SolverConfig(max_repair_passes=2))
+
+    assert getattr(repaired, "runtime_budget_trace", None) == expected_trace
+
+
 def test_large_case_boundary_repair_searches_wider_axis_candidates(monkeypatch):
     block_count = 118
     areas = torch.full((block_count,), 1.0)

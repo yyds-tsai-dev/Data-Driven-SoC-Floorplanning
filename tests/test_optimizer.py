@@ -232,6 +232,75 @@ def test_repair_trace_includes_runtime_budget_metadata(tmp_path, monkeypatch):
     assert '"runtime_budget"' in trace.read_text(encoding="utf-8")
 
 
+def test_conditional_runtime_budget_stops_candidate_profile_expansion(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", "1")
+    monkeypatch.setenv("FLOORSET_CONDITIONAL_RUNTIME_LIGHT_ATTEMPTS", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "0")
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    specs = [
+        CandidateSpec(name="baseline", profile="soft"),
+        CandidateSpec(name="extra", profile="compact"),
+    ]
+    calls = []
+
+    def fake_build_candidate(_inst, spec):
+        calls.append(spec.name)
+        placement = Placement(
+            {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+        )
+        placement.runtime_budget_trace = {
+            "extra_path": "v10_soft_repair",
+            "attempts": 1,
+            "accepted": 0,
+            "elapsed_ms": 0.25,
+            "stop_reason": "rejected_attempts",
+            "tier": "light",
+        }
+        return placement
+
+    monkeypatch.setattr(optimizer, "_build_candidate", fake_build_candidate)
+
+    candidates = optimizer._build_candidates(inst, specs)
+
+    assert len(candidates) == 1
+    assert calls == ["baseline"]
+
+
+def test_conditional_runtime_budget_disabled_keeps_candidate_expansion(monkeypatch):
+    monkeypatch.delenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", raising=False)
+    monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "0")
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    specs = [
+        CandidateSpec(name="baseline", profile="soft"),
+        CandidateSpec(name="extra", profile="compact"),
+    ]
+    calls = []
+
+    def fake_build_candidate(_inst, spec):
+        calls.append(spec.name)
+        placement = Placement(
+            {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+        )
+        placement.runtime_budget_trace = {
+            "extra_path": "v10_soft_repair",
+            "attempts": 1,
+            "accepted": 0,
+            "elapsed_ms": 0.25,
+            "stop_reason": "rejected_attempts",
+            "tier": "light",
+        }
+        return placement
+
+    monkeypatch.setattr(optimizer, "_build_candidate", fake_build_candidate)
+
+    candidates = optimizer._build_candidates(inst, specs)
+
+    assert len(candidates) == 2
+    assert calls == ["baseline", "extra"]
+
+
 def test_anchor_guidance_can_store_pairwise_logits():
     guidance = AnchorGuidance()
 

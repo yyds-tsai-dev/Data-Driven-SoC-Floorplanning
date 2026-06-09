@@ -981,6 +981,13 @@ def _v10_soft_repair(inst: Instance, placement: Placement, config: SolverConfig)
     return best
 
 
+def _preserve_runtime_budget_trace(source: Placement, target: Placement) -> Placement:
+    trace = getattr(source, "runtime_budget_trace", None)
+    if trace is not None and getattr(target, "runtime_budget_trace", None) is None:
+        target.runtime_budget_trace = trace
+    return target
+
+
 def _large_case_boundary_refine(inst: Instance, placement: Placement, config: SolverConfig) -> Placement:
     if inst.block_count < 118 or os.environ.get("FLOORSET_ENABLE_LARGE_CASE_BOUNDARY_REFINE") != "1":
         return placement
@@ -1037,9 +1044,15 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
     repaired = _guarded_soft_repair(inst, repaired, config)
     if _env_flag("FLOORSET_ENABLE_V10_SOFT_REPAIR"):
         repaired = _v10_soft_repair(inst, repaired, config)
-    repaired = _large_case_boundary_refine(inst, repaired, config)
+    repaired = _preserve_runtime_budget_trace(
+        repaired,
+        _large_case_boundary_refine(inst, repaired, config),
+    )
     if _should_run_no_guidance_geometry_refine(inst, repaired):
-        repaired = _geometry_preserving_refine(inst, repaired, config)
+        repaired = _preserve_runtime_budget_trace(
+            repaired,
+            _geometry_preserving_refine(inst, repaired, config),
+        )
 
     for block in range(inst.block_count):
         if block not in repaired.rects:
