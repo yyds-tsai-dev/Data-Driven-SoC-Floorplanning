@@ -233,8 +233,6 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         if not isinstance(trace, dict):
             return False
         try:
-            attempts = int(trace.get("attempts", 0))
-            accepted = int(trace.get("accepted", 0))
             elapsed_ms = float(trace.get("elapsed_ms", 0.0))
         except (TypeError, ValueError):
             return False
@@ -246,10 +244,8 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         except ValueError:
             tier = BudgetTier.LIGHT
         limits = conditional_runtime_budget_limits(tier)
-        rejected = max(0, attempts - accepted)
         return (
             stop_reason == "rejected_attempts"
-            or rejected >= limits.max_rejected_attempts
             or elapsed_ms >= limits.max_elapsed_ms
         )
 

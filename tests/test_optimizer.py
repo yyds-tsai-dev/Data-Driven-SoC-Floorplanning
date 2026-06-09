@@ -301,6 +301,41 @@ def test_conditional_runtime_budget_disabled_keeps_candidate_expansion(monkeypat
     assert calls == ["baseline", "extra"]
 
 
+def test_conditional_runtime_budget_does_not_infer_rejected_stop_from_max_passes(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", "1")
+    monkeypatch.setenv("FLOORSET_CONDITIONAL_RUNTIME_LIGHT_ATTEMPTS", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "0")
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    specs = [
+        CandidateSpec(name="baseline", profile="soft"),
+        CandidateSpec(name="extra", profile="compact"),
+    ]
+    calls = []
+
+    def fake_build_candidate(_inst, spec):
+        calls.append(spec.name)
+        placement = Placement(
+            {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+        )
+        placement.runtime_budget_trace = {
+            "extra_path": "v10_soft_repair",
+            "attempts": 2,
+            "accepted": 1,
+            "elapsed_ms": 0.25,
+            "stop_reason": "max_passes",
+            "tier": "light",
+        }
+        return placement
+
+    monkeypatch.setattr(optimizer, "_build_candidate", fake_build_candidate)
+
+    candidates = optimizer._build_candidates(inst, specs)
+
+    assert len(candidates) == 2
+    assert calls == ["baseline", "extra"]
+
+
 def test_anchor_guidance_can_store_pairwise_logits():
     guidance = AnchorGuidance()
 
