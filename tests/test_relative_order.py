@@ -3,7 +3,11 @@ import torch
 from floorset_arch.geometry import edge_touch_length
 from floorset_arch.models import AnchorGuidance, Rect, SolverConfig
 from floorset_arch.parser import parse_instance
-from floorset_arch.relative_order import construct_relative_order_placement
+from floorset_arch.relative_order import (
+    _cluster_grouping_pressure,
+    _narrow_grouping_axis_bonus,
+    construct_relative_order_placement,
+)
 
 
 def test_relative_order_can_clamp_guidance_to_preplaced_frame(monkeypatch):
@@ -142,6 +146,31 @@ def test_narrow_grouping_pair_bias_only_applies_to_ambiguous_same_cluster_pairs(
     monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1")
     monkeypatch.setenv("FLOORSET_NARROW_GROUPING_MIN_MEMBERS", "2")
     monkeypatch.setenv("FLOORSET_NARROW_GROUPING_AMBIGUITY_MARGIN", "0.30")
+    widths = [2.0, 2.0, 2.0, 2.0]
+    heights = [2.0, 2.0, 2.0, 2.0]
+    raw_x = [1.0, 4.0, 21.0, 21.0]
+    raw_y = [1.0, 4.0, 1.0, 81.0]
+
+    assert _cluster_grouping_pressure([0, 1], raw_x, raw_y, widths, heights)
+    assert _cluster_grouping_pressure([2, 3], raw_x, raw_y, widths, heights)
+    assert _narrow_grouping_axis_bonus(
+        1.5,
+        1.5,
+        enabled=True,
+        pressure=True,
+        orientation="H",
+        bonus=0.12,
+        ambiguity_margin=0.30,
+    ) == (1.62, 1.5)
+    assert _narrow_grouping_axis_bonus(
+        0.0,
+        40.0,
+        enabled=True,
+        pressure=True,
+        orientation="V",
+        bonus=0.12,
+        ambiguity_margin=0.30,
+    ) == (0.0, 40.0)
 
     placement = construct_relative_order_placement(inst, profile="compact")
 

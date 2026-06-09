@@ -244,6 +244,23 @@ def _cluster_grouping_pressure(
     return pressure >= _env_float("FLOORSET_NARROW_GROUPING_PRESSURE", 1.4)
 
 
+def _narrow_grouping_axis_bonus(
+    h_score: float,
+    v_score: float,
+    *,
+    enabled: bool,
+    pressure: bool,
+    orientation: str,
+    bonus: float,
+    ambiguity_margin: float,
+) -> tuple[float, float]:
+    if not enabled or not pressure or abs(h_score - v_score) > ambiguity_margin:
+        return h_score, v_score
+    if orientation == "H":
+        return h_score + bonus, v_score
+    return h_score, v_score + bonus
+
+
 def construct_relative_order_placement(inst: Instance, config: SolverConfig | None = None, profile: str = "soft") -> Placement:
     config = config or SolverConfig()
     guidance = inst.anchor_guidance
@@ -304,11 +321,15 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
             cj = _constraint_id(inst, j, 3)
             if ci and ci == cj:
                 if narrow_enabled and cluster_pressure.get(ci, False):
-                    if abs(h_score - v_score) <= ambiguity_margin:
-                        if orient.get(ci, "H") == "H":
-                            h_score += narrow_bonus
-                        else:
-                            v_score += narrow_bonus
+                    h_score, v_score = _narrow_grouping_axis_bonus(
+                        h_score,
+                        v_score,
+                        enabled=narrow_enabled,
+                        pressure=True,
+                        orientation=orient.get(ci, "H"),
+                        bonus=narrow_bonus,
+                        ambiguity_margin=ambiguity_margin,
+                    )
                 elif orient.get(ci, "H") == "H":
                     h_score += 0.45 if _grouping_adjacency_bias_enabled(profile) else 0.0
                 else:
