@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from floorset_arch.training.selection import CheckpointMetricRecord, append_metric_record
 
 
@@ -47,6 +49,74 @@ def test_promote_best_checkpoint_uses_evaluator_comparator_and_copies(tmp_path):
 
     selected = promote_best_checkpoint(manifest, promote_to=destination)
 
+    assert selected.checkpoint == str(good)
+    assert destination.read_bytes() == b"good"
+
+
+def test_promote_best_checkpoint_ignores_val_loss_only_records(tmp_path):
+    from floorset_arch.training.promote_checkpoint import promote_best_checkpoint
+
+    val_only = tmp_path / "val_only.pt"
+    val_only.write_bytes(b"val")
+    manifest = tmp_path / "checkpoint_metrics.jsonl"
+
+    append_metric_record(
+        manifest,
+        CheckpointMetricRecord(
+            checkpoint=str(val_only),
+            epoch=3,
+            metric_source="training",
+            feasible=100,
+            val_loss=0.001,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="No evaluator checkpoint metric records"):
+        promote_best_checkpoint(manifest, promote_to=tmp_path / "best.pt")
+
+
+def test_training_refreshes_best_checkpoint_from_evaluator_manifest(tmp_path):
+    from floorset_arch.training import train as train_module
+
+    bad = tmp_path / "bad.pt"
+    good = tmp_path / "good.pt"
+    bad.write_bytes(b"bad")
+    good.write_bytes(b"good")
+    manifest = tmp_path / "checkpoint_metrics.jsonl"
+    destination = tmp_path / "best_evaluator.pt"
+
+    append_metric_record(
+        manifest,
+        CheckpointMetricRecord(
+            checkpoint=str(bad),
+            epoch=1,
+            metric_source="tail_eval",
+            feasible=100,
+            val_loss=0.001,
+            total_score_no_runtime=None,
+            tail_weighted_no_runtime=2.20,
+            soft_violations=3,
+            avg_runtime=0.8,
+        ),
+    )
+    append_metric_record(
+        manifest,
+        CheckpointMetricRecord(
+            checkpoint=str(good),
+            epoch=2,
+            metric_source="full_eval",
+            feasible=100,
+            val_loss=0.010,
+            total_score_no_runtime=2.05,
+            tail_weighted_no_runtime=2.10,
+            soft_violations=5,
+            avg_runtime=1.2,
+        ),
+    )
+
+    selected = train_module.refresh_evaluator_best_checkpoint(manifest, destination)
+
+    assert selected is not None
     assert selected.checkpoint == str(good)
     assert destination.read_bytes() == b"good"
 

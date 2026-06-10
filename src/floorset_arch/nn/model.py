@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class GraphTransformerLayer(nn.Module):
@@ -68,6 +69,10 @@ def _relation_key(relation: tuple[str, str, str]) -> str:
     return "__".join(relation)
 
 
+def _inverse_softplus(value: float) -> float:
+    return math.log(math.expm1(max(float(value), 1e-6)))
+
+
 def _edge_softmax_by_dst(scores: torch.Tensor, dst: torch.Tensor, dst_count: int) -> torch.Tensor:
     if scores.numel() == 0:
         return scores
@@ -99,6 +104,7 @@ class HGTLayer(nn.Module):
         dropout: float,
         node_types: tuple[str, ...],
         relation_specs: tuple[tuple[str, str, str], ...],
+        relation_gate_min: float = 0.10,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -110,6 +116,9 @@ class HGTLayer(nn.Module):
         self.head_dim = hidden_dim // num_heads
         self.node_types = tuple(node_types)
         self.relation_specs = tuple(relation_specs)
+        if not 0.0 <= float(relation_gate_min) < 1.0:
+            raise ValueError("relation_gate_min must be in [0.0, 1.0)")
+        self.relation_gate_min = float(relation_gate_min)
         self.query = nn.ModuleDict(
             {node_type: nn.Linear(hidden_dim, hidden_dim) for node_type in self.node_types}
         )
@@ -122,9 +131,10 @@ class HGTLayer(nn.Module):
         self.rel_edge_bias = nn.ModuleDict(
             {_relation_key(relation): nn.Linear(1, num_heads, bias=False) for relation in self.relation_specs}
         )
+        raw_gate_init = _inverse_softplus(1.0 - self.relation_gate_min)
         self.rel_gate = nn.ParameterDict(
             {
-                _relation_key(relation): nn.Parameter(torch.ones(1))
+                _relation_key(relation): nn.Parameter(torch.full((1,), raw_gate_init))
                 for relation in self.relation_specs
             }
         )
@@ -146,6 +156,16 @@ class HGTLayer(nn.Module):
             {node_type: nn.LayerNorm(hidden_dim) for node_type in self.node_types}
         )
         self.dropout = nn.Dropout(dropout)
+
+    def effective_relation_gate(self, key: str) -> torch.Tensor:
+        raw = self.rel_gate[key]
+        return self.relation_gate_min + F.softplus(raw)
+
+    def effective_relation_gate_values(self) -> dict[str, float]:
+        return {
+            key: float(self.effective_relation_gate(key).detach().cpu().item())
+            for key in self.rel_gate
+        }
 
     def forward(
         self,
@@ -180,7 +200,8 @@ class HGTLayer(nn.Module):
             scores = scores + self.rel_edge_bias[key](attr)
             alpha = _edge_softmax_by_dst(scores, dst, states[dst_type].shape[0])
             msg = (alpha.unsqueeze(-1) * v).reshape(-1, self.hidden_dim)
-            msg = msg * self.rel_gate[key].to(device=msg.device, dtype=msg.dtype)
+            gate = self.effective_relation_gate(key).to(device=msg.device, dtype=msg.dtype)
+            msg = msg * gate
             messages[dst_type].index_add_(0, dst, msg)
 
         updated: dict[str, torch.Tensor] = {}
@@ -206,6 +227,7 @@ class FloorplanGNN(nn.Module):
         edge_type_count: int = 1,
         hgt_node_feat_dims: dict[str, int] | None = None,
         hgt_relation_specs: tuple[tuple[str, str, str], ...] | list[tuple[str, str, str]] | None = None,
+        hgt_relation_gate_min: float = 0.10,
     ):
         super().__init__()
         if encoder_type not in {"mpnn", "graph-transformer", "hgt"}:
@@ -220,6 +242,7 @@ class FloorplanGNN(nn.Module):
         self.edge_type_count = max(1, edge_type_count)
         self.hgt_node_feat_dims = dict(hgt_node_feat_dims or {"block": node_feat_dim})
         self.hgt_relation_specs = tuple(tuple(relation) for relation in (hgt_relation_specs or ()))
+        self.hgt_relation_gate_min = float(hgt_relation_gate_min)
 
         self.node_in = nn.Sequential(
             nn.Linear(node_feat_dim, hidden_dim),
@@ -282,6 +305,7 @@ class FloorplanGNN(nn.Module):
                     dropout,
                     tuple(sorted(self.hgt_node_feat_dims)),
                     self.hgt_relation_specs,
+                    self.hgt_relation_gate_min,
                 )
                 for _ in range(num_layers)
             )
@@ -368,12 +392,7 @@ class FloorplanGNN(nn.Module):
             return []
         values = []
         for layer in self.hgt_layers:
-            values.append(
-                {
-                    key: float(param.detach().cpu().item())
-                    for key, param in layer.rel_gate.items()
-                }
-            )
+            values.append(layer.effective_relation_gate_values())
         return values
 
     def forward(

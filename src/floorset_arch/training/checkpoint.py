@@ -57,6 +57,7 @@ def anchor_checkpoint_payload(
         "edge_type_count": getattr(model, "edge_type_count", 1),
         "hgt_node_feat_dims": getattr(model, "hgt_node_feat_dims", {}),
         "hgt_relation_specs": [tuple(relation) for relation in getattr(model, "hgt_relation_specs", ())],
+        "hgt_relation_gate_min": getattr(model, "hgt_relation_gate_min", 0.10),
         "hgt_relation_gates": (
             model.hgt_relation_gate_values()
             if hasattr(model, "hgt_relation_gate_values")
@@ -66,7 +67,7 @@ def anchor_checkpoint_payload(
         "epoch": epoch,
         "train_stats": train_stats,
         "val_stats": val_stats,
-        "selection_metric": "val_loss",
+        "selection_metric": getattr(args, "selection_metric", "training_health"),
         "args": vars(args),
     }
     if optimizer is not None:

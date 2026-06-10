@@ -11,6 +11,7 @@ from floorset_arch.training.selection import (
     CheckpointMetricRecord,
     append_metric_record,
     better_checkpoint_metric,
+    evaluator_metric_records,
     metric_sort_key,
     read_metric_records,
 )
@@ -91,11 +92,11 @@ def checkpoint_metric_from_eval_json(
 
 def select_best_checkpoint(records: Iterable[CheckpointMetricRecord]) -> CheckpointMetricRecord:
     best: CheckpointMetricRecord | None = None
-    for record in records:
+    for record in evaluator_metric_records(records):
         if better_checkpoint_metric(record, best):
             best = record
     if best is None:
-        raise ValueError("No checkpoint metric records found")
+        raise ValueError("No evaluator checkpoint metric records found")
     return best
 
 
@@ -116,7 +117,7 @@ def promote_best_checkpoint(
 
 
 def _print_ranking(records: list[CheckpointMetricRecord]) -> None:
-    ranked = sorted(records, key=metric_sort_key)
+    ranked = sorted(evaluator_metric_records(records), key=metric_sort_key)
     print("| Rank | Checkpoint | Source | Feasible | No-runtime | Tail no-runtime | Soft | Runtime | Val loss |")
     print("| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for rank, record in enumerate(ranked, 1):

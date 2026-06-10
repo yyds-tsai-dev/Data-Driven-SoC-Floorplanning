@@ -711,6 +711,9 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                         tuple(relation)
                         for relation in payload.get("hgt_relation_specs", ())
                     ),
+                    hgt_relation_gate_min=float(
+                        payload.get("hgt_relation_gate_min", 0.10)
+                    ),
                 )
                 model.load_state_dict(payload["model_state_dict"], strict=False)
                 self._checkpoint_config = {
@@ -726,6 +729,9 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     "hgt_relation_specs": tuple(
                         tuple(relation)
                         for relation in payload.get("hgt_relation_specs", ())
+                    ),
+                    "hgt_relation_gate_min": float(
+                        payload.get("hgt_relation_gate_min", 0.10)
                     ),
                     "has_pair_head": bool(payload.get("has_pair_head", False)),
                 }
