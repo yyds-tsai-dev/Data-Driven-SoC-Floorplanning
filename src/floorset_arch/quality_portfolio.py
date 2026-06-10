@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 
 from floorset_arch.geometry import Rect, bbox, candidate_frontier_points, first_non_overlapping
+from floorset_arch.budget_layer import quality_portfolio_allowed
 from floorset_arch.models import Instance, Placement, SolverConfig
 from floorset_arch.repair import soft_violation_counts
-from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.scoring import hpwl_proxy
 
 
@@ -23,14 +23,7 @@ def enabled_quality_profiles() -> list[str]:
 
 
 def is_quality_portfolio_case(inst: Instance) -> bool:
-    mode = os.environ.get("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "0").strip().lower()
-    if mode in {"0", "false", "off", "no"}:
-        return False
-    if mode in {"1", "true", "on", "yes", "always", "force"}:
-        return True
-
-    budget = instance_risk_budget(inst)
-    return budget.tier in {BudgetTier.MEDIUM, BudgetTier.HEAVY}
+    return quality_portfolio_allowed(inst)
 
 
 def _edge_weight(inst: Instance, block: int) -> float:

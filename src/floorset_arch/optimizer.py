@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - dependency is present in local runs.
     load_dotenv = None
 
 from floorset_arch.constructive import construct_beam_placement
+from floorset_arch.budget_layer import budget_trace_context, candidate_budget_tier
 from floorset_arch.diagnostics import placement_metrics, repair_delta
 from floorset_arch.geometry import (
     candidate_frontier_points,
@@ -486,8 +487,7 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         return self._is_targeted_high_risk_case(inst)
 
     def _is_targeted_high_risk_case(self, inst) -> bool:
-        budget = instance_risk_budget(inst)
-        return budget.tier in {BudgetTier.MEDIUM, BudgetTier.HEAVY}
+        return candidate_budget_tier(inst) is not BudgetTier.NONE
 
     def _is_high_risk_case(self, inst) -> bool:
         budget = instance_risk_budget(inst)
@@ -664,6 +664,7 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         row = {
             "block_count": inst.block_count,
             "checkpoint_loaded": self._checkpoint_model is not None,
+            "budget": budget_trace_context(inst),
             "candidate": candidate,
             "before_repair": before_metrics,
             "after_repair": after_metrics,

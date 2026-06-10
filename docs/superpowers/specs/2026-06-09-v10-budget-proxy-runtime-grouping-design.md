@@ -37,12 +37,12 @@ The existing `_candidate_rank()` default is soft-first. The existing v10 soft re
 
 ## Decisions
 
-1. Use option B: design all three phases, but promote only Phase 1 as the default behavior.
+1. Use option B: design all three phases, promote Phase 1 immediately, and promote Phase 3 only after full-validation evidence.
 2. Make Phase 1 V10 proxy selection and acceptance the production default.
 3. Preserve an environment override for the old soft-first candidate rank policy as an ablation path.
 4. Keep Phase 2 Conditional Runtime Budget behind `FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET=1`.
 5. Keep the old hard runtime clamp flag as ablation only; do not automatically apply it in the new Phase 2 path.
-6. Keep Phase 3 Narrow Grouping Pair Bias behind `FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS=1`.
+6. Promote Phase 3 Narrow Grouping Pair Bias to the default after the 2026-06-10 ablation, while preserving `FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS=0` as an ablation switch.
 7. Do not touch GNN architecture, checkpoint promotion, broad quality portfolio defaults, or validation-ID-specific production logic.
 
 ## Architecture
@@ -155,7 +155,7 @@ Conditional runtime trace write failures should not change solver output.
 
 Invalid environment variable values should fall back to conservative defaults.
 
-When Phase 2 and Phase 3 flags are disabled, their behavior should not change solver output. Phase 1 is the intentional default behavior change.
+When Phase 2 is disabled, it should not change solver output. Phase 1 and the evidence-promoted Phase 3 narrow grouping path are the intentional default behavior changes.
 
 ## Testing
 
@@ -199,6 +199,12 @@ Full validation should run in sequence:
 2. Phase 1 plus Phase 2 opt-in.
 3. Phase 1 plus Phase 2 and Phase 3 opt-in.
 
+The 2026-06-10 full-validation ablation supersedes the initial default decision
+for Phase 3: narrow grouping pair bias improved both no-runtime and total score
+when tested without Phase 2, so it is now default-on with an env switch for
+ablation. Conditional runtime budget improved runtime-aware total for the soft
+repair path, but not no-runtime; keep it opt-in.
+
 Each run should report no-runtime score, total score, feasible count, average runtime, p90 runtime, max runtime, top no-runtime contributors, and repair trace acceptance summaries.
 
 ## Out Of Scope
@@ -214,8 +220,8 @@ Each run should report no-runtime score, total score, feasible count, average ru
 
 ## Self-Review
 
-- The design has one default behavior change: Phase 1 proxy-first selection and acceptance.
-- Runtime and grouping changes remain opt-in until full-validation evidence supports promotion.
+- The design has two default behavior changes after validation: Phase 1 proxy-first selection/acceptance and Phase 3 narrow grouping pair bias.
+- Runtime changes remain opt-in until full-validation evidence supports no-runtime promotion.
 - The design separates evaluator-facing no-runtime score from the solver-internal V10 no-runtime proxy.
 - The design preserves baseline repair while allowing conditional stopping of extra paths.
 - No phase requires touching the GNN or training pipeline.

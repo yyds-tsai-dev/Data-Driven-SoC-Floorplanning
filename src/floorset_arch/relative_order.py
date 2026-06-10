@@ -27,7 +27,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _narrow_grouping_pair_bias_enabled() -> bool:
-    return os.environ.get("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "").strip().lower() in {"1", "true", "yes", "on"}
+    value = os.environ.get("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _shape_for_block(inst: Instance, block: int, guidance: AnchorGuidance | None, profile: str) -> tuple[float, float]:

@@ -5,9 +5,18 @@ from floorset_arch.models import AnchorGuidance, Rect, SolverConfig
 from floorset_arch.parser import parse_instance
 from floorset_arch.relative_order import (
     _cluster_grouping_pressure,
+    _narrow_grouping_pair_bias_enabled,
     _narrow_grouping_axis_bonus,
     construct_relative_order_placement,
 )
+
+
+def test_narrow_grouping_pair_bias_defaults_on_but_can_be_disabled(monkeypatch):
+    monkeypatch.delenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", raising=False)
+    assert _narrow_grouping_pair_bias_enabled()
+
+    monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "0")
+    assert not _narrow_grouping_pair_bias_enabled()
 
 
 def test_relative_order_can_clamp_guidance_to_preplaced_frame(monkeypatch):
@@ -84,6 +93,7 @@ def test_grouping_adjacency_bias_can_chain_compact_profile(monkeypatch):
         }
     )
     monkeypatch.setenv("FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "0")
 
     placement = construct_relative_order_placement(inst, profile="compact")
 
