@@ -213,15 +213,10 @@ bash scripts/update.sh "update: message"
 
 ```text
 src/
-├── architecture_v4_optimizer.py
-├── arch_old/
-│   ├── gnn_model.py
-│   ├── my_optimizer.py
-│   ├── my_optimizer_anchor_v2_best.py
-│   ├── my_optimizer_frame_first_best.py
-│   └── train_gnn_anchor_v2.py
+├── architecture_v5_optimizer.py
 └── floorset_arch/
     ├── __init__.py
+    ├── budget_layer.py
     ├── constructive.py
     ├── diagnostics.py
     ├── features.py
@@ -230,9 +225,13 @@ src/
     ├── models.py
     ├── optimizer.py
     ├── parser.py
+    ├── quality_portfolio.py
     ├── relative_order.py
     ├── repair.py
+    ├── risk_budget.py
     ├── scoring.py
+    ├── surrogate_guidance.py
+    ├── v10_proxy.py
     ├── nn/
     │   ├── __init__.py
     │   └── model.py
@@ -240,12 +239,17 @@ src/
         ├── __init__.py
         ├── checkpoint.py
         ├── losses.py
+        ├── promote_checkpoint.py
+        ├── pseudo_targets.py
+        ├── selection.py
         └── train.py
 ```
 
 ### Active production path
 
-`src/architecture_v4_optimizer.py` 是 contest-facing wrapper。它把 repo root、`src/` 和 `FloorSet/iccad2026contest` 加到 `sys.path`，並把 `MyOptimizer` / `ContestOptimizer` 指向 `floorset_arch.optimizer.ArchitectureV4Optimizer`。
+`src/architecture_v5_optimizer.py` 是目前 evaluator scripts 使用的 contest-facing wrapper。它把 repo root、`src/` 和 `FloorSet/iccad2026contest` 加到 `sys.path`，並把 `MyOptimizer` / `ContestOptimizer` 指向 `floorset_arch.optimizer.ArchitectureV5Optimizer`。
+
+`floorset_arch.optimizer.ArchitectureV4Optimizer` 目前保留為 `ArchitectureV5Optimizer` 的相容 alias，供舊 tests 或歷史 docs 讀懂演進脈絡；新的 eval/validate script 一律使用 v5 wrapper。
 
 `src/floorset_arch/optimizer.py` 是 production solver 入口。`solve()` 的流程是：
 
@@ -275,7 +279,6 @@ src/
 
 ### Legacy/reference files
 
-- `src/arch_old/`：舊版 optimizer 與訓練流程，只作歷史參考或幾何 helper 思路來源，不是 production solver path。
 - `FloorSet/iccad2026contest/iccad2026_evaluate.py`：官方 evaluator，本 repo 已使用 `time.perf_counter()` 計時，並支援 `total_score_no_runtime` 輸出。
 
 ## Repository File Tree
@@ -295,8 +298,7 @@ src/
 │   ├── train.sh
 │   └── update.sh
 ├── src/
-│   ├── architecture_v4_optimizer.py
-│   ├── arch_old/
+│   ├── architecture_v5_optimizer.py
 │   └── floorset_arch/
 ├── tests/
 │   ├── test_optimizer.py
