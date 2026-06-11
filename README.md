@@ -1,11 +1,11 @@
 # Data-Driven SoC Floorplanning
 
-本專案是 ICCAD 2026 FloorSet Challenge Problem C 的 SoC floorplanning solver。當前主線是 `Architecture v4`：用 Anchor-GNN checkpoint 產生 block-level 幾何先驗，再由 `floorset_arch` 的 relative-order / hetero-graph constructive decoder 生成合法 placement，最後用 repair pass 修正 overlap、boundary、grouping 與 MIB 等限制。
+本專案是 ICCAD 2026 FloorSet Challenge Problem C 的 SoC floorplanning solver。當前 evaluator-facing 主線是 `Architecture v5` wrapper：用 Anchor-GNN checkpoint 產生 block-level 幾何先驗，再由 `floorset_arch` 的 relative-order / hetero-graph constructive decoder 生成合法 placement，最後用 repair pass 修正 overlap、boundary、grouping 與 MIB 等限制。
 
 目前 production 預設 checkpoint：
 
 ```bash
-checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
+checkpoints/gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt
 ```
 
 若要覆蓋模型，可以設定 `.env` 或環境變數：
@@ -46,7 +46,7 @@ FloorSet Problem C 要求對一組 SoC blocks 產生 2D floorplan。每個 block
 
 ## Total Score No Runtime
 
-`total_score_no_runtime` 是本 repo 目前做架構比較與 checkpoint promotion 的主要本地指標。它沿用官方 evaluator 的 quality 與 soft-violation 計算，但把 runtime adjustment 固定為 `1.0`：
+`total_score_no_runtime` 是本 repo 目前做 solver 架構、repair policy、candidate matrix 與 checkpoint promotion 的主要本地指標。它沿用官方 evaluator 的 quality 與 soft-violation 計算，但把 runtime adjustment 固定為 `1.0`：
 
 ```text
 cost_no_runtime = quality_factor * violation_factor
@@ -55,7 +55,7 @@ cost_no_runtime = quality_factor * violation_factor
 用途：
 
 - 比較 solver 架構、repair policy、candidate matrix 與 checkpoint 時，先排除本地 runtime median 的扭曲。
-- 保留 `total_score` 與 raw runtime 作為 runtime risk signal，但不讓 WSL/local median artifact 成為唯一決策依據。
+- 提交前仍要看 raw runtime、P90 runtime、max runtime 與 runtime-aware `total_score`，但它們是 gating / sanity check，不取代 full-validation no-runtime promotion。
 - checkpoint promotion 以 full validation 的 `total_score_no_runtime` 為準，不只看 supervised validation loss。
 
 相關文件：
@@ -119,8 +119,8 @@ bash scripts/eval_single.sh 99
 
 ```bash
 bash scripts/eval_total.sh
-bash scripts/eval_total.sh gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
-bash scripts/eval_total.sh checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
+bash scripts/eval_total.sh gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt
+bash scripts/eval_total.sh checkpoints/gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt
 bash scripts/eval_total.sh /abs/path/to/checkpoint.pt
 ```
 
@@ -131,6 +131,23 @@ checkpoint 解析規則：
 - 只有檔名：視為 `checkpoints/<name>`。
 - repo-relative path：視為 repo root 下的相對路徑。
 - absolute path：直接使用。
+
+Evaluator / submission sanity controls：
+
+```bash
+FLOORSET_EVAL_REFRESH=1 bash scripts/eval_total.sh --best-since-0512
+FLOORSET_REPAIR_TRACE_JSONL=artifacts/repair_trace.jsonl bash scripts/eval_single.sh 99
+```
+
+Solver ablation-only controls：
+
+```bash
+FLOORSET_ENABLE_V10_SOFT_REPAIR=1 FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET=1 bash scripts/eval_total.sh
+FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS=0 bash scripts/eval_total.sh
+FLOORSET_ENABLE_QUALITY_PORTFOLIO=auto bash scripts/eval_total.sh
+```
+
+已移除的 hard runtime-tail clamp 與 broad grouping-adjacency flag 只保留在歷史 evidence 文件，不再作為 README runnable instruction。
 
 ### `scripts/validate.sh`
 
@@ -177,7 +194,7 @@ RESUME_CHECKPOINT=checkpoints/old_transformer.pt bash scripts/train_transformer.
 
 ### `scripts/train_hgt.sh`
 
-訓練 Local HGT encoder 版本的 Anchor-GNN。HGT 會保留 block、pin、cluster、MIB 與 boundary typed nodes，並只沿 heterogeneous factor graph 的 typed local edges 做 relation-specific attention；v1 不加入 global attention/refinement layer。參數格式與 `scripts/train_transformer.sh` 相同，但預設 `ENCODER=hgt`、`NUM_HEADS=4`、`BATCH_SIZE=8`、`CHECKPOINT_PREFIX=gnn_hgt`，log 檔名會帶 `train_arch_v5_hgt`。HGT script 也預設對高風險樣本啟用低風險 decoder-aware ranking 權重：`HIGH_RISK_ORDER_MULTIPLIER=1.5`、`HIGH_RISK_PAIRWISE_MULTIPLIER=1.5`，只加強 order/pairwise 訓練 loss，不改 decoder/repair。
+訓練 Local HGT encoder 版本的 Anchor-GNN。HGT 會保留 block、pin、cluster、MIB 與 boundary typed nodes，並只沿 heterogeneous factor graph 的 typed local edges 做 relation-specific attention；v1 不加入 global attention/refinement layer。參數格式與 `scripts/train_transformer.sh` 相同，但預設 `ENCODER=hgt`、`NUM_HEADS=4`、`BATCH_SIZE=8`、`CHECKPOINT_PREFIX=gnn_hgt`，log 檔名會帶 `train_arch_v5_hgt`。目前 quality-first HGT retraining 預設為 `NUM_SAMPLES=800000`、`EPOCHS=6`、`LR=1.5e-4`、`ASPECT_WEIGHT=0.06`、repaired pseudo targets 開啟、`HGT_RELATION_GATE_MIN=0.20`，並用 `HIGH_RISK_ORDER_MULTIPLIER=1.8` / `HIGH_RISK_PAIRWISE_MULTIPLIER=1.6` 加強高風險樣本的 order/pairwise 訓練 loss；這些 training weights 不直接改 decoder/repair。
 
 ```bash
 bash scripts/train_hgt.sh
@@ -187,12 +204,22 @@ OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_hgt_run bash scripts/train_hgt.sh
 RESUME_CHECKPOINT=checkpoints/old_hgt.pt bash scripts/train_hgt.sh
 ```
 
-HGT dirty-sample experiments can enable repaired pseudo targets:
+HGT dirty-sample experiments can tune repaired pseudo targets:
 
 ```bash
 ENABLE_REPAIRED_PSEUDO_TARGETS=1 bash scripts/train_hgt.sh
 DIRTY_PSEUDO_ORDER_WEIGHT=0.20 DIRTY_PSEUDO_CLEAN_ENOUGH_ORDER_WEIGHT=0.35 ENABLE_REPAIRED_PSEUDO_TARGETS=1 bash scripts/train_hgt.sh
 ```
+
+Training / checkpoint controls：
+
+```bash
+CHECKPOINT_METRICS_MANIFEST=artifacts/checkpoint_metrics.jsonl \
+EVALUATOR_BEST_CHECKPOINT=checkpoints/gnn_hgt_best_evaluator.pt \
+bash scripts/train_hgt.sh
+```
+
+`TRAIN_EVALUATE_EACH_EPOCH=1` 是 `scripts/train_hgt.sh` 目前預設，會在每個 epoch 後用 production-default checkpoint-isolation env 跑 full evaluator，把 evaluator evidence append 到 manifest，並只依 evaluator evidence 更新 evaluator-best checkpoint。若只想做 training-health run，可以設定 `TRAIN_EVALUATE_EACH_EPOCH=0`。
 
 Guidance ablations are evaluator-time knobs:
 
@@ -258,7 +285,7 @@ src/
 3. `_candidate_specs()` 依 instance statistics 選 candidate profiles。
 4. candidate 由 `relative_order.construct_relative_order_placement()` 或 opt-in `constructive.construct_beam_placement()` 生成。
 5. `repair.repair_placement()` 修正 overlap、boundary、grouping、MIB。
-6. `_select_best_candidate()` 用 soft-first ranking 與 no-runtime proxy 選出 best placement。
+6. `_select_best_candidate()` 使用 hard legality gate 和 V10 no-runtime proxy 選出 best placement。
 7. 回傳 evaluator 要求的 `(x, y, w, h)` list。
 
 ### Core files
@@ -296,6 +323,8 @@ src/
 │   ├── eval_total.sh
 │   ├── iccad2026_evaluate.py
 │   ├── train.sh
+│   ├── train_transformer.sh
+│   ├── train_hgt.sh
 │   └── update.sh
 ├── src/
 │   ├── architecture_v5_optimizer.py
@@ -311,7 +340,7 @@ src/
 │   ├── test_diagnostics.py
 │   └── test_evaluator_scoring.py
 ├── checkpoints/
-│   ├── gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt
+│   ├── gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt
 │   └── other experiment checkpoints
 ├── docs/
 │   ├── optimization-notes.md
@@ -331,9 +360,9 @@ src/
 ## 最近更新
 
 - README 已改成中文專案入口文件，補上 problem 定義、no-runtime scoring、scripts、`src/` 架構、逐檔功能與 file tree。
-- Production 預設 checkpoint 已更新為 `checkpoints/gnn_best_0519_ns1000000_ep3_encmpnn_h256_l6_acc32.pt`。
-- `scripts/eval_single.sh`、`scripts/eval_total.sh` 與 `SolverConfig.default_checkpoint` 已同步使用新的 best checkpoint。
-- `tests/test_optimizer.py` 的預設 checkpoint 測試已同步更新。
+- Production evaluator scripts 與 `.env` 預設 checkpoint 已更新為 `checkpoints/gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt`。
+- Hard runtime-tail clamp 與 broad grouping-adjacency opt-in code path 已移除；歷史 evidence 仍留在 `docs/evaluation/` 與 `docs/optimization-notes.md`。
+- `docs/evaluation/2026-06-11-opt-in-flag-cleanup.md` 是目前完整 opt-in / flag audit；training CLI、checkpoint selection、debug trace 與 evaluator plumbing 也納入清單。
 
 ## 測試
 
@@ -341,8 +370,9 @@ src/
 uv run pytest
 ```
 
-本次 checkpoint 預設更新已跑過聚焦測試：
+常用聚焦測試：
 
 ```bash
 uv run pytest tests/test_optimizer.py
+uv run pytest tests/test_relative_order.py tests/test_budget_layer.py tests/test_repair.py
 ```

@@ -141,6 +141,9 @@ work should avoid globally compacting cluster keys and instead use the retained
 narrow bias only when grouping soft pressure is high and the local order gap is ambiguous. The
 artifact is
 `artifacts/eval_v10/runtime_clamp_grouping_bias_graph_transformer_0521_v10.json`.
+These two flags are historical evidence only after the 2026-06-11 cleanup; their
+live code paths were removed in favor of conditional runtime budget and
+default-on narrow grouping pair bias.
 
 Large-case candidates still have no measured v10 gain. No-Checkpoint Guidance
 Mode remains useful for deterministic repair diagnosis but is not competitive
