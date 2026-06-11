@@ -15,7 +15,6 @@ class V10BudgetDecision:
     risk: RiskBudget
     candidate_budget_tier: BudgetTier
     quality_portfolio_allowed: bool
-    runtime_tail_clamp_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -122,10 +121,6 @@ def v10_soft_repair_allowed(
     return soft_total >= min_soft or soft_relative >= min_relative
 
 
-def runtime_tail_clamp_enabled() -> bool:
-    return env_flag("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP")
-
-
 def conditional_runtime_budget_enabled() -> bool:
     return env_flag("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET")
 
@@ -155,21 +150,6 @@ def conditional_runtime_budget_limits(tier: BudgetTier) -> ConditionalRuntimeLim
     )
 
 
-def runtime_tail_clamp_limits(tier: BudgetTier) -> tuple[int, int, int, int]:
-    if tier is BudgetTier.HEAVY:
-        defaults = (2, 20, 18, 24)
-    elif tier is BudgetTier.MEDIUM:
-        defaults = (2, 16, 14, 20)
-    else:
-        defaults = (1, 10, 8, 12)
-    return (
-        env_int("FLOORSET_RUNTIME_CLAMP_MAX_REPAIR_PASSES", defaults[0]),
-        env_int("FLOORSET_RUNTIME_CLAMP_BOUNDARY_SNAPS", defaults[1]),
-        env_int("FLOORSET_RUNTIME_CLAMP_CLUSTER_MOVES", defaults[2]),
-        env_int("FLOORSET_RUNTIME_CLAMP_PAIR_CANDIDATES", defaults[3]),
-    )
-
-
 def v10_soft_acceptance_slack(
     current_counts: SoftCounts,
     candidate_counts: SoftCounts,
@@ -193,7 +173,6 @@ def budget_decision(inst, *, budget: RiskBudget | None = None) -> V10BudgetDecis
         risk=budget,
         candidate_budget_tier=candidate_budget_tier(inst, budget=budget),
         quality_portfolio_allowed=quality_portfolio_allowed(inst, budget=budget),
-        runtime_tail_clamp_enabled=runtime_tail_clamp_enabled(),
     )
 
 
@@ -204,7 +183,6 @@ def budget_trace_context(inst, *, budget: RiskBudget | None = None) -> dict[str,
         "risk_tier": _tier_value(risk.tier),
         "candidate_budget_tier": _tier_value(decision.candidate_budget_tier),
         "quality_portfolio_allowed": decision.quality_portfolio_allowed,
-        "runtime_tail_clamp_enabled": decision.runtime_tail_clamp_enabled,
         "score_share": risk.score_share,
         "constraint_density": risk.constraint_density,
         "net_density": risk.net_density,

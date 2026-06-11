@@ -90,14 +90,24 @@ def test_v10_soft_repair_allowed_uses_risk_tier_and_soft_pressure(monkeypatch):
 def test_budget_trace_context_exposes_unified_decision_fields(monkeypatch):
     inst = _inst()
     monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "auto")
-    monkeypatch.setenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", "1")
 
     trace = budget_trace_context(inst)
 
+    assert set(trace) == {
+        "risk_tier",
+        "candidate_budget_tier",
+        "quality_portfolio_allowed",
+        "score_share",
+        "constraint_density",
+        "net_density",
+        "boundary_count",
+        "grouping_budget",
+        "mib_budget",
+        "hard_shape_count",
+    }
     assert trace["risk_tier"] in {"medium", "heavy"}
     assert trace["candidate_budget_tier"] in {"medium", "heavy"}
     assert trace["quality_portfolio_allowed"] is True
-    assert trace["runtime_tail_clamp_enabled"] is True
     assert trace["score_share"] > 0.0
     assert trace["net_density"] > 0.0
 

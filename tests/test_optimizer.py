@@ -525,29 +525,6 @@ def test_high_risk_repair_profiles_are_configurable(monkeypatch):
     )
 
 
-def test_runtime_tail_clamp_applies_after_heavy_repair_profile(monkeypatch):
-    monkeypatch.setenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", "1")
-    monkeypatch.setattr(
-        repair_module,
-        "instance_risk_budget",
-        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
-    )
-    inst = parse_instance(
-        4,
-        torch.full((4,), 4.0),
-        torch.empty(0, 3),
-        torch.empty(0, 3),
-        torch.empty(0, 2),
-        torch.zeros(4, 5),
-        torch.full((4, 4), -1.0),
-    )
-
-    config = optimizer_module._repair_profile_config(SolverConfig(), "grouping_first", inst)
-
-    assert config.max_cluster_component_moves == 18
-    assert config.max_pair_candidates_per_component == 24
-
-
 def test_auto_high_risk_portfolio_targets_extreme_tail_cases(monkeypatch):
     monkeypatch.delenv("FLOORSET_ENABLE_HIGH_RISK_PORTFOLIO", raising=False)
     monkeypatch.delenv("FLOORSET_HIGH_RISK_REPAIR_PROFILES", raising=False)

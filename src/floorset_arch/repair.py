@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import math
 import os
 import time
@@ -513,41 +512,6 @@ def _v10_soft_repair_eligible(inst: Instance, placement: Placement) -> bool:
     min_soft = _env_int("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_SOFT", 6)
     min_relative = _env_float("FLOORSET_V10_SOFT_REPAIR_LIGHT_MIN_RELATIVE", 0.12)
     return soft_total >= min_soft or soft_relative >= min_relative
-
-
-def _runtime_tail_clamp_limits(tier: BudgetTier) -> tuple[int, int, int, int]:
-    if tier is BudgetTier.HEAVY:
-        defaults = (2, 20, 18, 24)
-    elif tier is BudgetTier.MEDIUM:
-        defaults = (2, 16, 14, 20)
-    else:
-        defaults = (1, 10, 8, 12)
-    return (
-        _env_int("FLOORSET_RUNTIME_CLAMP_MAX_REPAIR_PASSES", defaults[0]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_BOUNDARY_SNAPS", defaults[1]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_CLUSTER_MOVES", defaults[2]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_PAIR_CANDIDATES", defaults[3]),
-    )
-
-
-def _runtime_tail_clamped_config(inst: Instance, config: SolverConfig) -> SolverConfig:
-    if not _env_flag("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP"):
-        return config
-    try:
-        tier = instance_risk_budget(inst).tier
-    except Exception:
-        tier = BudgetTier.LIGHT
-    max_passes, boundary_snaps, cluster_moves, pair_candidates = _runtime_tail_clamp_limits(tier)
-    return replace(
-        config,
-        max_repair_passes=min(config.max_repair_passes, max_passes),
-        max_boundary_component_snaps=min(config.max_boundary_component_snaps, boundary_snaps),
-        max_cluster_component_moves=min(config.max_cluster_component_moves, cluster_moves),
-        max_pair_candidates_per_component=min(
-            config.max_pair_candidates_per_component,
-            pair_candidates,
-        ),
-    )
 
 
 def _score_better_v10_soft(

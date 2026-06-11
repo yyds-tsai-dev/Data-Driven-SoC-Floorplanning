@@ -32,7 +32,7 @@ from floorset_arch.quality_portfolio import (
     refine_quality_candidate,
 )
 from floorset_arch.relative_order import construct_relative_order_placement
-from floorset_arch.repair import _runtime_tail_clamped_config, repair_placement
+from floorset_arch.repair import repair_placement
 from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.surrogate_guidance import build_surrogate_guidance
 from floorset_arch.v10_proxy import v10_proxy_better, v10_proxy_cost, v10_proxy_rank
@@ -129,9 +129,7 @@ def _repair_profile_config(config: SolverConfig, repair_profile: str, inst=None)
         )
     else:
         profile_config = config
-    if inst is None:
-        return profile_config
-    return _runtime_tail_clamped_config(inst, profile_config)
+    return profile_config
 
 
 def _build_candidate_worker(
