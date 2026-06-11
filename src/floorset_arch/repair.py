@@ -451,16 +451,6 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
-def _overlap_count(placement: Placement) -> int:
-    rects = list(placement.rects.values())
-    count = 0
-    for idx, rect in enumerate(rects):
-        for other in rects[idx + 1 :]:
-            if overlaps(rect, other):
-                count += 1
-    return count
-
-
 def _soft_capacity(inst: Instance) -> int:
     boundary_budget = len(inst.boundary)
     grouping_budget = sum(
@@ -468,30 +458,6 @@ def _soft_capacity(inst: Instance) -> int:
     )
     mib_budget = sum(max(0, len(members) - 1) for members in inst.mib_groups.values())
     return max(boundary_budget + grouping_budget + mib_budget, 1)
-
-
-def _hard_or_overlap_regressed(
-    inst: Instance,
-    candidate: Placement,
-    current: Placement,
-) -> bool:
-    if _overlap_count(candidate) > _overlap_count(current):
-        return True
-    for block in range(inst.block_count):
-        if block not in candidate.rects:
-            return True
-    for block in inst.fixed | inst.preplaced:
-        target = inst.target_rects.get(block)
-        rect = candidate.rects.get(block)
-        if target is None or rect is None:
-            return True
-        if block in inst.preplaced and (
-            abs(rect.x - target.x) > 1e-6 or abs(rect.y - target.y) > 1e-6
-        ):
-            return True
-        if abs(rect.width - target.width) > 1e-6 or abs(rect.height - target.height) > 1e-6:
-            return True
-    return False
 
 
 def _v10_soft_repair_eligible(inst: Instance, placement: Placement) -> bool:

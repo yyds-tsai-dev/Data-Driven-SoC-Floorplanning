@@ -132,26 +132,6 @@ def _repair_profile_config(config: SolverConfig, repair_profile: str, inst=None)
     return profile_config
 
 
-def _build_candidate_worker(
-    inst, config: SolverConfig, spec: CandidateSpec
-) -> Placement:
-    saved_guidance = inst.anchor_guidance
-    if spec.disable_guidance:
-        inst.anchor_guidance = None
-    try:
-        if spec.kind == "beam":
-            graph = build_hetero_floorplan_graph(inst)
-            placement = construct_beam_placement(inst, config, graph=graph)
-        else:
-            placement = construct_relative_order_placement(
-                inst, config, profile=spec.profile
-            )
-        return _repair_with_profile_worker(inst, placement, config, spec.repair_profile)
-    finally:
-        if spec.disable_guidance:
-            inst.anchor_guidance = saved_guidance
-
-
 def _env_flag(name: str) -> bool:
     value = os.environ.get(name, "")
     return value.lower() in {"1", "true", "yes", "on"}
@@ -916,9 +896,6 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         if boundary_count <= 28:
             return ["soft"]
         return ["compact"]
-
-    def _proxy_cost(self, inst, placement: Placement) -> float:
-        return v10_proxy_cost(inst, placement, placement_metrics(inst, placement))
 
     def _no_runtime_proxy_cost(
         self, inst, placement: Placement, metrics: dict[str, float | int]
