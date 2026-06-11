@@ -158,16 +158,7 @@ def _bias_order_keys(
         cluster = _constraint_id(inst, block, 3)
         if cluster:
             clusters.setdefault(cluster, []).append(block)
-    if profile == "compact" and _grouping_adjacency_bias_enabled(profile) and not _narrow_grouping_pair_bias_enabled():
-        blend = max(
-            0.0,
-            min(
-                1.0,
-                _env_float("FLOORSET_GROUPING_ADJACENCY_KEY_BLEND", 0.65),
-            ),
-        )
-    else:
-        blend = 0.0 if profile == "compact" else 0.18
+    blend = 0.0 if profile == "compact" else 0.18
     for members in clusters.values():
         if len(members) <= 1:
             continue
@@ -194,25 +185,6 @@ def _bias_order_keys(
             key_y[block] += offset_y + edge_counts[4] * max(heights[block], 1.0) * 0.05
             edge_counts[4] += 1
     return key_x, key_y
-
-
-def _grouping_adjacency_bias_enabled(profile: str) -> bool:
-    enabled = os.environ.get(
-        "FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS",
-        "",
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    if not enabled:
-        return profile != "compact"
-    mode = (
-        os.environ.get("FLOORSET_GROUPING_ADJACENCY_BIAS_MODE", "auto")
-        .strip()
-        .lower()
-    )
-    if mode == "soft_only":
-        return profile != "compact"
-    if mode == "compact_only":
-        return profile == "compact"
-    return True
 
 
 def _cluster_orientations(inst: Instance, raw_x: list[float], raw_y: list[float]) -> dict[int, str]:
@@ -331,10 +303,6 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
                         bonus=narrow_bonus,
                         ambiguity_margin=ambiguity_margin,
                     )
-                elif orient.get(ci, "H") == "H":
-                    h_score += 0.45 if _grouping_adjacency_bias_enabled(profile) else 0.0
-                else:
-                    v_score += 0.45 if _grouping_adjacency_bias_enabled(profile) else 0.0
             if guidance is not None and guidance.pairwise_axis:
                 key = (i, j) if i < j else (j, i)
                 pair_logits = guidance.pairwise_axis.get(key)
@@ -347,20 +315,6 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
                 add_h(i, j)
             else:
                 add_v(i, j)
-
-    if _grouping_adjacency_bias_enabled(profile) and not narrow_enabled:
-        for cluster, members in inst.cluster_groups.items():
-            chain = [block for block in members if block in pos_x]
-            if len(chain) <= 1:
-                continue
-            if orient.get(cluster, "H") == "H":
-                chain.sort(key=lambda i: (key_x[i], key_y[i], i))
-                for a, b in zip(chain, chain[1:]):
-                    add_h(a, b)
-            else:
-                chain.sort(key=lambda i: (key_y[i], key_x[i], i))
-                for a, b in zip(chain, chain[1:]):
-                    add_v(a, b)
 
     x_pos = {block: 0.0 for block in movable}
     y_pos = {block: 0.0 for block in movable}

@@ -71,36 +71,7 @@ def test_relative_order_supports_wide_and_tall_shape_profiles():
     assert abs(tall.area - 16.0) <= 1e-6
 
 
-def test_grouping_adjacency_bias_can_chain_compact_profile(monkeypatch):
-    constraints = torch.zeros(4, 5)
-    constraints[0, 3] = 1.0
-    constraints[1, 3] = 1.0
-    inst = parse_instance(
-        4,
-        torch.full((4,), 4.0),
-        torch.empty(0, 3),
-        torch.empty(0, 3),
-        torch.empty(0, 2),
-        constraints,
-        torch.full((4, 4), -1.0),
-    )
-    inst.anchor_guidance = AnchorGuidance(
-        rect_priors={
-            0: Rect(0.0, 0.0, 2.0, 2.0),
-            1: Rect(20.0, 20.0, 2.0, 2.0),
-            2: Rect(2.0, 0.0, 2.0, 2.0),
-            3: Rect(0.0, 2.0, 2.0, 2.0),
-        }
-    )
-    monkeypatch.setenv("FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS", "1")
-    monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "0")
-
-    placement = construct_relative_order_placement(inst, profile="compact")
-
-    assert edge_touch_length(placement.rects[0], placement.rects[1]) > 0.0
-
-
-def test_narrow_grouping_pair_bias_does_not_enable_global_key_blend(monkeypatch):
+def test_removed_broad_grouping_flag_does_not_enable_global_key_blend(monkeypatch):
     constraints = torch.zeros(3, 5)
     constraints[0, 3] = 1.0
     constraints[1, 3] = 1.0
@@ -121,13 +92,46 @@ def test_narrow_grouping_pair_bias_does_not_enable_global_key_blend(monkeypatch)
             2: Rect(0.0, 0.0, 2.0, 2.0),
         }
     )
-    monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1")
     monkeypatch.setenv("FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS", "1")
     monkeypatch.setenv("FLOORSET_GROUPING_ADJACENCY_KEY_BLEND", "1.0")
 
     placement = construct_relative_order_placement(inst, profile="compact")
 
     assert placement.rects[0].x >= placement.rects[1].right
+
+
+def test_narrow_grouping_pair_bias_flips_ambiguous_same_cluster_axis(monkeypatch):
+    constraints = torch.zeros(3, 5)
+    constraints[:, 3] = 1.0
+    inst = parse_instance(
+        3,
+        torch.full((3,), 16.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        torch.full((3, 4), -1.0),
+    )
+    inst.anchor_guidance = AnchorGuidance(
+        rect_priors={
+            0: Rect(0.0, 0.0, 8.0, 2.0),
+            1: Rect(4.0, 2.2, 8.0, 2.0),
+            2: Rect(80.0, 0.0, 8.0, 2.0),
+        }
+    )
+    config = SolverConfig(anchor_translation_strength=0.0)
+    monkeypatch.setenv("FLOORSET_NARROW_GROUPING_MIN_MEMBERS", "2")
+    monkeypatch.setenv("FLOORSET_NARROW_GROUPING_AMBIGUITY_MARGIN", "1.0")
+    monkeypatch.setenv("FLOORSET_NARROW_GROUPING_AXIS_BONUS", "1.0")
+    monkeypatch.setenv("FLOORSET_NARROW_GROUPING_PRESSURE", "1.0")
+
+    monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "0")
+    disabled = construct_relative_order_placement(inst, config, profile="soft")
+    assert disabled.rects[0].top <= disabled.rects[1].y
+
+    monkeypatch.setenv("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1")
+    enabled = construct_relative_order_placement(inst, config, profile="soft")
+    assert enabled.rects[0].right <= enabled.rects[1].x
 
 
 def test_narrow_grouping_pair_bias_only_applies_to_ambiguous_same_cluster_pairs(monkeypatch):

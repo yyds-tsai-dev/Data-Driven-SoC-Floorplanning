@@ -126,19 +126,19 @@ The first runtime-tail clamp reduced tail runtime but over-clamped quality. With
 soft repair enabled, p90 improved from `2.54s` to `1.89s` and max runtime
 improved from `9.47s` to `8.11s`, but no-runtime score regressed to `2.2741`
 and runtime-aware total regressed to `3.0120`. The largest bucket did not recover:
-IDs 95, 96, 98, and 99 were worse than baseline on no-runtime cost. Keep
-`FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP=1` opt-in and revise it from hard caps to
-per-case conditional caps before another promotion attempt. The artifact is
+IDs 95, 96, 98, and 99 were worse than baseline on no-runtime cost. The former
+`FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP=1` hard-cap opt-in was removed; future work
+should use per-case conditional caps instead of resurrecting that flag. The artifact is
 `artifacts/eval_v10/runtime_clamp_graph_transformer_0521_v10.json`.
 
 The first decoder-side grouping adjacency bias was also not submission-safe.
 Combined with soft repair and runtime clamp, no-runtime score regressed to
 `2.4989` and total score regressed to `3.3102`. Runtime stayed bounded, but many
 mid/large cases gained soft violations; the largest no-runtime regressions
-included IDs 81, 82, 49, 64, 68, and 92. Keep
-`FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS=1` opt-in only. The next version should
-avoid globally compacting cluster keys and instead apply a narrower bias only
-when grouping soft pressure is high and the local order gap is ambiguous. The
+included IDs 81, 82, 49, 64, 68, and 92. The former
+`FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS=1` broad opt-in was removed; current
+work should avoid globally compacting cluster keys and instead use the retained
+narrow bias only when grouping soft pressure is high and the local order gap is ambiguous. The
 artifact is
 `artifacts/eval_v10/runtime_clamp_grouping_bias_graph_transformer_0521_v10.json`.
 
