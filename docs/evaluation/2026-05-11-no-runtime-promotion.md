@@ -7,7 +7,7 @@ Use `total_score_no_runtime` as the promotion metric for available Anchor-GNN ch
 ## Evaluation Setup
 
 - Evaluator: `FloorSet/iccad2026contest/iccad2026_evaluate.py`
-- Optimizer wrapper: `src/architecture_v4_optimizer.py`
+- Optimizer wrapper: historical `src/architecture_v4_optimizer.py` path; current evaluator scripts use `src/architecture_v5_optimizer.py`.
 - Validation cases: 100/100
 - Promotion metric: `total_score_no_runtime`
 - Runtime source: `time.perf_counter()` after fixing wall-clock timing.
