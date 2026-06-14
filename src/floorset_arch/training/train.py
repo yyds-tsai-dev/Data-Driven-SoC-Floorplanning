@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,8 +27,11 @@ from floorset_arch.training.checkpoint import (
     load_checkpoint,
     save_anchor_checkpoint,
 )
-from floorset_arch.training.promote_checkpoint import select_best_checkpoint
-from floorset_arch.training.selection import read_metric_records
+from floorset_arch.training.promote_checkpoint import (
+    checkpoint_metric_from_eval_json,
+    select_best_checkpoint,
+)
+from floorset_arch.training.selection import append_metric_record, read_metric_records
 from floorset_arch.training.losses import (
     build_anchor_targets,
     build_pairwise_relation_targets,
@@ -638,6 +643,92 @@ def refresh_evaluator_best_checkpoint(
     return best
 
 
+TRAINING_EVAL_ENV_OVERRIDES = {
+    "FLOORSET_GNN_CHECKPOINT_SOURCE": "training_eval",
+    "FLOORSET_PROFILE_POLICY": "adaptive",
+    "FLOORSET_INCLUDE_COMPACT_RELATIVE": "1",
+    "FLOORSET_ENABLE_HIGH_RISK_PORTFOLIO": "auto",
+    "FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS": "1",
+    "FLOORSET_CANDIDATE_RANK_POLICY": "v10_proxy",
+    "FLOORSET_ENABLE_LARGE_CASE_CANDIDATES": "0",
+    "FLOORSET_INCLUDE_BEAM_CANDIDATES": "0",
+    "FLOORSET_INCLUDE_NO_GUIDANCE_CANDIDATE": "0",
+    "FLOORSET_ENABLE_QUALITY_PORTFOLIO": "0",
+    "FLOORSET_ENABLE_V10_SOFT_REPAIR": "0",
+    "FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET": "0",
+    "FLOORSET_GUIDANCE_ANCHOR_ONLY": "0",
+    "FLOORSET_GUIDANCE_DISABLE_PAIRWISE": "0",
+    "FLOORSET_GUIDANCE_DISABLE_ASPECT": "0",
+    "FLOORSET_GUIDANCE_DISABLE_PRIORITY": "0",
+}
+
+
+def _parse_train_eval_tail_ids(value: str) -> set[int] | None:
+    if not value.strip():
+        return None
+    return {int(part.strip()) for part in value.split(",") if part.strip()}
+
+
+def _training_eval_env(checkpoint: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(TRAINING_EVAL_ENV_OVERRIDES)
+    env["FLOORSET_GNN_CHECKPOINT"] = str(checkpoint.resolve())
+    pythonpath_parts = [
+        str(ROOT / "FloorSet" / "iccad2026contest"),
+        str(ROOT / "FloorSet"),
+    ]
+    if env.get("PYTHONPATH"):
+        pythonpath_parts.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    return env
+
+
+def run_training_evaluator(
+    checkpoint: str | Path,
+    epoch: int,
+    args,
+    metrics_manifest: str | Path,
+    evaluator_best_path: str | Path,
+):
+    checkpoint_path = Path(checkpoint)
+    output_dir = (
+        Path(args.train_eval_output_dir)
+        if getattr(args, "train_eval_output_dir", "")
+        else Path(args.output_dir) / "training_eval"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    eval_json = output_dir / f"{checkpoint_path.stem}_epoch{int(epoch):03d}_full_eval.json"
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "iccad2026_evaluate.py"),
+        "--data-path",
+        "../",
+        "--evaluate",
+        str(ROOT / "src" / "architecture_v5_optimizer.py"),
+        "--verbose",
+        "--output",
+        str(eval_json.resolve()),
+    ]
+    subprocess.run(
+        command,
+        cwd=ROOT / "FloorSet" / "iccad2026contest",
+        env=_training_eval_env(checkpoint_path),
+        check=True,
+    )
+    record = checkpoint_metric_from_eval_json(
+        checkpoint=str(checkpoint_path),
+        eval_json=eval_json,
+        epoch=epoch,
+        metric_source="training_full_eval",
+        val_loss=None,
+        tail_ids=_parse_train_eval_tail_ids(
+            getattr(args, "train_eval_tail_ids", "95,96,97,98,99")
+        ),
+    )
+    append_metric_record(metrics_manifest, record)
+    return refresh_evaluator_best_checkpoint(metrics_manifest, evaluator_best_path)
+
+
 def _load_optimizer_state_if_compatible(
     optimizer,
     optimizer_state,
@@ -861,9 +952,18 @@ def main(args) -> None:
                 val_stats,
                 optimizer=optimizer,
             )
-        selected_evaluator = refresh_evaluator_best_checkpoint(
-            metrics_manifest, evaluator_best_path
-        )
+        if args.train_evaluate_each_epoch:
+            selected_evaluator = run_training_evaluator(
+                checkpoint=latest_path,
+                epoch=epoch,
+                args=args,
+                metrics_manifest=metrics_manifest,
+                evaluator_best_path=evaluator_best_path,
+            )
+        else:
+            selected_evaluator = refresh_evaluator_best_checkpoint(
+                metrics_manifest, evaluator_best_path
+            )
         if selected_evaluator is not None:
             print(
                 "Updated evaluator-best checkpoint "
@@ -980,6 +1080,24 @@ def parse_args():
             "Destination for the best checkpoint selected from evaluator evidence. "
             "When omitted, training writes a run-tagged best_evaluator checkpoint."
         ),
+    )
+    parser.add_argument(
+        "--train-evaluate-each-epoch",
+        action="store_true",
+        help=(
+            "After each epoch, run the full evaluator on the latest checkpoint, "
+            "append evaluator evidence to the metrics manifest, and refresh evaluator-best."
+        ),
+    )
+    parser.add_argument(
+        "--train-eval-output-dir",
+        default="",
+        help="Directory for per-epoch full-evaluation JSON outputs.",
+    )
+    parser.add_argument(
+        "--train-eval-tail-ids",
+        default="95,96,97,98,99",
+        help="Comma-separated validation ids used for tail_weighted_no_runtime records.",
     )
     parser.add_argument("--resume-checkpoint", default="")
     parser.add_argument("--ignore-optimizer-state", action="store_true")
