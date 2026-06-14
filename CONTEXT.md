@@ -72,6 +72,10 @@ _Avoid_: renaming the package, treating encoder experiments as a separate solver
 The local architecture-tuning score that uses official quality and soft-violation factors with runtime adjustment fixed to `1.0`.
 _Avoid_: treating local runtime-aware score as the primary architecture metric.
 
+**Evaluator Evidence**:
+Validation scoring output produced by the official/local evaluator for a checkpoint, especially full-validation **No-Runtime Quality Score**, tail weighted no-runtime score, soft-violation count, and raw runtime.
+_Avoid_: promoting checkpoints from supervised validation loss, training health metrics, or single-case wins alone.
+
 **V10 No-Runtime Proxy**:
 A solver-internal acceptance proxy that approximates **No-Runtime Quality Score** during placement selection by putting hard legality first, then balancing geometric quality with soft-violation pressure.
 _Avoid_: soft-first acceptance that allows HPWL or bbox area to regress substantially because soft violations decreased.
@@ -134,6 +138,7 @@ _Avoid_: using validation case IDs as the risk definition.
 - A **Selectable Anchor-GNN Encoder** changes learned **Anchor-GNN Guidance** only; checkpoint promotion still requires evaluator evidence.
 - A **Local HGT Encoder** is a **Selectable Anchor-GNN Encoder** variant that preserves b2b/p2b locality and heterogeneous constraint factors instead of flattening them into a block-only graph.
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
+- **Evaluator Evidence** is the only basis for checkpoint promotion; supervised validation loss is a training health signal.
 - **V10 No-Runtime Proxy** is a solver-internal acceptance surface for candidate selection and repair/refine decisions; **No-Runtime Quality Score** remains the evaluator-facing validation metric.
 - A **Conservative Runtime Budget** gates **Sample-Local Parallelism** and **Sample-Local Quality Portfolio** so no-runtime wins do not automatically become submission defaults.
 - The **V10 Evidence-Gated Budget Layer** gathers **Validation Tail Diagnostics**, **High-Risk Case** signals, and raw runtime tails into one promotion decision surface.
