@@ -53,5 +53,4 @@ smoke.*
 wandb/
 
 # Other
-presentation/
 graphify-out/
