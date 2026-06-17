@@ -43,6 +43,7 @@ contest_venv/
 
 # Temporary files
 tmp/
+**/submission/
 
 # Results and logs (optional - contestants may want to track these)
 *_results.json

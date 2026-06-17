@@ -4,27 +4,27 @@
 
 ## Presentation Design Decisions
 
-| Decision | Recommended answer |
-|---|---|
-| Audience | PDA course audience familiar with floorplanning, not necessarily this repo. |
-| Main claim | The project combines learned geometric priors with a deterministic, legality-preserving floorplanning solver and evidence-gated v10 scoring decisions. |
-| Scope | Present Architecture v5 production inference, training/checkpoint flow, and v10 policy. Do not present HGT as the production winner unless evaluator evidence promotes it. |
+| Decision          | Recommended answer                                                                                                                                                                             |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Audience          | PDA course audience familiar with floorplanning, not necessarily this repo.                                                                                                                    |
+| Main claim        | The project combines learned geometric priors with a deterministic, legality-preserving floorplanning solver and evidence-gated v10 scoring decisions.                                         |
+| Scope             | Present Architecture v5 production inference, training/checkpoint flow, and v10 policy. Do not present HGT as the production winner unless evaluator evidence promotes it.                     |
 | Evidence standard | Use full-validation `total_score_no_runtime` as the main architecture and checkpoint comparison metric; use raw runtime, P90, max runtime, and runtime-aware total as gating/sanity signals. |
-| Timing | 11 main slides, about 40-55 seconds per slide, plus backup appendix slides for Q&A. |
+| Timing            | 11 main slides, about 40-55 seconds per slide, plus backup appendix slides for Q&A.                                                                                                            |
 
 ## Terminology Ledger
 
-| Canonical term | First-use definition |
-|---|---|
-| FloorSet Problem C | ICCAD 2026 contest task for data-driven SoC floorplanning. |
-| Production Solver Path | The single `solve()` path used by the evaluator. |
-| Anchor-GNN Guidance | Learned block-level geometric priors produced by a checkpoint and consumed by the decoder. |
-| Selectable Anchor-GNN Encoder | MPNN, Graph Transformer, or Local HGT encoder variants that share the same output heads. |
-| AnchorGuidance | Runtime guidance object containing `rect_priors`, `priority`, `log_aspect`, and `pairwise_axis`. |
-| Hard Legality Gate | Candidate ranking boundary that prioritizes missing blocks, overlaps, area, fixed-shape, and preplaced legality before soft quality. |
-| V10 No-Runtime Proxy | Solver-internal candidate acceptance proxy for v10 no-runtime quality. |
+| Canonical term                  | First-use definition                                                                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| FloorSet Problem C              | ICCAD 2026 contest task for data-driven SoC floorplanning.                                                                                 |
+| Production Solver Path          | The single `solve()` path used by the evaluator.                                                                                         |
+| Anchor-GNN Guidance             | Learned block-level geometric priors produced by a checkpoint and consumed by the decoder.                                                 |
+| Selectable Anchor-GNN Encoder   | MPNN, Graph Transformer, or Local HGT encoder variants that share the same output heads.                                                   |
+| AnchorGuidance                  | Runtime guidance object containing `rect_priors`, `priority`, `log_aspect`, and `pairwise_axis`.                                   |
+| Hard Legality Gate              | Candidate ranking boundary that prioritizes missing blocks, overlaps, area, fixed-shape, and preplaced legality before soft quality.       |
+| V10 No-Runtime Proxy            | Solver-internal candidate acceptance proxy for v10 no-runtime quality.                                                                     |
 | V10 Evidence-Gated Budget Layer | Shared decision surface for allocating extra candidate/repair/portfolio effort only when validation evidence and instance risk justify it. |
-| No-Runtime Quality Score | Local full-validation metric equal to official quality and soft-violation factors with runtime adjustment fixed to 1.0. |
+| No-Runtime Quality Score        | Local full-validation metric equal to official quality and soft-violation factors with runtime adjustment fixed to 1.0.                    |
 
 ## One-Sentence Argument
 
@@ -98,13 +98,13 @@ Evaluator evidence decides what becomes default
 
 **From branches to the current design**
 
-| Stage | Main attempt | What we learned | Design consequence |
-|---|---|---|---|
-| `arch-v1` / early `arch_new` | Build initial GNN-guided floorplanning path. | Direct learned geometry still needed strong deterministic repair. | Keep learned guidance as a prior, not as the whole solver. |
-| `arch-v2` / `arch-v3` | Add relative-order decoding, pairwise heads, checkpoint experiments. | Better training loss did not always mean better evaluator score. | Promote checkpoints by evaluator evidence, not validation loss alone. |
-| `arch-v4` | Add no-runtime scoring and runtime-aware diagnostics. | Local runtime-aware score could over-penalize large cases due to local median artifacts. | Use `total_score_no_runtime` for architecture tuning; keep runtime as a gate. |
-| `v5-graph-transformer-encoder` | Add Graph Transformer checkpoint and richer constraint context. | Factor-derived context improved the current default checkpoint path. | Make encoder selectable while preserving the same downstream contract. |
-| v10 branch | Add v10 proxy, conditional budget, and narrow grouping bias. | Soft-first acceptance and broad knobs could regress HPWL/area or runtime. | Move promotion decisions into v10 proxy and evidence-gated budget layers. |
+| Stage                            | Main attempt                                                         | What we learned                                                                          | Design consequence                                                              |
+| -------------------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `arch-v1` / early `arch_new` | Build initial GNN-guided floorplanning path.                         | Direct learned geometry still needed strong deterministic repair.                        | Keep learned guidance as a prior, not as the whole solver.                      |
+| `arch-v2` / `arch-v3`        | Add relative-order decoding, pairwise heads, checkpoint experiments. | Better training loss did not always mean better evaluator score.                         | Promote checkpoints by evaluator evidence, not validation loss alone.           |
+| `arch-v4`                      | Add no-runtime scoring and runtime-aware diagnostics.                | Local runtime-aware score could over-penalize large cases due to local median artifacts. | Use `total_score_no_runtime` for architecture tuning; keep runtime as a gate. |
+| `v5-graph-transformer-encoder` | Add Graph Transformer checkpoint and richer constraint context.      | Factor-derived context improved the current default checkpoint path.                     | Make encoder selectable while preserving the same downstream contract.          |
+| v10 branch                       | Add v10 proxy, conditional budget, and narrow grouping bias.         | Soft-first acceptance and broad knobs could regress HPWL/area or runtime.                | Move promotion decisions into v10 proxy and evidence-gated budget layers.       |
 
 **Chinese presenter note**
 
@@ -250,13 +250,13 @@ hard legality rank
 
 **Fresh v10 ablation surface**
 
-| Run | v10 no-runtime | v10 total | Feasible | Avg runtime | P90 runtime | Max runtime | Decision |
-|---|---:|---:|---:|---:|---:|---:|---|
-| Merge-base baseline | 2.2184 | 2.7762 | 100/100 | 1.25s | 2.27s | 7.01s | baseline |
-| Phase 1 v10 proxy default | 2.1634 | 2.7471 | 100/100 | 1.24s | 2.12s | 7.42s | keep default |
-| Phase 1 + narrow grouping pair bias | 2.1538 | 2.6993 | 100/100 | 1.23s | 2.24s | 6.58s | promote default |
-| Phase 1 + v10 soft repair | 2.1446 | 2.8314 | 100/100 | 1.40s | 2.46s | 9.64s | opt-in only |
-| Phase 1 + soft repair + conditional budget | 2.1670 | 2.7207 | 100/100 | 1.22s | 2.56s | 5.70s | runtime useful, not default |
+| Run                                        | v10 no-runtime | v10 total | Feasible | Avg runtime | P90 runtime | Max runtime | Decision                    |
+| ------------------------------------------ | -------------: | --------: | -------: | ----------: | ----------: | ----------: | --------------------------- |
+| Merge-base baseline                        |         2.2184 |    2.7762 |  100/100 |       1.25s |       2.27s |       7.01s | baseline                    |
+| Phase 1 v10 proxy default                  |         2.1634 |    2.7471 |  100/100 |       1.24s |       2.12s |       7.42s | keep default                |
+| Phase 1 + narrow grouping pair bias        |         2.1538 |    2.6993 |  100/100 |       1.23s |       2.24s |       6.58s | promote default             |
+| Phase 1 + v10 soft repair                  |         2.1446 |    2.8314 |  100/100 |       1.40s |       2.46s |       9.64s | opt-in only                 |
+| Phase 1 + soft repair + conditional budget |         2.1670 |    2.7207 |  100/100 |       1.22s |       2.56s |       5.70s | runtime useful, not default |
 
 **Evidence-backed interpretation**
 
@@ -300,19 +300,19 @@ hard legality rank
 
 ## 10-Minute Delivery Plan
 
-| Time | Slides | What to emphasize |
-|---:|---|---|
-| 0:00-0:35 | 1 | Project scope and main thesis. |
-| 0:35-1:25 | 2 | FloorSet inputs, outputs, hard/soft constraints, v10 pressure. |
-| 1:25-2:10 | 3 | Learned prior plus deterministic solver principle. |
-| 2:10-3:10 | 4 | Architecture evolution and why earlier attempts changed. |
-| 3:10-4:05 | 5 | End-to-end production data flow. |
-| 4:05-5:00 | 6 | Encoder variants and shared guidance contract. |
-| 5:00-5:50 | 7 | Decoder and repair logic. |
-| 5:50-6:45 | 8 | V10 ranking and budget layer. |
-| 6:45-7:35 | 9 | Training and evaluator-backed checkpoint promotion. |
-| 7:35-9:05 | 10 | Evidence table and promotion decisions. |
-| 9:05-10:00 | 11 | Takeaways, limitations, and next steps. |
+|       Time | Slides | What to emphasize                                              |
+| ---------: | ------ | -------------------------------------------------------------- |
+|  0:00-0:35 | 1      | Project scope and main thesis.                                 |
+|  0:35-1:25 | 2      | FloorSet inputs, outputs, hard/soft constraints, v10 pressure. |
+|  1:25-2:10 | 3      | Learned prior plus deterministic solver principle.             |
+|  2:10-3:10 | 4      | Architecture evolution and why earlier attempts changed.       |
+|  3:10-4:05 | 5      | End-to-end production data flow.                               |
+|  4:05-5:00 | 6      | Encoder variants and shared guidance contract.                 |
+|  5:00-5:50 | 7      | Decoder and repair logic.                                      |
+|  5:50-6:45 | 8      | V10 ranking and budget layer.                                  |
+|  6:45-7:35 | 9      | Training and evaluator-backed checkpoint promotion.            |
+|  7:35-9:05 | 10     | Evidence table and promotion decisions.                        |
+| 9:05-10:00 | 11     | Takeaways, limitations, and next steps.                        |
 
 ## Short English Talk Track
 
@@ -340,27 +340,27 @@ The main takeaway is that the strongest architecture is a hybrid: learned geomet
 
 ### Appendix A - Branch / Architecture Timeline
 
-| Branch or version | Evidence source | Attempt | Why it changed |
-|---|---|---|---|
-| `arch-v1` | git branch/log: initial `arch_new/` and checkpoint commits | Establish an initial learned floorplanning path. | Useful starting point, but later work needed explicit solver contracts, repair, and evaluator scripts. |
-| `arch-v2` | commits adding `arch_old/`, `architecture_v2_optimizer.py`, `hetero_graph.py`, and `relative_order.py` | Add wrapper generation and more structured geometry/graph handling. | The project moved toward `floorset_arch` as the stable solver package and wrapper versions as evaluator-facing labels. |
-| `arch-v3` | commits adding pairwise relation head/training plumbing and GNN checkpoints | Improve learned ordering and repair diagnosis. | Checkpoint quality could not be judged by training health alone; full evaluator evidence became necessary. |
-| `arch-v4` | runtime-aware v4 design and no-runtime promotion docs | Add explicit `total_score_no_runtime`, raw runtime summaries, `.env`, and v4 wrapper. | Local runtime-aware score used the solver's own median runtime and could distort architecture tuning; no-runtime became the main tuning metric. |
-| `v5-graph-transformer-encoder` | commits `520fb48`, `add5318`; README architecture flow | Add Graph Transformer encoder and factor-derived context edges. | Encoder changes were isolated behind the same `AnchorGuidance` contract so decoder/repair/ranking stayed comparable. |
-| Local HGT work | HGT design and training commits | Preserve typed block/pin/cluster/MIB/boundary relations with local relation-specific attention. | HGT remains a selectable encoder; it must beat the current checkpoint through evaluator evidence before changing production defaults. |
-| v10 branch | v10 proxy/runtime/grouping design and commits | Replace soft-first acceptance with v10 proxy-first ranking, conditional runtime budget, and narrow grouping bias. | v10 evidence showed the next gains came from ranking/budget policy, not another immediate decoder or GNN rewrite. |
+| Branch or version                | Evidence source                                                                                                | Attempt                                                                                                           | Why it changed                                                                                                                                  |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `arch-v1`                      | git branch/log: initial `arch_new/` and checkpoint commits                                                   | Establish an initial learned floorplanning path.                                                                  | Useful starting point, but later work needed explicit solver contracts, repair, and evaluator scripts.                                          |
+| `arch-v2`                      | commits adding `arch_old/`, `architecture_v2_optimizer.py`, `hetero_graph.py`, and `relative_order.py` | Add wrapper generation and more structured geometry/graph handling.                                               | The project moved toward `floorset_arch` as the stable solver package and wrapper versions as evaluator-facing labels.                        |
+| `arch-v3`                      | commits adding pairwise relation head/training plumbing and GNN checkpoints                                    | Improve learned ordering and repair diagnosis.                                                                    | Checkpoint quality could not be judged by training health alone; full evaluator evidence became necessary.                                      |
+| `arch-v4`                      | runtime-aware v4 design and no-runtime promotion docs                                                          | Add explicit `total_score_no_runtime`, raw runtime summaries, `.env`, and v4 wrapper.                         | Local runtime-aware score used the solver's own median runtime and could distort architecture tuning; no-runtime became the main tuning metric. |
+| `v5-graph-transformer-encoder` | commits `520fb48`, `add5318`; README architecture flow                                                     | Add Graph Transformer encoder and factor-derived context edges.                                                   | Encoder changes were isolated behind the same `AnchorGuidance` contract so decoder/repair/ranking stayed comparable.                          |
+| Local HGT work                   | HGT design and training commits                                                                                | Preserve typed block/pin/cluster/MIB/boundary relations with local relation-specific attention.                   | HGT remains a selectable encoder; it must beat the current checkpoint through evaluator evidence before changing production defaults.           |
+| v10 branch                       | v10 proxy/runtime/grouping design and commits                                                                  | Replace soft-first acceptance with v10 proxy-first ranking, conditional runtime budget, and narrow grouping bias. | v10 evidence showed the next gains came from ranking/budget policy, not another immediate decoder or GNN rewrite.                               |
 
 ### Appendix B - Failed or Mixed-Evidence Attempts
 
-| Attempt | Result | Decision |
-|---|---|---|
-| Large-case candidate matrix | With the promoted 2026-05-10 checkpoint, no-runtime total tied the default at `1.9560`; IDs 95-99 had zero no-runtime delta while runtime increased. | Keep opt-in; do not default. |
-| No-Checkpoint Guidance Mode | Feasible `100/100`, but no-runtime was far worse than configured GNN guidance (`4.6289` vs `2.0326` in the May run). | Use as repair diagnostic, not replacement architecture. |
-| Quality Portfolio v1 | Found ID 99 HPWL headroom, but local runtime-aware total regressed; later on Graph Transformer 0521, no-runtime regressed from `2.1194` to `2.2446`. | Keep as opt-in ablation only. |
-| V10 soft repair | Improved no-runtime in one run (`2.1194 -> 2.1082`) but worsened runtime-aware total and max runtime (`6.80s -> 9.47s`). | Keep opt-in; pair with conditional runtime budget experiments. |
-| Hard runtime-tail clamp | Reduced p90/max runtime but over-clamped quality; no-runtime regressed to `2.2741`, total to `3.0120`. | Removed live path; use conditional runtime budget instead. |
-| Broad grouping adjacency bias | Regressed no-runtime to `2.4989` and total to `3.3102` when combined with soft repair and clamp. | Removed broad path; replaced by narrow ambiguous-pair grouping bias. |
-| Narrow grouping pair bias | Fresh v10 ablation improved no-runtime (`2.1634 -> 2.1538`) and total (`2.7471 -> 2.6993`) relative to Phase 1. | Promoted default with an ablation switch. |
+| Attempt                       | Result                                                                                                                                                   | Decision                                                             |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Large-case candidate matrix   | With the promoted 2026-05-10 checkpoint, no-runtime total tied the default at `1.9560`; IDs 95-99 had zero no-runtime delta while runtime increased.   | Keep opt-in; do not default.                                         |
+| No-Checkpoint Guidance Mode   | Feasible `100/100`, but no-runtime was far worse than configured GNN guidance (`4.6289` vs `2.0326` in the May run).                               | Use as repair diagnostic, not replacement architecture.              |
+| Quality Portfolio v1          | Found ID 99 HPWL headroom, but local runtime-aware total regressed; later on Graph Transformer 0521, no-runtime regressed from `2.1194` to `2.2446`. | Keep as opt-in ablation only.                                        |
+| V10 soft repair               | Improved no-runtime in one run (`2.1194 -> 2.1082`) but worsened runtime-aware total and max runtime (`6.80s -> 9.47s`).                             | Keep opt-in; pair with conditional runtime budget experiments.       |
+| Hard runtime-tail clamp       | Reduced p90/max runtime but over-clamped quality; no-runtime regressed to `2.2741`, total to `3.0120`.                                               | Removed live path; use conditional runtime budget instead.           |
+| Broad grouping adjacency bias | Regressed no-runtime to `2.4989` and total to `3.3102` when combined with soft repair and clamp.                                                     | Removed broad path; replaced by narrow ambiguous-pair grouping bias. |
+| Narrow grouping pair bias     | Fresh v10 ablation improved no-runtime (`2.1634 -> 2.1538`) and total (`2.7471 -> 2.6993`) relative to Phase 1.                                      | Promoted default with an ablation switch.                            |
 
 **Chinese Q&A note**
 

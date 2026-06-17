@@ -1,0 +1,1 @@
+{"avg_runtime": 1.1779499832354485, "checkpoint": "checkpoints/gnn_hgt_latest_0612_ns800000_ep6_enchgt_h256_l4_acc32_bs8_heads4.pt", "epoch": 1, "feasible": 100, "metric_source": "training_full_eval", "soft_violations": 28, "tail_weighted_no_runtime": 1.973060960329228, "total_score_no_runtime": 2.1616014546269193, "val_loss": null}
