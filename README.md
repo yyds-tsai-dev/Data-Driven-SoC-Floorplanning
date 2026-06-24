@@ -1,6 +1,6 @@
 # Data-Driven SoC Floorplanning
 
-本專案是 ICCAD 2026 FloorSet Challenge Problem C 的 SoC floorplanning solver。當前 evaluator-facing 主線是 `Architecture v5` wrapper：用 Anchor-GNN checkpoint 產生 block-level 幾何先驗，再由 `floorset_arch` 的 relative-order / hetero-graph constructive decoder 生成合法 placement，最後用 repair pass 修正 overlap、boundary、grouping 與 MIB 等限制。
+本專案是 ICCAD 2026 FloorSet Challenge Problem C 的 SoC floorplanning solver。當前 evaluator-facing 主線是 `Architecture v11` wrapper：優先支援 graph-conditioned diffusion placement path，沒有 diffusion checkpoint 時保留既有 Anchor-GNN / relative-order / repair fallback。v11 仍由 `floorset_arch` 生成合法 placement，並用 repair pass 修正 overlap、boundary、grouping 與 MIB 等限制。
 
 目前 production 預設 checkpoint：
 
@@ -170,6 +170,7 @@ bash scripts/train.sh
 ```bash
 NUM_SAMPLES=200000 EPOCHS=10 LR=4e-4 bash scripts/train.sh
 OUTPUT_DIR=checkpoints CHECKPOINT_TAG=remote_run bash scripts/train.sh
+WANDB_PROJECT=floorset-v11-diffusion bash scripts/train.sh
 WANDB_MODE=offline WANDB=0 bash scripts/train.sh
 RESUME_CHECKPOINT=checkpoints/old.pt bash scripts/train.sh
 ```
@@ -180,10 +181,11 @@ RESUME_CHECKPOINT=checkpoints/old.pt bash scripts/train.sh
 - dirty samples 仍可提供低權重 geometry reference。
 - dirty order/pairwise supervision 預設被抑制，避免把 soft-violating `fp_sol` 當成可靠 constraint oracle。
 - `WRITE_STABLE_CHECKPOINTS=1` 才會覆寫穩定檔名，例如 `gnn_best.pt`。
+- online W&B runs 預設使用 `floorset-v11-diffusion` project；可用 `WANDB_PROJECT=...` 覆蓋。
 
 ### `scripts/train_transformer.sh`
 
-訓練 Graph Transformer encoder 版本的 Anchor-GNN。參數格式與 `scripts/train.sh` 相同，但預設 `ENCODER=graph-transformer`、`NUM_HEADS=8`、`CHECKPOINT_PREFIX=gnn_transformer`，log 檔名也會帶 `train_arch_v5_transformer`。
+訓練 Graph Transformer encoder 版本的 Anchor-GNN。參數格式與 `scripts/train.sh` 相同，但預設 `ENCODER=graph-transformer`、`NUM_HEADS=8`、`CHECKPOINT_PREFIX=gnn_transformer`，log 檔名也會帶 `train_arch_v11_transformer`。
 
 ```bash
 bash scripts/train_transformer.sh
@@ -194,7 +196,7 @@ RESUME_CHECKPOINT=checkpoints/old_transformer.pt bash scripts/train_transformer.
 
 ### `scripts/train_hgt.sh`
 
-訓練 Local HGT encoder 版本的 Anchor-GNN。HGT 會保留 block、pin、cluster、MIB 與 boundary typed nodes，並只沿 heterogeneous factor graph 的 typed local edges 做 relation-specific attention；v1 不加入 global attention/refinement layer。參數格式與 `scripts/train_transformer.sh` 相同，但預設 `ENCODER=hgt`、`NUM_HEADS=4`、`BATCH_SIZE=8`、`CHECKPOINT_PREFIX=gnn_hgt`，log 檔名會帶 `train_arch_v5_hgt`。目前 quality-first HGT retraining 預設為 `NUM_SAMPLES=800000`、`EPOCHS=6`、`LR=1.5e-4`、`ASPECT_WEIGHT=0.06`、repaired pseudo targets 開啟、`HGT_RELATION_GATE_MIN=0.20`，並用 `HIGH_RISK_ORDER_MULTIPLIER=1.8` / `HIGH_RISK_PAIRWISE_MULTIPLIER=1.6` 加強高風險樣本的 order/pairwise 訓練 loss；這些 training weights 不直接改 decoder/repair。
+訓練 Local HGT encoder 版本的 Anchor-GNN。HGT 會保留 block、pin、cluster、MIB 與 boundary typed nodes，並只沿 heterogeneous factor graph 的 typed local edges 做 relation-specific attention；v1 不加入 global attention/refinement layer。參數格式與 `scripts/train_transformer.sh` 相同，但預設 `ENCODER=hgt`、`NUM_HEADS=4`、`BATCH_SIZE=8`、`CHECKPOINT_PREFIX=gnn_hgt`，log 檔名會帶 `train_arch_v11_hgt`。目前 quality-first HGT retraining 預設為 `NUM_SAMPLES=800000`、`EPOCHS=6`、`LR=1.5e-4`、`ASPECT_WEIGHT=0.06`、repaired pseudo targets 開啟、`HGT_RELATION_GATE_MIN=0.20`，並用 `HIGH_RISK_ORDER_MULTIPLIER=1.8` / `HIGH_RISK_PAIRWISE_MULTIPLIER=1.6` 加強高風險樣本的 order/pairwise 訓練 loss；這些 training weights 不直接改 decoder/repair。
 
 ```bash
 bash scripts/train_hgt.sh

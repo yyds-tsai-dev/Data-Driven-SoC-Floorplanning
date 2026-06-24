@@ -43,7 +43,7 @@ CHECKPOINT_PREFIX="${CHECKPOINT_PREFIX:-gnn}"
 WRITE_STABLE_CHECKPOINTS="${WRITE_STABLE_CHECKPOINTS:-0}"
 IGNORE_OPTIMIZER_STATE="${IGNORE_OPTIMIZER_STATE:-0}"
 WANDB="${WANDB:-1}"
-WANDB_PROJECT="${WANDB_PROJECT:-floorset-arch-v5}"
+WANDB_PROJECT="${WANDB_PROJECT:-floorset-v11-diffusion}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 WANDB_MODE="${WANDB_MODE:-online}"
 
@@ -122,4 +122,4 @@ uv run -m floorset_arch.training.train \
   --num-workers "$NUM_WORKERS" \
   --checkpoint-prefix "$CHECKPOINT_PREFIX" \
   --print-every "$PRINT_EVERY" \
-  "${EXTRA_ARGS[@]}" | tee "$LOG_DIR/train_arch_v5_${LOG_TAG}.log"
+  "${EXTRA_ARGS[@]}" | tee "$LOG_DIR/train_arch_v11_${LOG_TAG}.log"

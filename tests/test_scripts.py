@@ -11,7 +11,7 @@ def test_train_transformer_script_defaults_to_graph_transformer():
     assert 'CHECKPOINT_PREFIX="${CHECKPOINT_PREFIX:-gnn_transformer}"' in text
     assert '--encoder "$ENCODER"' in text
     assert '--num-heads "$NUM_HEADS"' in text
-    assert 'train_arch_v5_transformer_${LOG_TAG}.log' in text
+    assert 'train_arch_v11_transformer_${LOG_TAG}.log' in text
 
 
 def test_train_hgt_script_defaults_to_hgt_encoder():
@@ -38,7 +38,7 @@ def test_train_hgt_script_defaults_to_hgt_encoder():
     assert '--high-risk-order-multiplier "$HIGH_RISK_ORDER_MULTIPLIER"' in text
     assert '--high-risk-pairwise-multiplier "$HIGH_RISK_PAIRWISE_MULTIPLIER"' in text
     assert '--hgt-relation-gate-min "$HGT_RELATION_GATE_MIN"' in text
-    assert 'train_arch_v5_hgt_${LOG_TAG}.log' in text
+    assert 'train_arch_v11_hgt_${LOG_TAG}.log' in text
 
 
 def test_train_hgt_script_exposes_pseudo_target_knobs():
@@ -82,3 +82,22 @@ def test_eval_scripts_write_floorplan_pngs():
     assert "--floorplan-output-dir \"$FLOORPLAN_DIR\"" in single
     assert "FLOORSET_EVAL_FLOORPLAN_DIR" in total
     assert "--floorplan-output-dir \"$floorplan_dir\"" in total
+
+
+def test_wandb_defaults_use_v11_diffusion_project_name():
+    expected = "floorset-v11-diffusion"
+    paths = [
+        Path("scripts/train.sh"),
+        Path("scripts/train_transformer.sh"),
+        Path("scripts/train_hgt.sh"),
+        Path("src/floorset_arch/training/train.py"),
+    ]
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert expected in text
+        assert "floorset-arch-v5" not in text
+
+
+def test_readme_wandb_examples_reference_v11_diffusion_project():
+    text = Path("README.md").read_text(encoding="utf-8")
+    assert "floorset-v11-diffusion" in text
