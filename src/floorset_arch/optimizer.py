@@ -19,6 +19,19 @@ except ImportError:  # pragma: no cover - dependency is present in local runs.
 from floorset_arch.constructive import construct_beam_placement
 from floorset_arch.budget_layer import budget_trace_context, candidate_budget_tier
 from floorset_arch.diagnostics import placement_metrics, repair_delta
+from floorset_arch.diffusion.concretize import (
+    concretize_diffusion_prior,
+    placement_from_tensor_candidate,
+)
+from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
+from floorset_arch.diffusion.ranking import (
+    rank_repaired_placement,
+    select_tensor_shortlist,
+)
+from floorset_arch.diffusion.sampling import (
+    load_diffusion_checkpoint,
+    sample_diffusion_prior,
+)
 from floorset_arch.geometry import (
     candidate_frontier_points,
     first_non_overlapping,
@@ -153,6 +166,9 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
         self._checkpoint_model = None
         self._checkpoint_config: dict = {}
         self._checkpoint_kind = ""
+        self._diffusion_checkpoint_key: Optional[Path] = None
+        self._diffusion_model = None
+        self.last_solve_metadata: dict[str, str] = {}
 
     def solve(
         self,
@@ -173,12 +189,88 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
             constraints,
             target_positions,
         )
+        self.last_solve_metadata = {"fallback": "", "diffusion_variant": ""}
+        prior = self._try_diffusion_prior(inst)
+        if prior is not None:
+            best = self._solve_from_diffusion_prior(inst, prior)
+            self.last_solve_metadata["diffusion_variant"] = prior.variant
+            return best.to_position_list(block_count)
+        if not self.last_solve_metadata.get("fallback"):
+            self.last_solve_metadata["fallback"] = "v5_no_diffusion_checkpoint"
+        best = self._solve_v5_instance(inst)
+        return best.to_position_list(block_count)
+
+    def _solve_v5_instance(self, inst) -> Placement:
         inst.anchor_guidance = self._try_anchor_guidance(inst)
         if inst.anchor_guidance is None and self._uses_surrogate_guidance():
             inst.anchor_guidance = build_surrogate_guidance(inst)
         candidates = self._build_candidates(inst, self._candidate_specs(inst))
-        best = self._select_best_candidate(inst, candidates)
-        return best.to_position_list(block_count)
+        return self._select_best_candidate(inst, candidates)
+
+    def _resolve_diffusion_checkpoint_path(self) -> Optional[Path]:
+        value = os.environ.get("FLOORSET_DIFFUSION_CHECKPOINT", "").strip()
+        if not value:
+            return None
+        raw = Path(value).expanduser()
+        if raw.is_absolute():
+            return raw if raw.exists() else None
+        for candidate in (ROOT / raw, ROOT / "checkpoints" / raw.name):
+            if candidate.exists():
+                return candidate.resolve()
+        return None
+
+    def _diffusion_variant(self) -> str:
+        variant = (
+            os.environ.get("FLOORSET_DIFFUSION_VARIANT", "hgt_lite").strip().lower()
+        )
+        return variant if variant in {"raw", "hgt_lite"} else "hgt_lite"
+
+    def _try_diffusion_prior(self, inst):
+        checkpoint = self._resolve_diffusion_checkpoint_path()
+        if checkpoint is None:
+            return None
+        try:
+            graph_inputs = build_diffusion_graph_inputs(inst, device=torch.device("cpu"))
+            if (
+                self._diffusion_checkpoint_key != checkpoint
+                or self._diffusion_model is None
+            ):
+                model = load_diffusion_checkpoint(
+                    checkpoint, graph_inputs, map_location="cpu"
+                )
+                self._diffusion_model = model
+                self._diffusion_checkpoint_key = checkpoint
+            samples = int(os.environ.get("FLOORSET_DIFFUSION_SAMPLES", "8"))
+            steps = int(os.environ.get("FLOORSET_DIFFUSION_STEPS", "16"))
+            seed = int(os.environ.get("FLOORSET_DIFFUSION_SEED", "0"))
+            return sample_diffusion_prior(
+                self._diffusion_model,
+                graph_inputs,
+                samples=samples,
+                steps=steps,
+                seed=seed,
+            )
+        except Exception as exc:
+            self.last_solve_metadata["fallback"] = (
+                f"v5_diffusion_error:{exc.__class__.__name__}"
+            )
+            return None
+
+    def _solve_from_diffusion_prior(self, inst, prior) -> Placement:
+        batch = concretize_diffusion_prior(inst, prior)
+        top_k = int(os.environ.get("FLOORSET_DIFFUSION_TOPK", "4"))
+        selected = select_tensor_shortlist(batch, top_k=top_k)
+        candidates: list[Placement] = []
+        for idx in selected.detach().cpu().tolist():
+            placement = placement_from_tensor_candidate(inst, batch, int(idx))
+            repaired = self._repair_with_profile(inst, placement, "normal")
+            repaired = refine_quality_candidate(inst, repaired, self.config, "default")
+            candidates.append(repaired)
+        if not candidates:
+            return self._solve_v5_instance(inst)
+        return min(
+            candidates, key=lambda placement: rank_repaired_placement(inst, placement)
+        )
 
     def _uses_surrogate_guidance(self) -> bool:
         mode = os.environ.get("FLOORSET_ENABLE_SURROGATE_GUIDANCE", "0").strip().lower()
