@@ -54,6 +54,8 @@ def _validate_node_features(
             "[N,F]",
             tuple(tensor.shape),
         )
+        if not tensor.is_floating_point():
+            raise ValueError(f"node_features[{node_type}] must be floating point")
         if tensor.device != device:
             raise ValueError("all tensors must be on the same device")
         node_counts[node_type] = int(tensor.shape[0])
@@ -93,6 +95,8 @@ def _validate_relation_edges(
             "[E,F]",
             tuple(attr.shape),
         )
+        if not attr.is_floating_point():
+            raise ValueError(f"edge_attr[{relation}] must be floating point")
         if edge_count > 0 and index.device.type != "meta":
             src = index[0]
             dst = index[1]

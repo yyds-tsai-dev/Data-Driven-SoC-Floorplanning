@@ -166,6 +166,12 @@ def test_diffusion_graph_inputs_validate_relation_dtypes_and_index_bounds():
     with pytest.raises(ValueError, match="edge_index"):
         _typed_graph_inputs(edge_index={relation: torch.tensor([[0.0], [1.0]])})
 
+    with pytest.raises(ValueError, match="node_features.*float"):
+        _typed_graph_inputs(node_features={"block": torch.ones((3, 2), dtype=torch.long)})
+
+    with pytest.raises(ValueError, match="edge_attr.*float"):
+        _typed_graph_inputs(edge_attr={relation: torch.ones(2, 1, dtype=torch.long)})
+
     with pytest.raises(ValueError, match="edge_index values must reference valid nodes"):
         _typed_graph_inputs(
             edge_index={relation: torch.tensor([[0], [3]], dtype=torch.long)},
