@@ -2003,6 +2003,79 @@ def explore_training_data(
 # =============================================================================
 # VISUALIZATION
 # =============================================================================
+def _plot_positions(ax, positions, title: str, plt_module):
+    import matplotlib.patches as mpatches
+
+    ax.set_title(title)
+    if not positions:
+        ax.text(
+            0.5,
+            0.5,
+            "no positions",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        return
+    colors = plt_module.cm.tab20(np.linspace(0, 1, max(len(positions), 1)))
+    for i, (x, y, w, h) in enumerate(positions):
+        rect = mpatches.Rectangle(
+            (x, y),
+            w,
+            h,
+            fill=True,
+            facecolor=colors[i % len(colors)],
+            edgecolor="black",
+            alpha=0.75,
+        )
+        ax.add_patch(rect)
+        ax.text(x + w / 2, y + h / 2, str(i), ha="center", va="center", fontsize=7)
+    ax.autoscale()
+    ax.set_aspect("equal")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+
+
+def save_predicted_floorplan_pngs(
+    result, output_dir: str | Path, top_k: int = 10
+) -> list[Path]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib required for floorplan PNG output")
+        return []
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    solved = [row for row in result.test_results if getattr(row, "positions", None)]
+    if not solved:
+        return []
+    single_case = len(solved) == 1
+    ranked = sorted(solved, key=lambda row: float(row.cost), reverse=True)
+    selected = ranked[: max(1, min(int(top_k), len(ranked)))]
+    written: list[Path] = []
+    for rank, row in enumerate(selected, start=1):
+        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+        _plot_positions(
+            ax,
+            row.positions,
+            f"Case {row.test_id} predicted cost={row.cost:.4f}",
+            plt,
+        )
+        if single_case:
+            filename = f"case_{row.test_id}_cost_{row.cost:.4f}.png"
+        else:
+            filename = (
+                f"top_cost_rank_{rank:02d}_case_{row.test_id}_cost_{row.cost:.4f}.png"
+            )
+        path = out_dir / filename
+        fig.tight_layout()
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        written.append(path)
+    return written
+
+
 def visualize_test_case(test_id: int, data_path: str = "../", 
                        solution_path: str = None):
     """Visualize a validation case (and optionally a solution).
@@ -2311,6 +2384,8 @@ def main():
                        help='Quick mode (skip some checks)')
     parser.add_argument('--save-solutions', '-s', action='store_true',
                        help='Save solutions (positions) to separate file')
+    parser.add_argument('--floorplan-output-dir', default=None,
+                       help='Directory for predicted floorplan PNG outputs')
     
     args = parser.parse_args()
     
@@ -2350,6 +2425,14 @@ def main():
         with open(output, 'w') as f:
             json.dump(asdict(result), f, indent=2, default=str)
         print(f"\nResults saved to {output}")
+
+        floorplan_dir = args.floorplan_output_dir
+        if floorplan_dir is None:
+            run_stem = Path(output).stem
+            floorplan_dir = Path("artifacts") / "eval_v11" / "floorplans" / run_stem
+        written_pngs = save_predicted_floorplan_pngs(result, floorplan_dir, top_k=10)
+        if written_pngs:
+            print(f"Floorplan PNGs saved to {Path(floorplan_dir)}")
         
         # Save solutions separately if requested
         if args.save_solutions:

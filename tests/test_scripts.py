@@ -72,3 +72,13 @@ def test_train_hgt_script_exposes_training_self_eval_knobs():
     assert 'EXTRA_ARGS+=(--train-evaluate-each-epoch)' in text
     assert 'EXTRA_ARGS+=(--train-eval-output-dir "$TRAIN_EVAL_OUTPUT_DIR")' in text
     assert 'EXTRA_ARGS+=(--train-eval-tail-ids "$TRAIN_EVAL_TAIL_IDS")' in text
+
+
+def test_eval_scripts_write_floorplan_pngs():
+    single = Path("scripts/eval_single.sh").read_text(encoding="utf-8")
+    total = Path("scripts/eval_total.sh").read_text(encoding="utf-8")
+
+    assert "FLOORSET_EVAL_FLOORPLAN_DIR" in single
+    assert "--floorplan-output-dir \"$FLOORPLAN_DIR\"" in single
+    assert "FLOORSET_EVAL_FLOORPLAN_DIR" in total
+    assert "--floorplan-output-dir \"$floorplan_dir\"" in total

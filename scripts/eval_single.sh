@@ -42,14 +42,17 @@ load_env_defaults "$ROOT/.env"
 export FLOORSET_GNN_CHECKPOINT="${FLOORSET_GNN_CHECKPOINT:-$DEFAULT_CKPT}"
 export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
 export FLOORSET_GNN_CHECKPOINT_SOURCE="${FLOORSET_GNN_CHECKPOINT_SOURCE:-dotenv}"
+FLOORPLAN_DIR="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/single_case_${TESTID}}"
 cd "$ROOT/FloorSet/iccad2026contest"
 echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
 echo "Using evaluator: $EVALUATOR"
+echo "Floorplan PNG output: $FLOORPLAN_DIR"
 echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"
 export PYTHONPATH="$ROOT/FloorSet/iccad2026contest:$ROOT/FloorSet:${PYTHONPATH:-}"
 uv run "$EVALUATOR" \
   --data-path ../ \
   --evaluate "$OPTIMIZER" \
   --test-id "$TESTID" \
+  --floorplan-output-dir "$FLOORPLAN_DIR" \
   --verbose \
   "${EXTRA_ARGS[@]}"

@@ -43,11 +43,13 @@ resolve_ckpt_path() {
 }
 
 run_evaluator() {
+  local floorplan_dir="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/latest_total}"
   export PYTHONPATH="$ROOT/FloorSet/iccad2026contest:$ROOT/FloorSet:${PYTHONPATH:-}"
   cd "$ROOT/FloorSet/iccad2026contest"
   uv run "$EVALUATOR" \
     --data-path ../ \
     --evaluate "$OPTIMIZER" \
+    --floorplan-output-dir "$floorplan_dir" \
     --verbose \
     "$@"
 }
@@ -200,6 +202,7 @@ export FLOORSET_GNN_CHECKPOINT_SOURCE="${FLOORSET_GNN_CHECKPOINT_SOURCE:-dotenv}
 
 echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
 echo "Using evaluator: $EVALUATOR"
+echo "Floorplan PNG output: ${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/latest_total}"
 echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"
 
 run_evaluator "${EXTRA_ARGS[@]}"
