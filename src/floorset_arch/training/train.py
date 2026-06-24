@@ -116,13 +116,14 @@ def make_loader(
 
 
 def unpack_batch(batch):
-    area_targets, b2b, p2b, pins, constraints, _tree_sol, fp_sol, metrics = batch
+    area_targets, b2b, p2b, pins, constraints, tree_sol, fp_sol, metrics = batch
     return (
         area_targets.squeeze(0),
         b2b.squeeze(0),
         p2b.squeeze(0),
         pins.squeeze(0),
         constraints.squeeze(0),
+        tree_sol.squeeze(0),
         fp_sol.squeeze(0),
         metrics.squeeze(0),
     )
@@ -138,13 +139,14 @@ def _batch_sample_count(batch) -> int:
 def unpack_batch_sample(batch, index: int):
     if _batch_sample_count(batch) == 1:
         return unpack_batch(batch)
-    area_targets, b2b, p2b, pins, constraints, _tree_sol, fp_sol, metrics = batch
+    area_targets, b2b, p2b, pins, constraints, tree_sol, fp_sol, metrics = batch
     return (
         area_targets[index],
         b2b[index],
         p2b[index],
         pins[index],
         constraints[index],
+        tree_sol[index],
         fp_sol[index],
         metrics[index],
     )
@@ -222,7 +224,7 @@ def _target_weight_policy(
 
 
 def _prepare_training_sample(sample, model, device: torch.device, args):
-    area_targets, b2b, p2b, pins, constraints, fp_sol, _metrics = sample
+    area_targets, b2b, p2b, pins, constraints, _tree_sol, fp_sol, _metrics = sample
     soft_violations = fp_sol_soft_violations(
         fp_sol, area_targets, b2b, p2b, pins, constraints
     )
@@ -850,7 +852,7 @@ def main(args) -> None:
 
         if model is None:
             first = next(iter(train_loader))
-            area_targets, b2b, p2b, pins, constraints, _fp_sol, _metrics = (
+            area_targets, b2b, p2b, pins, constraints, _tree_sol, _fp_sol, _metrics = (
                 unpack_batch_sample(first, 0)
             )
             inst = parse_instance(
