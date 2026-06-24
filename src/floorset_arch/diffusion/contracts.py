@@ -42,6 +42,66 @@ def _validate_pair_index(pair_index: torch.Tensor, block_count: int) -> int:
     return pair_count
 
 
+def _validate_node_features(
+    node_features: dict[str, torch.Tensor],
+    device: torch.device,
+) -> dict[str, int]:
+    node_counts: dict[str, int] = {}
+    for node_type, tensor in node_features.items():
+        _require_shape(
+            tensor.dim() == 2,
+            f"node_features[{node_type}]",
+            "[N,F]",
+            tuple(tensor.shape),
+        )
+        if tensor.device != device:
+            raise ValueError("all tensors must be on the same device")
+        node_counts[node_type] = int(tensor.shape[0])
+    return node_counts
+
+
+def _validate_relation_edges(
+    relation_specs: tuple[Relation, ...],
+    edge_index: dict[Relation, torch.Tensor],
+    edge_attr: dict[Relation, torch.Tensor],
+    node_counts: dict[str, int],
+    device: torch.device,
+) -> None:
+    for relation in relation_specs:
+        if relation not in edge_index:
+            raise ValueError(f"edge_index missing relation {relation}")
+        if relation not in edge_attr:
+            raise ValueError(f"edge_attr missing relation {relation}")
+        src_type, _edge_type, dst_type = relation
+        if src_type not in node_counts or dst_type not in node_counts:
+            raise ValueError(f"node_features missing node type for relation {relation}")
+        index = edge_index[relation]
+        attr = edge_attr[relation]
+        _require_shape(
+            index.dim() == 2 and index.shape[0] == 2,
+            f"edge_index[{relation}]",
+            "[2,E]",
+            tuple(index.shape),
+        )
+        _require_dtype(index, f"edge_index[{relation}]", torch.long)
+        if index.device != device or attr.device != device:
+            raise ValueError("all tensors must be on the same device")
+        edge_count = int(index.shape[1])
+        _require_shape(
+            attr.dim() == 2 and attr.shape[0] == edge_count,
+            f"edge_attr[{relation}]",
+            "[E,F]",
+            tuple(attr.shape),
+        )
+        if edge_count > 0 and index.device.type != "meta":
+            src = index[0]
+            dst = index[1]
+            src_valid = bool(((src >= 0) & (src < node_counts[src_type])).all().item())
+            dst_valid = bool(((dst >= 0) & (dst < node_counts[dst_type])).all().item())
+            if not (src_valid and dst_valid):
+                raise ValueError("edge_index values must reference valid nodes")
+
+
 @dataclass(frozen=True)
 class DiffusionGraphInputs:
     node_features: dict[str, torch.Tensor]
@@ -95,6 +155,14 @@ class DiffusionGraphInputs:
             "[P,F]",
             tuple(self.raw_pair_features.shape),
         )
+        node_counts = _validate_node_features(self.node_features, self.raw_block_features.device)
+        _validate_relation_edges(
+            self.relation_specs,
+            self.edge_index,
+            self.edge_attr,
+            node_counts,
+            self.raw_block_features.device,
+        )
         _require_same_device(
             (
                 ("area", self.area),
@@ -110,6 +178,14 @@ class DiffusionGraphInputs:
                 ("global_features", self.global_features),
             )
         )
+
+    @property
+    def block_count(self) -> int:
+        return int(self.area.shape[0])
+
+    @property
+    def pair_count(self) -> int:
+        return int(self.pair_index.shape[0])
 
 
 @dataclass

@@ -37,6 +37,8 @@ def test_diffusion_graph_inputs_keep_raw_side_channels_and_typed_relations():
     graph_inputs = build_diffusion_graph_inputs(_sample_instance())
 
     assert isinstance(graph_inputs, DiffusionGraphInputs)
+    assert graph_inputs.block_count == 4
+    assert graph_inputs.pair_count == graph_inputs.pair_index.shape[0]
     assert {"block", "pin", "cluster", "mib", "boundary"} <= set(graph_inputs.node_features)
     assert graph_inputs.raw_block_features.shape[0] == 4
     assert graph_inputs.area.shape == (4,)

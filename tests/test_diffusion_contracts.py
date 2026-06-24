@@ -34,6 +34,18 @@ def _graph_inputs(**overrides):
     return DiffusionGraphInputs(**values)
 
 
+def _typed_graph_inputs(**overrides):
+    relation = ("block", "connects", "block")
+    values = {
+        "node_features": {"block": torch.zeros(3, 2)},
+        "edge_index": {relation: torch.tensor([[0, 1], [1, 2]], dtype=torch.long)},
+        "edge_attr": {relation: torch.ones(2, 1)},
+        "relation_specs": (relation,),
+    }
+    values.update(overrides)
+    return _graph_inputs(**values)
+
+
 def test_diffusion_public_import_keeps_graph_builder_lazy():
     code = """
 import sys
@@ -130,6 +142,35 @@ def test_diffusion_graph_inputs_validate_masks_ids_pairs_and_devices():
 
     with pytest.raises(ValueError, match="all tensors must be on the same device"):
         _graph_inputs(global_features=torch.zeros(2, device="meta"))
+
+
+def test_diffusion_graph_inputs_validate_relation_tensor_presence_and_shapes():
+    relation = ("block", "connects", "block")
+
+    with pytest.raises(ValueError, match="edge_index"):
+        _typed_graph_inputs(edge_index={}, relation_specs=(relation,))
+
+    with pytest.raises(ValueError, match="edge_attr"):
+        _typed_graph_inputs(edge_attr={}, relation_specs=(relation,))
+
+    with pytest.raises(ValueError, match="edge_index"):
+        _typed_graph_inputs(edge_index={relation: torch.zeros(3, 2, dtype=torch.long)})
+
+    with pytest.raises(ValueError, match="edge_attr"):
+        _typed_graph_inputs(edge_attr={relation: torch.ones(1, 1)})
+
+
+def test_diffusion_graph_inputs_validate_relation_dtypes_and_index_bounds():
+    relation = ("block", "connects", "block")
+
+    with pytest.raises(ValueError, match="edge_index"):
+        _typed_graph_inputs(edge_index={relation: torch.tensor([[0.0], [1.0]])})
+
+    with pytest.raises(ValueError, match="edge_index values must reference valid nodes"):
+        _typed_graph_inputs(
+            edge_index={relation: torch.tensor([[0], [3]], dtype=torch.long)},
+            edge_attr={relation: torch.ones(1, 1)},
+        )
 
 
 def test_placement_tensor_batch_exposes_topk_slice():
