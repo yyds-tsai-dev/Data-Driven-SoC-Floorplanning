@@ -19,19 +19,6 @@ except ImportError:  # pragma: no cover - dependency is present in local runs.
 from floorset_arch.constructive import construct_beam_placement
 from floorset_arch.budget_layer import budget_trace_context, candidate_budget_tier
 from floorset_arch.diagnostics import placement_metrics, repair_delta
-from floorset_arch.diffusion.concretize import (
-    concretize_diffusion_prior,
-    placement_from_tensor_candidate,
-)
-from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
-from floorset_arch.diffusion.ranking import (
-    rank_repaired_placement,
-    select_tensor_shortlist,
-)
-from floorset_arch.diffusion.sampling import (
-    load_diffusion_checkpoint,
-    sample_diffusion_prior,
-)
 from floorset_arch.geometry import (
     candidate_frontier_points,
     first_non_overlapping,
@@ -226,6 +213,12 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
         return variant if variant in {"raw", "hgt_lite"} else "hgt_lite"
 
     def _try_diffusion_prior(self, inst):
+        from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
+        from floorset_arch.diffusion.sampling import (
+            load_diffusion_checkpoint,
+            sample_diffusion_prior,
+        )
+
         checkpoint = self._resolve_diffusion_checkpoint_path()
         if checkpoint is None:
             return None
@@ -257,6 +250,15 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
             return None
 
     def _solve_from_diffusion_prior(self, inst, prior) -> Placement:
+        from floorset_arch.diffusion.concretize import (
+            concretize_diffusion_prior,
+            placement_from_tensor_candidate,
+        )
+        from floorset_arch.diffusion.ranking import (
+            rank_repaired_placement,
+            select_tensor_shortlist,
+        )
+
         batch = concretize_diffusion_prior(inst, prior)
         top_k = int(os.environ.get("FLOORSET_DIFFUSION_TOPK", "4"))
         selected = select_tensor_shortlist(batch, top_k=top_k)
