@@ -13,6 +13,7 @@ __all__ = [
     "GraphConditionedPlacementDiffusion",
     "build_diffusion_graph_inputs",
     "concretize_diffusion_prior",
+    "diffusion_training_loss",
     "load_diffusion_checkpoint",
     "placement_from_tensor_candidate",
     "rank_repaired_placement",
@@ -50,6 +51,10 @@ def __getattr__(name: str):
             "rank_repaired_placement": rank_repaired_placement,
             "select_tensor_shortlist": select_tensor_shortlist,
         }[name]
+    if name == "diffusion_training_loss":
+        from floorset_arch.diffusion.training import diffusion_training_loss
+
+        return diffusion_training_loss
     if name in {"load_diffusion_checkpoint", "sample_diffusion_prior"}:
         from floorset_arch.diffusion.sampling import (
             load_diffusion_checkpoint,

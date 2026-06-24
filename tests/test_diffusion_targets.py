@@ -3,11 +3,13 @@ from __future__ import annotations
 import torch
 
 from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
+from floorset_arch.diffusion.model import GraphConditionedPlacementDiffusion
 from floorset_arch.diffusion.targets import (
     build_diffusion_targets,
     parse_tree_sol_edges,
     split_metrics_sol,
 )
+from floorset_arch.diffusion.training import diffusion_training_loss
 from floorset_arch.parser import parse_instance
 
 
@@ -69,3 +71,27 @@ def test_build_diffusion_targets_aligns_pair_index_with_tree_labels():
     assert targets.pair_axis_label.shape[0] == graph_inputs.pair_index.shape[0]
     assert targets.tree_pair_mask.any()
     assert targets.quality_labels.tolist() == [25.0, 10.0, 12.0]
+
+
+def test_diffusion_training_loss_uses_tree_and_quality_targets():
+    inst = _inst()
+    graph_inputs = build_diffusion_graph_inputs(inst)
+    fp_sol = torch.tensor(
+        [
+            [2.0, 2.0, 0.0, 0.0],
+            [3.0, 3.0, 3.0, 0.0],
+            [4.0, 4.0, 0.0, 4.0],
+        ]
+    )
+    tree_sol = torch.tensor([[0.0, 1.0, 0.0], [0.0, 2.0, 1.0]])
+    metrics_sol = torch.tensor([25.0, 0.0, 2.0, 2.0, 0.0, 0.0, 10.0, 12.0])
+    targets = build_diffusion_targets(inst, graph_inputs, fp_sol, tree_sol, metrics_sol)
+    model = GraphConditionedPlacementDiffusion.from_graph_inputs(
+        graph_inputs, variant="raw", hidden_dim=16, layers=1
+    )
+
+    loss, parts = diffusion_training_loss(model, graph_inputs, targets, seed=3)
+
+    assert loss.requires_grad
+    assert parts["tree"] >= 0.0
+    assert parts["quality"] >= 0.0
