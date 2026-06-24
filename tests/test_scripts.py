@@ -41,6 +41,24 @@ def test_train_hgt_script_defaults_to_hgt_encoder():
     assert 'train_arch_v11_hgt_${LOG_TAG}.log' in text
 
 
+def test_train_diffusion_script_defaults_to_hgt_lite():
+    script = Path("scripts/train_diffusion.sh")
+
+    text = script.read_text(encoding="utf-8")
+
+    assert 'NUM_SAMPLES="${NUM_SAMPLES:-800000}"' in text
+    assert 'VARIANT="${VARIANT:-hgt_lite}"' in text
+    assert 'HIDDEN_DIM="${HIDDEN_DIM:-128}"' in text
+    assert 'LAYERS="${LAYERS:-2}"' in text
+    assert 'DIFFUSION_STEPS="${DIFFUSION_STEPS:-1000}"' in text
+    assert 'NOISE_SCHEDULE="${NOISE_SCHEDULE:-cosine}"' in text
+    assert 'WANDB_PROJECT="${WANDB_PROJECT:-floorset-v11-diffusion}"' in text
+    assert 'uv run -m floorset_arch.training.train_diffusion' in text
+    assert '--variant "$VARIANT"' in text
+    assert '--max-diffusion-steps "$DIFFUSION_STEPS"' in text
+    assert 'train_arch_v11_diffusion_${LOG_TAG}.log' in text
+
+
 def test_train_hgt_script_exposes_pseudo_target_knobs():
     script = Path("scripts/train_hgt.sh")
 
@@ -90,7 +108,9 @@ def test_wandb_defaults_use_v11_diffusion_project_name():
         Path("scripts/train.sh"),
         Path("scripts/train_transformer.sh"),
         Path("scripts/train_hgt.sh"),
+        Path("scripts/train_diffusion.sh"),
         Path("src/floorset_arch/training/train.py"),
+        Path("src/floorset_arch/training/train_diffusion.py"),
     ]
     for path in paths:
         text = path.read_text(encoding="utf-8")

@@ -40,6 +40,10 @@ def test_diffusion_graph_inputs_keep_raw_side_channels_and_typed_relations():
     assert graph_inputs.block_count == 4
     assert graph_inputs.pair_count == graph_inputs.pair_index.shape[0]
     assert {"block", "pin", "cluster", "mib", "boundary"} <= set(graph_inputs.node_features)
+    assert graph_inputs.node_features["pin"].shape[1] == 3
+    assert graph_inputs.node_features["cluster"].shape[1] == 4
+    assert graph_inputs.node_features["mib"].shape[1] == 4
+    assert graph_inputs.node_features["boundary"].shape[1] == 5
     assert graph_inputs.raw_block_features.shape[0] == 4
     assert graph_inputs.area.shape == (4,)
     assert graph_inputs.fixed_mask.tolist() == [True, False, False, False]
@@ -75,6 +79,36 @@ def test_parse_instance_stays_model_agnostic():
 
     assert isinstance(graph_inputs, DiffusionGraphInputs)
     assert graph_inputs.global_features.shape[0] > 0
+
+
+def test_diffusion_graph_inputs_keep_factor_feature_widths_stable_across_samples():
+    left = build_diffusion_graph_inputs(_sample_instance())
+    right = build_diffusion_graph_inputs(
+        parse_instance(
+            4,
+            torch.tensor([4.0, 9.0, 16.0, 25.0]),
+            torch.tensor([[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]]),
+            torch.tensor([[0.0, 0.0, 2.0], [1.0, 3.0, 3.0]]),
+            torch.tensor([[10.0, 20.0], [30.0, 5.0]]),
+            torch.tensor(
+                [
+                    [1.0, 0.0, 1.0, 1.0, 1.0],
+                    [0.0, 1.0, 1.0, 2.0, 0.0],
+                    [0.0, 0.0, 0.0, 3.0, 2.0],
+                    [0.0, 0.0, 0.0, 0.0, 4.0],
+                ]
+            ),
+            None,
+        )
+    )
+
+    assert {
+        node_type: features.shape[1]
+        for node_type, features in left.node_features.items()
+    } == {
+        node_type: features.shape[1]
+        for node_type, features in right.node_features.items()
+    }
 
 
 def test_diffusion_graph_inputs_reject_empty_instances_before_feature_building():

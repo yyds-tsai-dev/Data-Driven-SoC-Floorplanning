@@ -68,6 +68,18 @@ _Avoid_: architecture_v2, treating wrapper version names as separate solver pack
 The current experimental architecture generation that keeps `floorset_arch` as the active solver package while exposing a v5 contest wrapper and selectable Anchor-GNN encoder.
 _Avoid_: renaming the package, treating encoder experiments as a separate solver path.
 
+**Architecture v11**:
+The current contest-facing architecture generation for graph-conditioned diffusion placement in the shared solver package.
+_Avoid_: calling active diffusion work Architecture v5, treating legacy wrapper aliases as the preferred name.
+
+**Diffusion Training Path**:
+The training-only supervision path that learns diffusion placement priors from floorplan, tree-topology, and solution-quality labels.
+_Avoid_: using solution-quality labels as inference inputs, treating diffusion training as an Anchor-GNN encoder variant.
+
+**Diffusion Checkpoint**:
+A learned v11 diffusion prior artifact consumed before repair, ranking, and evaluator output.
+_Avoid_: ranking or promoting it by supervised loss alone when evaluator evidence is available, treating it as Anchor-GNN Guidance.
+
 **No-Runtime Quality Score**:
 The local architecture-tuning score that uses official quality and soft-violation factors with runtime adjustment fixed to `1.0`.
 _Avoid_: treating local runtime-aware score as the primary architecture metric.
@@ -135,6 +147,9 @@ _Avoid_: using validation case IDs as the risk definition.
 - The **Hard Legality Gate** precedes **V10 No-Runtime Proxy** decisions so soft repair, candidate ranking, and refinement do not trade hard feasibility for local quality.
 - **Architecture v4** names the contest-facing wrapper generation; the **Production Solver Path** remains `floorset_arch`.
 - **Architecture v5** extends **Architecture v4** with a **Selectable Anchor-GNN Encoder** while preserving `floorset_arch` as the **Production Solver Path**.
+- **Architecture v11** names the current graph-conditioned diffusion generation; v4/v5 wrapper names remain compatibility aliases, not the preferred label for new work.
+- The **Diffusion Training Path** uses **Heterogeneous Floorplan Graph** evidence and training-only floorplan, tree-topology, and quality labels to learn diffusion placement priors.
+- A **Diffusion Checkpoint** is consumed by the v11 diffusion sampler and repair/ranking path, not by **Anchor-GNN Guidance**.
 - A **Selectable Anchor-GNN Encoder** changes learned **Anchor-GNN Guidance** only; checkpoint promotion still requires evaluator evidence.
 - A **Local HGT Encoder** is a **Selectable Anchor-GNN Encoder** variant that preserves b2b/p2b locality and heterogeneous constraint factors instead of flattening them into a block-only graph.
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
@@ -176,3 +191,4 @@ _Avoid_: using validation case IDs as the risk definition.
 - "Canonical HGT hetero graph encoder" was resolved to mean **Local HGT Encoder**: relation-specific typed local message passing over the **Heterogeneous Floorplan Graph**, no global refinement in v1, and no decoder path change before full evaluator evidence.
 - "Evidence & Budget Layer" was resolved to mean **V10 Evidence-Gated Budget Layer**: a shared decision surface for promotion and extra solver budget, not a new architecture version or executable solver branch.
 - "Narrow grouping default" was resolved by the 2026-06-10 full-validation ablation: keep narrow same-cluster pair bias on by default, but preserve an environment switch for ablation.
+- "V11 diffusion training default" was resolved to use `hgt_lite` as the default graph-conditioned diffusion trainer variant, while keeping `raw` as an ablation for diagnosing graph-conditioner cost or instability.

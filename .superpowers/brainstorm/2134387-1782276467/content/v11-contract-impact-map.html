@@ -1,0 +1,52 @@
+<h2>v11 Diffusion / Tree Contract Impact Map</h2>
+<p class="subtitle">A visual map of where each redesign route touches the current FloorSet solver contract.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Current production path</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:repeat(7,minmax(110px,1fr));gap:10px;align-items:stretch">
+      <div class="placeholder">Evaluator tensors</div>
+      <div class="placeholder">parse_instance()<br>Instance</div>
+      <div class="placeholder">MPNN / Transformer / HGT</div>
+      <div class="placeholder">AnchorGuidance<br>anchor, priority, aspect, pair axis</div>
+      <div class="placeholder">relative_order decoder</div>
+      <div class="placeholder">repair + v10 proxy rank</div>
+      <div class="placeholder">Placement<br>(x, y, w, h)</div>
+    </div>
+  </div>
+</div>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-image">
+      <div class="placeholder">Low contract impact</div>
+    </div>
+    <div class="card-body">
+      <h3>A. Diffusion guidance head</h3>
+      <p>Denoise anchors/aspect/pairwise guidance, keep decoder, repair, ranking, and evaluator path stable.</p>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-image">
+      <div class="placeholder">Medium contract impact</div>
+    </div>
+    <div class="card-body">
+      <h3>B. Tree-supervised compact decoder</h3>
+      <p>Use tree_sol to learn B*-tree topology or compact relative order, then convert to Placement before repair.</p>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-image">
+      <div class="placeholder">High contract impact</div>
+    </div>
+    <div class="card-body">
+      <h3>C. Full diffusion floorplan generator</h3>
+      <p>Denoise full placement or tree tokens directly, then rely on legalization, repair, and ranking to recover feasibility.</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Key boundary</h3>
+  <p>Current glossary says encoder variants may change AnchorGuidance source but should not change decoder behavior without evaluator evidence. Routes B and C cross that boundary.</p>
+</div>

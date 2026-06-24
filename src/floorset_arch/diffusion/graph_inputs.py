@@ -4,9 +4,11 @@ from itertools import combinations
 
 import torch
 
-from floorset_arch.diffusion.contracts import DiffusionGraphInputs, Relation
-from floorset_arch.features import ANCHOR_HGT_RELATION_SPECS, build_anchor_node_features
-from floorset_arch.hetero_graph import build_hetero_floorplan_graph
+from floorset_arch.diffusion.contracts import DiffusionGraphInputs
+from floorset_arch.features import (
+    build_anchor_hgt_graph_inputs,
+    build_anchor_node_features,
+)
 from floorset_arch.models import Instance
 
 
@@ -96,49 +98,6 @@ def _pair_features(
     return torch.tensor(rows, dtype=torch.float32, device=device)
 
 
-def _typed_edges(
-    inst: Instance,
-    node_features: dict[str, torch.Tensor],
-    block_features: torch.Tensor,
-    device: torch.device,
-) -> tuple[dict[Relation, torch.Tensor], dict[Relation, torch.Tensor]]:
-    graph = build_hetero_floorplan_graph(inst, block_features=block_features.detach().cpu())
-    edge_src: dict[Relation, list[int]] = {}
-    edge_dst: dict[Relation, list[int]] = {}
-    edge_weight: dict[Relation, list[float]] = {}
-    canonical = set(ANCHOR_HGT_RELATION_SPECS)
-
-    for edge in graph.edges:
-        relation = (edge.src_type, edge.edge_type, edge.dst_type)
-        if relation not in canonical:
-            continue
-        if edge.src >= node_features[edge.src_type].shape[0]:
-            continue
-        if edge.dst >= node_features[edge.dst_type].shape[0]:
-            continue
-        weight = max(float(edge.weight), 0.0)
-        if edge.edge_type in {"connects", "pin_connects"}:
-            weight = float(torch.log1p(torch.tensor(weight)).item())
-        edge_src.setdefault(relation, []).append(int(edge.src))
-        edge_dst.setdefault(relation, []).append(int(edge.dst))
-        edge_weight.setdefault(relation, []).append(weight)
-
-    edge_index: dict[Relation, torch.Tensor] = {}
-    edge_attr: dict[Relation, torch.Tensor] = {}
-    for relation in ANCHOR_HGT_RELATION_SPECS:
-        if relation not in edge_src:
-            edge_index[relation] = torch.empty((2, 0), dtype=torch.long, device=device)
-            edge_attr[relation] = torch.empty((0, 1), dtype=torch.float32, device=device)
-            continue
-        weights = torch.tensor(edge_weight[relation], dtype=torch.float32, device=device).view(-1, 1)
-        weights = weights / weights.max().clamp_min(1.0)
-        edge_index[relation] = torch.tensor(
-            [edge_src[relation], edge_dst[relation]], dtype=torch.long, device=device
-        )
-        edge_attr[relation] = weights
-    return edge_index, edge_attr
-
-
 def _global_features(
     inst: Instance,
     area: torch.Tensor,
@@ -174,16 +133,15 @@ def build_diffusion_graph_inputs(
         raise ValueError("build_diffusion_graph_inputs requires positive block_count")
     device = device or inst.area_targets.device
     block_features, scale = build_anchor_node_features(inst, device=device)
-    hetero_graph = build_hetero_floorplan_graph(inst, block_features=block_features.detach().cpu())
-    node_features = {
-        node_type: value.to(device=device, dtype=torch.float32)
-        for node_type, value in hetero_graph.node_features.items()
-    }
-    for node_type, width in (("block", block_features.shape[1]), ("pin", 2), ("cluster", 0), ("mib", 0), ("boundary", 4)):
-        if node_type not in node_features:
-            node_features[node_type] = torch.empty((0, width), dtype=torch.float32, device=device)
-
-    edge_index, edge_attr = _typed_edges(inst, node_features, block_features, device)
+    hgt_graph = build_anchor_hgt_graph_inputs(
+        inst,
+        device=device,
+        block_features=block_features,
+        scale=scale,
+    )
+    node_features = hgt_graph.node_features
+    edge_index = hgt_graph.edge_index
+    edge_attr = hgt_graph.edge_attr
     area = inst.area_targets[: inst.block_count].float().to(device)
     fixed_mask = _block_mask(inst.fixed, inst.block_count, device)
     preplaced_mask = _block_mask(inst.preplaced, inst.block_count, device)
@@ -212,7 +170,7 @@ def build_diffusion_graph_inputs(
         node_features=node_features,
         edge_index=edge_index,
         edge_attr=edge_attr,
-        relation_specs=ANCHOR_HGT_RELATION_SPECS,
+        relation_specs=hgt_graph.relation_specs,
         raw_block_features=block_features,
         raw_pair_features=raw_pair_features,
         pair_index=pair_index,
