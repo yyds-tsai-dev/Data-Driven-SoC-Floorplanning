@@ -1,7 +1,9 @@
+import pytest
 import torch
 
-from floorset_arch import features
-from floorset_arch.diffusion import DiffusionGraphInputs, build_diffusion_graph_inputs
+from floorset_arch.features import ANCHOR_HGT_RELATION_SPECS
+from floorset_arch.diffusion import DiffusionGraphInputs
+from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
 from floorset_arch.parser import parse_instance
 
 
@@ -45,7 +47,7 @@ def test_diffusion_graph_inputs_keep_raw_side_channels_and_typed_relations():
     relations = set(graph_inputs.relation_specs)
     assert ("block", "connects", "block") in relations
     assert ("boundary", "has_member", "block") in relations
-    for relation in features.ANCHOR_HGT_RELATION_SPECS:
+    for relation in ANCHOR_HGT_RELATION_SPECS:
         assert relation in graph_inputs.edge_index
         assert relation in graph_inputs.edge_attr
         assert graph_inputs.edge_index[relation].shape[0] == 2
@@ -71,3 +73,18 @@ def test_parse_instance_stays_model_agnostic():
 
     assert isinstance(graph_inputs, DiffusionGraphInputs)
     assert graph_inputs.global_features.shape[0] > 0
+
+
+def test_diffusion_graph_inputs_reject_empty_instances_before_feature_building():
+    inst = parse_instance(
+        0,
+        torch.empty(0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.empty(0, 5),
+        None,
+    )
+
+    with pytest.raises(ValueError, match="block_count|positive"):
+        build_diffusion_graph_inputs(inst)

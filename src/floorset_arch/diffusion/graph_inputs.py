@@ -4,9 +4,8 @@ from itertools import combinations
 
 import torch
 
-from floorset_arch import features
 from floorset_arch.diffusion.contracts import DiffusionGraphInputs, Relation
-from floorset_arch.features import build_anchor_node_features
+from floorset_arch.features import ANCHOR_HGT_RELATION_SPECS, build_anchor_node_features
 from floorset_arch.hetero_graph import build_hetero_floorplan_graph
 from floorset_arch.models import Instance
 
@@ -107,7 +106,7 @@ def _typed_edges(
     edge_src: dict[Relation, list[int]] = {}
     edge_dst: dict[Relation, list[int]] = {}
     edge_weight: dict[Relation, list[float]] = {}
-    canonical = set(features.ANCHOR_HGT_RELATION_SPECS)
+    canonical = set(ANCHOR_HGT_RELATION_SPECS)
 
     for edge in graph.edges:
         relation = (edge.src_type, edge.edge_type, edge.dst_type)
@@ -126,7 +125,7 @@ def _typed_edges(
 
     edge_index: dict[Relation, torch.Tensor] = {}
     edge_attr: dict[Relation, torch.Tensor] = {}
-    for relation in features.ANCHOR_HGT_RELATION_SPECS:
+    for relation in ANCHOR_HGT_RELATION_SPECS:
         if relation not in edge_src:
             edge_index[relation] = torch.empty((2, 0), dtype=torch.long, device=device)
             edge_attr[relation] = torch.empty((0, 1), dtype=torch.float32, device=device)
@@ -171,6 +170,8 @@ def build_diffusion_graph_inputs(
     inst: Instance,
     device: torch.device | None = None,
 ) -> DiffusionGraphInputs:
+    if inst.block_count <= 0:
+        raise ValueError("build_diffusion_graph_inputs requires positive block_count")
     device = device or inst.area_targets.device
     block_features, scale = build_anchor_node_features(inst, device=device)
     hetero_graph = build_hetero_floorplan_graph(inst, block_features=block_features.detach().cpu())
@@ -211,7 +212,7 @@ def build_diffusion_graph_inputs(
         node_features=node_features,
         edge_index=edge_index,
         edge_attr=edge_attr,
-        relation_specs=features.ANCHOR_HGT_RELATION_SPECS,
+        relation_specs=ANCHOR_HGT_RELATION_SPECS,
         raw_block_features=block_features,
         raw_pair_features=raw_pair_features,
         pair_index=pair_index,

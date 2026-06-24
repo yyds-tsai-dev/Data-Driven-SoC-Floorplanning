@@ -13,6 +13,35 @@ def _require_shape(condition: bool, name: str, expected: str, actual: tuple[int,
         raise ValueError(f"{name} must have shape {expected}; got {actual}")
 
 
+def _require_dtype(tensor: torch.Tensor, name: str, dtype: torch.dtype) -> None:
+    if tensor.dtype != dtype:
+        dtype_name = "torch.long" if dtype is torch.long else str(dtype)
+        raise ValueError(f"{name} must be {dtype_name}")
+
+
+def _require_same_device(named_tensors: tuple[tuple[str, torch.Tensor | None], ...]) -> None:
+    devices = {tensor.device for _name, tensor in named_tensors if tensor is not None}
+    if len(devices) > 1:
+        raise ValueError("all tensors must be on the same device")
+
+
+def _validate_pair_index(pair_index: torch.Tensor, block_count: int) -> int:
+    _require_shape(
+        pair_index.dim() == 2 and pair_index.shape[1] == 2,
+        "pair_index",
+        "[P,2]",
+        tuple(pair_index.shape),
+    )
+    _require_dtype(pair_index, "pair_index", torch.long)
+    pair_count = int(pair_index.shape[0])
+    if pair_count > 0 and pair_index.device.type != "meta":
+        valid_min = bool((pair_index >= 0).all().item())
+        valid_max = bool((pair_index < block_count).all().item())
+        if not (valid_min and valid_max):
+            raise ValueError("pair_index values must reference valid blocks")
+    return pair_count
+
+
 @dataclass(frozen=True)
 class DiffusionGraphInputs:
     node_features: dict[str, torch.Tensor]
@@ -35,6 +64,15 @@ class DiffusionGraphInputs:
     def __post_init__(self) -> None:
         block_count = int(self.area.shape[0]) if self.area.dim() == 1 else -1
         _require_shape(self.area.dim() == 1, "area", "[N]", tuple(self.area.shape))
+        for name, value, dtype in (
+            ("fixed_mask", self.fixed_mask, torch.bool),
+            ("preplaced_mask", self.preplaced_mask, torch.bool),
+            ("movable_mask", self.movable_mask, torch.bool),
+            ("boundary_codes", self.boundary_codes, torch.long),
+            ("cluster_ids", self.cluster_ids, torch.long),
+            ("mib_ids", self.mib_ids, torch.long),
+        ):
+            _require_dtype(value, name, dtype)
         for name, value in (
             ("fixed_mask", self.fixed_mask),
             ("preplaced_mask", self.preplaced_mask),
@@ -50,18 +88,27 @@ class DiffusionGraphInputs:
             "[N,F]",
             tuple(self.raw_block_features.shape),
         )
-        _require_shape(
-            self.pair_index.dim() == 2 and self.pair_index.shape[1] == 2,
-            "pair_index",
-            "[P,2]",
-            tuple(self.pair_index.shape),
-        )
-        pair_count = int(self.pair_index.shape[0])
+        pair_count = _validate_pair_index(self.pair_index, block_count)
         _require_shape(
             self.raw_pair_features.dim() == 2 and self.raw_pair_features.shape[0] == pair_count,
             "raw_pair_features",
             "[P,F]",
             tuple(self.raw_pair_features.shape),
+        )
+        _require_same_device(
+            (
+                ("area", self.area),
+                ("raw_block_features", self.raw_block_features),
+                ("raw_pair_features", self.raw_pair_features),
+                ("pair_index", self.pair_index),
+                ("fixed_mask", self.fixed_mask),
+                ("preplaced_mask", self.preplaced_mask),
+                ("movable_mask", self.movable_mask),
+                ("boundary_codes", self.boundary_codes),
+                ("cluster_ids", self.cluster_ids),
+                ("mib_ids", self.mib_ids),
+                ("global_features", self.global_features),
+            )
         )
 
 
@@ -90,13 +137,7 @@ class DiffusionPlacementPrior:
             "[S,N]",
             tuple(self.log_aspect.shape),
         )
-        _require_shape(
-            self.pair_index.dim() == 2 and self.pair_index.shape[1] == 2,
-            "pair_index",
-            "[P,2]",
-            tuple(self.pair_index.shape),
-        )
-        pair_count = int(self.pair_index.shape[0])
+        pair_count = _validate_pair_index(self.pair_index, block_count)
         _require_shape(
             self.pairwise_axis_logits.dim() == 3
             and self.pairwise_axis_logits.shape[0] == sample_count
@@ -119,6 +160,16 @@ class DiffusionPlacementPrior:
                 "[S,...]",
                 tuple(self.uncertainty.shape),
             )
+        _require_same_device(
+            (
+                ("centers", self.centers),
+                ("log_aspect", self.log_aspect),
+                ("pairwise_axis_logits", self.pairwise_axis_logits),
+                ("pair_index", self.pair_index),
+                ("quality_pred", self.quality_pred),
+                ("uncertainty", self.uncertainty),
+            )
+        )
 
     @property
     def sample_count(self) -> int:
@@ -149,13 +200,8 @@ class PlacementTensorBatch:
             tuple(self.rect_xywh.shape),
         )
         sample_count = int(self.rect_xywh.shape[0])
-        _require_shape(
-            self.pair_index.dim() == 2 and self.pair_index.shape[1] == 2,
-            "pair_index",
-            "[P,2]",
-            tuple(self.pair_index.shape),
-        )
-        pair_count = int(self.pair_index.shape[0])
+        block_count = int(self.rect_xywh.shape[1])
+        pair_count = _validate_pair_index(self.pair_index, block_count)
         _require_shape(
             self.pairwise_axis_logits.dim() == 3
             and self.pairwise_axis_logits.shape[0] == sample_count
@@ -171,6 +217,14 @@ class PlacementTensorBatch:
                 "[S,...]",
                 tuple(self.score_features.shape),
             )
+        _require_same_device(
+            (
+                ("rect_xywh", self.rect_xywh),
+                ("pairwise_axis_logits", self.pairwise_axis_logits),
+                ("pair_index", self.pair_index),
+                ("score_features", self.score_features),
+            )
+        )
 
     def select(self, indices: torch.Tensor | list[int]) -> "PlacementTensorBatch":
         index = torch.as_tensor(indices, dtype=torch.long, device=self.rect_xywh.device)

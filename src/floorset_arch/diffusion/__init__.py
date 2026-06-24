@@ -4,7 +4,6 @@ from floorset_arch.diffusion.contracts import (
     PlacementTensorBatch,
     Relation,
 )
-from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
 
 __all__ = [
     "DiffusionGraphInputs",
@@ -13,3 +12,11 @@ __all__ = [
     "Relation",
     "build_diffusion_graph_inputs",
 ]
+
+
+def __getattr__(name: str):
+    if name == "build_diffusion_graph_inputs":
+        from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
+
+        return build_diffusion_graph_inputs
+    raise AttributeError(name)
