@@ -9,6 +9,13 @@ from floorset_arch.diffusion import (
     DiffusionPlacementPrior,
     PlacementTensorBatch,
 )
+from floorset_arch.diffusion.concretize import (
+    concretize_diffusion_prior,
+    placement_from_tensor_candidate,
+)
+from floorset_arch.diffusion.ranking import select_tensor_shortlist
+from floorset_arch.models import Rect
+from floorset_arch.parser import parse_instance
 
 
 def _graph_inputs(**overrides):
@@ -220,3 +227,48 @@ def test_placement_tensor_batch_validates_pair_index_and_device():
             pair_index=torch.tensor([[0, 1]], dtype=torch.long),
             score_features=torch.zeros(2, 1, device="meta"),
         )
+
+
+def _concretize_instance():
+    return parse_instance(
+        2,
+        torch.tensor([4.0, 9.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0, 0.0]]
+        ),
+        torch.tensor([[-1.0, -1.0, -1.0, -1.0], [10.0, 20.0, 3.0, 3.0]]),
+    )
+
+
+def test_concretize_preserves_area_and_preplaced_blocks():
+    inst = _concretize_instance()
+    prior = DiffusionPlacementPrior(
+        centers=torch.tensor([[[5.0, 5.0], [1.0, 1.0]]]),
+        log_aspect=torch.zeros(1, 2),
+        pairwise_axis_logits=torch.zeros(1, 1, 3),
+        pair_index=torch.tensor([[0, 1]]),
+        variant="raw",
+    )
+
+    batch = concretize_diffusion_prior(inst, prior)
+    placement = placement_from_tensor_candidate(inst, batch, 0)
+
+    assert batch.rect_xywh.shape == (1, 2, 4)
+    assert round(float(batch.rect_xywh[0, 0, 2] * batch.rect_xywh[0, 0, 3]), 5) == 4.0
+    assert placement.rects[1] == Rect(10.0, 20.0, 3.0, 3.0)
+
+
+def test_tensor_shortlist_prefers_lower_score_features():
+    batch = PlacementTensorBatch(
+        rect_xywh=torch.zeros(3, 2, 4),
+        pairwise_axis_logits=torch.zeros(3, 1, 3),
+        pair_index=torch.tensor([[0, 1]]),
+        score_features=torch.tensor([[10.0], [1.0], [5.0]]),
+    )
+
+    selected = select_tensor_shortlist(batch, top_k=2)
+
+    assert selected.tolist() == [1, 2]
