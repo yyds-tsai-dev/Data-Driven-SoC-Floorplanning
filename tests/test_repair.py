@@ -16,6 +16,7 @@ from floorset_arch.repair import (
     repair_placement,
     soft_violation_counts,
 )
+from floorset_arch.risk_budget import BudgetTier
 
 
 def _soft_test_instance():
@@ -328,64 +329,6 @@ def test_v10_soft_repair_skips_none_risk_tier(monkeypatch):
     assert not _v10_soft_repair_eligible(inst, placement)
 
 
-def test_runtime_tail_clamp_is_opt_in(monkeypatch):
-    config = SolverConfig(
-        max_repair_passes=8,
-        max_boundary_component_snaps=30,
-        max_cluster_component_moves=26,
-        max_pair_candidates_per_component=40,
-    )
-    monkeypatch.delenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", raising=False)
-
-    clamped = repair_module._runtime_tail_clamped_config(_soft_test_instance(), config)
-
-    assert clamped is config
-
-
-def test_runtime_tail_clamp_lowers_heavy_budget_knobs(monkeypatch):
-    config = SolverConfig(
-        max_repair_passes=8,
-        max_boundary_component_snaps=30,
-        max_cluster_component_moves=26,
-        max_pair_candidates_per_component=40,
-    )
-    monkeypatch.setenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", "1")
-    monkeypatch.setattr(
-        repair_module,
-        "instance_risk_budget",
-        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
-    )
-
-    clamped = repair_module._runtime_tail_clamped_config(_soft_test_instance(), config)
-
-    assert clamped.max_repair_passes == 2
-    assert clamped.max_boundary_component_snaps == 20
-    assert clamped.max_cluster_component_moves == 18
-    assert clamped.max_pair_candidates_per_component == 24
-
-
-def test_runtime_tail_clamp_never_increases_existing_caps(monkeypatch):
-    config = SolverConfig(
-        max_repair_passes=1,
-        max_boundary_component_snaps=7,
-        max_cluster_component_moves=6,
-        max_pair_candidates_per_component=5,
-    )
-    monkeypatch.setenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", "1")
-    monkeypatch.setattr(
-        repair_module,
-        "instance_risk_budget",
-        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
-    )
-
-    clamped = repair_module._runtime_tail_clamped_config(_soft_test_instance(), config)
-
-    assert clamped.max_repair_passes == 1
-    assert clamped.max_boundary_component_snaps == 7
-    assert clamped.max_cluster_component_moves == 6
-    assert clamped.max_pair_candidates_per_component == 5
-
-
 def test_v10_soft_accepts_grouping_improvement_with_grouping_slack(monkeypatch):
     inst = _soft_test_instance()
     current = Placement(
@@ -414,7 +357,7 @@ def test_v10_soft_accepts_grouping_improvement_with_grouping_slack(monkeypatch):
     assert _score_better_v10_soft(inst, SolverConfig(), candidate, current)
 
 
-def test_v10_soft_rejects_boundary_only_improvement_beyond_boundary_slack(monkeypatch):
+def test_v10_soft_rejects_boundary_only_improvement_with_proxy_regression(monkeypatch):
     inst = _soft_test_instance()
     current = Placement(
         {
@@ -434,9 +377,8 @@ def test_v10_soft_rejects_boundary_only_improvement_beyond_boundary_slack(monkey
     )
     scores = {id(current): 100.0, id(candidate): 107.0}
     monkeypatch.setattr(
-        repair_module,
-        "_geometry_quality_proxy",
-        lambda _inst, placement: scores[id(placement)],
+        "floorset_arch.v10_proxy.v10_proxy_cost",
+        lambda _inst, placement, metrics=None: scores[id(placement)],
     )
 
     assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
@@ -469,7 +411,7 @@ def test_v10_soft_rejects_overlap_regression_even_when_soft_improves(monkeypatch
     assert not _score_better_v10_soft(inst, SolverConfig(), candidate, current)
 
 
-def test_v10_soft_requires_geometry_improvement_when_soft_does_not_improve(monkeypatch):
+def test_v10_soft_requires_proxy_improvement_when_soft_does_not_improve(monkeypatch):
     inst = _soft_test_instance()
     current = Placement(
         {
@@ -487,11 +429,10 @@ def test_v10_soft_requires_geometry_improvement_when_soft_does_not_improve(monke
             3: Rect(8.0, 0.0, 2.0, 2.0),
         }
     )
-    scores = {id(current): 100.0, id(candidate): 99.98}
+    scores = {id(current): 100.0, id(candidate): 99.8}
     monkeypatch.setattr(
-        repair_module,
-        "_geometry_quality_proxy",
-        lambda _inst, placement: scores[id(placement)],
+        "floorset_arch.v10_proxy.v10_proxy_cost",
+        lambda _inst, placement, metrics=None: scores[id(placement)],
     )
 
     assert _score_better_v10_soft(inst, SolverConfig(), candidate, current)
@@ -535,6 +476,75 @@ def test_v10_soft_repair_path_runs_only_when_opted_in(monkeypatch):
     repaired_with_flag = repair_placement(inst, placement, SolverConfig())
 
     assert repaired_with_flag is marker
+
+
+def test_v10_soft_repair_records_conditional_runtime_budget(monkeypatch):
+    inst = _soft_test_instance()
+    placement = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(8.0, 0.0, 2.0, 2.0),
+            3: Rect(12.0, 0.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", "1")
+    monkeypatch.setattr(
+        "floorset_arch.repair.instance_risk_budget",
+        lambda _inst: SimpleNamespace(tier=BudgetTier.MEDIUM),
+    )
+
+    repaired = repair_placement(inst, placement, SolverConfig(max_repair_passes=2))
+
+    trace = getattr(repaired, "runtime_budget_trace", None)
+    assert trace is not None
+    assert trace["extra_path"] == "v10_soft_repair"
+    assert "attempts" in trace
+    assert "accepted" in trace
+    assert "elapsed_ms" in trace
+    assert "stop_reason" in trace
+    assert trace["tier"] == "medium"
+
+
+def test_runtime_budget_trace_survives_post_v10_refine_copy(monkeypatch):
+    inst = _soft_test_instance()
+    placement = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(8.0, 0.0, 2.0, 2.0),
+            3: Rect(12.0, 0.0, 2.0, 2.0),
+        }
+    )
+    expected_trace = {
+        "extra_path": "v10_soft_repair",
+        "attempts": 1,
+        "accepted": 0,
+        "elapsed_ms": 0.5,
+        "stop_reason": "rejected_attempts",
+        "tier": "light",
+    }
+
+    def fake_v10_repair(_inst, input_placement, _config):
+        repaired = input_placement.copy()
+        repaired.runtime_budget_trace = expected_trace
+        return repaired
+
+    def fake_large_case_boundary_refine(_inst, input_placement, _config):
+        return input_placement.copy()
+
+    monkeypatch.setenv("FLOORSET_ENABLE_V10_SOFT_REPAIR", "1")
+    monkeypatch.setattr(repair_module, "_v10_soft_repair", fake_v10_repair)
+    monkeypatch.setattr(
+        repair_module,
+        "_large_case_boundary_refine",
+        fake_large_case_boundary_refine,
+    )
+
+    repaired = repair_placement(inst, placement, SolverConfig(max_repair_passes=2))
+
+    assert getattr(repaired, "runtime_budget_trace", None) == expected_trace
 
 
 def test_large_case_boundary_repair_searches_wider_axis_candidates(monkeypatch):
@@ -719,3 +729,72 @@ def test_boundary_edge_shrink_pulls_satisfied_right_edge_inward():
     assert bounds.right < 100.0
     assert abs(refined.rects[2].right - bounds.right) <= 1e-6
     assert abs(refined.rects[3].right - bounds.right) <= 1e-6
+
+
+def test_v10_soft_acceptance_rejects_proxy_regression_even_when_soft_improves(monkeypatch):
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        ),
+        torch.full((3, 4), -1.0),
+    )
+    current = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    huge_clean = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(200.0, 0.0, 2.0, 2.0),
+            2: Rect(202.0, 0.0, 2.0, 2.0),
+        }
+    )
+
+    assert not _score_better_v10_soft(inst, SolverConfig(), huge_clean, current)
+
+
+def test_v10_soft_acceptance_allows_soft_tie_when_proxy_is_equal(monkeypatch):
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        ),
+        torch.full((3, 4), -1.0),
+    )
+    current = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    soft_better = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 3.0, 2.0, 2.0),
+            2: Rect(2.0, 3.0, 2.0, 2.0),
+        }
+    )
+    monkeypatch.setattr("floorset_arch.v10_proxy.v10_proxy_cost", lambda _inst, placement, metrics=None: 1.0)
+
+    assert _score_better_v10_soft(inst, SolverConfig(), soft_better, current)

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import math
 import os
+import time
 
+from floorset_arch.budget_layer import (
+    conditional_runtime_budget_enabled,
+    conditional_runtime_budget_limits,
+)
 from floorset_arch.constructive import block_dimensions
 from floorset_arch.geometry import bbox, candidate_frontier_points, edge_touch_length, first_non_overlapping, overlaps
 from floorset_arch.models import Instance, Placement, Rect, SolverConfig
 from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.scoring import candidate_hpwl_proxy, hpwl_proxy
+from floorset_arch.v10_proxy import v10_proxy_better
 
 
 def _snap_hard(inst: Instance, placement: Placement) -> None:
@@ -446,16 +451,6 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
-def _overlap_count(placement: Placement) -> int:
-    rects = list(placement.rects.values())
-    count = 0
-    for idx, rect in enumerate(rects):
-        for other in rects[idx + 1 :]:
-            if overlaps(rect, other):
-                count += 1
-    return count
-
-
 def _soft_capacity(inst: Instance) -> int:
     boundary_budget = len(inst.boundary)
     grouping_budget = sum(
@@ -463,30 +458,6 @@ def _soft_capacity(inst: Instance) -> int:
     )
     mib_budget = sum(max(0, len(members) - 1) for members in inst.mib_groups.values())
     return max(boundary_budget + grouping_budget + mib_budget, 1)
-
-
-def _hard_or_overlap_regressed(
-    inst: Instance,
-    candidate: Placement,
-    current: Placement,
-) -> bool:
-    if _overlap_count(candidate) > _overlap_count(current):
-        return True
-    for block in range(inst.block_count):
-        if block not in candidate.rects:
-            return True
-    for block in inst.fixed | inst.preplaced:
-        target = inst.target_rects.get(block)
-        rect = candidate.rects.get(block)
-        if target is None or rect is None:
-            return True
-        if block in inst.preplaced and (
-            abs(rect.x - target.x) > 1e-6 or abs(rect.y - target.y) > 1e-6
-        ):
-            return True
-        if abs(rect.width - target.width) > 1e-6 or abs(rect.height - target.height) > 1e-6:
-            return True
-    return False
 
 
 def _v10_soft_repair_eligible(inst: Instance, placement: Placement) -> bool:
@@ -509,41 +480,6 @@ def _v10_soft_repair_eligible(inst: Instance, placement: Placement) -> bool:
     return soft_total >= min_soft or soft_relative >= min_relative
 
 
-def _runtime_tail_clamp_limits(tier: BudgetTier) -> tuple[int, int, int, int]:
-    if tier is BudgetTier.HEAVY:
-        defaults = (2, 20, 18, 24)
-    elif tier is BudgetTier.MEDIUM:
-        defaults = (2, 16, 14, 20)
-    else:
-        defaults = (1, 10, 8, 12)
-    return (
-        _env_int("FLOORSET_RUNTIME_CLAMP_MAX_REPAIR_PASSES", defaults[0]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_BOUNDARY_SNAPS", defaults[1]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_CLUSTER_MOVES", defaults[2]),
-        _env_int("FLOORSET_RUNTIME_CLAMP_PAIR_CANDIDATES", defaults[3]),
-    )
-
-
-def _runtime_tail_clamped_config(inst: Instance, config: SolverConfig) -> SolverConfig:
-    if not _env_flag("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP"):
-        return config
-    try:
-        tier = instance_risk_budget(inst).tier
-    except Exception:
-        tier = BudgetTier.LIGHT
-    max_passes, boundary_snaps, cluster_moves, pair_candidates = _runtime_tail_clamp_limits(tier)
-    return replace(
-        config,
-        max_repair_passes=min(config.max_repair_passes, max_passes),
-        max_boundary_component_snaps=min(config.max_boundary_component_snaps, boundary_snaps),
-        max_cluster_component_moves=min(config.max_cluster_component_moves, cluster_moves),
-        max_pair_candidates_per_component=min(
-            config.max_pair_candidates_per_component,
-            pair_candidates,
-        ),
-    )
-
-
 def _score_better_v10_soft(
     inst: Instance,
     config: SolverConfig,
@@ -551,38 +487,34 @@ def _score_better_v10_soft(
     current: Placement,
 ) -> bool:
     del config
-    if _hard_or_overlap_regressed(inst, candidate, current):
-        return False
-
-    cand_counts = soft_violation_counts(inst, candidate)
-    cur_counts = soft_violation_counts(inst, current)
-    cand_soft = sum(cand_counts)
-    cur_soft = sum(cur_counts)
     try:
-        cand_proxy = _geometry_quality_proxy(inst, candidate)
-        cur_proxy = _geometry_quality_proxy(inst, current)
+        return v10_proxy_better(
+            inst,
+            candidate,
+            current,
+            allow_tie_soft=True,
+            allow_proxy_regression=False,
+        )
     except Exception:
         return False
 
-    if cand_soft < cur_soft:
-        if cand_counts[1] < cur_counts[1]:
-            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_GROUPING_SLACK", 0.12)
-        elif cand_counts[1] > cur_counts[1]:
-            return False
-        elif cand_counts[0] < cur_counts[0] and cand_counts[2] >= cur_counts[2]:
-            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_BOUNDARY_SLACK", 0.06)
-        else:
-            slack = _env_float("FLOORSET_V10_SOFT_REPAIR_GENERAL_SLACK", 0.08)
-        return cand_proxy <= cur_proxy * (1.0 + slack)
 
-    if cand_soft == cur_soft:
-        min_improvement = _env_float(
-            "FLOORSET_V10_SOFT_REPAIR_MIN_GEOMETRY_IMPROVEMENT",
-            0.0001,
-        )
-        return cand_proxy <= cur_proxy * (1.0 - min_improvement)
-
-    return False
+def _runtime_budget_trace(
+    extra_path: str,
+    attempts: int,
+    accepted: int,
+    elapsed_ms: float,
+    stop_reason: str,
+    tier: str,
+) -> dict[str, object]:
+    return {
+        "extra_path": extra_path,
+        "attempts": attempts,
+        "accepted": accepted,
+        "elapsed_ms": round(float(elapsed_ms), 3),
+        "stop_reason": stop_reason,
+        "tier": tier,
+    }
 
 
 def _block_connectivity_weight(inst: Instance, block: int) -> float:
@@ -928,10 +860,29 @@ def _v10_soft_repair(inst: Instance, placement: Placement, config: SolverConfig)
     if not _v10_soft_repair_eligible(inst, placement):
         return placement
 
-    config = _runtime_tail_clamped_config(inst, config)
     best = placement.copy()
+    attempts = 0
+    accepted = 0
+    rejected = 0
+    stop_reason = "max_passes"
+    started = time.perf_counter()
+    try:
+        budget = instance_risk_budget(inst)
+        tier = budget.tier
+    except Exception:
+        tier = BudgetTier.LIGHT
+    limits = conditional_runtime_budget_limits(tier)
     max_passes = max(1, min(config.max_repair_passes, 3))
     for _ in range(max_passes):
+        if conditional_runtime_budget_enabled():
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if elapsed_ms >= limits.max_elapsed_ms:
+                stop_reason = "elapsed_budget"
+                break
+            if rejected >= limits.max_rejected_attempts:
+                stop_reason = "rejected_attempts"
+                break
+        attempts += 1
         trial = best.copy()
         _repair_boundary(inst, trial)
         _connect_clusters(inst, trial, config)
@@ -941,9 +892,30 @@ def _v10_soft_repair(inst: Instance, placement: Placement, config: SolverConfig)
         _snap_hard(inst, trial)
         if _score_better_v10_soft(inst, config, trial, best):
             best = trial
+            accepted += 1
+            rejected = 0
         else:
-            break
+            rejected += 1
+            if not conditional_runtime_budget_enabled():
+                stop_reason = "rejected"
+                break
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    best.runtime_budget_trace = _runtime_budget_trace(
+        "v10_soft_repair",
+        attempts,
+        accepted,
+        elapsed_ms,
+        stop_reason,
+        tier.value,
+    )
     return best
+
+
+def _preserve_runtime_budget_trace(source: Placement, target: Placement) -> Placement:
+    trace = getattr(source, "runtime_budget_trace", None)
+    if trace is not None and getattr(target, "runtime_budget_trace", None) is None:
+        target.runtime_budget_trace = trace
+    return target
 
 
 def _large_case_boundary_refine(inst: Instance, placement: Placement, config: SolverConfig) -> Placement:
@@ -1002,9 +974,15 @@ def repair_placement(inst: Instance, placement: Placement, config: SolverConfig 
     repaired = _guarded_soft_repair(inst, repaired, config)
     if _env_flag("FLOORSET_ENABLE_V10_SOFT_REPAIR"):
         repaired = _v10_soft_repair(inst, repaired, config)
-    repaired = _large_case_boundary_refine(inst, repaired, config)
+    repaired = _preserve_runtime_budget_trace(
+        repaired,
+        _large_case_boundary_refine(inst, repaired, config),
+    )
     if _should_run_no_guidance_geometry_refine(inst, repaired):
-        repaired = _geometry_preserving_refine(inst, repaired, config)
+        repaired = _preserve_runtime_budget_trace(
+            repaired,
+            _geometry_preserving_refine(inst, repaired, config),
+        )
 
     for block in range(inst.block_count):
         if block not in repaired.rects:

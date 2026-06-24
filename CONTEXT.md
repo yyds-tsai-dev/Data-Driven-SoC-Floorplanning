@@ -40,13 +40,25 @@ _Avoid_: flat block-only graph.
 A legal candidate placement location derived from maximal empty rectangle candidates and skyline/frontier candidates.
 _Avoid_: arbitrary greedy coordinate.
 
+**Hard Legality Gate**:
+The solver-internal first-pass acceptance boundary that keeps placements with missing blocks, overlaps, area violations, fixed-shape dimension changes, or preplaced position/dimension changes behind hard-legal alternatives.
+_Avoid_: treating soft-constraint improvement as a reason to accept hard infeasibility.
+
 **Beam Decoder**:
 A constructive decoder that expands multiple partial placements by selecting a remaining block, shape, and legal slot at each step.
 _Avoid_: evaluator-in-loop reranking, single greedy placement.
 
 **Decoder-Side Grouping Adjacency Bias**:
 A later decoder-ranking preference that encourages grouped blocks to become adjacent before repair runs.
-_Avoid_: treating grouping repair as the only source of group satisfaction, hard-coding validation IDs.
+_Avoid_: broad cluster key blending, chaining entire groups by default, or hard-coding validation IDs.
+
+**Narrow Grouping Pair Bias**:
+A constrained decoder-side grouping preference that applies only to ambiguous same-cluster block pairs under high group soft pressure, using a small pairwise axis bonus without global cluster key blending or default whole-group chaining.
+_Avoid_: treating every grouped block as eligible for global reordering pressure.
+
+**Cluster-Level Grouping Pressure**:
+A local grouping-risk signal for one cluster, used to decide whether same-cluster ambiguous pairs should receive narrow decoder-side pressure.
+_Avoid_: enabling grouping bias for every cluster because the overall instance is grouping-heavy.
 
 **Architecture v4**:
 The current production architecture generation that keeps `floorset_arch` as the active solver package while exposing a v4 contest wrapper.
@@ -60,6 +72,14 @@ _Avoid_: renaming the package, treating encoder experiments as a separate solver
 The local architecture-tuning score that uses official quality and soft-violation factors with runtime adjustment fixed to `1.0`.
 _Avoid_: treating local runtime-aware score as the primary architecture metric.
 
+**Evaluator Evidence**:
+Validation scoring output produced by the official/local evaluator for a checkpoint, especially full-validation **No-Runtime Quality Score**, tail weighted no-runtime score, soft-violation count, and raw runtime.
+_Avoid_: promoting checkpoints from supervised validation loss, training health metrics, or single-case wins alone.
+
+**V10 No-Runtime Proxy**:
+A solver-internal acceptance proxy that approximates **No-Runtime Quality Score** during placement selection by putting hard legality first, then balancing geometric quality with soft-violation pressure.
+_Avoid_: soft-first acceptance that allows HPWL or bbox area to regress substantially because soft violations decreased.
+
 **Local Runtime-Aware Score**:
 The local evaluator score that uses each validation runtime divided by the solver's own validation-run median runtime.
 _Avoid_: treating it as the official contest runtime factor.
@@ -68,9 +88,17 @@ _Avoid_: treating it as the official contest runtime factor.
 The submission-oriented policy that permits extra sample-local search only when reusable v10 risk signals justify the raw runtime cost.
 _Avoid_: ignoring runtime after a no-runtime score win, enabling every opt-in portfolio by default.
 
+**V10 Evidence-Gated Budget Layer**:
+The decision surface that combines full-validation v10 score evidence, reusable instance risk signals, and raw runtime tail risk before allowing extra candidate, repair, or portfolio work.
+_Avoid_: new solver branch, hand-tuned validation ID policy, enabling knobs from single-case wins.
+
 **Runtime-Tail Budget Clamp**:
 A follow-up policy that reduces expensive candidate or repair work on cases whose runtime tail is not buying v10 score improvement.
-_Avoid_: global timeouts, disabling repair on every large instance.
+_Avoid_: treating hard clamp behavior as the preferred v10 runtime policy after evidence shows it can damage no-runtime quality.
+
+**Conditional Runtime Budget**:
+A softer runtime policy that preserves baseline repair while stopping only extra repair paths or profile expansion when repeated attempts are not accepted by the **V10 No-Runtime Proxy** or when tier-specific elapsed/attempt budgets are exhausted.
+_Avoid_: global timeouts, fixed pass cuts, or disabling baseline repair before acceptance evidence is observed.
 
 **Sample-Local Parallelism**:
 Parallel work that happens inside one `solve()` call for a single contest sample, such as independent candidate generation or repair profiles.
@@ -104,16 +132,24 @@ _Avoid_: using validation case IDs as the risk definition.
 - A **Legacy Strategy** may donate geometry helper logic, but it is not a selectable **Production Solver Path**.
 - A **Reference Architecture** may be consulted while tuning `floorset_arch`, but it does not define the active solver architecture.
 - A **MER/Skyline Slot** must respect hard placement legality before repair is allowed to refine soft constraints.
+- The **Hard Legality Gate** precedes **V10 No-Runtime Proxy** decisions so soft repair, candidate ranking, and refinement do not trade hard feasibility for local quality.
 - **Architecture v4** names the contest-facing wrapper generation; the **Production Solver Path** remains `floorset_arch`.
 - **Architecture v5** extends **Architecture v4** with a **Selectable Anchor-GNN Encoder** while preserving `floorset_arch` as the **Production Solver Path**.
 - A **Selectable Anchor-GNN Encoder** changes learned **Anchor-GNN Guidance** only; checkpoint promotion still requires evaluator evidence.
 - A **Local HGT Encoder** is a **Selectable Anchor-GNN Encoder** variant that preserves b2b/p2b locality and heterogeneous constraint factors instead of flattening them into a block-only graph.
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
+- **Evaluator Evidence** is the only basis for checkpoint promotion; supervised validation loss is a training health signal.
+- **V10 No-Runtime Proxy** is a solver-internal acceptance surface for candidate selection and repair/refine decisions; **No-Runtime Quality Score** remains the evaluator-facing validation metric.
 - A **Conservative Runtime Budget** gates **Sample-Local Parallelism** and **Sample-Local Quality Portfolio** so no-runtime wins do not automatically become submission defaults.
-- A **Runtime-Tail Budget Clamp** is considered only after v10 risk-gated repair acceptance, so runtime reductions do not preempt soft-feasibility improvements.
+- The **V10 Evidence-Gated Budget Layer** gathers **Validation Tail Diagnostics**, **High-Risk Case** signals, and raw runtime tails into one promotion decision surface.
+- The **V10 Evidence-Gated Budget Layer** may allocate more budget to a medium-large dense instance than to a sparse largest instance when v10 score share, constraint density, and net density justify it.
+- Extra **Sample-Local Quality Portfolio**, high-risk repair, **Runtime-Tail Budget Clamp**, or **Decoder-Side Grouping Adjacency Bias** work must pass the **V10 Evidence-Gated Budget Layer** before becoming a default submission behavior.
+- **Conditional Runtime Budget** replaces hard **Runtime-Tail Budget Clamp** as the preferred follow-up when hard clamps reduce runtime at the cost of **No-Runtime Quality Score**.
+- A runtime budget policy is considered only after **V10 No-Runtime Proxy** acceptance, so runtime reductions do not preempt quality-preserving repair.
 - **Sample-Local Parallelism** may use multiprocessing or multithreading inside one sample, but contest samples remain sequential.
 - A **Sample-Local Quality Portfolio** may refine and rank multiple placements for one sample, but it must preserve the **Production Solver Path** and remain gated by reusable instance statistics and full evaluator evidence.
-- A **Decoder-Side Grouping Adjacency Bias** is considered only after repair acceptance and runtime-tail budget work, because it changes pre-repair placement behavior.
+- **Narrow Grouping Pair Bias** is the evidence-promoted default follow-up to broad **Decoder-Side Grouping Adjacency Bias** when full-cluster key blending or default chaining regresses HPWL/area.
+- **Cluster-Level Grouping Pressure** gates **Narrow Grouping Pair Bias** so grouping-heavy instances do not globally reorder low-risk clusters.
 - **Training Golden Answer** should teach geometric priors, while soft-constraint satisfaction remains the responsibility of constraint-aware decoding, repair, and scoring.
 - A **Constraint-Clean Training Sample** is eligible for full imitation training; soft-violating training samples are low-weight geometry references by default, with dirty order/pairwise supervision suppressed.
 - **Validation Tail Diagnostics** may guide optimization priorities, but production behavior must be triggered by reusable instance features such as block count, boundary/group density, fixed/preplaced structure, or net statistics.
@@ -123,6 +159,9 @@ _Avoid_: using validation case IDs as the risk definition.
 
 > **Dev:** "Can we keep default as a backup beam if the Anchor-GNN path looks weak?"
 > **Domain expert:** "No. The Production Solver Path should be the Anchor-GNN guided hetero-graph beam decoder; default and legacy are only historical references."
+>
+> **Dev:** "Can we turn on v10 soft repair because it improved no-runtime score?"
+> **Domain expert:** "Not by itself. The V10 Evidence-Gated Budget Layer also checks full-validation scope and raw runtime tail before promotion."
 
 ## Flagged Ambiguities
 
@@ -135,3 +174,5 @@ _Avoid_: using validation case IDs as the risk definition.
 - "Only high-risk cases get heavier search" was resolved to mean generalized instance-stat triggers, not validation-tail IDs.
 - "No GNN model ckpt mode" was resolved to mean **No-Checkpoint Guidance Mode**: use the normal production path with `AnchorGuidance=None` to measure how much deterministic decoding and repair can achieve without learned priors.
 - "Canonical HGT hetero graph encoder" was resolved to mean **Local HGT Encoder**: relation-specific typed local message passing over the **Heterogeneous Floorplan Graph**, no global refinement in v1, and no decoder path change before full evaluator evidence.
+- "Evidence & Budget Layer" was resolved to mean **V10 Evidence-Gated Budget Layer**: a shared decision surface for promotion and extra solver budget, not a new architecture version or executable solver branch.
+- "Narrow grouping default" was resolved by the 2026-06-10 full-validation ablation: keep narrow same-cluster pair bias on by default, but preserve an environment switch for ablation.

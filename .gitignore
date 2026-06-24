@@ -41,6 +41,10 @@ contest_venv/
 *.swp
 *.swo
 
+# Temporary files
+tmp/
+**/submission/
+
 # Results and logs (optional - contestants may want to track these)
 *_results.json
 *.log
@@ -50,6 +54,4 @@ smoke.*
 wandb/
 
 # Other
-test/
-presentation/
 graphify-out/

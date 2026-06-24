@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,18 @@ class CheckpointMetricRecord:
     avg_runtime: float | None = None
 
 
+def has_evaluator_evidence(record: CheckpointMetricRecord) -> bool:
+    return any(
+        value is not None
+        for value in (
+            record.total_score_no_runtime,
+            record.tail_weighted_no_runtime,
+            record.soft_violations,
+            record.avg_runtime,
+        )
+    )
+
+
 def _score_value(value: float | None) -> float:
     return float("inf") if value is None else float(value)
 
@@ -28,12 +41,10 @@ def _violation_value(value: int | None) -> int:
 
 def metric_sort_key(record: CheckpointMetricRecord) -> tuple:
     return (
-        -int(record.feasible),
         _score_value(record.total_score_no_runtime),
         _score_value(record.tail_weighted_no_runtime),
         _violation_value(record.soft_violations),
         _score_value(record.avg_runtime),
-        _score_value(record.val_loss),
         int(record.epoch),
     )
 
@@ -62,3 +73,9 @@ def read_metric_records(path: str | Path) -> list[CheckpointMetricRecord]:
         if line.strip():
             records.append(CheckpointMetricRecord(**json.loads(line)))
     return records
+
+
+def evaluator_metric_records(
+    records: Iterable[CheckpointMetricRecord],
+) -> list[CheckpointMetricRecord]:
+    return [record for record in records if has_evaluator_evidence(record)]

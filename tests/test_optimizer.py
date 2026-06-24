@@ -211,6 +211,186 @@ def test_runtime_calibration_env_does_not_sleep(monkeypatch):
     assert len(optimizer.solve(**problem)) == block_count
 
 
+def test_repair_trace_includes_runtime_budget_metadata(tmp_path, monkeypatch):
+    trace = tmp_path / "repair.jsonl"
+    monkeypatch.setenv("FLOORSET_REPAIR_TRACE_JSONL", str(trace))
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    before = Placement({0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)})
+    after = before.copy()
+    after.runtime_budget_trace = {
+        "extra_path": "v10_soft_repair",
+        "attempts": 1,
+        "accepted": 0,
+        "elapsed_ms": 1.25,
+        "stop_reason": "rejected_attempts",
+        "tier": "medium",
+    }
+
+    optimizer._trace_repair(inst, before, after, {"name": "unit"})
+
+    assert '"runtime_budget"' in trace.read_text(encoding="utf-8")
+
+
+def test_conditional_runtime_budget_stops_candidate_profile_expansion(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", "1")
+    monkeypatch.setenv("FLOORSET_CONDITIONAL_RUNTIME_LIGHT_ATTEMPTS", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "0")
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    specs = [
+        CandidateSpec(name="baseline", profile="soft"),
+        CandidateSpec(name="extra", profile="compact"),
+    ]
+    calls = []
+
+    def fake_build_candidate(_inst, spec):
+        calls.append(spec.name)
+        placement = Placement(
+            {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+        )
+        placement.runtime_budget_trace = {
+            "extra_path": "v10_soft_repair",
+            "attempts": 1,
+            "accepted": 0,
+            "elapsed_ms": 0.25,
+            "stop_reason": "rejected_attempts",
+            "tier": "light",
+        }
+        return placement
+
+    monkeypatch.setattr(optimizer, "_build_candidate", fake_build_candidate)
+
+    candidates = optimizer._build_candidates(inst, specs)
+
+    assert len(candidates) == 1
+    assert calls == ["baseline"]
+
+
+def test_conditional_runtime_budget_disabled_keeps_candidate_expansion(monkeypatch):
+    monkeypatch.delenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", raising=False)
+    monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "0")
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    specs = [
+        CandidateSpec(name="baseline", profile="soft"),
+        CandidateSpec(name="extra", profile="compact"),
+    ]
+    calls = []
+
+    def fake_build_candidate(_inst, spec):
+        calls.append(spec.name)
+        placement = Placement(
+            {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+        )
+        placement.runtime_budget_trace = {
+            "extra_path": "v10_soft_repair",
+            "attempts": 1,
+            "accepted": 0,
+            "elapsed_ms": 0.25,
+            "stop_reason": "rejected_attempts",
+            "tier": "light",
+        }
+        return placement
+
+    monkeypatch.setattr(optimizer, "_build_candidate", fake_build_candidate)
+
+    candidates = optimizer._build_candidates(inst, specs)
+
+    assert len(candidates) == 2
+    assert calls == ["baseline", "extra"]
+
+
+def test_conditional_runtime_budget_does_not_infer_rejected_stop_from_max_passes(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", "1")
+    monkeypatch.setenv("FLOORSET_CONDITIONAL_RUNTIME_LIGHT_ATTEMPTS", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "0")
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    specs = [
+        CandidateSpec(name="baseline", profile="soft"),
+        CandidateSpec(name="extra", profile="compact"),
+    ]
+    calls = []
+
+    def fake_build_candidate(_inst, spec):
+        calls.append(spec.name)
+        placement = Placement(
+            {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+        )
+        placement.runtime_budget_trace = {
+            "extra_path": "v10_soft_repair",
+            "attempts": 2,
+            "accepted": 1,
+            "elapsed_ms": 0.25,
+            "stop_reason": "max_passes",
+            "tier": "light",
+        }
+        return placement
+
+    monkeypatch.setattr(optimizer, "_build_candidate", fake_build_candidate)
+
+    candidates = optimizer._build_candidates(inst, specs)
+
+    assert len(candidates) == 2
+    assert calls == ["baseline", "extra"]
+
+
+def test_conditional_runtime_budget_stop_skips_quality_portfolio(monkeypatch):
+    monkeypatch.setenv("FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET", "1")
+    monkeypatch.setenv("FLOORSET_ENABLE_QUALITY_PORTFOLIO", "1")
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    specs = [CandidateSpec(name="baseline", profile="soft")]
+
+    def fake_build_candidate(_inst, _spec):
+        placement = Placement(
+            {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+        )
+        placement.runtime_budget_trace = {
+            "extra_path": "v10_soft_repair",
+            "attempts": 1,
+            "accepted": 0,
+            "elapsed_ms": 0.25,
+            "stop_reason": "rejected_attempts",
+            "tier": "light",
+        }
+        return placement
+
+    def fail_refine(_inst, _candidates):
+        raise AssertionError("budget-stopped candidates must skip quality refinement")
+
+    monkeypatch.setattr(optimizer, "_build_candidate", fake_build_candidate)
+    monkeypatch.setattr(optimizer, "_with_quality_refined_candidates", fail_refine)
+
+    candidates = optimizer._build_candidates(inst, specs)
+
+    assert len(candidates) == 1
+
+
+def test_quality_refine_preserves_runtime_budget_trace(monkeypatch):
+    optimizer = ArchitectureV4Optimizer()
+    inst = parse_instance(**_tiny_problem())
+    placement = Placement(
+        {0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(3.0, 0.0, 2.0, 2.0)}
+    )
+    trace = {
+        "extra_path": "v10_soft_repair",
+        "attempts": 1,
+        "accepted": 0,
+        "elapsed_ms": 0.25,
+        "stop_reason": "rejected_attempts",
+        "tier": "light",
+    }
+    placement.runtime_budget_trace = trace
+    monkeypatch.setenv("FLOORSET_QUALITY_REFINE_MAX_BLOCKS", "1")
+    monkeypatch.setenv("FLOORSET_QUALITY_REFINE_MAX_SLOTS", "1")
+
+    refined = optimizer._quality_refine_candidate(inst, placement)
+
+    assert getattr(refined, "runtime_budget_trace", None) == trace
+
+
 def test_anchor_guidance_can_store_pairwise_logits():
     guidance = AnchorGuidance()
 
@@ -343,29 +523,6 @@ def test_high_risk_repair_profiles_are_configurable(monkeypatch):
     assert {"normal", "boundary_first", "grouping_first", "quality_refine"}.issubset(
         {spec.repair_profile for spec in specs}
     )
-
-
-def test_runtime_tail_clamp_applies_after_heavy_repair_profile(monkeypatch):
-    monkeypatch.setenv("FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP", "1")
-    monkeypatch.setattr(
-        repair_module,
-        "instance_risk_budget",
-        lambda _inst: SimpleNamespace(tier=repair_module.BudgetTier.HEAVY),
-    )
-    inst = parse_instance(
-        4,
-        torch.full((4,), 4.0),
-        torch.empty(0, 3),
-        torch.empty(0, 3),
-        torch.empty(0, 2),
-        torch.zeros(4, 5),
-        torch.full((4, 4), -1.0),
-    )
-
-    config = optimizer_module._repair_profile_config(SolverConfig(), "grouping_first", inst)
-
-    assert config.max_cluster_component_moves == 18
-    assert config.max_pair_candidates_per_component == 24
 
 
 def test_auto_high_risk_portfolio_targets_extreme_tail_cases(monkeypatch):
@@ -703,46 +860,8 @@ def test_candidate_selection_prefers_fewer_soft_violations():
     assert best is larger_clean
 
 
-def test_default_candidate_selection_keeps_soft_first_policy():
-    constraints = torch.tensor(
-        [
-            [0.0, 0.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 0.0],
-        ]
-    )
-    inst = parse_instance(
-        3,
-        torch.tensor([4.0, 4.0, 4.0]),
-        torch.empty(0, 3),
-        torch.empty(0, 3),
-        torch.empty(0, 2),
-        constraints,
-        torch.full((3, 4), -1.0),
-    )
-    compact_dirty = Placement(
-        {
-            0: Rect(4.0, 0.0, 2.0, 2.0),
-            1: Rect(0.0, 0.0, 2.0, 2.0),
-            2: Rect(2.0, 0.0, 2.0, 2.0),
-        }
-    )
-    huge_clean = Placement(
-        {
-            0: Rect(0.0, 0.0, 2.0, 2.0),
-            1: Rect(200.0, 0.0, 2.0, 2.0),
-            2: Rect(202.0, 0.0, 2.0, 2.0),
-        }
-    )
-    optimizer = ArchitectureV4Optimizer()
-
-    best = optimizer._select_best_candidate(inst, [compact_dirty, huge_clean])
-
-    assert best is huge_clean
-
-
-def test_no_runtime_proxy_candidate_selection_is_opt_in(monkeypatch):
-    monkeypatch.setenv("FLOORSET_CANDIDATE_RANK_POLICY", "no_runtime_proxy")
+def test_default_candidate_selection_uses_v10_proxy_policy(monkeypatch):
+    monkeypatch.delenv("FLOORSET_CANDIDATE_RANK_POLICY", raising=False)
     constraints = torch.tensor(
         [
             [0.0, 0.0, 0.0, 0.0, 1.0],
@@ -780,6 +899,45 @@ def test_no_runtime_proxy_candidate_selection_is_opt_in(monkeypatch):
     assert best is compact_dirty
 
 
+def test_soft_first_candidate_selection_is_legacy_opt_in(monkeypatch):
+    monkeypatch.setenv("FLOORSET_CANDIDATE_RANK_POLICY", "soft_first")
+    constraints = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    inst = parse_instance(
+        3,
+        torch.tensor([4.0, 4.0, 4.0]),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        torch.full((3, 4), -1.0),
+    )
+    compact_dirty = Placement(
+        {
+            0: Rect(4.0, 0.0, 2.0, 2.0),
+            1: Rect(0.0, 0.0, 2.0, 2.0),
+            2: Rect(2.0, 0.0, 2.0, 2.0),
+        }
+    )
+    huge_clean = Placement(
+        {
+            0: Rect(0.0, 0.0, 2.0, 2.0),
+            1: Rect(200.0, 0.0, 2.0, 2.0),
+            2: Rect(202.0, 0.0, 2.0, 2.0),
+        }
+    )
+    optimizer = ArchitectureV4Optimizer()
+
+    best = optimizer._select_best_candidate(inst, [compact_dirty, huge_clean])
+
+    assert best is huge_clean
+
+
 def test_quality_refine_moves_block_to_better_frontier_without_soft_regression():
     inst = parse_instance(
         3,
@@ -805,3 +963,43 @@ def test_quality_refine_moves_block_to_better_frontier_without_soft_regression()
 
     assert after < before
     assert refined.rects != placement.rects
+
+
+def test_candidate_rank_defaults_to_v10_proxy(monkeypatch):
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]]),
+        torch.full((3, 4), -1.0),
+    )
+    compact_dirty = Placement({0: Rect(4.0, 0.0, 2.0, 2.0), 1: Rect(0.0, 0.0, 2.0, 2.0), 2: Rect(2.0, 0.0, 2.0, 2.0)})
+    huge_clean = Placement({0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(200.0, 0.0, 2.0, 2.0), 2: Rect(202.0, 0.0, 2.0, 2.0)})
+    monkeypatch.delenv("FLOORSET_CANDIDATE_RANK_POLICY", raising=False)
+    optimizer = ArchitectureV4Optimizer()
+    metrics = optimizer._placement_metrics(inst, compact_dirty)
+
+    assert optimizer._candidate_rank(
+        inst, compact_dirty
+    ) == optimizer_module.v10_proxy_rank(inst, compact_dirty, metrics)
+    assert optimizer._candidate_rank(inst, compact_dirty) < optimizer._candidate_rank(inst, huge_clean)
+
+
+def test_candidate_rank_can_restore_soft_first(monkeypatch):
+    inst = parse_instance(
+        3,
+        torch.full((3,), 4.0),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]]),
+        torch.full((3, 4), -1.0),
+    )
+    compact_dirty = Placement({0: Rect(4.0, 0.0, 2.0, 2.0), 1: Rect(0.0, 0.0, 2.0, 2.0), 2: Rect(2.0, 0.0, 2.0, 2.0)})
+    huge_clean = Placement({0: Rect(0.0, 0.0, 2.0, 2.0), 1: Rect(200.0, 0.0, 2.0, 2.0), 2: Rect(202.0, 0.0, 2.0, 2.0)})
+    monkeypatch.setenv("FLOORSET_CANDIDATE_RANK_POLICY", "soft_first")
+    optimizer = ArchitectureV4Optimizer()
+
+    assert optimizer._candidate_rank(inst, huge_clean) < optimizer._candidate_rank(inst, compact_dirty)

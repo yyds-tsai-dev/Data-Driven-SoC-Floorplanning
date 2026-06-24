@@ -12,6 +12,25 @@ def _constraint_id(inst: Instance, block: int, column: int) -> int:
     return int(float(inst.constraints[block, column]))
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _narrow_grouping_pair_bias_enabled() -> bool:
+    value = os.environ.get("FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def _shape_for_block(inst: Instance, block: int, guidance: AnchorGuidance | None, profile: str) -> tuple[float, float]:
     target = inst.target_rects.get(block)
     if target is not None and (block in inst.fixed or block in inst.preplaced):
@@ -139,16 +158,7 @@ def _bias_order_keys(
         cluster = _constraint_id(inst, block, 3)
         if cluster:
             clusters.setdefault(cluster, []).append(block)
-    if profile == "compact" and _grouping_adjacency_bias_enabled(profile):
-        blend = max(
-            0.0,
-            min(
-                1.0,
-                float(os.environ.get("FLOORSET_GROUPING_ADJACENCY_KEY_BLEND", "0.65")),
-            ),
-        )
-    else:
-        blend = 0.0 if profile == "compact" else 0.18
+    blend = 0.0 if profile == "compact" else 0.18
     for members in clusters.values():
         if len(members) <= 1:
             continue
@@ -177,25 +187,6 @@ def _bias_order_keys(
     return key_x, key_y
 
 
-def _grouping_adjacency_bias_enabled(profile: str) -> bool:
-    enabled = os.environ.get(
-        "FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS",
-        "",
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    if not enabled:
-        return profile != "compact"
-    mode = (
-        os.environ.get("FLOORSET_GROUPING_ADJACENCY_BIAS_MODE", "auto")
-        .strip()
-        .lower()
-    )
-    if mode == "soft_only":
-        return profile != "compact"
-    if mode == "compact_only":
-        return profile == "compact"
-    return True
-
-
 def _cluster_orientations(inst: Instance, raw_x: list[float], raw_y: list[float]) -> dict[int, str]:
     orientations: dict[int, str] = {}
     for cluster, members in inst.cluster_groups.items():
@@ -206,6 +197,41 @@ def _cluster_orientations(inst: Instance, raw_x: list[float], raw_y: list[float]
         span_y = max(raw_y[i] for i in members) - min(raw_y[i] for i in members)
         orientations[cluster] = "H" if span_x >= span_y else "V"
     return orientations
+
+
+def _cluster_grouping_pressure(
+    members: list[int],
+    raw_x: list[float],
+    raw_y: list[float],
+    widths: list[float],
+    heights: list[float],
+) -> bool:
+    min_members = max(1, _env_int("FLOORSET_NARROW_GROUPING_MIN_MEMBERS", 3))
+    if len(members) < min_members:
+        return False
+    span_x = max(raw_x[i] for i in members) - min(raw_x[i] for i in members)
+    span_y = max(raw_y[i] for i in members) - min(raw_y[i] for i in members)
+    avg_w = sum(widths[i] for i in members) / max(len(members), 1)
+    avg_h = sum(heights[i] for i in members) / max(len(members), 1)
+    pressure = max(span_x / max(avg_w, 1e-6), span_y / max(avg_h, 1e-6))
+    return pressure >= _env_float("FLOORSET_NARROW_GROUPING_PRESSURE", 1.4)
+
+
+def _narrow_grouping_axis_bonus(
+    h_score: float,
+    v_score: float,
+    *,
+    enabled: bool,
+    pressure: bool,
+    orientation: str,
+    bonus: float,
+    ambiguity_margin: float,
+) -> tuple[float, float]:
+    if not enabled or not pressure or abs(h_score - v_score) > ambiguity_margin:
+        return h_score, v_score
+    if orientation == "H":
+        return h_score + bonus, v_score
+    return h_score, v_score + bonus
 
 
 def construct_relative_order_placement(inst: Instance, config: SolverConfig | None = None, profile: str = "soft") -> Placement:
@@ -230,6 +256,17 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
     h_adj = {block: [] for block in movable}
     v_adj = {block: [] for block in movable}
     orient = _cluster_orientations(inst, raw_x, raw_y)
+    narrow_enabled = _narrow_grouping_pair_bias_enabled()
+    cluster_pressure = (
+        {
+            cluster: _cluster_grouping_pressure(members, raw_x, raw_y, widths, heights)
+            for cluster, members in inst.cluster_groups.items()
+        }
+        if narrow_enabled
+        else {}
+    )
+    narrow_bonus = _env_float("FLOORSET_NARROW_GROUPING_AXIS_BONUS", 0.12)
+    ambiguity_margin = _env_float("FLOORSET_NARROW_GROUPING_AMBIGUITY_MARGIN", 0.15)
 
     def add_h(a: int, b: int) -> None:
         if pos_x[a] <= pos_x[b]:
@@ -256,10 +293,16 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
             ci = _constraint_id(inst, i, 3)
             cj = _constraint_id(inst, j, 3)
             if ci and ci == cj:
-                if orient.get(ci, "H") == "H":
-                    h_score += 0.45 if _grouping_adjacency_bias_enabled(profile) else 0.0
-                else:
-                    v_score += 0.45 if _grouping_adjacency_bias_enabled(profile) else 0.0
+                if narrow_enabled and cluster_pressure.get(ci, False):
+                    h_score, v_score = _narrow_grouping_axis_bonus(
+                        h_score,
+                        v_score,
+                        enabled=narrow_enabled,
+                        pressure=True,
+                        orientation=orient.get(ci, "H"),
+                        bonus=narrow_bonus,
+                        ambiguity_margin=ambiguity_margin,
+                    )
             if guidance is not None and guidance.pairwise_axis:
                 key = (i, j) if i < j else (j, i)
                 pair_logits = guidance.pairwise_axis.get(key)
@@ -272,20 +315,6 @@ def construct_relative_order_placement(inst: Instance, config: SolverConfig | No
                 add_h(i, j)
             else:
                 add_v(i, j)
-
-    if _grouping_adjacency_bias_enabled(profile):
-        for cluster, members in inst.cluster_groups.items():
-            chain = [block for block in members if block in pos_x]
-            if len(chain) <= 1:
-                continue
-            if orient.get(cluster, "H") == "H":
-                chain.sort(key=lambda i: (key_x[i], key_y[i], i))
-                for a, b in zip(chain, chain[1:]):
-                    add_h(a, b)
-            else:
-                chain.sort(key=lambda i: (key_y[i], key_x[i], i))
-                for a, b in zip(chain, chain[1:]):
-                    add_v(a, b)
 
     x_pos = {block: 0.0 for block in movable}
     y_pos = {block: 0.0 for block in movable}

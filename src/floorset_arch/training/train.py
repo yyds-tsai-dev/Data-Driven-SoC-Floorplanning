@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +27,11 @@ from floorset_arch.training.checkpoint import (
     load_checkpoint,
     save_anchor_checkpoint,
 )
+from floorset_arch.training.promote_checkpoint import (
+    checkpoint_metric_from_eval_json,
+    select_best_checkpoint,
+)
+from floorset_arch.training.selection import append_metric_record, read_metric_records
 from floorset_arch.training.losses import (
     build_anchor_targets,
     build_pairwise_relation_targets,
@@ -559,6 +567,15 @@ def load_resume_model(
         "hgt_relation_specs", model_config.get("hgt_relation_specs", ())
     )
     hgt_relation_specs = tuple(tuple(relation) for relation in hgt_relation_specs)
+    hgt_relation_gate_min = float(
+        payload.get(
+            "hgt_relation_gate_min",
+            model_config.get(
+                "hgt_relation_gate_min",
+                getattr(args, "hgt_relation_gate_min", 0.10),
+            ),
+        )
+    )
     if node_feat_dim <= 0:
         raise RuntimeError(
             f"Resume checkpoint has no node feature dimension: {checkpoint_path}"
@@ -593,6 +610,7 @@ def load_resume_model(
         edge_type_count=edge_type_count,
         hgt_node_feat_dims=hgt_node_feat_dims,
         hgt_relation_specs=hgt_relation_specs,
+        hgt_relation_gate_min=hgt_relation_gate_min,
     ).to(device)
     model.load_state_dict(state, strict=False)
     resume_epoch = int(payload.get("epoch", 0))
@@ -604,6 +622,111 @@ def load_resume_model(
             flush=True,
         )
     return model, resume_epoch, payload.get("optimizer_state_dict")
+
+
+def refresh_evaluator_best_checkpoint(
+    manifest: str | Path, destination: str | Path
+):
+    manifest_path = Path(manifest)
+    if not manifest_path.exists():
+        return None
+    try:
+        best = select_best_checkpoint(read_metric_records(manifest_path))
+    except ValueError:
+        return None
+    source = Path(best.checkpoint)
+    if not source.exists():
+        raise FileNotFoundError(f"Selected evaluator checkpoint does not exist: {source}")
+    output = Path(destination)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, output)
+    return best
+
+
+TRAINING_EVAL_ENV_OVERRIDES = {
+    "FLOORSET_GNN_CHECKPOINT_SOURCE": "training_eval",
+    "FLOORSET_PROFILE_POLICY": "adaptive",
+    "FLOORSET_INCLUDE_COMPACT_RELATIVE": "1",
+    "FLOORSET_ENABLE_HIGH_RISK_PORTFOLIO": "auto",
+    "FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS": "1",
+    "FLOORSET_CANDIDATE_RANK_POLICY": "v10_proxy",
+    "FLOORSET_ENABLE_LARGE_CASE_CANDIDATES": "0",
+    "FLOORSET_INCLUDE_BEAM_CANDIDATES": "0",
+    "FLOORSET_INCLUDE_NO_GUIDANCE_CANDIDATE": "0",
+    "FLOORSET_ENABLE_QUALITY_PORTFOLIO": "0",
+    "FLOORSET_ENABLE_V10_SOFT_REPAIR": "0",
+    "FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET": "0",
+    "FLOORSET_GUIDANCE_ANCHOR_ONLY": "0",
+    "FLOORSET_GUIDANCE_DISABLE_PAIRWISE": "0",
+    "FLOORSET_GUIDANCE_DISABLE_ASPECT": "0",
+    "FLOORSET_GUIDANCE_DISABLE_PRIORITY": "0",
+}
+
+
+def _parse_train_eval_tail_ids(value: str) -> set[int] | None:
+    if not value.strip():
+        return None
+    return {int(part.strip()) for part in value.split(",") if part.strip()}
+
+
+def _training_eval_env(checkpoint: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(TRAINING_EVAL_ENV_OVERRIDES)
+    env["FLOORSET_GNN_CHECKPOINT"] = str(checkpoint.resolve())
+    pythonpath_parts = [
+        str(ROOT / "FloorSet" / "iccad2026contest"),
+        str(ROOT / "FloorSet"),
+    ]
+    if env.get("PYTHONPATH"):
+        pythonpath_parts.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    return env
+
+
+def run_training_evaluator(
+    checkpoint: str | Path,
+    epoch: int,
+    args,
+    metrics_manifest: str | Path,
+    evaluator_best_path: str | Path,
+):
+    checkpoint_path = Path(checkpoint)
+    output_dir = (
+        Path(args.train_eval_output_dir)
+        if getattr(args, "train_eval_output_dir", "")
+        else Path(args.output_dir) / "training_eval"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    eval_json = output_dir / f"{checkpoint_path.stem}_epoch{int(epoch):03d}_full_eval.json"
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "iccad2026_evaluate.py"),
+        "--data-path",
+        "../",
+        "--evaluate",
+        str(ROOT / "src" / "architecture_v5_optimizer.py"),
+        "--verbose",
+        "--output",
+        str(eval_json.resolve()),
+    ]
+    subprocess.run(
+        command,
+        cwd=ROOT / "FloorSet" / "iccad2026contest",
+        env=_training_eval_env(checkpoint_path),
+        check=True,
+    )
+    record = checkpoint_metric_from_eval_json(
+        checkpoint=str(checkpoint_path),
+        eval_json=eval_json,
+        epoch=epoch,
+        metric_source="training_full_eval",
+        val_loss=None,
+        tail_ids=_parse_train_eval_tail_ids(
+            getattr(args, "train_eval_tail_ids", "95,96,97,98,99")
+        ),
+    )
+    append_metric_record(metrics_manifest, record)
+    return refresh_evaluator_best_checkpoint(metrics_manifest, evaluator_best_path)
 
 
 def _load_optimizer_state_if_compatible(
@@ -677,6 +800,16 @@ def main(args) -> None:
     run_tag = args.checkpoint_tag or build_run_tag(args)
     latest_path = out_dir / f"{args.checkpoint_prefix}_latest_{run_tag}.pt"
     best_val_loss_path = out_dir / f"{args.checkpoint_prefix}_best_val_loss_{run_tag}.pt"
+    metrics_manifest = (
+        Path(args.checkpoint_metrics_manifest)
+        if args.checkpoint_metrics_manifest
+        else out_dir / f"{args.checkpoint_prefix}_checkpoint_metrics_{run_tag}.jsonl"
+    )
+    evaluator_best_path = (
+        Path(args.evaluator_best_checkpoint)
+        if args.evaluator_best_checkpoint
+        else out_dir / f"{args.checkpoint_prefix}_best_evaluator_{run_tag}.pt"
+    )
     wandb_run = maybe_init_wandb(args)
 
     print("=" * 72)
@@ -693,6 +826,8 @@ def main(args) -> None:
     print(f"  accumulation     = {max(1, args.accumulation_steps)}")
     print(f"  batch size       = {max(1, args.batch_size)}")
     print(f"  checkpoint tag   = {run_tag}")
+    print(f"  evaluator metrics= {metrics_manifest}")
+    print(f"  evaluator best   = {evaluator_best_path}")
     if args.resume_checkpoint:
         print(f"  resume checkpoint= {args.resume_checkpoint}")
     print("=" * 72, flush=True)
@@ -752,6 +887,7 @@ def main(args) -> None:
                 edge_type_count=edge_type_count,
                 hgt_node_feat_dims=hgt_node_feat_dims,
                 hgt_relation_specs=hgt_relation_specs,
+                hgt_relation_gate_min=args.hgt_relation_gate_min,
             ).to(device)
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -816,6 +952,35 @@ def main(args) -> None:
                 val_stats,
                 optimizer=optimizer,
             )
+        if args.train_evaluate_each_epoch:
+            selected_evaluator = run_training_evaluator(
+                checkpoint=latest_path,
+                epoch=epoch,
+                args=args,
+                metrics_manifest=metrics_manifest,
+                evaluator_best_path=evaluator_best_path,
+            )
+        else:
+            selected_evaluator = refresh_evaluator_best_checkpoint(
+                metrics_manifest, evaluator_best_path
+            )
+        if selected_evaluator is not None:
+            print(
+                "Updated evaluator-best checkpoint "
+                f"{evaluator_best_path} from {selected_evaluator.checkpoint} "
+                f"(no-runtime={selected_evaluator.total_score_no_runtime}, "
+                f"tail={selected_evaluator.tail_weighted_no_runtime}, "
+                f"soft={selected_evaluator.soft_violations}, "
+                f"runtime={selected_evaluator.avg_runtime})",
+                flush=True,
+            )
+            if args.write_stable_checkpoints:
+                stable_best = out_dir / f"{args.checkpoint_prefix}_best.pt"
+                shutil.copy2(evaluator_best_path, stable_best)
+                print(
+                    f"Updated stable evaluator-best checkpoint at {stable_best}",
+                    flush=True,
+                )
         if val_stats["loss"] < best_val:
             best_val = val_stats["loss"]
             save_anchor_checkpoint(
@@ -827,25 +992,12 @@ def main(args) -> None:
                 val_stats,
                 optimizer=optimizer,
             )
-            if args.write_stable_checkpoints:
-                save_anchor_checkpoint(
-                    out_dir / f"{args.checkpoint_prefix}_best.pt",
-                    model,
-                    args,
-                    epoch,
-                    train_stats,
-                    val_stats,
-                    optimizer=optimizer,
-                )
             print(f"Saved best checkpoint to {best_val_loss_path}", flush=True)
-            if args.write_stable_checkpoints:
-                print(
-                    f"Updated stable checkpoint at {out_dir / f'{args.checkpoint_prefix}_best.pt'}",
-                    flush=True,
-                )
 
     print(f"Best val loss: {best_val:.5f}")
     print(f"Best val-loss checkpoint: {best_val_loss_path}")
+    print(f"Evaluator metrics manifest: {metrics_manifest}")
+    print(f"Evaluator-best checkpoint: {evaluator_best_path}")
     if wandb_run is not None:
         wandb_run.summary["best_val_loss"] = best_val
         wandb_run.finish()
@@ -898,6 +1050,7 @@ def parse_args():
     parser.add_argument("--high-risk-pairwise-multiplier", type=float, default=1.0)
     parser.add_argument("--high-risk-min-blocks", type=int, default=110)
     parser.add_argument("--high-risk-min-constraints", type=int, default=12)
+    parser.add_argument("--hgt-relation-gate-min", type=float, default=0.10)
     parser.add_argument("--boundary-weight-boost", type=float, default=0.45)
     parser.add_argument("--cluster-weight-boost", type=float, default=0.20)
     parser.add_argument("--mib-weight-boost", type=float, default=0.25)
@@ -912,6 +1065,40 @@ def parse_args():
     parser.add_argument("--checkpoint-prefix", default="gnn")
     parser.add_argument("--checkpoint-tag", default="")
     parser.add_argument("--write-stable-checkpoints", action="store_true")
+    parser.add_argument(
+        "--checkpoint-metrics-manifest",
+        default="",
+        help=(
+            "Evaluator metric JSONL used to refresh evaluator-best checkpoints. "
+            "When omitted, training uses a run-tagged manifest in the output dir."
+        ),
+    )
+    parser.add_argument(
+        "--evaluator-best-checkpoint",
+        default="",
+        help=(
+            "Destination for the best checkpoint selected from evaluator evidence. "
+            "When omitted, training writes a run-tagged best_evaluator checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--train-evaluate-each-epoch",
+        action="store_true",
+        help=(
+            "After each epoch, run the full evaluator on the latest checkpoint, "
+            "append evaluator evidence to the metrics manifest, and refresh evaluator-best."
+        ),
+    )
+    parser.add_argument(
+        "--train-eval-output-dir",
+        default="",
+        help="Directory for per-epoch full-evaluation JSON outputs.",
+    )
+    parser.add_argument(
+        "--train-eval-tail-ids",
+        default="95,96,97,98,99",
+        help="Comma-separated validation ids used for tail_weighted_no_runtime records.",
+    )
     parser.add_argument("--resume-checkpoint", default="")
     parser.add_argument("--ignore-optimizer-state", action="store_true")
     parser.add_argument("--wandb", action="store_true")

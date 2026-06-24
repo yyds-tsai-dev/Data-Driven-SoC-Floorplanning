@@ -317,8 +317,31 @@ def test_hgt_layers_create_identity_relation_gates():
     assert set(first_layer.rel_gate) == {
         model_module._relation_key(relation) for relation in graph_inputs.relation_specs
     }
+    for value in first_layer.effective_relation_gate_values().values():
+        assert value == pytest.approx(1.0)
+
+
+def test_hgt_relation_gates_are_bounded_when_raw_values_collapse():
+    inst = _hgt_sample_instance()
+    graph_inputs = features.build_anchor_hgt_graph_inputs(inst)
+    model = FloorplanGNN(
+        node_feat_dim=graph_inputs.node_features["block"].shape[1],
+        hidden_dim=16,
+        num_layers=1,
+        dropout=0.0,
+        encoder_type="hgt",
+        num_heads=4,
+        hgt_node_feat_dims=graph_inputs.node_feat_dims,
+        hgt_relation_specs=graph_inputs.relation_specs,
+        hgt_relation_gate_min=0.2,
+    )
+
+    first_layer = model.hgt_layers[0]
     for parameter in first_layer.rel_gate.values():
-        assert torch.allclose(parameter.detach(), torch.ones_like(parameter))
+        parameter.data.fill_(-100.0)
+
+    for value in first_layer.effective_relation_gate_values().values():
+        assert value >= 0.2
 
 
 def test_floorplan_gnn_hgt_batched_forward_matches_separate_graphs():

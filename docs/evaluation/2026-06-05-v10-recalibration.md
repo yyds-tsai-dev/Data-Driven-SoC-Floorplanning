@@ -118,29 +118,86 @@ IDs 95-99 each had flat or worse no-runtime cost, and the runtime tail worsened
 on IDs 95, 96, 98, and 99. The worst runtime regression was ID 88, rising from
 `6.02s` to `9.47s` while also worsening total cost. Keep
 `FLOORSET_ENABLE_V10_SOFT_REPAIR=1` opt-in and do not combine it with production
-submission defaults until runtime-tail budget clamp is in place. The artifact is
+submission defaults until conditional runtime budget also preserves no-runtime
+quality. The artifact is
 `artifacts/eval_v10/v10_soft_repair_graph_transformer_0521_v10.json`.
 
 The first runtime-tail clamp reduced tail runtime but over-clamped quality. With
 soft repair enabled, p90 improved from `2.54s` to `1.89s` and max runtime
 improved from `9.47s` to `8.11s`, but no-runtime score regressed to `2.2741`
 and runtime-aware total regressed to `3.0120`. The largest bucket did not recover:
-IDs 95, 96, 98, and 99 were worse than baseline on no-runtime cost. Keep
-`FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP=1` opt-in and revise it from hard caps to
-per-case conditional caps before another promotion attempt. The artifact is
+IDs 95, 96, 98, and 99 were worse than baseline on no-runtime cost. The former
+`FLOORSET_ENABLE_RUNTIME_TAIL_CLAMP=1` hard-cap opt-in was removed; future work
+should use per-case conditional caps instead of resurrecting that flag. The artifact is
 `artifacts/eval_v10/runtime_clamp_graph_transformer_0521_v10.json`.
 
 The first decoder-side grouping adjacency bias was also not submission-safe.
 Combined with soft repair and runtime clamp, no-runtime score regressed to
 `2.4989` and total score regressed to `3.3102`. Runtime stayed bounded, but many
 mid/large cases gained soft violations; the largest no-runtime regressions
-included IDs 81, 82, 49, 64, 68, and 92. Keep
-`FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS=1` opt-in only. The next version should
-avoid globally compacting cluster keys and instead apply a narrower bias only
-when grouping soft pressure is high and the local order gap is ambiguous. The
+included IDs 81, 82, 49, 64, 68, and 92. The former
+`FLOORSET_ENABLE_GROUPING_ADJACENCY_BIAS=1` broad opt-in was removed; current
+work should avoid globally compacting cluster keys and instead use the retained
+narrow bias only when grouping soft pressure is high and the local order gap is ambiguous. The
 artifact is
 `artifacts/eval_v10/runtime_clamp_grouping_bias_graph_transformer_0521_v10.json`.
+These two flags are historical evidence only after the 2026-06-11 cleanup; their
+live code paths were removed in favor of conditional runtime budget and
+default-on narrow grouping pair bias.
 
 Large-case candidates still have no measured v10 gain. No-Checkpoint Guidance
 Mode remains useful for deterministic repair diagnosis but is not competitive
 with the configured checkpoint path.
+
+## 2026-06-10 Proxy / Runtime / Grouping Ablation
+
+This run uses fresh same-machine full validation with clean detached worktrees:
+
+- baseline worktree: `78b8f86022753874a0e6d86e5ef70cb480544ec8`
+- current worktree: `1907b6386c0bfc7fb8cc71f51fd22b3dcde43cdf`
+- checkpoint:
+  `gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt`
+- output directory: `artifacts/eval_v10_ablation/`
+
+Treat this table as the current apples-to-apples ablation surface. The older
+`artifacts/eval_v10/` results above remain useful history, but their baseline
+does not numerically match this rerun and should not be mixed into delta claims.
+
+| Run | v10 no-runtime | v10 total | Feasible | Avg runtime | P90 runtime | Max runtime | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| merge-base baseline | `2.2184` | `2.7762` | `100/100` | `1.25s` | `2.27s` | `7.01s` | comparison baseline |
+| Phase 1 V10 proxy default | `2.1634` | `2.7471` | `100/100` | `1.24s` | `2.12s` | `7.42s` | keep default |
+| Phase 1 + v10 soft repair, no conditional budget | `2.1446` | `2.8314` | `100/100` | `1.40s` | `2.46s` | `9.64s` | keep opt-in only |
+| Phase 1 + v10 soft repair + conditional budget | `2.1670` | `2.7207` | `100/100` | `1.22s` | `2.56s` | `5.70s` | useful for total/runtime, not no-runtime |
+| Phase 1 + narrow grouping pair bias | `2.1538` | `2.6993` | `100/100` | `1.23s` | `2.24s` | `6.58s` | promote to default |
+| Phase 1 + conditional budget + narrow grouping | `2.1926` | `2.7515` | `100/100` | `1.18s` | `2.13s` | `5.79s` | do not combine by default |
+
+Phase 1 is confirmed as a production default: it lowers no-runtime by `0.0549`
+and total by `0.0291` against the fresh merge-base rerun. The remaining tail
+risk is runtime noise and case-specific geometry, not a reason to return to
+soft-first selection.
+
+Conditional runtime budget improves the soft-repair path's runtime-aware total
+relative to unbudgeted soft repair (`2.8314 -> 2.7207`) and cuts max runtime
+(`9.64s -> 5.70s`), but it slightly regresses no-runtime relative to Phase 1
+alone (`2.1634 -> 2.1670`). Keep
+`FLOORSET_ENABLE_CONDITIONAL_RUNTIME_BUDGET=1` and
+`FLOORSET_ENABLE_V10_SOFT_REPAIR=1` as an explicit ablation pair. The next
+optimization should gate the extra soft-repair attempt more tightly on proxy
+acceptance and geometry deltas, especially for regressions like IDs 68, 55, 62,
+73, and 27.
+
+Narrow grouping pair bias is the first grouping-side variant that improves both
+primary surfaces in this rerun. It lowers no-runtime from `2.1634` to `2.1538`
+and total from `2.7471` to `2.6993` relative to Phase 1 alone, while avoiding
+the old broad global key-blend failure mode. Promote narrow grouping pair bias
+to default, but keep `FLOORSET_ENABLE_NARROW_GROUPING_PAIR_BIAS=0` as an
+ablation switch. Remaining regressions are local geometry/soft tradeoffs, with
+IDs 59, 27, 5, 73, 25, 89, 71, and 76 the first targets if this bias is tuned
+again.
+
+Do not promote the combined conditional-budget plus narrow-grouping preset. It
+reduces raw runtime tail, but no-runtime regresses to `2.1926` and total
+regresses to `2.7515` versus narrow grouping alone. This suggests the current
+soft-repair extra path fights the narrow decoder bias on high-weight cases such
+as ID 99.

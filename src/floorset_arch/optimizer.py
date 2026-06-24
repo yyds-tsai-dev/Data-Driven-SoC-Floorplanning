@@ -17,9 +17,9 @@ except ImportError:  # pragma: no cover - dependency is present in local runs.
     load_dotenv = None
 
 from floorset_arch.constructive import construct_beam_placement
+from floorset_arch.budget_layer import budget_trace_context, candidate_budget_tier
 from floorset_arch.diagnostics import placement_metrics, repair_delta
 from floorset_arch.geometry import (
-    bbox,
     candidate_frontier_points,
     first_non_overlapping,
 )
@@ -32,9 +32,10 @@ from floorset_arch.quality_portfolio import (
     refine_quality_candidate,
 )
 from floorset_arch.relative_order import construct_relative_order_placement
-from floorset_arch.repair import _runtime_tail_clamped_config, repair_placement
+from floorset_arch.repair import repair_placement
 from floorset_arch.risk_budget import BudgetTier, instance_risk_budget
 from floorset_arch.surrogate_guidance import build_surrogate_guidance
+from floorset_arch.v10_proxy import v10_proxy_better, v10_proxy_cost, v10_proxy_rank
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTEST_DIR = ROOT / "FloorSet" / "iccad2026contest"
@@ -128,29 +129,7 @@ def _repair_profile_config(config: SolverConfig, repair_profile: str, inst=None)
         )
     else:
         profile_config = config
-    if inst is None:
-        return profile_config
-    return _runtime_tail_clamped_config(inst, profile_config)
-
-
-def _build_candidate_worker(
-    inst, config: SolverConfig, spec: CandidateSpec
-) -> Placement:
-    saved_guidance = inst.anchor_guidance
-    if spec.disable_guidance:
-        inst.anchor_guidance = None
-    try:
-        if spec.kind == "beam":
-            graph = build_hetero_floorplan_graph(inst)
-            placement = construct_beam_placement(inst, config, graph=graph)
-        else:
-            placement = construct_relative_order_placement(
-                inst, config, profile=spec.profile
-            )
-        return _repair_with_profile_worker(inst, placement, config, spec.repair_profile)
-    finally:
-        if spec.disable_guidance:
-            inst.anchor_guidance = saved_guidance
+    return profile_config
 
 
 def _env_flag(name: str) -> bool:
@@ -207,14 +186,51 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
 
     def _build_candidates(self, inst, specs: list[CandidateSpec]) -> list[Placement]:
         workers = self._candidate_worker_count_for_specs(specs)
+        budget_stopped = False
         if workers <= 1:
-            candidates = [self._build_candidate(inst, spec) for spec in specs]
+            candidates = []
+            for spec in specs:
+                candidate = self._build_candidate(inst, spec)
+                candidates.append(candidate)
+                if self._conditional_runtime_budget_stops_expansion(candidate):
+                    budget_stopped = True
+                    break
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 candidates = list(
                     pool.map(self._build_candidate, [inst] * len(specs), specs)
                 )
+        if budget_stopped:
+            return candidates
         return self._with_quality_refined_candidates(inst, candidates)
+
+    def _conditional_runtime_budget_stops_expansion(self, placement: Placement) -> bool:
+        from floorset_arch.budget_layer import (
+            conditional_runtime_budget_enabled,
+            conditional_runtime_budget_limits,
+        )
+
+        if not conditional_runtime_budget_enabled():
+            return False
+        trace = getattr(placement, "runtime_budget_trace", None)
+        if not isinstance(trace, dict):
+            return False
+        try:
+            elapsed_ms = float(trace.get("elapsed_ms", 0.0))
+        except (TypeError, ValueError):
+            return False
+        stop_reason = str(trace.get("stop_reason", ""))
+        if stop_reason == "elapsed_budget":
+            return True
+        try:
+            tier = BudgetTier(str(trace.get("tier", BudgetTier.LIGHT.value)))
+        except ValueError:
+            tier = BudgetTier.LIGHT
+        limits = conditional_runtime_budget_limits(tier)
+        return (
+            stop_reason == "rejected_attempts"
+            or elapsed_ms >= limits.max_elapsed_ms
+        )
 
     def _candidate_worker_count_for_specs(self, specs: list[CandidateSpec]) -> int:
         if any(spec.repair_profile != "normal" for spec in specs):
@@ -378,20 +394,34 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         workers = self._quality_refine_worker_count(len(jobs))
         if workers <= 1:
             refined = [
-                refine_quality_candidate(inst, seed, self.config, profile)
+                self._preserve_runtime_budget_trace(
+                    seed,
+                    refine_quality_candidate(inst, seed, self.config, profile),
+                )
                 for seed, profile in jobs
             ]
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 refined = list(
                     pool.map(
-                        lambda item: refine_quality_candidate(
-                            inst, item[0], self.config, item[1]
+                        lambda item: self._preserve_runtime_budget_trace(
+                            item[0],
+                            refine_quality_candidate(
+                                inst, item[0], self.config, item[1]
+                            ),
                         ),
                         jobs,
                     )
                 )
         return candidates + refined
+
+    def _preserve_runtime_budget_trace(
+        self, source: Placement, target: Placement
+    ) -> Placement:
+        trace = getattr(source, "runtime_budget_trace", None)
+        if trace is not None and getattr(target, "runtime_budget_trace", None) is None:
+            target.runtime_budget_trace = trace
+        return target
 
     def _large_case_repair_profiles(self) -> list[str]:
         raw = os.environ.get("FLOORSET_LARGE_CASE_REPAIR_PROFILES", "normal")
@@ -435,8 +465,7 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         return self._is_targeted_high_risk_case(inst)
 
     def _is_targeted_high_risk_case(self, inst) -> bool:
-        budget = instance_risk_budget(inst)
-        return budget.tier in {BudgetTier.MEDIUM, BudgetTier.HEAVY}
+        return candidate_budget_tier(inst) is not BudgetTier.NONE
 
     def _is_high_risk_case(self, inst) -> bool:
         budget = instance_risk_budget(inst)
@@ -490,8 +519,14 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         before = placement
         after = self._repair_with_profile(inst, before, spec.repair_profile)
         if spec.repair_profile == "quality_refine":
-            after = self._quality_refine_candidate(inst, after)
-        after = refine_quality_candidate(inst, after, self.config, spec.quality_profile)
+            after = self._preserve_runtime_budget_trace(
+                after,
+                self._quality_refine_candidate(inst, after),
+            )
+        after = self._preserve_runtime_budget_trace(
+            after,
+            refine_quality_candidate(inst, after, self.config, spec.quality_profile),
+        )
         self._trace_repair(
             inst,
             before,
@@ -516,38 +551,27 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
             candidates, key=lambda placement: self._candidate_rank(inst, placement)
         )
 
-    def _candidate_rank(self, inst, placement: Placement) -> tuple[int, float, int]:
+    def _candidate_rank(self, inst, placement: Placement) -> tuple:
         metrics = self._placement_metrics(inst, placement)
-        soft = (
-            int(metrics["boundary_violations"])
-            + int(metrics["group_violations"])
-            + int(metrics["mib_violations"])
-        )
-        if (
-            os.environ.get("FLOORSET_CANDIDATE_RANK_POLICY", "soft_first")
-            == "no_runtime_proxy"
-        ):
+        if os.environ.get("FLOORSET_CANDIDATE_RANK_POLICY", "v10_proxy") == "soft_first":
+            soft = self._soft_total(metrics)
             return (
                 int(metrics["overlap_count"]),
-                self._no_runtime_proxy_cost(inst, placement, metrics),
-                soft,
+                float(soft),
+                int(metrics["boundary_violations"]),
+                int(metrics["group_violations"]),
+                v10_proxy_cost(inst, placement, metrics),
             )
-        return (
-            int(metrics["overlap_count"]),
-            float(soft),
-            int(metrics["boundary_violations"]),
-            int(metrics["group_violations"]),
-            self._no_runtime_proxy_cost(inst, placement, metrics),
-        )
+        return v10_proxy_rank(inst, placement, metrics)
 
     def _placement_metrics(self, inst, placement: Placement) -> dict[str, float | int]:
         return placement_metrics(inst, placement)
 
     def _quality_refine_candidate(self, inst, placement: Placement) -> Placement:
         best = placement.copy()
+        self._preserve_runtime_budget_trace(placement, best)
         best_metrics = self._placement_metrics(inst, best)
         best_soft = self._soft_total(best_metrics)
-        best_score = self._no_runtime_proxy_cost(inst, best, best_metrics)
         max_blocks = int(os.environ.get("FLOORSET_QUALITY_REFINE_MAX_BLOCKS", "32"))
         max_slots = int(os.environ.get("FLOORSET_QUALITY_REFINE_MAX_SLOTS", "48"))
         movable = [block for block in best.rects if block not in inst.preplaced]
@@ -582,12 +606,18 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     or self._soft_total(metrics) > best_soft
                 ):
                     continue
-                score = self._no_runtime_proxy_cost(inst, trial, metrics)
-                if score < best_score * (1.0 - 1e-4):
+                if v10_proxy_better(
+                    inst,
+                    trial,
+                    best,
+                    candidate_metrics=metrics,
+                    current_metrics=best_metrics,
+                    allow_tie_soft=True,
+                    allow_proxy_regression=False,
+                ):
                     best = trial
                     best_metrics = metrics
                     best_soft = self._soft_total(metrics)
-                    best_score = score
                     rect = candidate
                     others = [
                         other for idx, other in best.rects.items() if idx != block
@@ -612,11 +642,15 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         row = {
             "block_count": inst.block_count,
             "checkpoint_loaded": self._checkpoint_model is not None,
+            "budget": budget_trace_context(inst),
             "candidate": candidate,
             "before_repair": before_metrics,
             "after_repair": after_metrics,
             "delta": repair_delta(before, after, before_metrics, after_metrics),
         }
+        runtime_budget = getattr(after, "runtime_budget_trace", None)
+        if runtime_budget is not None:
+            row["runtime_budget"] = runtime_budget
         with open(trace_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
@@ -656,6 +690,9 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                         tuple(relation)
                         for relation in payload.get("hgt_relation_specs", ())
                     ),
+                    hgt_relation_gate_min=float(
+                        payload.get("hgt_relation_gate_min", 0.10)
+                    ),
                 )
                 model.load_state_dict(payload["model_state_dict"], strict=False)
                 self._checkpoint_config = {
@@ -671,6 +708,9 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
                     "hgt_relation_specs": tuple(
                         tuple(relation)
                         for relation in payload.get("hgt_relation_specs", ())
+                    ),
+                    "hgt_relation_gate_min": float(
+                        payload.get("hgt_relation_gate_min", 0.10)
                     ),
                     "has_pair_head": bool(payload.get("has_pair_head", False)),
                 }
@@ -857,35 +897,10 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
             return ["soft"]
         return ["compact"]
 
-    def _proxy_cost(self, inst, placement: Placement) -> float:
-        return self._no_runtime_proxy_cost(
-            inst, placement, placement_metrics(inst, placement)
-        )
-
     def _no_runtime_proxy_cost(
         self, inst, placement: Placement, metrics: dict[str, float | int]
     ) -> float:
-        rects = placement.rects
-        bounds = bbox(list(rects.values()))
-        total_area = float(
-            torch.clamp(inst.area_targets[: inst.block_count], min=1.0).sum().item()
-        )
-        edge_weight = sum(float(w) for *_ij, w in inst.valid_b2b.tolist()) + sum(
-            float(w) for *_ij, w in inst.valid_p2b.tolist()
-        )
-        hpwl_scale = max(1.0, edge_weight * max(1.0, total_area**0.5))
-        area_score = bounds.area / max(total_area, 1.0)
-        hpwl_score = float(metrics["hpwl_proxy"]) / hpwl_scale
-        boundary_violations = int(metrics["boundary_violations"])
-        group_violations = int(metrics["group_violations"])
-        mib_violations = int(metrics["mib_violations"])
-        n_soft = max(1, len(inst.boundary))
-        n_soft += sum(
-            max(0, len(members) - 1) for members in inst.cluster_groups.values()
-        )
-        n_soft += sum(max(0, len(members) - 1) for members in inst.mib_groups.values())
-        v_rel = (boundary_violations + group_violations + mib_violations) / n_soft
-        return (1.0 + 0.5 * (hpwl_score + area_score)) * (2.718281828 ** (2.0 * v_rel))
+        return v10_proxy_cost(inst, placement, metrics)
 
 
 ArchitectureV4Optimizer = ArchitectureV5Optimizer
