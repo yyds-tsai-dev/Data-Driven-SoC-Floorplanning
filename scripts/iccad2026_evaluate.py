@@ -2421,7 +2421,11 @@ def main():
         print_evaluation_diagnostics(result.summary.get('diagnostics', {}))
         
         # Save results
-        output = args.output or f"{result.submission_name}_results.json"
+        repo_root = find_repo_root()
+        output = Path(args.output or f"{result.submission_name}_results.json")
+        if not output.is_absolute():
+            output = repo_root / output
+        output.parent.mkdir(parents=True, exist_ok=True)
         with open(output, 'w') as f:
             json.dump(asdict(result), f, indent=2, default=str)
         print(f"\nResults saved to {output}")
@@ -2429,7 +2433,11 @@ def main():
         floorplan_dir = args.floorplan_output_dir
         if floorplan_dir is None:
             run_stem = Path(output).stem
-            floorplan_dir = Path("artifacts") / "eval_v11" / "floorplans" / run_stem
+            floorplan_dir = repo_root / "artifacts" / "eval_v11" / "floorplans" / run_stem
+        else:
+            floorplan_dir = Path(floorplan_dir)
+            if not floorplan_dir.is_absolute():
+                floorplan_dir = repo_root / floorplan_dir
         written_pngs = save_predicted_floorplan_pngs(result, floorplan_dir, top_k=10)
         if written_pngs:
             print(f"Floorplan PNGs saved to {Path(floorplan_dir)}")
