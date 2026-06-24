@@ -8,7 +8,7 @@ else
 fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EVALUATOR="$ROOT/scripts/iccad2026_evaluate.py"
-OPTIMIZER="$ROOT/src/architecture_v5_optimizer.py"
+OPTIMIZER="$ROOT/src/architecture_v11_optimizer.py"
 DEFAULT_CKPT="$ROOT/checkpoints/gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt"
 
 resolve_ckpt_path() {

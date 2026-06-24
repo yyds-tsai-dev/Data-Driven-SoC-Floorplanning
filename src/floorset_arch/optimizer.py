@@ -137,8 +137,8 @@ def _env_flag(name: str) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-class ArchitectureV5Optimizer(FloorplanOptimizer):
-    """Anchor-GNN guided hetero-graph beam solver with selectable checkpoint encoders."""
+class ArchitectureV11Optimizer(FloorplanOptimizer):
+    """Diffusion-ready floorplanning optimizer with legacy v5 fallback."""
 
     def __init__(self, verbose: bool = False, config: Optional[SolverConfig] = None):
         super().__init__(verbose=verbose)
@@ -903,4 +903,5 @@ class ArchitectureV5Optimizer(FloorplanOptimizer):
         return v10_proxy_cost(inst, placement, metrics)
 
 
-ArchitectureV4Optimizer = ArchitectureV5Optimizer
+ArchitectureV5Optimizer = ArchitectureV11Optimizer
+ArchitectureV4Optimizer = ArchitectureV11Optimizer
