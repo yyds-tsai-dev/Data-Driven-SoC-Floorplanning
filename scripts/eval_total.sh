@@ -4,6 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EVALUATOR="$ROOT/scripts/iccad2026_evaluate.py"
 OPTIMIZER="$ROOT/src/architecture_v11_optimizer.py"
 DEFAULT_CKPT="$ROOT/checkpoints/gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt"
+EVAL_RUN_ID="${FLOORSET_EVAL_RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
 
 load_env_defaults() {
   local env_file="$1"
@@ -27,6 +28,8 @@ load_env_defaults "$ROOT/.env"
 #   bash scripts/eval_total.sh gnn_epoch10.pt          # use checkpoints/gnn_epoch10.pt
 #   bash scripts/eval_total.sh checkpoints/model.pt    # use repo-relative checkpoint path
 #   bash scripts/eval_total.sh /path/to/model.pt       # use absolute checkpoint path
+#   bash scripts/eval_total.sh --diffusion-checkpoint diffusion_latest.pt
+#   bash scripts/eval_total.sh --diffusion-checkpoint diffusion_latest.pt --diffusion-use-raw
 #   bash scripts/eval_total.sh gnn_epoch10.pt --output eval.json
 #   bash scripts/eval_total.sh --output eval.json      # use default checkpoint, custom output
 #   bash scripts/eval_total.sh --best-since-0512       # evaluate all dated *best*.pt checkpoints from 0512 onward
@@ -43,7 +46,7 @@ resolve_ckpt_path() {
 }
 
 run_evaluator() {
-  local floorplan_dir="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/latest_total}"
+  local floorplan_dir="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/total_${EVAL_RUN_ID}}"
   export PYTHONPATH="$ROOT/FloorSet/iccad2026contest:$ROOT/FloorSet:${PYTHONPATH:-}"
   cd "$ROOT/FloorSet/iccad2026contest"
   uv run "$EVALUATOR" \
@@ -176,6 +179,50 @@ if len(data["test_results"]) == 0:
 PY
 }
 
+diffusion_state_label() {
+  local use_ema="${FLOORSET_DIFFUSION_USE_EMA:-1}"
+  case "${use_ema,,}" in
+    0|false|off|no|raw) printf '%s\n' "raw" ;;
+    *) printf '%s\n' "ema-preferred" ;;
+  esac
+}
+
+parse_eval_args() {
+  EXTRA_ARGS=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --diffusion-checkpoint)
+        shift
+        if [ -z "${1:-}" ]; then
+          echo "--diffusion-checkpoint requires a path" >&2
+          return 1
+        fi
+        export FLOORSET_DIFFUSION_CHECKPOINT="$(resolve_ckpt_path "$1")"
+        export FLOORSET_DIFFUSION_CHECKPOINT_SOURCE="cli"
+        ;;
+      --diffusion-use-ema)
+        export FLOORSET_DIFFUSION_USE_EMA="1"
+        ;;
+      --diffusion-use-raw)
+        export FLOORSET_DIFFUSION_USE_EMA="0"
+        ;;
+      --gnn-checkpoint)
+        shift
+        if [ -z "${1:-}" ]; then
+          echo "--gnn-checkpoint requires a path" >&2
+          return 1
+        fi
+        export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
+        export FLOORSET_GNN_CHECKPOINT_SOURCE="cli"
+        ;;
+      *)
+        EXTRA_ARGS+=("$1")
+        ;;
+    esac
+    shift
+  done
+}
+
 if [ "${1:-}" = "--best-since-0512" ]; then
   run_best_since_0512
   exit $?
@@ -186,11 +233,11 @@ if [ -n "${1:-}" ] && [[ "$1" == --* ]]; then
     export FLOORSET_GNN_CHECKPOINT="$DEFAULT_CKPT"
   fi
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
-  EXTRA_ARGS=("$@")
+  parse_eval_args "$@" || exit $?
 elif [ -n "${1:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
   export FLOORSET_GNN_CHECKPOINT_SOURCE="cli"
-  EXTRA_ARGS=("${@:2}")
+  parse_eval_args "${@:2}" || exit $?
 elif [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$DEFAULT_CKPT"
   EXTRA_ARGS=()
@@ -201,8 +248,10 @@ fi
 export FLOORSET_GNN_CHECKPOINT_SOURCE="${FLOORSET_GNN_CHECKPOINT_SOURCE:-dotenv}"
 
 echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
+echo "Using diffusion checkpoint: ${FLOORSET_DIFFUSION_CHECKPOINT:-<none>}"
+echo "Using diffusion checkpoint state: $(diffusion_state_label)"
 echo "Using evaluator: $EVALUATOR"
-echo "Floorplan PNG output: ${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/latest_total}"
+echo "Floorplan PNG output: ${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/total_${EVAL_RUN_ID}}"
 echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"
 
 run_evaluator "${EXTRA_ARGS[@]}"

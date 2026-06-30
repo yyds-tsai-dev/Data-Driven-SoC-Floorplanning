@@ -22,6 +22,50 @@ resolve_ckpt_path() {
   fi
 }
 
+diffusion_state_label() {
+  local use_ema="${FLOORSET_DIFFUSION_USE_EMA:-1}"
+  case "${use_ema,,}" in
+    0|false|off|no|raw) printf '%s\n' "raw" ;;
+    *) printf '%s\n' "ema-preferred" ;;
+  esac
+}
+
+parse_eval_args() {
+  EXTRA_ARGS=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --diffusion-checkpoint)
+        shift
+        if [ -z "${1:-}" ]; then
+          echo "--diffusion-checkpoint requires a path" >&2
+          return 1
+        fi
+        export FLOORSET_DIFFUSION_CHECKPOINT="$(resolve_ckpt_path "$1")"
+        export FLOORSET_DIFFUSION_CHECKPOINT_SOURCE="cli"
+        ;;
+      --diffusion-use-ema)
+        export FLOORSET_DIFFUSION_USE_EMA="1"
+        ;;
+      --diffusion-use-raw)
+        export FLOORSET_DIFFUSION_USE_EMA="0"
+        ;;
+      --gnn-checkpoint)
+        shift
+        if [ -z "${1:-}" ]; then
+          echo "--gnn-checkpoint requires a path" >&2
+          return 1
+        fi
+        export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
+        export FLOORSET_GNN_CHECKPOINT_SOURCE="cli"
+        ;;
+      *)
+        EXTRA_ARGS+=("$1")
+        ;;
+    esac
+    shift
+  done
+}
+
 load_env_defaults() {
   local env_file="$1"
   [ -f "$env_file" ] || return 0
@@ -38,6 +82,7 @@ load_env_defaults() {
 }
 
 load_env_defaults "$ROOT/.env"
+parse_eval_args "${EXTRA_ARGS[@]}" || exit $?
 
 export FLOORSET_GNN_CHECKPOINT="${FLOORSET_GNN_CHECKPOINT:-$DEFAULT_CKPT}"
 export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
@@ -45,6 +90,8 @@ export FLOORSET_GNN_CHECKPOINT_SOURCE="${FLOORSET_GNN_CHECKPOINT_SOURCE:-dotenv}
 FLOORPLAN_DIR="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/single_case_${TESTID}}"
 cd "$ROOT/FloorSet/iccad2026contest"
 echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
+echo "Using diffusion checkpoint: ${FLOORSET_DIFFUSION_CHECKPOINT:-<none>}"
+echo "Using diffusion checkpoint state: $(diffusion_state_label)"
 echo "Using evaluator: $EVALUATOR"
 echo "Floorplan PNG output: $FLOORPLAN_DIR"
 echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"

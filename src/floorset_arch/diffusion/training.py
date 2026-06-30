@@ -7,6 +7,13 @@ import torch
 import torch.nn.functional as F
 
 from floorset_arch.diffusion.contracts import DiffusionGraphInputs
+from floorset_arch.diffusion.layout_losses import (
+    bbox_loss,
+    boundary_loss,
+    mib_aspect_loss,
+    overlap_loss,
+    pair_distance_loss,
+)
 from floorset_arch.diffusion.model import GraphConditionedPlacementDiffusion
 from floorset_arch.diffusion.targets import DiffusionTargets
 
@@ -20,6 +27,13 @@ class DiffusionLossConfig:
     pair_weight: float = 0.25
     tree_weight: float = 0.25
     quality_weight: float = 0.01
+    aspect_weight: float = 0.05
+    overlap_weight: float = 0.05
+    bbox_weight: float = 0.01
+    net_weight: float = 0.01
+    cluster_weight: float = 0.02
+    boundary_weight: float = 0.02
+    mib_weight: float = 0.02
     noise_samples: int = 1
 
 
@@ -80,6 +94,11 @@ def diffusion_training_loss(
     noisy = alpha.sqrt() * clean + (1.0 - alpha).sqrt() * noise
     pred = model(graph, noisy, timestep)
     denoise = F.mse_loss(pred["eps_pred"], noise)
+    alpha = alpha.clamp(1e-5, 0.999999)
+    x0_pred = (
+        noisy - (1.0 - alpha).sqrt() * pred["eps_pred"]
+    ) / alpha.sqrt()
+    aspect_loss = F.smooth_l1_loss(x0_pred[:, :, 2], clean[:, :, 2])
 
     pair_mask = targets.pair_axis_label >= 0
     if pair_mask.any():
@@ -121,11 +140,25 @@ def diffusion_training_loss(
     else:
         quality_loss = _zero_like_loss(denoise)
 
+    layout_overlap = overlap_loss(graph, x0_pred).mean()
+    layout_bbox = bbox_loss(graph, x0_pred).mean()
+    layout_net = pair_distance_loss(graph, x0_pred, 1).mean()
+    layout_cluster = pair_distance_loss(graph, x0_pred, 2).mean()
+    layout_boundary = boundary_loss(graph, x0_pred).mean()
+    layout_mib = mib_aspect_loss(graph, x0_pred).mean()
+
     loss = (
         denoise
         + float(config.pair_weight) * pair_loss
         + float(config.tree_weight) * tree_loss
         + float(config.quality_weight) * quality_loss
+        + float(config.aspect_weight) * aspect_loss
+        + float(config.overlap_weight) * layout_overlap
+        + float(config.bbox_weight) * layout_bbox
+        + float(config.net_weight) * layout_net
+        + float(config.cluster_weight) * layout_cluster
+        + float(config.boundary_weight) * layout_boundary
+        + float(config.mib_weight) * layout_mib
     )
     return loss, {
         "total": float(loss.detach().cpu().item()),
@@ -133,6 +166,13 @@ def diffusion_training_loss(
         "pair": float(pair_loss.detach().cpu().item()),
         "tree": float(tree_loss.detach().cpu().item()),
         "quality": float(quality_loss.detach().cpu().item()),
+        "aspect": float(aspect_loss.detach().cpu().item()),
+        "layout_overlap": float(layout_overlap.detach().cpu().item()),
+        "layout_bbox": float(layout_bbox.detach().cpu().item()),
+        "layout_net": float(layout_net.detach().cpu().item()),
+        "layout_cluster": float(layout_cluster.detach().cpu().item()),
+        "layout_boundary": float(layout_boundary.detach().cpu().item()),
+        "layout_mib": float(layout_mib.detach().cpu().item()),
         "quality_target": float(quality_target.detach().cpu().item())
         if targets.quality_labels.numel() > 0
         else 0.0,

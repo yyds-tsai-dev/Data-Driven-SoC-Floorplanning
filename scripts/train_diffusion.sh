@@ -23,13 +23,26 @@ NOISE_SCHEDULE="${NOISE_SCHEDULE:-cosine}"
 BETA_START="${BETA_START:-1e-4}"
 BETA_END="${BETA_END:-0.02}"
 NOISE_SAMPLES="${NOISE_SAMPLES:-1}"
+EMA_DECAY="${EMA_DECAY:-0.9999}"
 PAIR_WEIGHT="${PAIR_WEIGHT:-0.25}"
 TREE_WEIGHT="${TREE_WEIGHT:-0.25}"
 QUALITY_WEIGHT="${QUALITY_WEIGHT:-0.01}"
+ASPECT_WEIGHT="${ASPECT_WEIGHT:-0.05}"
+OVERLAP_WEIGHT="${OVERLAP_WEIGHT:-0.05}"
+BBOX_WEIGHT="${BBOX_WEIGHT:-0.01}"
+NET_WEIGHT="${NET_WEIGHT:-0.01}"
+CLUSTER_WEIGHT="${CLUSTER_WEIGHT:-0.02}"
+BOUNDARY_WEIGHT="${BOUNDARY_WEIGHT:-0.02}"
+MIB_WEIGHT="${MIB_WEIGHT:-0.02}"
 DEVICE="${DEVICE:-cuda}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 PRINT_EVERY="${PRINT_EVERY:-1000}"
 CHECKPOINT_PREFIX="${CHECKPOINT_PREFIX:-diffusion}"
+TRAIN_EVALUATE_EACH_EPOCH="${TRAIN_EVALUATE_EACH_EPOCH:-1}"
+TRAIN_EVAL_OUTPUT_DIR="${TRAIN_EVAL_OUTPUT_DIR:-}"
+TRAIN_EVAL_TAIL_IDS="${TRAIN_EVAL_TAIL_IDS:-95,96,97,98,99}"
+CHECKPOINT_METRICS_MANIFEST="${CHECKPOINT_METRICS_MANIFEST:-}"
+EVALUATOR_BEST_CHECKPOINT="${EVALUATOR_BEST_CHECKPOINT:-}"
 SYNTHETIC_SMOKE_SAMPLES="${SYNTHETIC_SMOKE_SAMPLES:-0}"
 WANDB="${WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-floorset-v11-diffusion}"
@@ -64,6 +77,21 @@ fi
 if [ "$SYNTHETIC_SMOKE_SAMPLES" != "0" ]; then
   EXTRA_ARGS+=(--synthetic-smoke-samples "$SYNTHETIC_SMOKE_SAMPLES")
 fi
+if [ "$TRAIN_EVALUATE_EACH_EPOCH" = "1" ]; then
+  EXTRA_ARGS+=(--train-evaluate-each-epoch)
+fi
+if [ -n "$TRAIN_EVAL_OUTPUT_DIR" ]; then
+  EXTRA_ARGS+=(--train-eval-output-dir "$TRAIN_EVAL_OUTPUT_DIR")
+fi
+if [ -n "$TRAIN_EVAL_TAIL_IDS" ]; then
+  EXTRA_ARGS+=(--train-eval-tail-ids "$TRAIN_EVAL_TAIL_IDS")
+fi
+if [ -n "$CHECKPOINT_METRICS_MANIFEST" ]; then
+  EXTRA_ARGS+=(--checkpoint-metrics-manifest "$CHECKPOINT_METRICS_MANIFEST")
+fi
+if [ -n "$EVALUATOR_BEST_CHECKPOINT" ]; then
+  EXTRA_ARGS+=(--evaluator-best-checkpoint "$EVALUATOR_BEST_CHECKPOINT")
+fi
 
 mkdir -p "$LOG_DIR"
 
@@ -89,9 +117,17 @@ uv run -m floorset_arch.training.train_diffusion \
   --beta-start "$BETA_START" \
   --beta-end "$BETA_END" \
   --noise-samples "$NOISE_SAMPLES" \
+  --ema-decay "$EMA_DECAY" \
   --pair-weight "$PAIR_WEIGHT" \
   --tree-weight "$TREE_WEIGHT" \
   --quality-weight "$QUALITY_WEIGHT" \
+  --aspect-weight "$ASPECT_WEIGHT" \
+  --overlap-weight "$OVERLAP_WEIGHT" \
+  --bbox-weight "$BBOX_WEIGHT" \
+  --net-weight "$NET_WEIGHT" \
+  --cluster-weight "$CLUSTER_WEIGHT" \
+  --boundary-weight "$BOUNDARY_WEIGHT" \
+  --mib-weight "$MIB_WEIGHT" \
   --num-workers "$NUM_WORKERS" \
   --checkpoint-prefix "$CHECKPOINT_PREFIX" \
   --print-every "$PRINT_EVERY" \

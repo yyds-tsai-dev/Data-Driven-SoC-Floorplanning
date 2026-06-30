@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
+import subprocess
+import sys
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -17,12 +20,18 @@ from floorset_arch.diffusion.training import DiffusionLossConfig, diffusion_trai
 from floorset_arch.parser import parse_instance
 from floorset_arch.training.train import (
     FloorplanDatasetLite,
+    ROOT,
+    TRAINING_EVAL_ENV_OVERRIDES,
+    _parse_train_eval_tail_ids,
     choose_window_start,
     iter_batch_samples,
     make_loader,
     maybe_init_wandb,
+    refresh_evaluator_best_checkpoint,
     valid_block_count,
 )
+from floorset_arch.training.promote_checkpoint import checkpoint_metric_from_eval_json
+from floorset_arch.training.selection import append_metric_record
 
 
 def build_diffusion_run_tag(args, stamp: str | None = None) -> str:
@@ -50,6 +59,8 @@ def _checkpoint_payload(
     train_stats: dict[str, float],
     val_stats: dict[str, float],
     optimizer=None,
+    ema_state: dict[str, torch.Tensor] | None = None,
+    ema_decay: float | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model_state_dict": model.state_dict(),
@@ -64,6 +75,12 @@ def _checkpoint_payload(
     }
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
+    if ema_decay is not None:
+        payload["ema_decay"] = float(ema_decay)
+    if ema_state is not None:
+        payload["ema_model_state_dict"] = {
+            key: value.detach().clone() for key, value in ema_state.items()
+        }
     return payload
 
 
@@ -76,6 +93,8 @@ def _save_diffusion_checkpoint(
     train_stats: dict[str, float],
     val_stats: dict[str, float],
     optimizer=None,
+    ema_state: dict[str, torch.Tensor] | None = None,
+    ema_decay: float | None = None,
 ) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -88,6 +107,8 @@ def _save_diffusion_checkpoint(
             train_stats,
             val_stats,
             optimizer=optimizer,
+            ema_state=ema_state,
+            ema_decay=ema_decay,
         ),
         output,
     )
@@ -113,7 +134,35 @@ def _prepare_diffusion_sample(sample, device: torch.device):
     return graph, targets
 
 
-def _optimizer_step(model, optimizer, args, pending_samples: int, force: bool = False) -> int:
+def _clone_ema_state(model: GraphConditionedPlacementDiffusion) -> dict[str, torch.Tensor]:
+    return {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+
+def _update_ema_state(
+    ema_state: dict[str, torch.Tensor],
+    model: GraphConditionedPlacementDiffusion,
+    decay: float,
+) -> None:
+    with torch.no_grad():
+        for key, value in model.state_dict().items():
+            if not value.is_floating_point():
+                ema_state[key] = value.detach().clone()
+                continue
+            if key not in ema_state:
+                ema_state[key] = value.detach().clone()
+                continue
+            ema_state[key].mul_(float(decay)).add_(value.detach(), alpha=1.0 - float(decay))
+
+
+def _optimizer_step(
+    model,
+    optimizer,
+    args,
+    pending_samples: int,
+    force: bool = False,
+    ema_state: dict[str, torch.Tensor] | None = None,
+    ema_decay: float = 0.0,
+) -> int:
     if pending_samples <= 0:
         return pending_samples
     accumulation_steps = max(1, int(args.accumulation_steps))
@@ -122,6 +171,8 @@ def _optimizer_step(model, optimizer, args, pending_samples: int, force: bool = 
     if args.grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
     optimizer.step()
+    if ema_state is not None and ema_decay > 0.0:
+        _update_ema_state(ema_state, model, ema_decay)
     optimizer.zero_grad(set_to_none=True)
     return 0
 
@@ -135,6 +186,8 @@ def run_epoch(
     loss_config: DiffusionLossConfig,
     epoch: int,
     train: bool,
+    ema_state: dict[str, torch.Tensor] | None = None,
+    ema_decay: float = 0.0,
 ) -> dict[str, float]:
     model.train(train)
     sums = {
@@ -143,6 +196,13 @@ def run_epoch(
         "pair": 0.0,
         "tree": 0.0,
         "quality": 0.0,
+        "aspect": 0.0,
+        "layout_overlap": 0.0,
+        "layout_bbox": 0.0,
+        "layout_net": 0.0,
+        "layout_cluster": 0.0,
+        "layout_boundary": 0.0,
+        "layout_mib": 0.0,
         "timestep_mean": 0.0,
     }
     count = 0
@@ -178,6 +238,8 @@ def run_epoch(
                         args,
                         pending_samples,
                         force=False,
+                        ema_state=ema_state,
+                        ema_decay=ema_decay,
                     )
 
             sums["loss"] += float(loss.detach().cpu().item())
@@ -185,6 +247,13 @@ def run_epoch(
             sums["pair"] += float(parts["pair"])
             sums["tree"] += float(parts["tree"])
             sums["quality"] += float(parts["quality"])
+            sums["aspect"] += float(parts["aspect"])
+            sums["layout_overlap"] += float(parts["layout_overlap"])
+            sums["layout_bbox"] += float(parts["layout_bbox"])
+            sums["layout_net"] += float(parts["layout_net"])
+            sums["layout_cluster"] += float(parts["layout_cluster"])
+            sums["layout_boundary"] += float(parts["layout_boundary"])
+            sums["layout_mib"] += float(parts["layout_mib"])
             sums["timestep_mean"] += float(parts["timestep_mean"])
             count += 1
 
@@ -193,12 +262,21 @@ def run_epoch(
                     f"[epoch {epoch:03d} step {count:05d}] "
                     f"loss={loss.item():.5f} denoise={parts['denoise']:.5f} "
                     f"pair={parts['pair']:.5f} tree={parts['tree']:.5f} "
-                    f"quality={parts['quality']:.5f} t={parts['timestep_mean']:.1f}",
+                    f"quality={parts['quality']:.5f} aspect={parts['aspect']:.5f} "
+                    f"overlap={parts['layout_overlap']:.5f} t={parts['timestep_mean']:.1f}",
                     flush=True,
                 )
 
     if train:
-        _optimizer_step(model, optimizer, args, pending_samples, force=True)
+        _optimizer_step(
+            model,
+            optimizer,
+            args,
+            pending_samples,
+            force=True,
+            ema_state=ema_state,
+            ema_decay=ema_decay,
+        )
 
     stats = {key: value / max(count, 1) for key, value in sums.items()}
     stats["used"] = float(count)
@@ -301,6 +379,84 @@ def _load_resume_optimizer_state(
     return True
 
 
+def _load_resume_ema_state(
+    checkpoint_path: str | Path,
+    device: torch.device,
+) -> dict[str, torch.Tensor] | None:
+    payload = torch.load(checkpoint_path, map_location=device)
+    state = payload.get("ema_model_state_dict")
+    if state is None:
+        return None
+    return {key: value.detach().clone().to(device) for key, value in state.items()}
+
+
+def _diffusion_training_eval_env(checkpoint: Path, use_ema: bool = True) -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(TRAINING_EVAL_ENV_OVERRIDES)
+    env["FLOORSET_GNN_CHECKPOINT"] = ""
+    env["FLOORSET_GNN_CHECKPOINT_SOURCE"] = "training_eval_disabled"
+    env["FLOORSET_DIFFUSION_CHECKPOINT"] = str(checkpoint.resolve())
+    env["FLOORSET_DIFFUSION_CHECKPOINT_SOURCE"] = "training_eval"
+    env["FLOORSET_DIFFUSION_USE_EMA"] = "1" if use_ema else "0"
+    pythonpath_parts = [
+        str(ROOT / "FloorSet" / "iccad2026contest"),
+        str(ROOT / "FloorSet"),
+    ]
+    if env.get("PYTHONPATH"):
+        pythonpath_parts.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    return env
+
+
+def run_diffusion_training_evaluator(
+    checkpoint: str | Path,
+    epoch: int,
+    args,
+    metrics_manifest: str | Path,
+    evaluator_best_path: str | Path,
+):
+    checkpoint_path = Path(checkpoint)
+    output_dir = (
+        Path(args.train_eval_output_dir)
+        if getattr(args, "train_eval_output_dir", "")
+        else Path(args.output_dir) / "training_eval"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    eval_json = output_dir / f"{checkpoint_path.stem}_epoch{int(epoch):03d}_full_eval.json"
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "iccad2026_evaluate.py"),
+        "--data-path",
+        "../",
+        "--evaluate",
+        str(ROOT / "src" / "architecture_v11_optimizer.py"),
+        "--verbose",
+        "--output",
+        str(eval_json.resolve()),
+    ]
+    subprocess.run(
+        command,
+        cwd=ROOT / "FloorSet" / "iccad2026contest",
+        env=_diffusion_training_eval_env(
+            checkpoint_path,
+            use_ema=bool(getattr(args, "train_eval_use_ema", True)),
+        ),
+        check=True,
+    )
+    record = checkpoint_metric_from_eval_json(
+        checkpoint=str(checkpoint_path),
+        eval_json=eval_json,
+        epoch=epoch,
+        metric_source="diffusion_training_full_eval",
+        val_loss=None,
+        tail_ids=_parse_train_eval_tail_ids(
+            getattr(args, "train_eval_tail_ids", "95,96,97,98,99")
+        ),
+    )
+    append_metric_record(metrics_manifest, record)
+    return refresh_evaluator_best_checkpoint(metrics_manifest, evaluator_best_path)
+
+
 def main(args) -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -315,6 +471,7 @@ def main(args) -> None:
             Path(args.resume_checkpoint),
             first_graph,
             map_location=device,
+            use_ema=False,
         )
         model = model.to(device)
         args.variant = model.variant
@@ -335,6 +492,16 @@ def main(args) -> None:
         loaded = _load_resume_optimizer_state(optimizer, args.resume_checkpoint, device)
         print(f"Resume optimizer state loaded: {loaded}", flush=True)
 
+    ema_decay = float(getattr(args, "ema_decay", 0.9999))
+    if not 0.0 <= ema_decay < 1.0:
+        raise ValueError("--ema-decay must be in the range [0, 1)")
+    ema_state = None
+    if ema_decay > 0.0:
+        if args.resume_checkpoint:
+            ema_state = _load_resume_ema_state(args.resume_checkpoint, device)
+        if ema_state is None:
+            ema_state = _clone_ema_state(model)
+
     loss_config = DiffusionLossConfig(
         max_steps=args.max_diffusion_steps,
         noise_schedule=args.noise_schedule,
@@ -343,6 +510,13 @@ def main(args) -> None:
         pair_weight=args.pair_weight,
         tree_weight=args.tree_weight,
         quality_weight=args.quality_weight,
+        aspect_weight=args.aspect_weight,
+        overlap_weight=args.overlap_weight,
+        bbox_weight=args.bbox_weight,
+        net_weight=args.net_weight,
+        cluster_weight=args.cluster_weight,
+        boundary_weight=args.boundary_weight,
+        mib_weight=args.mib_weight,
         noise_samples=args.noise_samples,
     )
     out_dir = Path(args.output_dir)
@@ -350,6 +524,16 @@ def main(args) -> None:
     run_tag = args.checkpoint_tag or build_diffusion_run_tag(args)
     latest_path = out_dir / f"{args.checkpoint_prefix}_latest_{run_tag}.pt"
     best_val_loss_path = out_dir / f"{args.checkpoint_prefix}_best_val_loss_{run_tag}.pt"
+    metrics_manifest = (
+        Path(args.checkpoint_metrics_manifest)
+        if getattr(args, "checkpoint_metrics_manifest", "")
+        else out_dir / f"{args.checkpoint_prefix}_checkpoint_metrics_{run_tag}.jsonl"
+    )
+    evaluator_best_path = (
+        Path(args.evaluator_best_checkpoint)
+        if getattr(args, "evaluator_best_checkpoint", "")
+        else out_dir / f"{args.checkpoint_prefix}_best_evaluator_{run_tag}.pt"
+    )
     best_val = float("inf")
     wandb_run = maybe_init_wandb(args)
 
@@ -363,6 +547,7 @@ def main(args) -> None:
     print(f"  hidden/layers    = {args.hidden_dim}/{args.layers}")
     print(f"  diffusion steps  = {args.max_diffusion_steps}")
     print(f"  noise schedule   = {args.noise_schedule}")
+    print(f"  ema decay        = {ema_decay}")
     print(f"  accumulation     = {max(1, args.accumulation_steps)}")
     print(f"  batch size       = {max(1, args.batch_size)}")
     print(f"  checkpoint tag   = {run_tag}")
@@ -374,6 +559,13 @@ def main(args) -> None:
         "pair": 0.0,
         "tree": 0.0,
         "quality": 0.0,
+        "aspect": 0.0,
+        "layout_overlap": 0.0,
+        "layout_bbox": 0.0,
+        "layout_net": 0.0,
+        "layout_cluster": 0.0,
+        "layout_boundary": 0.0,
+        "layout_mib": 0.0,
         "timestep_mean": 0.0,
         "used": 0.0,
         "skipped": 0.0,
@@ -396,7 +588,16 @@ def main(args) -> None:
             print(f"Epoch {epoch:03d}: train window {ts}..{te}", flush=True)
 
         train_stats = run_epoch(
-            model, optimizer, train_loader, device, args, loss_config, epoch, train=True
+            model,
+            optimizer,
+            train_loader,
+            device,
+            args,
+            loss_config,
+            epoch,
+            train=True,
+            ema_state=ema_state,
+            ema_decay=ema_decay,
         )
         val_stats = run_epoch(
             model, optimizer, val_loader, device, args, loss_config, epoch, train=False
@@ -405,6 +606,7 @@ def main(args) -> None:
             f"Epoch {epoch:03d} train loss={train_stats['loss']:.5f} "
             f"denoise={train_stats['denoise']:.5f} pair={train_stats['pair']:.5f} "
             f"tree={train_stats['tree']:.5f} quality={train_stats['quality']:.5f} "
+            f"aspect={train_stats['aspect']:.5f} overlap={train_stats['layout_overlap']:.5f} "
             f"used={train_stats['used']:.0f} skipped={train_stats['skipped']:.0f}",
             flush=True,
         )
@@ -412,6 +614,7 @@ def main(args) -> None:
             f"Epoch {epoch:03d} val   loss={val_stats['loss']:.5f} "
             f"denoise={val_stats['denoise']:.5f} pair={val_stats['pair']:.5f} "
             f"tree={val_stats['tree']:.5f} quality={val_stats['quality']:.5f} "
+            f"aspect={val_stats['aspect']:.5f} overlap={val_stats['layout_overlap']:.5f} "
             f"used={val_stats['used']:.0f} skipped={val_stats['skipped']:.0f}",
             flush=True,
         )
@@ -434,6 +637,8 @@ def main(args) -> None:
             train_stats,
             val_stats,
             optimizer=optimizer,
+            ema_state=ema_state,
+            ema_decay=ema_decay,
         )
         if val_stats["loss"] < best_val:
             best_val = val_stats["loss"]
@@ -446,13 +651,37 @@ def main(args) -> None:
                 train_stats,
                 val_stats,
                 optimizer=optimizer,
+                ema_state=ema_state,
+                ema_decay=ema_decay,
             )
             print(f"Saved best checkpoint to {best_val_loss_path}", flush=True)
+        selected_evaluator = None
+        if args.train_evaluate_each_epoch and int(args.synthetic_smoke_samples) <= 0:
+            selected_evaluator = run_diffusion_training_evaluator(
+                latest_path,
+                epoch,
+                args,
+                metrics_manifest,
+                evaluator_best_path,
+            )
+        if selected_evaluator is not None:
+            print(
+                "Updated diffusion evaluator-best checkpoint "
+                f"{evaluator_best_path} from {selected_evaluator.checkpoint} "
+                f"(no-runtime={selected_evaluator.total_score_no_runtime}, "
+                f"tail={selected_evaluator.tail_weighted_no_runtime}, "
+                f"soft={selected_evaluator.soft_violations}, "
+                f"runtime={selected_evaluator.avg_runtime})",
+                flush=True,
+            )
         empty_stats = val_stats
 
     print(f"Best val loss: {best_val:.5f}")
     print(f"Latest checkpoint: {latest_path}")
     print(f"Best val-loss checkpoint: {best_val_loss_path}")
+    if args.train_evaluate_each_epoch:
+        print(f"Evaluator metric manifest: {metrics_manifest}")
+        print(f"Evaluator-best checkpoint: {evaluator_best_path}")
     if wandb_run is not None:
         wandb_run.summary["best_val_loss"] = best_val
         wandb_run.summary["last_val_loss"] = empty_stats["loss"]
@@ -481,9 +710,17 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--beta-start", type=float, default=1e-4)
     parser.add_argument("--beta-end", type=float, default=0.02)
     parser.add_argument("--noise-samples", type=int, default=1)
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--pair-weight", type=float, default=0.25)
     parser.add_argument("--tree-weight", type=float, default=0.25)
     parser.add_argument("--quality-weight", type=float, default=0.01)
+    parser.add_argument("--aspect-weight", type=float, default=0.05)
+    parser.add_argument("--overlap-weight", type=float, default=0.05)
+    parser.add_argument("--bbox-weight", type=float, default=0.01)
+    parser.add_argument("--net-weight", type=float, default=0.01)
+    parser.add_argument("--cluster-weight", type=float, default=0.02)
+    parser.add_argument("--boundary-weight", type=float, default=0.02)
+    parser.add_argument("--mib-weight", type=float, default=0.02)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
@@ -491,6 +728,55 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--checkpoint-prefix", default="diffusion")
     parser.add_argument("--checkpoint-tag", default="")
     parser.add_argument("--resume-checkpoint", default="")
+    parser.add_argument(
+        "--checkpoint-metrics-manifest",
+        default="",
+        help=(
+            "Evaluator metric JSONL used to refresh evaluator-best diffusion "
+            "checkpoints. When omitted, training uses a run-tagged manifest in "
+            "the output dir."
+        ),
+    )
+    parser.add_argument(
+        "--evaluator-best-checkpoint",
+        default="",
+        help=(
+            "Destination for the best diffusion checkpoint selected from "
+            "evaluator evidence. When omitted, training writes a run-tagged "
+            "best_evaluator checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--train-evaluate-each-epoch",
+        action="store_true",
+        help=(
+            "After each epoch, run the full evaluator on the latest diffusion "
+            "checkpoint, append evaluator evidence, and refresh evaluator-best."
+        ),
+    )
+    parser.add_argument(
+        "--train-eval-output-dir",
+        default="",
+        help="Directory for per-epoch diffusion full-evaluation JSON outputs.",
+    )
+    parser.add_argument(
+        "--train-eval-tail-ids",
+        default="95,96,97,98,99",
+        help="Comma-separated validation ids used for tail_weighted_no_runtime records.",
+    )
+    parser.add_argument(
+        "--train-eval-use-raw",
+        dest="train_eval_use_ema",
+        action="store_false",
+        help="Evaluate raw diffusion weights instead of EMA weights.",
+    )
+    parser.add_argument(
+        "--train-eval-use-ema",
+        dest="train_eval_use_ema",
+        action="store_true",
+        help="Evaluate EMA diffusion weights when available.",
+    )
+    parser.set_defaults(train_eval_use_ema=True)
     parser.add_argument(
         "--synthetic-smoke-samples",
         type=int,
