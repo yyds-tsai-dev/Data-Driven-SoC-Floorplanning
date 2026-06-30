@@ -84,6 +84,17 @@ bash scripts/install.sh
 ```
 
 這會初始化 `FloorSet` submodule、安裝 `uv`、建立 venv、安裝 dependencies，並用官方 template 跑一個 quick evaluator smoke test。
+如果要手動 activate `.venv`，請依照 shell 使用正確的 uv-generated script：
+
+```bash
+# bash / zsh
+source .venv/bin/activate
+
+# fish
+source .venv/bin/activate.fish
+```
+
+也可以不 activate，直接用 `uv run <command>` 執行 repo 內的 Python command。
 
 ## Scripts 目的與使用方法
 

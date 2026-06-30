@@ -7,3 +7,13 @@ uv pip install -r requirements.txt
 mkdir -p test
 cp FloorSet/iccad2026contest/optimizer_template.py test/my_optimizer.py
 uv run FloorSet/iccad2026contest/iccad2026_evaluate.py --evaluate test/my_optimizer.py --test-id 0 --verbose
+
+cat <<'EOF'
+
+Virtual environment ready.
+Activate it with the command for your shell:
+  bash/zsh: source .venv/bin/activate
+  fish:     source .venv/bin/activate.fish
+
+You can also skip activation and run commands with: uv run <command>
+EOF
