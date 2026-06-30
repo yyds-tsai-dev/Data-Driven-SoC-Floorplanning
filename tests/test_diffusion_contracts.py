@@ -272,3 +272,27 @@ def test_tensor_shortlist_prefers_lower_score_features():
     selected = select_tensor_shortlist(batch, top_k=2)
 
     assert selected.tolist() == [1, 2]
+
+
+def test_tensor_shortlist_uses_pairwise_logits_consistency():
+    rects = torch.tensor(
+        [
+            [[0.0, 0.0, 2.0, 2.0], [4.0, 0.0, 2.0, 2.0]],
+            [[0.0, 0.0, 2.0, 2.0], [4.0, 0.0, 2.0, 2.0]],
+        ]
+    )
+    batch = PlacementTensorBatch(
+        rect_xywh=rects,
+        pairwise_axis_logits=torch.tensor(
+            [
+                [[5.0, -2.0, -2.0]],
+                [[-2.0, 5.0, -2.0]],
+            ]
+        ),
+        pair_index=torch.tensor([[0, 1]]),
+        score_features=torch.tensor([[1.0], [0.0]]),
+    )
+
+    selected = select_tensor_shortlist(batch, top_k=1)
+
+    assert selected.tolist() == [0]

@@ -155,7 +155,7 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
         self._checkpoint_kind = ""
         self._diffusion_checkpoint_key: Optional[Path] = None
         self._diffusion_model = None
-        self.last_solve_metadata: dict[str, str] = {}
+        self.last_solve_metadata: dict[str, object] = {}
 
     def solve(
         self,
@@ -212,6 +212,10 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
         )
         return variant if variant in {"raw", "hgt_lite"} else "hgt_lite"
 
+    def _diffusion_use_ema(self) -> bool:
+        raw = os.environ.get("FLOORSET_DIFFUSION_USE_EMA", "1").strip().lower()
+        return raw not in {"0", "false", "off", "no", "raw"}
+
     def _try_diffusion_prior(self, inst):
         from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
         from floorset_arch.diffusion.sampling import (
@@ -229,12 +233,15 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
                 or self._diffusion_model is None
             ):
                 model = load_diffusion_checkpoint(
-                    checkpoint, graph_inputs, map_location="cpu"
+                    checkpoint,
+                    graph_inputs,
+                    map_location="cpu",
+                    use_ema=self._diffusion_use_ema(),
                 )
                 self._diffusion_model = model
                 self._diffusion_checkpoint_key = checkpoint
             samples = int(os.environ.get("FLOORSET_DIFFUSION_SAMPLES", "8"))
-            steps = int(os.environ.get("FLOORSET_DIFFUSION_STEPS", "16"))
+            steps = int(os.environ.get("FLOORSET_DIFFUSION_STEPS", "64"))
             seed = int(os.environ.get("FLOORSET_DIFFUSION_SEED", "0"))
             return sample_diffusion_prior(
                 self._diffusion_model,
@@ -262,17 +269,75 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
         batch = concretize_diffusion_prior(inst, prior)
         top_k = int(os.environ.get("FLOORSET_DIFFUSION_TOPK", "4"))
         selected = select_tensor_shortlist(batch, top_k=top_k)
-        candidates: list[Placement] = []
+        candidates: list[tuple[Placement, Placement, dict[str, object]]] = []
+        repair_profiles = self._diffusion_repair_profiles()
+        quality_profiles = self._diffusion_quality_profiles()
         for idx in selected.detach().cpu().tolist():
             placement = placement_from_tensor_candidate(inst, batch, int(idx))
-            repaired = self._repair_with_profile(inst, placement, "normal")
-            repaired = refine_quality_candidate(inst, repaired, self.config, "default")
-            candidates.append(repaired)
+            for repair_profile in repair_profiles:
+                repaired = self._repair_with_profile(inst, placement, repair_profile)
+                if repair_profile == "quality_refine":
+                    repaired = self._preserve_runtime_budget_trace(
+                        repaired,
+                        self._quality_refine_candidate(inst, repaired),
+                    )
+                for quality_profile in quality_profiles:
+                    refined = self._preserve_runtime_budget_trace(
+                        repaired,
+                        refine_quality_candidate(
+                            inst, repaired, self.config, quality_profile
+                        ),
+                    )
+                    candidates.append(
+                        (
+                            placement,
+                            refined,
+                            {
+                                "sample_index": int(idx),
+                                "repair_profile": repair_profile,
+                                "quality_profile": quality_profile,
+                            },
+                        )
+                    )
         if not candidates:
             return self._solve_v5_instance(inst)
-        return min(
-            candidates, key=lambda placement: rank_repaired_placement(inst, placement)
+        raw, repaired, selected_meta = min(
+            candidates, key=lambda item: rank_repaired_placement(inst, item[1])
         )
+        self.last_solve_metadata["raw_diffusion_positions"] = raw.to_position_list(
+            inst.block_count
+        )
+        self.last_solve_metadata["repaired_positions"] = repaired.to_position_list(
+            inst.block_count
+        )
+        self.last_solve_metadata["diffusion_selected_candidate"] = selected_meta
+        return repaired
+
+    def _diffusion_repair_profiles(self) -> list[str]:
+        raw = os.environ.get(
+            "FLOORSET_DIFFUSION_REPAIR_PROFILES",
+            "normal,boundary_first,grouping_first,quality_refine",
+        )
+        allowed = {
+            "normal",
+            "boundary_first",
+            "grouping_first",
+            "quality_refine",
+            "large_boundary",
+        }
+        profiles = [part.strip() for part in raw.split(",") if part.strip()]
+        filtered = [profile for profile in profiles if profile in allowed]
+        return filtered or ["normal"]
+
+    def _diffusion_quality_profiles(self) -> list[str]:
+        raw = os.environ.get(
+            "FLOORSET_DIFFUSION_QUALITY_PROFILES",
+            "default,hpwl_refine,area_refine",
+        )
+        allowed = {"default", "hpwl_refine", "area_refine", "balanced_refine"}
+        profiles = [part.strip() for part in raw.split(",") if part.strip()]
+        filtered = [profile for profile in profiles if profile in allowed]
+        return filtered or ["default"]
 
     def _uses_surrogate_guidance(self) -> bool:
         mode = os.environ.get("FLOORSET_ENABLE_SURROGATE_GUIDANCE", "0").strip().lower()

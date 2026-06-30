@@ -8,6 +8,7 @@ import floorset_arch.optimizer as optimizer_module
 import floorset_arch.repair as repair_module
 from floorset_arch.models import Placement, Rect
 from floorset_arch.models import AnchorGuidance, SolverConfig
+from floorset_arch.diffusion.contracts import DiffusionPlacementPrior
 from floorset_arch.nn.model import FloorplanGNN
 from floorset_arch.optimizer import ArchitectureV4Optimizer, CandidateSpec
 from floorset_arch.parser import parse_instance
@@ -92,6 +93,103 @@ def test_checkpoint_relative_path_resolves_from_repo_root(tmp_path, monkeypatch)
     optimizer = ArchitectureV4Optimizer()
 
     assert optimizer._try_anchor_guidance(inst) is not None
+
+
+def test_diffusion_solver_records_selected_raw_candidate_for_eval_visualization(monkeypatch):
+    problem = _tiny_problem()
+    inst = parse_instance(**problem)
+    prior = DiffusionPlacementPrior(
+        centers=torch.tensor([[[1.0, 1.0], [1.5, 1.0]]]),
+        log_aspect=torch.zeros(1, 2),
+        pairwise_axis_logits=torch.zeros(1, 0, 3),
+        pair_index=torch.empty(0, 2, dtype=torch.long),
+        quality_pred=torch.zeros(1),
+        uncertainty=torch.zeros(1, 2),
+        scale=1.0,
+        variant="unit",
+    )
+    optimizer = ArchitectureV4Optimizer()
+    monkeypatch.setattr(optimizer, "_repair_with_profile", lambda _inst, placement, _profile: placement)
+
+    optimizer._solve_from_diffusion_prior(inst, prior)
+
+    raw_positions = optimizer.last_solve_metadata.get("raw_diffusion_positions")
+    assert raw_positions == [(0.0, 0.0, 2.0, 2.0), (0.5, 0.0, 2.0, 2.0)]
+
+
+def test_diffusion_checkpoint_loader_honors_raw_state_env(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "diffusion.pt"
+    checkpoint.write_bytes(b"placeholder")
+    problem = _tiny_problem()
+    inst = parse_instance(**problem)
+    calls: list[bool] = []
+
+    def fake_loader(_path, _graph, map_location="cpu", use_ema=True):
+        calls.append(bool(use_ema))
+        return object()
+
+    def fake_sampler(_model, graph, samples=8, steps=64, seed=0):
+        return DiffusionPlacementPrior(
+            centers=torch.zeros(1, graph.block_count, 2),
+            log_aspect=torch.zeros(1, graph.block_count),
+            pairwise_axis_logits=torch.zeros(1, graph.pair_count, 3),
+            pair_index=graph.pair_index,
+            quality_pred=torch.zeros(1),
+            uncertainty=torch.zeros(1, graph.block_count),
+            scale=graph.scale,
+            variant="unit",
+        )
+
+    monkeypatch.setenv("FLOORSET_DIFFUSION_CHECKPOINT", str(checkpoint))
+    monkeypatch.setenv("FLOORSET_DIFFUSION_USE_EMA", "0")
+    monkeypatch.setattr("floorset_arch.diffusion.sampling.load_diffusion_checkpoint", fake_loader)
+    monkeypatch.setattr("floorset_arch.diffusion.sampling.sample_diffusion_prior", fake_sampler)
+    optimizer = ArchitectureV4Optimizer()
+
+    prior = optimizer._try_diffusion_prior(inst)
+
+    assert prior is not None
+    assert calls == [False]
+
+
+def test_diffusion_solver_uses_diffusion_repair_portfolio_without_v5(monkeypatch):
+    problem = _tiny_problem()
+    inst = parse_instance(**problem)
+    prior = DiffusionPlacementPrior(
+        centers=torch.tensor([[[1.0, 1.0], [3.0, 1.0]]]),
+        log_aspect=torch.zeros(1, 2),
+        pairwise_axis_logits=torch.zeros(1, 0, 3),
+        pair_index=torch.empty(0, 2, dtype=torch.long),
+        quality_pred=torch.zeros(1),
+        uncertainty=torch.zeros(1, 2),
+        scale=1.0,
+        variant="unit",
+    )
+    repair_profiles: list[str] = []
+    quality_profiles: list[str] = []
+    optimizer = ArchitectureV4Optimizer()
+
+    def fake_repair(_inst, placement, profile):
+        repair_profiles.append(profile)
+        return placement
+
+    def fake_refine(_inst, placement, _config, profile):
+        quality_profiles.append(profile)
+        return placement
+
+    def fail_v5(_inst):
+        raise AssertionError("diffusion solve must not add v5 candidates")
+
+    monkeypatch.setenv("FLOORSET_DIFFUSION_REPAIR_PROFILES", "normal,boundary_first")
+    monkeypatch.setenv("FLOORSET_DIFFUSION_QUALITY_PROFILES", "default,hpwl_refine")
+    monkeypatch.setattr(optimizer, "_repair_with_profile", fake_repair)
+    monkeypatch.setattr(optimizer, "_solve_v5_instance", fail_v5)
+    monkeypatch.setattr(optimizer_module, "refine_quality_candidate", fake_refine)
+
+    optimizer._solve_from_diffusion_prior(inst, prior)
+
+    assert repair_profiles == ["normal", "boundary_first"]
+    assert quality_profiles == ["default", "hpwl_refine", "default", "hpwl_refine"]
 
 
 def test_optimizer_loads_hgt_checkpoint_for_anchor_guidance(tmp_path, monkeypatch):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from floorset_arch.diagnostics import placement_metrics
 from floorset_arch.diffusion.contracts import PlacementTensorBatch
@@ -32,6 +33,27 @@ def _overlap_proxy(rect_xywh: torch.Tensor) -> torch.Tensor:
     return score
 
 
+def _pairwise_consistency_penalty(batch: PlacementTensorBatch) -> torch.Tensor:
+    logits = batch.pairwise_axis_logits
+    if batch.pair_index.numel() == 0 or logits.numel() == 0 or logits.shape[2] < 2:
+        return torch.zeros(
+            batch.rect_xywh.shape[0],
+            dtype=batch.rect_xywh.dtype,
+            device=batch.rect_xywh.device,
+        )
+    pair_index = batch.pair_index.to(batch.rect_xywh.device)
+    centers = batch.rect_xywh[:, :, :2] + 0.5 * batch.rect_xywh[:, :, 2:4]
+    delta = centers[:, pair_index[:, 1], :] - centers[:, pair_index[:, 0], :]
+    labels = torch.where(delta[:, :, 0].abs() >= delta[:, :, 1].abs(), 0, 1)
+    class_logits = logits[:, :, :3]
+    per_pair = F.cross_entropy(
+        class_logits.reshape(-1, class_logits.shape[2]),
+        labels.reshape(-1).to(logits.device),
+        reduction="none",
+    ).view(logits.shape[0], -1)
+    return per_pair.mean(dim=1).to(batch.rect_xywh.device)
+
+
 def tensor_prefilter_score(batch: PlacementTensorBatch) -> torch.Tensor:
     overlap = _overlap_proxy(batch.rect_xywh)
     bbox_right = batch.rect_xywh[:, :, 0] + batch.rect_xywh[:, :, 2]
@@ -40,7 +62,8 @@ def tensor_prefilter_score(batch: PlacementTensorBatch) -> torch.Tensor:
     model_score = torch.zeros_like(overlap)
     if batch.score_features is not None and batch.score_features.numel() > 0:
         model_score = batch.score_features[:, 0].to(overlap.device)
-    return overlap * 1000.0 + bbox * 0.001 + model_score
+    pair_consistency = _pairwise_consistency_penalty(batch)
+    return overlap * 1000.0 + bbox * 0.001 + pair_consistency * 0.25 + model_score
 
 
 def select_tensor_shortlist(batch: PlacementTensorBatch, top_k: int) -> torch.Tensor:
