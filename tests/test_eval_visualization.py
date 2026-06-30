@@ -26,6 +26,7 @@ save_predicted_floorplan_pngs = evaluator.save_predicted_floorplan_pngs
 
 def test_save_predicted_floorplan_pngs_writes_single_case(tmp_path):
     pytest.importorskip("matplotlib")
+    mpimg = pytest.importorskip("matplotlib.image")
     result = SimpleNamespace(
         submission_name="unit",
         test_results=[
@@ -38,7 +39,12 @@ def test_save_predicted_floorplan_pngs_writes_single_case(tmp_path):
                 violations_relative=0.0,
                 runtime_seconds=0.1,
                 cost=3.25,
+                cost_no_runtime=3.0,
                 positions=[(0.0, 0.0, 2.0, 2.0), (3.0, 0.0, 3.0, 3.0)],
+                raw_positions=[(0.0, 0.0, 2.0, 2.0), (1.0, 0.0, 3.0, 3.0)],
+                golden_positions=[(0.0, 0.0, 2.0, 2.0), (0.0, 2.0, 3.0, 3.0)],
+                raw_cost=9.0,
+                golden_cost=1.0,
             )
         ],
     )
@@ -46,8 +52,10 @@ def test_save_predicted_floorplan_pngs_writes_single_case(tmp_path):
     written = save_predicted_floorplan_pngs(result, tmp_path, top_k=10)
 
     assert len(written) == 1
-    assert written[0].name == "case_7_cost_3.2500.png"
+    assert written[0].name == "case_7_cost_3.2500_comparison.png"
     assert written[0].exists()
+    image = mpimg.imread(written[0])
+    assert image.shape[1] > image.shape[0] * 1.5
 
 
 def test_save_predicted_floorplan_pngs_writes_top_10_by_cost(tmp_path):

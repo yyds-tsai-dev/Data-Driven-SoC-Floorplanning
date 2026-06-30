@@ -205,6 +205,10 @@ class TestResult:
     cost: float
     cost_no_runtime: float = M_PENALTY
     positions: Optional[List[Tuple[float, float, float, float]]] = None
+    raw_positions: Optional[List[Tuple[float, float, float, float]]] = None
+    golden_positions: Optional[List[Tuple[float, float, float, float]]] = None
+    raw_cost: Optional[float] = None
+    golden_cost: Optional[float] = None
     error: Optional[str] = None
     hpwl_b2b: float = 0.0
     hpwl_p2b: float = 0.0
@@ -710,6 +714,51 @@ def evaluate_solution(
         cost_breakdown=cost_breakdown,
         cost_breakdown_no_runtime=cost_no_runtime_breakdown,
     )
+
+
+def _normalize_positions(
+    positions: Any,
+    block_count: int,
+) -> Optional[List[Tuple[float, float, float, float]]]:
+    if positions is None:
+        return None
+    normalized: List[Tuple[float, float, float, float]] = []
+    try:
+        for item in list(positions)[:block_count]:
+            x, y, w, h = item
+            normalized.append((float(x), float(y), float(w), float(h)))
+    except (TypeError, ValueError):
+        return None
+    return normalized if len(normalized) == block_count else None
+
+
+def _diagnostic_cost_no_runtime(
+    positions: Optional[List[Tuple[float, float, float, float]]],
+    baseline: Dict[str, float],
+    constraints,
+    b2b_conn,
+    p2b_conn,
+    pins_pos,
+    area_target,
+    target_pos,
+) -> Optional[float]:
+    if positions is None:
+        return None
+    try:
+        metrics = evaluate_solution(
+            {"positions": positions, "runtime": 1.0},
+            baseline,
+            constraints,
+            b2b_conn,
+            p2b_conn,
+            pins_pos,
+            area_target,
+            target_pos,
+            median_runtime=1.0,
+        )
+    except Exception:
+        return None
+    return float(metrics.cost_no_runtime)
 
 
 def compute_total_score(costs: List[float], block_counts: List[int]) -> float:
@@ -1262,6 +1311,31 @@ class ContestEvaluator:
                     target_pos,
                     median_runtime=1.0
                 )
+                metadata = getattr(optimizer, "last_solve_metadata", {}) or {}
+                raw_positions = _normalize_positions(
+                    metadata.get("raw_diffusion_positions"), block_count
+                )
+                golden_positions = _normalize_positions(target_pos, block_count)
+                raw_cost = _diagnostic_cost_no_runtime(
+                    raw_positions,
+                    baseline,
+                    constraints,
+                    b2b_conn,
+                    p2b_conn,
+                    pins_pos,
+                    area_target,
+                    target_pos,
+                )
+                golden_cost = _diagnostic_cost_no_runtime(
+                    golden_positions,
+                    baseline,
+                    constraints,
+                    b2b_conn,
+                    p2b_conn,
+                    pins_pos,
+                    area_target,
+                    target_pos,
+                )
                 
                 results.append(TestResult(
                     test_id=idx,
@@ -1274,6 +1348,10 @@ class ContestEvaluator:
                     cost=metrics.cost,
                     cost_no_runtime=metrics.cost_no_runtime,
                     positions=positions,
+                    raw_positions=raw_positions,
+                    golden_positions=golden_positions,
+                    raw_cost=raw_cost,
+                    golden_cost=golden_cost,
                     hpwl_b2b=metrics.hpwl_b2b,
                     hpwl_p2b=metrics.hpwl_p2b,
                     hpwl_total=metrics.hpwl_total,
@@ -2036,11 +2114,110 @@ def _plot_positions(ax, positions, title: str, plt_module):
     ax.set_ylabel("Y")
 
 
+def _target_tensor_from_positions(
+    positions: Optional[List[Tuple[float, float, float, float]]],
+    constraints,
+    block_count: int,
+) -> torch.Tensor:
+    target_positions = torch.full((block_count, 4), -1.0)
+    if positions is None or constraints is None:
+        return target_positions
+    ncols = constraints.shape[1] if constraints is not None and constraints.dim() > 1 else 0
+    for block in range(min(block_count, len(positions))):
+        is_fixed = ncols > 0 and constraints[block, 0] != 0
+        is_preplaced = ncols > 1 and constraints[block, 1] != 0
+        x, y, width, height = positions[block]
+        if is_preplaced:
+            target_positions[block] = torch.tensor([x, y, width, height])
+        elif is_fixed:
+            target_positions[block, 2] = float(width)
+            target_positions[block, 3] = float(height)
+    return target_positions
+
+
+def _minimal_visualization_instance(row: TestResult):
+    from floorset_arch.parser import parse_instance
+
+    positions = (
+        row.golden_positions
+        or row.positions
+        or [(0.0, 0.0, 1.0, 1.0) for _ in range(max(1, row.block_count))]
+    )
+    block_count = max(1, int(row.block_count or len(positions)))
+    areas = torch.tensor(
+        [max(1.0, float(w) * float(h)) for _x, _y, w, h in positions[:block_count]],
+        dtype=torch.float32,
+    )
+    constraints = torch.zeros((block_count, 5), dtype=torch.float32)
+    return parse_instance(
+        block_count,
+        areas,
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        torch.empty(0, 2),
+        constraints,
+        _target_tensor_from_positions(row.golden_positions, constraints, block_count),
+    )
+
+
+def _visualization_instance_for_row(row: TestResult, data_path: str | Path | None):
+    if data_path is None:
+        return _minimal_visualization_instance(row)
+    try:
+        from floorset_arch.parser import parse_instance
+
+        dataset = FloorplanDatasetLiteTest(str(data_path))
+        sample = dataset[int(row.test_id)]
+        inputs, labels = sample["input"], sample["label"]
+        area_target, b2b_conn, p2b_conn, pins_pos, constraints = inputs
+        block_count = int((area_target != -1).sum().item())
+        polygons, _metrics = labels
+        golden_positions = row.golden_positions
+        if golden_positions is None:
+            golden_positions = []
+            for block in range(block_count):
+                polygon = polygons[block]
+                valid = polygon[polygon[:, 0] != -1]
+                if len(valid) > 0:
+                    x_min, y_min = valid.min(dim=0).values
+                    x_max, y_max = valid.max(dim=0).values
+                    golden_positions.append(
+                        (
+                            float(x_min),
+                            float(y_min),
+                            float(x_max - x_min),
+                            float(y_max - y_min),
+                        )
+                    )
+                else:
+                    golden_positions.append((0.0, 0.0, 1.0, 1.0))
+        target_positions = _target_tensor_from_positions(
+            golden_positions, constraints, block_count
+        )
+        return parse_instance(
+            block_count,
+            area_target,
+            b2b_conn,
+            p2b_conn,
+            pins_pos,
+            constraints,
+            target_positions,
+        )
+    except Exception:
+        return _minimal_visualization_instance(row)
+
+
 def save_predicted_floorplan_pngs(
-    result, output_dir: str | Path, top_k: int = 10
+    result,
+    output_dir: str | Path,
+    top_k: int = 10,
+    data_path: str | Path | None = None,
 ) -> list[Path]:
     try:
-        import matplotlib.pyplot as plt
+        from floorset_arch.diffusion.diagnostics import (
+            placement_from_positions,
+            plot_diffusion_diagnostic,
+        )
     except ImportError:
         print("matplotlib required for floorplan PNG output")
         return []
@@ -2055,23 +2232,40 @@ def save_predicted_floorplan_pngs(
     selected = ranked[: max(1, min(int(top_k), len(ranked)))]
     written: list[Path] = []
     for rank, row in enumerate(selected, start=1):
-        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        _plot_positions(
-            ax,
-            row.positions,
-            f"Case {row.test_id} predicted cost={row.cost:.4f}",
-            plt,
-        )
+        raw_positions = row.raw_positions or row.positions
+        golden_positions = row.golden_positions or row.positions
+        if raw_positions is None or row.positions is None or golden_positions is None:
+            continue
+        inst = _visualization_instance_for_row(row, data_path)
+        raw = placement_from_positions(raw_positions, row.block_count)
+        repaired = placement_from_positions(row.positions, row.block_count)
+        golden = placement_from_positions(golden_positions, row.block_count)
         if single_case:
-            filename = f"case_{row.test_id}_cost_{row.cost:.4f}.png"
+            filename = f"case_{row.test_id}_cost_{row.cost:.4f}_comparison.png"
         else:
             filename = (
-                f"top_cost_rank_{rank:02d}_case_{row.test_id}_cost_{row.cost:.4f}.png"
+                f"top_cost_rank_{rank:02d}_case_{row.test_id}_cost_{row.cost:.4f}_comparison.png"
             )
         path = out_dir / filename
-        fig.tight_layout()
-        fig.savefig(path, dpi=150)
-        plt.close(fig)
+        raw_title = "Diffusion raw" if row.raw_positions else "Diffusion raw (fallback final)"
+        plot_diffusion_diagnostic(
+            inst,
+            raw,
+            repaired,
+            golden,
+            path,
+            case_id=row.test_id,
+            costs={
+                "raw": row.raw_cost,
+                "repaired": row.cost_no_runtime,
+                "golden": row.golden_cost,
+            },
+            panel_titles={
+                "raw": raw_title,
+                "repaired": "Repaired",
+                "golden": "Official golden",
+            },
+        )
         written.append(path)
     return written
 
@@ -2438,7 +2632,12 @@ def main():
             floorplan_dir = Path(floorplan_dir)
             if not floorplan_dir.is_absolute():
                 floorplan_dir = repo_root / floorplan_dir
-        written_pngs = save_predicted_floorplan_pngs(result, floorplan_dir, top_k=10)
+        written_pngs = save_predicted_floorplan_pngs(
+            result,
+            floorplan_dir,
+            top_k=10,
+            data_path=args.data_path,
+        )
         if written_pngs:
             print(f"Floorplan PNGs saved to {Path(floorplan_dir)}")
         
