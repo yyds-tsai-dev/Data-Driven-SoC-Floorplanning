@@ -129,6 +129,22 @@ def test_train_diffusion_script_exposes_training_self_eval_knobs():
     assert 'EXTRA_ARGS+=(--evaluator-best-checkpoint "$EVALUATOR_BEST_CHECKPOINT")' in text
 
 
+def test_train_diffusion_eval_probe_script_uses_probe_defaults_and_final_eval():
+    text = Path("scripts/train_diffusion_eval_probe.sh").read_text(encoding="utf-8")
+
+    assert 'DATASET_MODE="${DATASET_MODE:-eval-probe}"' in text
+    assert 'NUM_SAMPLES="${NUM_SAMPLES:-100}"' in text
+    assert 'VAL_SAMPLES="${VAL_SAMPLES:-100}"' in text
+    assert 'EPOCHS="${EPOCHS:-100}"' in text
+    assert 'TREE_WEIGHT="${TREE_WEIGHT:-0}"' in text
+    assert 'TRAIN_EVALUATE_EACH_EPOCH="${TRAIN_EVALUATE_EACH_EPOCH:-0}"' in text
+    assert 'CHECKPOINT_PREFIX="${CHECKPOINT_PREFIX:-diffusion_eval_probe}"' in text
+    assert '--dataset-mode "$DATASET_MODE"' in text
+    assert '--tree-weight "$TREE_WEIGHT"' in text
+    assert 'PROBE_CKPT="$OUTPUT_DIR/${CHECKPOINT_PREFIX}_latest_${CHECKPOINT_TAG}.pt"' in text
+    assert 'bash "$ROOT/scripts/eval_total.sh" --diffusion-checkpoint "$PROBE_CKPT" --diffusion-use-ema --output "$EVAL_OUTPUT"' in text
+
+
 def test_eval_total_uses_unique_default_floorplan_run_directory():
     text = Path("scripts/eval_total.sh").read_text(encoding="utf-8")
 
