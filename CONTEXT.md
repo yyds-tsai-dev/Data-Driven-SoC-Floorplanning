@@ -80,6 +80,10 @@ _Avoid_: using solution-quality labels as inference inputs, treating diffusion t
 A learned v11 diffusion prior artifact consumed before repair, ranking, and evaluator output.
 _Avoid_: ranking or promoting it by supervised loss alone when evaluator evidence is available, treating it as Anchor-GNN Guidance.
 
+**Overfit Probe Checkpoint**:
+A deliberately train/eval-leaking diffusion checkpoint trained on the 100 local evaluation cases to test whether the training, sampling, repair, and ranking pipeline can learn usable signal.
+_Avoid_: treating its score as generalized validation evidence, hidden-test evidence, or checkpoint-promotion evidence.
+
 **No-Runtime Quality Score**:
 The local architecture-tuning score that uses official quality and soft-violation factors with runtime adjustment fixed to `1.0`.
 _Avoid_: treating local runtime-aware score as the primary architecture metric.
@@ -150,6 +154,7 @@ _Avoid_: using validation case IDs as the risk definition.
 - **Architecture v11** names the current graph-conditioned diffusion generation; v4/v5 wrapper names remain compatibility aliases, not the preferred label for new work.
 - The **Diffusion Training Path** uses **Heterogeneous Floorplan Graph** evidence and training-only floorplan, tree-topology, and quality labels to learn diffusion placement priors.
 - A **Diffusion Checkpoint** is consumed by the v11 diffusion sampler and repair/ranking path, not by **Anchor-GNN Guidance**.
+- An **Overfit Probe Checkpoint** may exercise the same v11 diffusion sampler and repair/ranking path, but its evidence is diagnostic rather than promotion-grade.
 - A **Selectable Anchor-GNN Encoder** changes learned **Anchor-GNN Guidance** only; checkpoint promotion still requires evaluator evidence.
 - A **Local HGT Encoder** is a **Selectable Anchor-GNN Encoder** variant that preserves b2b/p2b locality and heterogeneous constraint factors instead of flattening them into a block-only graph.
 - **No-Runtime Quality Score** is the primary metric for local architecture comparison; **Local Runtime-Aware Score** is a runtime-risk signal.
