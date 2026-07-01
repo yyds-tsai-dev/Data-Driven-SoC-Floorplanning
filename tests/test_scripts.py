@@ -46,7 +46,7 @@ def test_train_diffusion_script_defaults_to_hgt_lite():
 
     text = script.read_text(encoding="utf-8")
 
-    assert 'NUM_SAMPLES="${NUM_SAMPLES:-800000}"' in text
+    assert 'NUM_SAMPLES="${NUM_SAMPLES:-1000000}"' in text
     assert 'VARIANT="${VARIANT:-hgt_lite}"' in text
     assert 'HIDDEN_DIM="${HIDDEN_DIM:-128}"' in text
     assert 'LAYERS="${LAYERS:-2}"' in text
