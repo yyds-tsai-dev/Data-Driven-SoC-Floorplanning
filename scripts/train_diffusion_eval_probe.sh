@@ -56,7 +56,7 @@ DEFAULT_TAG="${DATE_STAMP}_probe_ns${NUM_SAMPLES}_ep${EPOCHS}_diff${VARIANT_TAG}
 CHECKPOINT_TAG="${CHECKPOINT_TAG:-$DEFAULT_TAG}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-$CHECKPOINT_TAG}"
 LOG_TAG="${LOG_TAG:-$CHECKPOINT_TAG}"
-EVAL_OUTPUT="${EVAL_OUTPUT:-artifacts/eval_v11/diffusion_eval_probe_${LOG_TAG}.json}"
+EVAL_OUTPUT="${EVAL_OUTPUT:-artifacts/eval_probe/${LOG_TAG}_full_eval.json}"
 PROBE_CKPT="$OUTPUT_DIR/${CHECKPOINT_PREFIX}_latest_${CHECKPOINT_TAG}.pt"
 
 if [ "$DATASET_MODE" != "eval-probe" ]; then

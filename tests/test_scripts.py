@@ -139,6 +139,7 @@ def test_train_diffusion_eval_probe_script_uses_probe_defaults_and_final_eval():
     assert 'TREE_WEIGHT="${TREE_WEIGHT:-0}"' in text
     assert 'TRAIN_EVALUATE_EACH_EPOCH="${TRAIN_EVALUATE_EACH_EPOCH:-0}"' in text
     assert 'CHECKPOINT_PREFIX="${CHECKPOINT_PREFIX:-diffusion_eval_probe}"' in text
+    assert 'EVAL_OUTPUT="${EVAL_OUTPUT:-artifacts/eval_probe/${LOG_TAG}_full_eval.json}"' in text
     assert '--dataset-mode "$DATASET_MODE"' in text
     assert '--tree-weight "$TREE_WEIGHT"' in text
     assert 'PROBE_CKPT="$OUTPUT_DIR/${CHECKPOINT_PREFIX}_latest_${CHECKPOINT_TAG}.pt"' in text
