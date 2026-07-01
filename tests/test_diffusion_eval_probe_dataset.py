@@ -93,6 +93,16 @@ def test_polygon_adapter_reports_case_index_for_bad_polygon():
         polygon_fp_sol_to_training_rects(bad, block_count=1, case_index=12)
 
 
+def test_polygon_adapter_reports_case_index_and_block_for_malformed_shape():
+    bad = torch.ones(1, 2, 3)
+
+    with pytest.raises(
+        ValueError,
+        match=r"case 12 block 0 polygon must have shape \[vertices, 2\]",
+    ):
+        polygon_fp_sol_to_training_rects(bad, block_count=1, case_index=12)
+
+
 def test_adapted_sample_builds_diffusion_targets_without_tree_edges():
     adapted = adapt_eval_probe_sample(_polygon_sample(), case_index=5)
     area, b2b, p2b, pins, constraints = adapted["input"]

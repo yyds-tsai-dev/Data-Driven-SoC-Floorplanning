@@ -45,7 +45,7 @@ def polygon_fp_sol_to_training_rects(
     block_count = int(block_count)
     if isinstance(fp_sol, torch.Tensor):
         polygons = torch.as_tensor(fp_sol).detach().float()
-        if polygons.dim() < 3 or polygons.shape[-1] != 2:
+        if polygons.dim() == 0:
             raise ValueError(
                 f"{prefix}polygon fp_sol must have shape [blocks, vertices, 2], "
                 f"got {tuple(polygons.shape)}"
