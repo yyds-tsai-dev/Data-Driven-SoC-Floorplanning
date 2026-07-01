@@ -18,6 +18,7 @@ from floorset_arch.diffusion.sampling import load_diffusion_checkpoint
 from floorset_arch.diffusion.targets import build_diffusion_targets
 from floorset_arch.diffusion.training import DiffusionLossConfig, diffusion_training_loss
 from floorset_arch.parser import parse_instance
+from floorset_arch.training.eval_probe_dataset import EvalProbeDataset
 from floorset_arch.training.train import (
     FloorplanDatasetLite,
     ROOT,
@@ -32,6 +33,19 @@ from floorset_arch.training.train import (
 )
 from floorset_arch.training.promote_checkpoint import checkpoint_metric_from_eval_json
 from floorset_arch.training.selection import append_metric_record
+
+
+def _is_eval_probe_mode(args) -> bool:
+    return getattr(args, "dataset_mode", "lite") == "eval-probe"
+
+
+def _validate_diffusion_training_args(args) -> None:
+    if not _is_eval_probe_mode(args):
+        return
+    if float(getattr(args, "tree_weight", 0.0)) != 0.0:
+        raise ValueError("eval-probe requires --tree-weight 0")
+    if bool(getattr(args, "train_evaluate_each_epoch", False)):
+        raise ValueError("eval-probe uses final-only evaluator")
 
 
 def build_diffusion_run_tag(args, stamp: str | None = None) -> str:
@@ -327,6 +341,20 @@ def _make_loaders(args):
             len(train_loader),
         )
 
+    if _is_eval_probe_mode(args):
+        dataset = EvalProbeDataset(args.data_path)
+        total = len(dataset)
+        train_loader, ts, te = make_loader(
+            dataset,
+            0,
+            total,
+            True,
+            args.seed,
+            args.num_workers,
+            args.batch_size,
+        )
+        return train_loader, None, ts, te, -1, -1, total
+
     dataset = FloorplanDatasetLite(args.data_path)
     total = len(dataset)
     val_start = choose_window_start(
@@ -458,6 +486,7 @@ def run_diffusion_training_evaluator(
 
 
 def main(args) -> None:
+    _validate_diffusion_training_args(args)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -523,7 +552,8 @@ def main(args) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_tag = args.checkpoint_tag or build_diffusion_run_tag(args)
     latest_path = out_dir / f"{args.checkpoint_prefix}_latest_{run_tag}.pt"
-    best_val_loss_path = out_dir / f"{args.checkpoint_prefix}_best_val_loss_{run_tag}.pt"
+    best_loss_name = "best_probe_loss" if _is_eval_probe_mode(args) else "best_val_loss"
+    best_loss_path = out_dir / f"{args.checkpoint_prefix}_{best_loss_name}_{run_tag}.pt"
     metrics_manifest = (
         Path(args.checkpoint_metrics_manifest)
         if getattr(args, "checkpoint_metrics_manifest", "")
@@ -539,9 +569,13 @@ def main(args) -> None:
 
     print("=" * 72)
     print("Architecture v11 graph-conditioned diffusion training")
+    print(f"  dataset mode     = {args.dataset_mode}")
     print(f"  dataset samples  = {total}")
     print(f"  train window     = {ts}..{te}")
-    print(f"  val window       = {vs}..{ve}")
+    if _is_eval_probe_mode(args):
+        print("  val window       = disabled")
+    else:
+        print(f"  val window       = {vs}..{ve}")
     print(f"  device           = {device}")
     print(f"  variant          = {args.variant}")
     print(f"  hidden/layers    = {args.hidden_dim}/{args.layers}")
@@ -571,7 +605,7 @@ def main(args) -> None:
         "skipped": 0.0,
     }
     for epoch in range(1, int(args.epochs) + 1):
-        if int(args.synthetic_smoke_samples) <= 0:
+        if int(args.synthetic_smoke_samples) <= 0 and not _is_eval_probe_mode(args):
             dataset = FloorplanDatasetLite(args.data_path)
             train_start = choose_window_start(
                 len(dataset), args.num_samples, args.seed, epoch, args.window_start
@@ -599,9 +633,12 @@ def main(args) -> None:
             ema_state=ema_state,
             ema_decay=ema_decay,
         )
-        val_stats = run_epoch(
-            model, optimizer, val_loader, device, args, loss_config, epoch, train=False
-        )
+        if _is_eval_probe_mode(args):
+            val_stats = dict(train_stats)
+        else:
+            val_stats = run_epoch(
+                model, optimizer, val_loader, device, args, loss_config, epoch, train=False
+            )
         print(
             f"Epoch {epoch:03d} train loss={train_stats['loss']:.5f} "
             f"denoise={train_stats['denoise']:.5f} pair={train_stats['pair']:.5f} "
@@ -610,20 +647,31 @@ def main(args) -> None:
             f"used={train_stats['used']:.0f} skipped={train_stats['skipped']:.0f}",
             flush=True,
         )
-        print(
-            f"Epoch {epoch:03d} val   loss={val_stats['loss']:.5f} "
-            f"denoise={val_stats['denoise']:.5f} pair={val_stats['pair']:.5f} "
-            f"tree={val_stats['tree']:.5f} quality={val_stats['quality']:.5f} "
-            f"aspect={val_stats['aspect']:.5f} overlap={val_stats['layout_overlap']:.5f} "
-            f"used={val_stats['used']:.0f} skipped={val_stats['skipped']:.0f}",
-            flush=True,
-        )
+        if _is_eval_probe_mode(args):
+            print(
+                f"Epoch {epoch:03d} probe loss={val_stats['loss']:.5f} "
+                f"denoise={val_stats['denoise']:.5f} pair={val_stats['pair']:.5f} "
+                f"tree={val_stats['tree']:.5f} quality={val_stats['quality']:.5f} "
+                f"aspect={val_stats['aspect']:.5f} overlap={val_stats['layout_overlap']:.5f} "
+                f"used={val_stats['used']:.0f} skipped={val_stats['skipped']:.0f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"Epoch {epoch:03d} val   loss={val_stats['loss']:.5f} "
+                f"denoise={val_stats['denoise']:.5f} pair={val_stats['pair']:.5f} "
+                f"tree={val_stats['tree']:.5f} quality={val_stats['quality']:.5f} "
+                f"aspect={val_stats['aspect']:.5f} overlap={val_stats['layout_overlap']:.5f} "
+                f"used={val_stats['used']:.0f} skipped={val_stats['skipped']:.0f}",
+                flush=True,
+            )
         if wandb_run is not None:
+            heldout_prefix = "probe" if _is_eval_probe_mode(args) else "val"
             wandb_run.log(
                 {
                     "epoch": epoch,
                     **{f"train/{key}": value for key, value in train_stats.items()},
-                    **{f"val/{key}": value for key, value in val_stats.items()},
+                    **{f"{heldout_prefix}/{key}": value for key, value in val_stats.items()},
                     "lr": optimizer.param_groups[0]["lr"],
                 }
             )
@@ -643,7 +691,7 @@ def main(args) -> None:
         if val_stats["loss"] < best_val:
             best_val = val_stats["loss"]
             _save_diffusion_checkpoint(
-                best_val_loss_path,
+                best_loss_path,
                 model,
                 args,
                 loss_config,
@@ -654,7 +702,7 @@ def main(args) -> None:
                 ema_state=ema_state,
                 ema_decay=ema_decay,
             )
-            print(f"Saved best checkpoint to {best_val_loss_path}", flush=True)
+            print(f"Saved best checkpoint to {best_loss_path}", flush=True)
         selected_evaluator = None
         if args.train_evaluate_each_epoch and int(args.synthetic_smoke_samples) <= 0:
             selected_evaluator = run_diffusion_training_evaluator(
@@ -676,20 +724,23 @@ def main(args) -> None:
             )
         empty_stats = val_stats
 
-    print(f"Best val loss: {best_val:.5f}")
+    best_label = "probe" if _is_eval_probe_mode(args) else "val"
+    print(f"Best {best_label} loss: {best_val:.5f}")
     print(f"Latest checkpoint: {latest_path}")
-    print(f"Best val-loss checkpoint: {best_val_loss_path}")
+    print(f"Best {best_label}-loss checkpoint: {best_loss_path}")
     if args.train_evaluate_each_epoch:
         print(f"Evaluator metric manifest: {metrics_manifest}")
         print(f"Evaluator-best checkpoint: {evaluator_best_path}")
     if wandb_run is not None:
-        wandb_run.summary["best_val_loss"] = best_val
-        wandb_run.summary["last_val_loss"] = empty_stats["loss"]
+        summary_prefix = "probe" if _is_eval_probe_mode(args) else "val"
+        wandb_run.summary[f"best_{summary_prefix}_loss"] = best_val
+        wandb_run.summary[f"last_{summary_prefix}_loss"] = empty_stats["loss"]
         wandb_run.finish()
 
 
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-mode", choices=("lite", "eval-probe"), default="lite")
     parser.add_argument("--data-path", default="FloorSet")
     parser.add_argument("--output-dir", default="checkpoints")
     parser.add_argument("--num-samples", type=int, default=800000)
@@ -790,7 +841,12 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument(
         "--wandb-mode", default="online", choices=("online", "offline", "disabled")
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    try:
+        _validate_diffusion_training_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 if __name__ == "__main__":
