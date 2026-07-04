@@ -28,6 +28,7 @@ load_env_defaults "$ROOT/.env"
 #   bash scripts/eval_total.sh gnn_epoch10.pt          # use checkpoints/gnn_epoch10.pt
 #   bash scripts/eval_total.sh checkpoints/model.pt    # use repo-relative checkpoint path
 #   bash scripts/eval_total.sh /path/to/model.pt       # use absolute checkpoint path
+#   bash scripts/eval_total.sh checkpoints/diffusion_latest.pt
 #   bash scripts/eval_total.sh --diffusion-checkpoint diffusion_latest.pt
 #   bash scripts/eval_total.sh --diffusion-checkpoint diffusion_latest.pt --diffusion-use-raw
 #   bash scripts/eval_total.sh gnn_epoch10.pt --output eval.json
@@ -43,6 +44,12 @@ resolve_ckpt_path() {
   else
     printf '%s\n' "$ROOT/checkpoints/$ckpt"
   fi
+}
+
+is_diffusion_checkpoint_arg() {
+  local base
+  base="$(basename "$1")"
+  [[ "${base,,}" == *diffusion* ]]
 }
 
 run_evaluator() {
@@ -235,8 +242,17 @@ if [ -n "${1:-}" ] && [[ "$1" == --* ]]; then
   export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
   parse_eval_args "$@" || exit $?
 elif [ -n "${1:-}" ]; then
-  export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
-  export FLOORSET_GNN_CHECKPOINT_SOURCE="cli"
+  if is_diffusion_checkpoint_arg "$1"; then
+    if [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
+      export FLOORSET_GNN_CHECKPOINT="$DEFAULT_CKPT"
+    fi
+    export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$FLOORSET_GNN_CHECKPOINT")"
+    export FLOORSET_DIFFUSION_CHECKPOINT="$(resolve_ckpt_path "$1")"
+    export FLOORSET_DIFFUSION_CHECKPOINT_SOURCE="cli"
+  else
+    export FLOORSET_GNN_CHECKPOINT="$(resolve_ckpt_path "$1")"
+    export FLOORSET_GNN_CHECKPOINT_SOURCE="cli"
+  fi
   parse_eval_args "${@:2}" || exit $?
 elif [ -z "${FLOORSET_GNN_CHECKPOINT:-}" ]; then
   export FLOORSET_GNN_CHECKPOINT="$DEFAULT_CKPT"
@@ -247,11 +263,15 @@ else
 fi
 export FLOORSET_GNN_CHECKPOINT_SOURCE="${FLOORSET_GNN_CHECKPOINT_SOURCE:-dotenv}"
 
-echo "Using checkpoint: $FLOORSET_GNN_CHECKPOINT"
+echo "Using GNN fallback checkpoint: $FLOORSET_GNN_CHECKPOINT"
 echo "Using diffusion checkpoint: ${FLOORSET_DIFFUSION_CHECKPOINT:-<none>}"
 echo "Using diffusion checkpoint state: $(diffusion_state_label)"
 echo "Using evaluator: $EVALUATOR"
 echo "Floorplan PNG output: ${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/total_${EVAL_RUN_ID}}"
 echo "Evaluation diagnostics: cost factors, top score contributors, best/worst cost cases"
+
+if [ "${FLOORSET_EVAL_DRY_RUN:-0}" = "1" ]; then
+  exit 0
+fi
 
 run_evaluator "${EXTRA_ARGS[@]}"

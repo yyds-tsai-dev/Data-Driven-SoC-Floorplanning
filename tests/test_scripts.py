@@ -1,3 +1,5 @@
+import os
+import subprocess
 from pathlib import Path
 
 
@@ -112,8 +114,58 @@ def test_eval_scripts_expose_diffusion_checkpoint_ux():
         assert "--diffusion-checkpoint" in text
         assert "FLOORSET_DIFFUSION_CHECKPOINT" in text
         assert "FLOORSET_DIFFUSION_USE_EMA" in text
+        assert "Using GNN fallback checkpoint:" in text
         assert "Using diffusion checkpoint:" in text
         assert "Using diffusion checkpoint state:" in text
+
+
+def test_eval_total_routes_positional_diffusion_checkpoint_to_diffusion_env():
+    env = os.environ.copy()
+    env["FLOORSET_EVAL_DRY_RUN"] = "1"
+    env.pop("FLOORSET_GNN_CHECKPOINT", None)
+    env.pop("FLOORSET_DIFFUSION_CHECKPOINT", None)
+
+    result = subprocess.run(
+        ["bash", "scripts/eval_total.sh", "checkpoints/diffusion_unit.pt"],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    root = Path.cwd()
+    assert (
+        "Using GNN fallback checkpoint: "
+        f"{root}/checkpoints/gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt"
+    ) in result.stdout
+    assert (
+        "Using diffusion checkpoint: "
+        f"{root}/checkpoints/diffusion_unit.pt"
+    ) in result.stdout
+
+
+def test_eval_total_keeps_positional_gnn_checkpoint_as_fallback():
+    env = os.environ.copy()
+    env["FLOORSET_EVAL_DRY_RUN"] = "1"
+    env.pop("FLOORSET_GNN_CHECKPOINT", None)
+    env.pop("FLOORSET_DIFFUSION_CHECKPOINT", None)
+
+    result = subprocess.run(
+        ["bash", "scripts/eval_total.sh", "checkpoints/gnn_unit.pt"],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    root = Path.cwd()
+    assert (
+        "Using GNN fallback checkpoint: "
+        f"{root}/checkpoints/gnn_unit.pt"
+    ) in result.stdout
+    assert "Using diffusion checkpoint: <none>" in result.stdout
 
 
 def test_train_diffusion_script_exposes_training_self_eval_knobs():
