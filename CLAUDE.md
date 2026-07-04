@@ -90,6 +90,44 @@ Blocks range 21–120. Training set = 1M samples (`LiteTensorData/`), validation
 - `checkpoints/`, `artifacts/`, `wandb/`, and `*.log` are generated/evidence outputs — don't hand-edit them or bundle them into code/doc commits.
 - Style: 4-space indent, `snake_case` functions/vars, `PascalCase` classes, typed dataclasses for solver state; group imports stdlib / third-party / local.
 
+## Model orchestration (Fable 5 scheduler)
+
+This project runs a multi-model team to spend the expensive scheduler budget
+sparingly. **Fable 5 (max reasoning) is the scheduler**, set in
+`.claude/settings.json` (`model: claude-fable-5`, `effortLevel: xhigh`) — takes
+effect on the next session, not retroactively. The scheduler plans, decomposes,
+delegates, and integrates results; it should keep its own context lean and push
+the actual work down to the specialists rather than burning Fable budget on it.
+
+Division of labour:
+
+- **Scheduler — Fable 5 (this main thread).** Understand the request, break it
+  into well-scoped units, route each to the cheapest capable executor below,
+  then stitch the results together and verify. Do the thinking about *what* and
+  *who*; delegate the *doing*.
+- **Deep reasoning → `deep-reasoner` subagent (Opus).** Hard architecture,
+  solver-policy design, scoring/ranking trade-offs, subtle root-cause debugging,
+  "does this actually move the No-Runtime Quality Score?" judgements. Hand it a
+  self-contained problem statement plus file paths. See
+  [.claude/agents/deep-reasoner.md](.claude/agents/deep-reasoner.md).
+- **Mechanical execution → `fast-worker` subagent (Sonnet).** Well-specified,
+  low-ambiguity work: applying a decided edit, running scripts/tests and
+  reporting, renames/moves, boilerplate, doc sync, fact-gathering. Give it an
+  explicit instruction and exact commands. See
+  [.claude/agents/fast-worker.md](.claude/agents/fast-worker.md).
+- **Peer engineer → Codex (OpenAI).** A same-level engineer with a *different
+  vantage point* — use it for independent cross-checks, second opinions, and
+  alternative implementations of a tricky piece, then reconcile its take with
+  `deep-reasoner`'s. Requires the Codex integration to be configured (MCP server
+  / plugin + OpenAI auth); when it is absent, fall back to a second
+  `deep-reasoner` pass with an adversarial framing.
+
+Routing heuristic: if a task needs a *decision or a diagnosis*, send it to
+`deep-reasoner`; if it needs *hands* on already-decided work, send it to
+`fast-worker`; if you want a *dissenting second implementation or review*, ask
+Codex. When in doubt about cost, prefer delegating over doing it in the
+scheduler thread.
+
 ## Deeper references
 
 - [CONTEXT.md](CONTEXT.md) — the authoritative domain glossary (Production Solver Path, V10 proxy, budget layer, diffusion terms) and resolved ambiguities. Read it before proposing solver-policy changes; the precise vocabulary matters.
