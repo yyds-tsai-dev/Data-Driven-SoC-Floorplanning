@@ -113,6 +113,25 @@ def test_eval_env_loader_prefers_dotenv_checkpoint(monkeypatch, tmp_path):
     assert os.environ["FLOORSET_GNN_CHECKPOINT"] == "checkpoints/from-dotenv.pt"
 
 
+def test_verbose_eval_env_labels_gnn_checkpoint_as_fallback(
+    monkeypatch, tmp_path, capsys
+):
+    (tmp_path / "src").mkdir()
+    (tmp_path / ".env").write_text(
+        "FLOORSET_GNN_CHECKPOINT=checkpoints/from-dotenv.pt\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(evaluator, "find_repo_root", lambda start=None: tmp_path)
+    monkeypatch.delenv("FLOORSET_GNN_CHECKPOINT", raising=False)
+    monkeypatch.delenv("FLOORSET_GNN_CHECKPOINT_SOURCE", raising=False)
+
+    evaluator.load_repo_env_defaults(verbose=True)
+
+    captured = capsys.readouterr()
+    assert "Using GNN fallback checkpoint:" in captured.out
+    assert "Using checkpoint:" not in captured.out
+
+
 def test_evaluate_uses_monotonic_timer_for_runtime(monkeypatch):
     evaluator_obj = evaluator.ContestEvaluator(data_path="../", verbose=False)
     evaluator_obj.dataset = [

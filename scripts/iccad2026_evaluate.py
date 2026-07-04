@@ -139,7 +139,10 @@ def load_repo_env_defaults(verbose: bool = False) -> Optional[Path]:
         os.environ["FLOORSET_GNN_CHECKPOINT"] = resolve_repo_checkpoint_path(
             checkpoint, root)
     if verbose and os.environ.get("FLOORSET_GNN_CHECKPOINT"):
-        print(f"Using checkpoint: {os.environ['FLOORSET_GNN_CHECKPOINT']}")
+        print(
+            "Using GNN fallback checkpoint: "
+            f"{os.environ['FLOORSET_GNN_CHECKPOINT']}"
+        )
     return env_file if env_file.exists() else None
 
 
