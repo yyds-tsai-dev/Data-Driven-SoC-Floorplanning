@@ -34,6 +34,7 @@ minimize a proxy of the contest cost (HPWL + bbox area + soft violations).
 from __future__ import annotations
 
 import math
+import os
 import random
 import time
 from collections import defaultdict
@@ -113,7 +114,8 @@ def rectangles_from_z(
 class _Unit:
     __slots__ = ("uid", "subgroups", "blocks", "soft_area", "rigid_h", "max_rigid_w",
                  "area_total", "force", "anchors", "seed_x", "seed_y", "hasB", "hasT",
-                 "bands", "eff_soft", "eff_rigid_h", "banded", "hcache", "dyn", "pairable")
+                 "bands", "eff_soft", "eff_rigid_h", "banded", "hcache", "dyn", "pairable",
+                 "version")
 
     def __init__(self, uid: int):
         self.uid = uid
@@ -129,6 +131,9 @@ class _Unit:
         self.seed_y = 0.0
         self.hasB = False
         self.hasT = False
+        # monotone counter bumped whenever the unit's internal geometry
+        # changes (subgroup reorder etc.); keys the FAST_EVAL layout cache.
+        self.version = 0
 
     def flatten(self):
         self.blocks = [b for sg in self.subgroups for b in sg]
@@ -191,6 +196,16 @@ class _ColumnOptimizer:
             (self.lx[i], self.ly[i], self.rw[i], self.rh[i])
             for i in range(n) if self.kind[i] == 2
         ]
+        # x-projections of the obstacles, for the FAST_EVAL cache: a column
+        # whose [x, x+w) span intersects one of these has geometry that
+        # depends on its absolute x, so it cannot be rigid-shifted blindly.
+        self._obs_x = [(ox, ox + ow) for (ox, _oy, ow, _oh) in self.locked_rects]
+        # FAST_EVAL: memoize per-column base geometry keyed by (unit ids,
+        # unit versions). Read the flag once so it is stable for this
+        # optimizer's lifetime. Cache is per-instance (never shared across
+        # workers/pickle).
+        self._fast_eval = os.environ.get("FLOORSET_FAST_EVAL", "0") == "1"
+        self._col_cache: Dict[tuple, tuple] = {}
 
         self._build_hpwl_arrays(b2b, p2b, pins)
         self._build_soft_norm()
@@ -618,6 +633,8 @@ class _ColumnOptimizer:
                  for b in bands]
         u.banded = any(len(b) > 1 for b in bands) or any(u.dyn)
         u.hcache = None
+        # invalidate any cached column geometry that includes this unit
+        u.version += 1
 
     def _solve_band(self, band, w: float):
         """Find the band height h so the chunk widths sum to w. Mixed chunks
@@ -1157,20 +1174,94 @@ class _ColumnOptimizer:
         occ[:] = merged
 
     # ------------------------------------------------------------------
+    def _solve_column(self, ulist, x, pos):
+        """Compute one column's width and stack its units into `pos` at left
+        offset `x`. Returns (w, placed, occupied, col_top). Pure function of
+        (ulist, x, units-state, locked_rects); writes only pos[block] for the
+        blocks in this column."""
+        H = self.H
+        has_locked = bool(self.locked_rects)
+        units = self.units
+        soft_a = 0.0
+        rigid_h = 0.0
+        max_w = 0.0
+        for k in ulist:
+            u = units[k]
+            soft_a += u.eff_soft
+            rigid_h += u.eff_rigid_h
+            if u.max_rigid_w > max_w:
+                max_w = u.max_rigid_w
+        avail = H - rigid_h
+        if avail < 0.05 * H:
+            avail = 0.05 * H
+        w = soft_a / avail
+        if w < max_w:
+            w = max_w
+        if w < 0.5:
+            w = 0.5
+        if has_locked:
+            for _ in range(3):
+                obs = self._obstacles_in(x, x + w)
+                obs_h = 0.0
+                for s, e in obs:
+                    if e > 0.0 and s < H:
+                        span = (e if e < H else H) - (s if s > 0.0 else 0.0)
+                        strip = self._band_strip(x, w, s, e, ())
+                        if strip is not None:
+                            span *= 1.0 - strip[1] / w
+                        obs_h += span
+                avail = H - rigid_h - obs_h
+                if avail < 0.05 * H:
+                    avail = 0.05 * H
+                w2 = soft_a / avail
+                if w2 < max_w:
+                    w2 = max_w
+                if w2 < 0.5:
+                    w2 = 0.5
+                if abs(w2 - w) < 5e-3:
+                    w = w2
+                    break
+                w = w2
+
+        placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
+        # widen and retry when fragmentation pushed content past the frame;
+        # only the soft part shrinks with width, so solve for it exactly
+        if soft_a > 0:
+            tries = 0
+            w_base = w
+            prev_overhead = None
+            while col_top > H * 1.0005 and tries < 3:
+                overhead = col_top - soft_a / w
+                # dead (non-soft) space already dominates the column: widening
+                # only shrinks the soft part, it cannot recover fixed overhead.
+                if overhead >= H * 0.90:
+                    break
+                # require overhead to shrink by >=1% per try; otherwise the
+                # loop is diverging (e.g. widen exposes no more free space).
+                if prev_overhead is not None and overhead > prev_overhead * 0.99:
+                    break
+                prev_overhead = overhead
+                if overhead < H * 0.98:
+                    w2 = soft_a / (H - overhead)
+                else:
+                    w2 = w * 1.25
+                w = min(max(w2, w * 1.01), w_base * 1.6)
+                placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
+                tries += 1
+        return w, placed, occupied, col_top
+
     def _layout(self, cols: List[List[int]]) -> Tuple[np.ndarray, float, float]:
+        if self._fast_eval:
+            return self._layout_fast(cols)
         n = self.n
         pos = np.zeros((n, 4))
         for i in range(n):
             if self.kind[i] == 2:
                 pos[i] = (self.lx[i], self.ly[i], self.rw[i], self.rh[i])
 
-        H = self.H
         x = 0.0
         col_records = []  # (x0, w, [(unit, y_bot, y_top)], occupied)
 
-        units = self.units
-        boundary = self.boundary
-        has_locked = bool(self.locked_rects)
         unit_col = self._unit_col
         col_spans = []
         for ci, ulist in enumerate(cols):
@@ -1180,79 +1271,19 @@ class _ColumnOptimizer:
                 continue
             for k in ulist:
                 unit_col[k] = ci
-            soft_a = 0.0
-            rigid_h = 0.0
-            max_w = 0.0
-            for k in ulist:
-                u = units[k]
-                soft_a += u.eff_soft
-                rigid_h += u.eff_rigid_h
-                if u.max_rigid_w > max_w:
-                    max_w = u.max_rigid_w
-            avail = H - rigid_h
-            if avail < 0.05 * H:
-                avail = 0.05 * H
-            w = soft_a / avail
-            if w < max_w:
-                w = max_w
-            if w < 0.5:
-                w = 0.5
-            if has_locked:
-                for _ in range(3):
-                    obs = self._obstacles_in(x, x + w)
-                    obs_h = 0.0
-                    for s, e in obs:
-                        if e > 0.0 and s < H:
-                            span = (e if e < H else H) - (s if s > 0.0 else 0.0)
-                            strip = self._band_strip(x, w, s, e, ())
-                            if strip is not None:
-                                span *= 1.0 - strip[1] / w
-                            obs_h += span
-                    avail = H - rigid_h - obs_h
-                    if avail < 0.05 * H:
-                        avail = 0.05 * H
-                    w2 = soft_a / avail
-                    if w2 < max_w:
-                        w2 = max_w
-                    if w2 < 0.5:
-                        w2 = 0.5
-                    if abs(w2 - w) < 5e-3:
-                        w = w2
-                        break
-                    w = w2
-
-            placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
-            # widen and retry when fragmentation pushed content past the frame;
-            # only the soft part shrinks with width, so solve for it exactly
-            if soft_a > 0:
-                tries = 0
-                w_base = w
-                prev_overhead = None
-                while col_top > H * 1.0005 and tries < 3:
-                    overhead = col_top - soft_a / w
-                    # dead (non-soft) space already dominates the column: widening
-                    # only shrinks the soft part, it cannot recover fixed overhead.
-                    if overhead >= H * 0.90:
-                        break
-                    # require overhead to shrink by >=1% per try; otherwise the
-                    # loop is diverging (e.g. widen exposes no more free space).
-                    if prev_overhead is not None and overhead > prev_overhead * 0.99:
-                        break
-                    prev_overhead = overhead
-                    if overhead < H * 0.98:
-                        w2 = soft_a / (H - overhead)
-                    else:
-                        w2 = w * 1.25
-                    w = min(max(w2, w * 1.01), w_base * 1.6)
-                    placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
-                    tries += 1
-
+            w, placed, occupied, _col_top = self._solve_column(ulist, x, pos)
             col_records.append((x, w, placed, occupied))
             col_spans.append((x, x + w))
             x += w
         self._col_spans = col_spans
+        return self._finish_layout(pos, col_records, x)
 
-        x_right = x
+    def _finish_layout(self, pos, col_records, x_right):
+        """Global post-passes shared by the slow and fast layout paths:
+        compute the frame extent, lift top-tagged units flush to the top
+        edge, and right-align right-tagged blocks. Operates on the same
+        col_records shape ((x0, w, placed, occupied) or None) and gives
+        bit-identical results regardless of how pos/col_records were built."""
         y_top = 0.0
         for rec in col_records:
             if rec is None:
@@ -1316,6 +1347,74 @@ class _ColumnOptimizer:
                             pos[i, 0] = nx
 
         return pos, x_right, y_top
+
+    # ------------------------------------------------------------------
+    # FAST_EVAL: per-column memoized layout. On a cache miss the column is
+    # solved with the identical _solve_column body and its base geometry is
+    # recorded relative to the column's left edge; on a hit the cached base
+    # geometry is rigidly shifted to the current x. A column whose absolute
+    # x-span intersects an obstacle strip depends on x, so its cache entry
+    # records the x it was solved at and is recomputed when x changes.
+    # ------------------------------------------------------------------
+    def _col_touches_obstacle(self, x0: float, x1: float) -> bool:
+        for (ox0, ox1) in self._obs_x:
+            if ox0 < x1 - 1e-9 and ox1 > x0 + 1e-9:
+                return True
+        return False
+
+    def _layout_fast(self, cols):
+        n = self.n
+        pos = np.zeros((n, 4))
+        for i in range(n):
+            if self.kind[i] == 2:
+                pos[i] = (self.lx[i], self.ly[i], self.rw[i], self.rh[i])
+
+        has_obs = bool(self._obs_x)
+        cache = self._col_cache
+        unit_col = self._unit_col
+        col_records = []
+        col_spans = []
+        x = 0.0
+        for ci, ulist in enumerate(cols):
+            if not ulist:
+                col_records.append(None)
+                col_spans.append(None)
+                continue
+            for k in ulist:
+                unit_col[k] = ci
+            key = (tuple(ulist), tuple(self.units[k].version for k in ulist))
+            ent = cache.get(key)
+            # An obstacle-touching column depends on absolute x: only reuse a
+            # cached entry when it was solved at (nearly) the same x AND the
+            # obstacle-intersection status of the old/new span is unchanged.
+            reuse = ent is not None
+            if reuse and has_obs:
+                ent_x = ent[0]
+                ent_w = ent[1]
+                old_touch = ent[4]
+                new_touch = self._col_touches_obstacle(x, x + ent_w)
+                if old_touch or new_touch:
+                    reuse = abs(ent_x - x) <= 1e-9 and old_touch == new_touch
+            if reuse:
+                _ex, w, ids, rel, _touch, placed, occupied = ent
+                # rigid x-shift + fixed y (base geometry `rel` is relative to
+                # the column's left edge); recompose by a single vectorized
+                # block copy plus the x offset (rel is never mutated).
+                pos[ids] = rel
+                pos[ids, 0] += x
+            else:
+                w, placed, occupied, _col_top = self._solve_column(ulist, x, pos)
+                ids = np.array([i for k in ulist for i in self.units[k].blocks],
+                               dtype=np.int64)
+                rel = pos[ids].copy()
+                rel[:, 0] -= x
+                touch = self._col_touches_obstacle(x, x + w) if has_obs else False
+                cache[key] = (x, w, ids, rel, touch, placed, occupied)
+            col_records.append((x, w, placed, occupied))
+            col_spans.append((x, x + w))
+            x += w
+        self._col_spans = col_spans
+        return self._finish_layout(pos, col_records, x)
 
     # ------------------------------------------------------------------
     def _hpwl(self, pos: np.ndarray) -> float:
