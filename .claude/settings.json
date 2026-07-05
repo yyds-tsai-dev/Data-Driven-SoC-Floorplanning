@@ -2,5 +2,15 @@
   "model": "claude-fable-5",
   "effortLevel": "xhigh",
   "alwaysThinkingEnabled": true,
-  "enabledMcpjsonServers": ["codex"]
+  "extraKnownMarketplaces": {
+    "openai-codex": {
+      "source": {
+        "source": "github",
+        "repo": "openai/codex-plugin-cc"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "codex@openai-codex": true
+  }
 }

@@ -119,12 +119,19 @@ Division of labour:
   reporting, renames/moves, boilerplate, doc sync, fact-gathering. Give it an
   explicit instruction and exact commands. See
   [.claude/agents/fast-worker.md](.claude/agents/fast-worker.md).
-- **Peer engineer → Codex (OpenAI).** A same-level engineer with a *different
-  vantage point* — use it for independent cross-checks, second opinions, and
-  alternative implementations of a tricky piece, then reconcile its take with
-  `deep-reasoner`'s. Requires the Codex integration to be configured (MCP server
-  / plugin + OpenAI auth); when it is absent, fall back to a second
-  `deep-reasoner` pass with an adversarial framing.
+- **Peer engineer → Codex (OpenAI), via the official `codex@openai-codex`
+  plugin.** A same-level engineer with a *different vantage point*. Use
+  `/codex:review` (read-only) or `/codex:adversarial-review` (steerable
+  challenge that pressure-tests design choices and tradeoffs) for independent
+  cross-checks and second opinions, and `/codex:rescue` / the
+  `codex:codex-rescue` subagent to delegate a task or get an alternative
+  implementation (`/codex:status` / `/codex:result` manage background jobs);
+  then reconcile its take with `deep-reasoner`'s. The plugin (marketplace
+  `openai-codex`, from `openai/codex-plugin-cc`) is enabled in
+  `.claude/settings.json` and drives the already-authenticated `codex` CLI —
+  run `/codex:setup` once per machine to confirm readiness. When Codex is
+  unavailable, fall back to a second `deep-reasoner` pass with an adversarial
+  framing.
 
 Routing heuristic: if a task needs a *decision or a diagnosis*, send it to
 `deep-reasoner`; if it needs *hands* on already-decided work, send it to
