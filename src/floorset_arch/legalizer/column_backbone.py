@@ -170,7 +170,14 @@ def solve_with_column_backbone(
     target_positions: Optional[torch.Tensor] = None,
 ) -> List[Rect]:
     start = time.time()
-    deadline = start + _time_budget(block_count)
+    budget = _time_budget(block_count)
+    deadline = start + budget
+    # When the slack refiner is on, carve its time out of the SA share so the
+    # total per-case runtime is unchanged; without a reserve the refiner is
+    # deadline-starved on large cases (phase1+aspect alone ~0.3s at n=120).
+    refine_reserve = 0.0
+    if os.environ.get("FLOORSET_SLACK_REFINE", "0") == "1":
+        refine_reserve = min(2.0, 0.3 + 0.012 * block_count, 0.4 * budget)
 
     area_targets = area_targets[:block_count].detach().float().cpu()
     constraints = constraints[:block_count].detach().float().cpu()
@@ -189,7 +196,7 @@ def solve_with_column_backbone(
         out = legalize_rectangles(
             seed_rects, area_targets, constraints, target_positions,
             b2b_connectivity=b2b, p2b_connectivity=p2b, pins_pos=pins,
-            deadline=deadline,
+            deadline=deadline - refine_reserve,
         )
         if os.environ.get("FLOORSET_SLACK_REFINE", "0") == "1":
             from floorset_arch.refine.api import refine_layout
@@ -201,7 +208,7 @@ def solve_with_column_backbone(
             # pure numpy, single-core, bounded by MAX_SWEEPS and n<=120, so
             # its own pass costs at most tens of ms -- give it a small
             # dedicated allowance instead of inheriting the spent deadline.
-            refine_deadline = time.time() + min(0.5, max(0.1, 0.02 * block_count / 10))
+            refine_deadline = time.time() + max(refine_reserve, 0.1)
             # FLOORSET_SLACK_REFINE_VSNAP=1 (default off) enables a further
             # Phase-V violation-snap post-pass inside refine_layout itself
             # (read directly from os.environ there, not threaded through as a
