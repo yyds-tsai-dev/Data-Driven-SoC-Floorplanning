@@ -55,16 +55,20 @@ The contest calls a `FloorplanOptimizer` subclass's `solve(block_count, area_tar
 
 ### `solve()` — the Production Solver Path
 
-`solve()` parses inputs into an `Instance` (`parser.py`), then chooses ONE of two priors — there is a single production path, not hidden fallbacks:
+**Production path (promoted 2026-07-05 on Evaluator Evidence: 1.238–1.246 vs 2.1158, 100/100 feasible; see [docs/experiments/2026-07-05-column-backbone-pivot.md](docs/experiments/2026-07-05-column-backbone-pivot.md)):** when `FLOORSET_COLUMN_BACKBONE=1` (the `.env` default), `solve()` short-circuits into the **column-slicing backbone** in `src/floorset_arch/legalizer/` (vendored teammate solver): heuristic centroid seed → column-slicing + parallel-restart SA legalizer (overlap-free / exact-area / MIB-consistent **by construction**) → optional slack refiner in `src/floorset_arch/refine/` (`FLOORSET_SLACK_REFINE`, `_ASPECT`, `_VSNAP`; pure function that returns its input on any guard failure) → guaranteed-feasible row fallback on exception. Pure CPU; consumes **no** model checkpoint — the backbone's seed channel is measured dead (GT-coordinate seeds move the total < 0.002; probe: `scripts/probes/gt_seed_optimizer.py`).
 
-1. **v11 diffusion path** (active) — taken when `FLOORSET_DIFFUSION_CHECKPOINT` is set. Sample a graph-conditioned diffusion prior → concretize to placements → repair → rank → best. Lives in `src/floorset_arch/diffusion/` (`sampling.py`, `concretize.py`, `ranking.py`).
-2. **v5 Anchor-GNN path** — fallback when no diffusion checkpoint. Load Anchor-GNN guidance (or a deterministic `surrogate_guidance` when no GNN checkpoint) → build candidates with the hetero-graph beam decoder over MER/skyline slots → select best via the v10 proxy.
+Legacy paths (unset `FLOORSET_COLUMN_BACKBONE` to reach them): `solve()` parses inputs into an `Instance` (`parser.py`), then chooses ONE of two priors:
+
+1. **v11 diffusion path** — taken when `FLOORSET_DIFFUSION_CHECKPOINT` is set. Sample a graph-conditioned diffusion prior → concretize to placements → repair → rank → best. Lives in `src/floorset_arch/diffusion/` (`sampling.py`, `concretize.py`, `ranking.py`). Validation: 3.3894.
+2. **v5 Anchor-GNN path** — fallback when no diffusion checkpoint. Load Anchor-GNN guidance (or a deterministic `surrogate_guidance` when no GNN checkpoint) → build candidates with the hetero-graph beam decoder over MER/skyline slots → select best via the v10 proxy. Validation: 2.1007–2.19 across checkpoints.
 
 Both priors are advisory; the decoder + repair + ranking produce the final legal layout. Hard legality (no overlaps/missing blocks/fixed-shape or preplaced violations) always precedes soft-constraint refinement.
 
 ### `src/floorset_arch/` module map
 
 - `optimizer.py` — orchestrates `solve()`; reads all `FLOORSET_*` runtime toggles.
+- `legalizer/` — **production backbone**: `column_slicing.py` (vendored column-slicing + parallel-restart SA legalizer; do not hand-edit without eval evidence) and `column_backbone.py` (seed, time budget, refiner budget carve-out, row fallback).
+- `refine/` — slack refiner on top of the legal layout: `constraint_graph.py` (axis separation DAGs), `slack_solve.py` (weighted-median projected sweeps), `aspect.py`, `vsnap.py` (boundary wall snap + bounded reorder), `guards.py` (evaluator-faithful, shapely-backed), `api.py` (failure containment). Spec in [docs/design/slack_refiner_spec.md](docs/design/slack_refiner_spec.md); invariant tests in `tests/test_refine_invariants.py`.
 - `parser.py`, `hetero_graph.py`, `features.py` — build the `Instance` and the Heterogeneous Floorplan Graph (typed block/pin/cluster/MIB/boundary nodes).
 - `constructive.py`, `geometry.py`, `relative_order.py` — beam decoder, MER/skyline slot candidates, geometry helpers.
 - `repair.py` — hard-legality + soft-constraint repair (multiple repair profiles).
