@@ -78,6 +78,7 @@ DEFAULT_RESTARTS = 220            # BLF restarts for medium k
 DEFAULT_ENUM_K = 4               # exhaustive order enumeration for k <= this
 DEFAULT_SEED = 12345
 DEFAULT_ASPECT_CAP = 4.0         # max soft-block aspect (bound the resize)
+DEFAULT_MAX_ROUNDS = 3           # re-rank + re-sweep rounds while budget remains
 
 
 def _envf(name: str, default: float) -> float:
@@ -118,6 +119,20 @@ def _overlaps(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1) -> bool:
     ox = min(ax1, bx1) - max(ax0, bx0)
     oy = min(ay1, by1) - max(ay0, by0)
     return ox > SEP_TOL and oy > SEP_TOL
+
+
+def _boxes_overlap_free(boxes: Sequence[Rect]) -> bool:
+    """True iff no two rects in `boxes` overlap (SEP_TOL tolerance). O(k^2),
+    but k <= max_k (<= ~9) so this is cheap."""
+    m = len(boxes)
+    for a in range(m):
+        ax0, ay0, aw, ah = boxes[a]
+        ax1, ay1 = ax0 + aw, ay0 + ah
+        for b in range(a + 1, m):
+            bx0, by0, bw, bh = boxes[b]
+            if _overlaps(ax0, ay0, ax1, ay1, bx0, by0, bx0 + bw, by0 + bh):
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +724,47 @@ def _pack_strip(
     return placed
 
 
+def _wall_snap(
+    boxes: List[Rect],
+    win: Tuple[float, float, float, float],
+    bound_local: Dict[int, int],
+) -> Optional[List[Rect]]:
+    """Translate every boundary-tagged window block flush to its owned window
+    wall (LEFT->win.x0, RIGHT->win.x1, BOTTOM->win.y0, TOP->win.y1), preserving
+    each block's shape. Because `_boundary_ok` only admits a boundary block when
+    its tagged wall coincides with the window box edge, snapping to the window
+    wall is exactly the evaluator's boundary condition for that block.
+
+    Returns the wall-consistent boxes iff they stay inside the window AND remain
+    overlap-free among the k window blocks; otherwise None. When the input is
+    ALREADY wall-consistent (every boundary block flush to its wall) the boxes
+    are returned unchanged -- an already-flush raw packing is itself a valid
+    snapped candidate, so the caller must not discard it. Pure translation --
+    never resizes, so exact-area / MIB-shape invariants are untouched."""
+    if not bound_local:
+        return None
+    wx0, wy0, wx1, wy1 = win
+    out = list(boxes)
+    for k, code in bound_local.items():
+        bx, by, bw, bh = out[k]
+        nx, ny = bx, by
+        if code & BOUND_LEFT:
+            nx = wx0
+        if code & BOUND_RIGHT:
+            nx = wx1 - bw
+        if code & BOUND_BOTTOM:
+            ny = wy0
+        if code & BOUND_TOP:
+            ny = wy1 - bh
+        # Containment: a snapped block must still fit the window on both axes.
+        if nx < wx0 - 1e-6 or ny < wy0 - 1e-6 or nx + bw > wx1 + 1e-6 or ny + bh > wy1 + 1e-6:
+            return None
+        out[k] = (nx, ny, bw, bh)
+    if not _boxes_overlap_free(out):
+        return None
+    return out
+
+
 def _repack_window(
     selected: List[int],
     rects: Sequence[Rect],
@@ -720,7 +776,7 @@ def _repack_window(
     restarts: int,
     enum_k: int,
     aspect_cap: float,
-) -> Optional[Tuple[List[Rect], float]]:
+) -> Optional[Tuple[List[Rect], float, bool]]:
     """Repack the window blocks inside `win`, minimizing anchored HPWL.
 
     Uses a randomized recursive SLICING packer that flexes soft-block aspects
@@ -728,8 +784,17 @@ def _repack_window(
     window (the incoming column-slicing sub-layout is space-tight), so the real
     geometric freedom comes from re-slicing the box with different block orders,
     cut directions, and per-block aspect flex (exact area preserved). MIB /
-    fixed-shape blocks keep their literal shape. Returns
-    (new_boxes_local_order, window_hpwl) for the best packing found, or None.
+    fixed-shape blocks keep their literal shape.
+
+    Boundary-tagged window blocks are kept flush to their owned window wall via
+    a `_wall_snap` projection applied to every candidate BEFORE scoring: the
+    packer is wall-agnostic, so a raw slicing/strip pack usually drops a
+    boundary block off its wall and the full-layout `soft_regress` guard then
+    rejects the whole window. Snapping the boundary blocks flush to the window
+    wall (a pure translation, overlap-revalidated) recovers those windows.
+
+    Returns (new_boxes_local_order, window_hpwl, used_wall_snap) for the best
+    packing found, or None.
     """
     k = len(selected)
     if k < 2:
@@ -744,12 +809,34 @@ def _repack_window(
             fixed_shape[kk] = shapes[kk][0]
         areas_local[kk] = ctx.areas.get(b, rects[b][2] * rects[b][3])
 
+    # Boundary code per LOCAL window index (0 if none). Drives the wall snap
+    # so boundary blocks stay glued to their owned window wall after packing.
+    bound_local: Dict[int, int] = {}
+    for kk in range(k):
+        code = ctx.boundary.get(selected[kk], 0)
+        if code:
+            bound_local[kk] = code
+    # Kill-switch for A/B measurement only (default ON). Never set in .env.
+    wall_snap_on = os.environ.get("FLOORSET_WINDOW_WALL_SNAP", "1") != "0"
+
     # Baseline: the incoming window layout -- the packer must strictly beat it.
     base_boxes = [rects[b] for b in selected]
     base_hpwl = _window_hpwl(base_boxes, internal, external)
 
-    best_boxes: Optional[List[Rect]] = None
-    best_hpwl = base_hpwl
+    # Two separate optima:
+    #   best_raw     -- lowest-HPWL packing ignoring boundary walls.
+    #   best_snap    -- lowest-HPWL packing with all boundary blocks snapped
+    #                   flush to their owned window wall (overlap-revalidated).
+    # For a window with boundary blocks, the RAW optimum almost always drops a
+    # boundary block off its wall and the full-layout `soft_regress` guard then
+    # rejects it -- so we must PREFER the snapped optimum for such windows, even
+    # if its window-HPWL is slightly higher, because it is the only candidate
+    # that can survive the guard. Non-boundary windows have no snapped variant
+    # and fall back to best_raw. Both must strictly beat the incoming baseline.
+    best_raw: Optional[List[Rect]] = None
+    best_raw_hpwl = base_hpwl
+    best_snap: Optional[List[Rect]] = None
+    best_snap_hpwl = base_hpwl
 
     # Anchor-sorted orders (x-pull, y-pull) bias the pack toward the netlist;
     # random restarts explore the slicing space.
@@ -788,16 +875,26 @@ def _repack_window(
         return True
 
     def _consider(placed_map: Optional[Dict[int, Rect]]) -> None:
-        nonlocal best_boxes, best_hpwl
+        nonlocal best_raw, best_raw_hpwl, best_snap, best_snap_hpwl
         if not placed_map or len(placed_map) != k:
             return
         boxes = [placed_map[kk] for kk in range(k)]
         if not _in_box(boxes):
             return
+        # Raw optimum (boundary-agnostic).
         h = _window_hpwl(boxes, internal, external)
-        if h < best_hpwl - EPS:
-            best_hpwl = h
-            best_boxes = boxes
+        if h < best_raw_hpwl - EPS:
+            best_raw_hpwl = h
+            best_raw = boxes
+        # Snapped optimum: glue boundary blocks flush to their owned wall, then
+        # re-score. Overlap-revalidated inside _wall_snap.
+        if bound_local and wall_snap_on:
+            snapped = _wall_snap(boxes, win, bound_local)
+            if snapped is not None and _in_box(snapped):
+                hs = _window_hpwl(snapped, internal, external)
+                if hs < best_snap_hpwl - EPS:
+                    best_snap_hpwl = hs
+                    best_snap = snapped
 
     n_restarts = max(1, restarts)
     orders_pool = list(base_orders)
@@ -826,9 +923,15 @@ def _repack_window(
             _consider(_pack_strip(order, win, nrows, fixed_shape,
                                   areas_local, horizontal=False))
 
-    if best_boxes is None:
-        return None
-    return list(best_boxes), best_hpwl
+    # Selection: for a boundary window, return the snapped optimum when one
+    # exists (it is the only wall-consistent packing that can pass the soft
+    # guard); otherwise the raw optimum. Non-boundary windows have no snapped
+    # variant and always take the raw optimum.
+    if bound_local and best_snap is not None:
+        return list(best_snap), best_snap_hpwl, True
+    if best_raw is not None:
+        return list(best_raw), best_raw_hpwl, False
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +984,7 @@ def refine_window(
         enum_k = _envi("FLOORSET_WINDOW_ENUM_K", DEFAULT_ENUM_K)
         seed = _envi("FLOORSET_WINDOW_SEED", DEFAULT_SEED)
         aspect_cap = _envf("FLOORSET_WINDOW_ASPECT_CAP", DEFAULT_ASPECT_CAP)
+        max_rounds = max(1, _envi("FLOORSET_WINDOW_MAX_ROUNDS", DEFAULT_MAX_ROUNDS))
         rng = random.Random(seed)
 
         pre_hpwl = hpwl(original, b2b_edges, p2b_edges, pins)
@@ -903,91 +1007,115 @@ def refine_window(
         k_sum = 0
         used_regions: set = set()
 
-        pairs = _tension_ranked_pairs(cur, b2b_edges, topk)
-
-        for (i, j, _t) in pairs:
+        n_rounds = 0
+        # Multi-round sweep: each round re-ranks tension on the CURRENT
+        # (improved) layout and re-sweeps the pairs. `used_regions` carries
+        # across rounds so an already-improved window is never re-attempted; a
+        # round that accepts nothing new ends the loop (fixpoint). All rounds
+        # share the SAME reserve (the outer deadline is unchanged) -- the stage
+        # runs well under budget, so re-ranking harvests the slack instead of
+        # growing it. Round 1 alone is byte-identical to the single-pass stage.
+        for round_idx in range(max_rounds):
             if n_tried >= max_windows:
                 break
             if deadline is not None and time.time() >= deadline:
                 break
-            if not (0 <= i < n and 0 <= j < n) or i == j:
-                continue
+            round_accepts_before = n_accepted
+            n_rounds = round_idx + 1
+            pairs = _tension_ranked_pairs(cur, b2b_edges, topk)
 
-            sel = _select_window(cur, i, j, ctx, inflate, max_k, used_regions)
-            if sel is None:
-                continue
-            selected, win = sel
-            n_tried += 1
-            k_sum += len(selected)
-
-            internal, external = _window_nets(selected, cur, b2b_edges, p2b_edges, pins)
-            repacked = _repack_window(
-                selected, cur, win, ctx, internal, external,
-                rng, restarts, enum_k, aspect_cap,
-            )
-            win_pre = _window_hpwl([cur[b] for b in selected], internal, external)
-            win_rec: Dict[str, object] = {
-                "stage": "window",
-                "window_blocks": list(selected),
-                "k": len(selected),
-                "win_pre_hpwl": win_pre,
-                "full_pre_hpwl": cur_hpwl,
-                "elapsed": None,
-                "guard_result": "no_repack",
-            }
-            if repacked is None:
-                _log(log_path, win_rec)
-                continue
-
-            new_boxes, win_post = repacked
-            win_rec["win_post_hpwl"] = win_post
-
-            # Build the candidate full layout: splice re-packed boxes back in.
-            cand = list(cur)
-            in_bbox_ok = True
-            for k_local, b in enumerate(selected):
-                nb = new_boxes[k_local]
-                # Belt-and-braces: every re-packed block must lie inside the
-                # window bbox (with tolerance) BEFORE the full guard check.
-                if not (nb[0] >= win[0] - 1e-6 and nb[1] >= win[1] - 1e-6
-                        and nb[0] + nb[2] <= win[2] + 1e-6
-                        and nb[1] + nb[3] <= win[3] + 1e-6):
-                    in_bbox_ok = False
+            for (i, j, _t) in pairs:
+                if n_tried >= max_windows:
                     break
-                cand[b] = nb
-            if not in_bbox_ok:
-                win_rec["guard_result"] = "out_of_bbox"
-                _log(log_path, win_rec)
-                continue
+                if deadline is not None and time.time() >= deadline:
+                    break
+                if not (0 <= i < n and 0 <= j < n) or i == j:
+                    continue
 
-            cand_hpwl = hpwl(cand, b2b_edges, p2b_edges, pins)
-            if not (cand_hpwl < cur_hpwl - EPS):
-                win_rec["guard_result"] = "hpwl_not_lower"
-                _log(log_path, win_rec)
-                continue
-            if not (_bbox_area(cand) <= pre_bbox + 1e-9):
-                win_rec["guard_result"] = "bbox_grew"
-                _log(log_path, win_rec)
-                continue
-            cand_soft = soft_violations(cand, constraints)
-            if not all(c <= b for c, b in zip(cand_soft, base_soft)):
-                win_rec["guard_result"] = "soft_regress"
-                _log(log_path, win_rec)
-                continue
-            if not hard_legal(cand, area_targets, constraints, target_positions):
-                win_rec["guard_result"] = "hard_legal"
-                _log(log_path, win_rec)
-                continue
+                sel = _select_window(cur, i, j, ctx, inflate, max_k, used_regions)
+                if sel is None:
+                    continue
+                selected, win = sel
+                n_tried += 1
+                k_sum += len(selected)
 
-            # Accept.
-            cur = cand
-            cur_hpwl = cand_hpwl
-            n_accepted += 1
-            used_regions.add(frozenset(selected))
-            win_rec["guard_result"] = "accepted"
-            win_rec["full_post_hpwl"] = cand_hpwl
-            _log(log_path, win_rec)
+                internal, external = _window_nets(selected, cur, b2b_edges, p2b_edges, pins)
+                repacked = _repack_window(
+                    selected, cur, win, ctx, internal, external,
+                    rng, restarts, enum_k, aspect_cap,
+                )
+                win_pre = _window_hpwl([cur[b] for b in selected], internal, external)
+                win_rec: Dict[str, object] = {
+                    "stage": "window",
+                    "round": round_idx,
+                    "window_blocks": list(selected),
+                    "k": len(selected),
+                    "win_pre_hpwl": win_pre,
+                    "full_pre_hpwl": cur_hpwl,
+                    "elapsed": None,
+                    "guard_result": "no_repack",
+                }
+                if repacked is None:
+                    _log(log_path, win_rec)
+                    continue
 
+                new_boxes, win_post, used_snap = repacked
+                win_rec["win_post_hpwl"] = win_post
+                win_rec["wall_snap"] = bool(used_snap)
+
+                # Build the candidate full layout: splice re-packed boxes back in.
+                cand = list(cur)
+                in_bbox_ok = True
+                for k_local, b in enumerate(selected):
+                    nb = new_boxes[k_local]
+                    # Belt-and-braces: every re-packed block must lie inside the
+                    # window bbox (with tolerance) BEFORE the full guard check.
+                    if not (nb[0] >= win[0] - 1e-6 and nb[1] >= win[1] - 1e-6
+                            and nb[0] + nb[2] <= win[2] + 1e-6
+                            and nb[1] + nb[3] <= win[3] + 1e-6):
+                        in_bbox_ok = False
+                        break
+                    cand[b] = nb
+                if not in_bbox_ok:
+                    win_rec["guard_result"] = "out_of_bbox"
+                    _log(log_path, win_rec)
+                    continue
+
+                cand_hpwl = hpwl(cand, b2b_edges, p2b_edges, pins)
+                if not (cand_hpwl < cur_hpwl - EPS):
+                    win_rec["guard_result"] = "hpwl_not_lower"
+                    _log(log_path, win_rec)
+                    continue
+                if not (_bbox_area(cand) <= pre_bbox + 1e-9):
+                    win_rec["guard_result"] = "bbox_grew"
+                    _log(log_path, win_rec)
+                    continue
+                cand_soft = soft_violations(cand, constraints)
+                if not all(c <= b for c, b in zip(cand_soft, base_soft)):
+                    win_rec["guard_result"] = "soft_regress"
+                    _log(log_path, win_rec)
+                    continue
+                if not hard_legal(cand, area_targets, constraints, target_positions):
+                    win_rec["guard_result"] = "hard_legal"
+                    _log(log_path, win_rec)
+                    continue
+
+                # Accept.
+                cur = cand
+                cur_hpwl = cand_hpwl
+                n_accepted += 1
+                used_regions.add(frozenset(selected))
+                win_rec["guard_result"] = "accepted"
+                win_rec["full_post_hpwl"] = cand_hpwl
+                _log(log_path, win_rec)
+
+            # Round fixpoint: a full pass over the re-ranked pairs that accepted
+            # nothing new means further rounds cannot help (the ranking depends
+            # only on `cur`, which is unchanged) -- stop and keep the budget.
+            if n_accepted == round_accepts_before:
+                break
+
+        detail["n_rounds"] = n_rounds
         detail["n_windows_tried"] = n_tried
         detail["n_windows_accepted"] = n_accepted
         detail["mean_k"] = (k_sum / n_tried) if n_tried else 0.0

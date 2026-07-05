@@ -16,9 +16,13 @@ import torch
 from floorset_arch.refine.api import refine_layout
 from floorset_arch.refine.guards import hard_legal, soft_violations
 from floorset_arch.refine.window_repack import (
+    BOUND_BOTTOM,
+    BOUND_LEFT,
+    BOUND_RIGHT,
     _build_ctx,
     _select_window,
     _tension_ranked_pairs,
+    _wall_snap,
     refine_window,
 )
 from floorset_arch.refine.wirelength import hpwl
@@ -228,6 +232,80 @@ def test_mib_shape_equality_preserved():
     assert hard_legal(out, area, cons, tpos)
     v = soft_violations(out, cons)
     assert v[2] == 0  # v_mib
+
+
+# --- boundary wall-snap -----------------------------------------------------
+
+
+def test_wall_snap_glues_boundary_block_to_owned_wall():
+    """A LEFT-tagged block sitting off the window's left wall is snapped flush
+    (x0 == win.x0), preserving its shape, when the snap stays overlap-free."""
+    win = (0.0, 0.0, 4.0, 2.0)
+    # local 0 is LEFT-tagged but placed at x=1 (off the wall); local 1 fills
+    # the rest of the strip. Snapping 0 to x=0 pushes it left into free space
+    # only if 1 leaves room -- here 1 occupies x=2..4, so x=0..1 is free.
+    boxes = [(1.0, 0.0, 1.0, 2.0), (2.0, 0.0, 2.0, 2.0)]
+    snapped = _wall_snap(boxes, win, {0: BOUND_LEFT})
+    assert snapped is not None
+    assert abs(snapped[0][0] - 0.0) <= 1e-9      # flush to left wall
+    assert snapped[0][2:] == boxes[0][2:]        # shape unchanged
+    assert snapped[1] == boxes[1]                # non-boundary block untouched
+
+
+def test_wall_snap_rejects_when_it_would_overlap():
+    """If snapping a boundary block flush to its wall would overlap a neighbor,
+    the snap is rejected (returns None) so the caller keeps the raw candidate."""
+    win = (0.0, 0.0, 4.0, 2.0)
+    # local 0 LEFT-tagged at x=2; a neighbor already occupies x=0..2, so
+    # snapping 0 to x=0 would overlap it -> snap must be refused.
+    boxes = [(2.0, 0.0, 2.0, 2.0), (0.0, 0.0, 2.0, 2.0)]
+    snapped = _wall_snap(boxes, win, {0: BOUND_LEFT})
+    assert snapped is None
+
+
+def test_wall_snap_already_flush_returns_boxes():
+    """An already-wall-consistent packing is itself a valid snapped candidate
+    and must be returned unchanged (not dropped as a no-op)."""
+    win = (0.0, 0.0, 4.0, 2.0)
+    boxes = [(0.0, 0.0, 1.0, 2.0), (1.0, 0.0, 3.0, 2.0)]  # block 0 flush LEFT
+    snapped = _wall_snap(boxes, win, {0: BOUND_LEFT})
+    assert snapped is not None
+    assert snapped == boxes
+
+
+def test_wall_snap_corner_two_walls():
+    """A corner block (LEFT|BOTTOM) snaps on both axes at once."""
+    win = (0.0, 0.0, 3.0, 3.0)
+    boxes = [(1.0, 1.0, 1.0, 1.0), (2.0, 0.0, 1.0, 3.0)]
+    snapped = _wall_snap(boxes, win, {0: BOUND_LEFT | BOUND_BOTTOM})
+    assert snapped is not None
+    assert abs(snapped[0][0] - 0.0) <= 1e-9
+    assert abs(snapped[0][1] - 0.0) <= 1e-9
+
+
+def test_boundary_pinning_avoids_soft_regress():
+    """End-to-end: a window whose repack would move a boundary block off its
+    wall must NOT regress the boundary soft-violation count. With the wall-snap
+    on (default) the accepted layout keeps the boundary block on its wall."""
+    # 2x2 grid; block 0 is BOTTOM+LEFT tagged (a corner at the origin). A heavy
+    # diagonal net tempts the repacker to move it; the snap must keep it pinned.
+    rects = [
+        (0.0, 0.0, 1.0, 1.0),  # 0 -- corner, BOTTOM|LEFT
+        (1.0, 0.0, 1.0, 1.0),  # 1
+        (0.0, 1.0, 1.0, 1.0),  # 2
+        (1.0, 1.0, 1.0, 1.0),  # 3
+    ]
+    area = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    cons = _constraints(4, boundary=[float(BOUND_BOTTOM | BOUND_LEFT), 0.0, 0.0, 0.0])
+    tpos = _targets(4)
+    b2b = [(0, 3, 20.0), (0, 1, 1.0), (2, 3, 1.0)]
+    base = soft_violations(rects, cons)
+    out, detail = refine_window(rects, area, cons, tpos, b2b, [], [],
+                                deadline=time.time() + 3.0)
+    after = soft_violations(out, cons)
+    assert all(a <= b for a, b in zip(after, base))
+    assert hard_legal(out, area, cons, tpos)
+    _no_overlap(out)
 
 
 # --- determinism -----------------------------------------------------------
