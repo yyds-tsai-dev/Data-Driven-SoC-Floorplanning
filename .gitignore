@@ -3,9 +3,9 @@
 Thumbs.db
 .nfs*
 
-# Partner reference checkpoint (178MB, unusable without partner's
-# diffusion_data/diffusion_model modules)
+# Partner reference checkpoint (178MB) and the harness symlink to it
 partner/*.pt
+partner/harness/checkpoints/
 
 # Python
 __pycache__/
