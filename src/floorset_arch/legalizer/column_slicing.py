@@ -52,6 +52,19 @@ UTIL_TARGET_REF = 0.97     # utilization used for the area cost reference
 MIB_AREA_GUARD = 0.0095    # stay under the 1% hard area tolerance
 
 
+def _cumulative(weights: List[float]) -> List[float]:
+    """Cumulative-threshold list for the move selector. The last entry is
+    pinned to 1.0 so a uniform draw always lands in some family."""
+    acc = 0.0
+    cum = []
+    for w in weights:
+        acc += w
+        cum.append(acc)
+    if cum:
+        cum[-1] = 1.0
+    return cum
+
+
 # =============================================================================
 # Constraint parsing helpers (API kept for my_opt_claude.py)
 # =============================================================================
@@ -206,6 +219,35 @@ class _ColumnOptimizer:
         # workers/pickle).
         self._fast_eval = os.environ.get("FLOORSET_FAST_EVAL", "0") == "1"
         self._col_cache: Dict[tuple, tuple] = {}
+
+        # --- M1c: adaptive move probabilities (FLOORSET_SA_ADAPTIVE) ---------
+        # The move selector in `_random_move` picks a family from a single
+        # rng.random() draw compared against these cumulative thresholds. With
+        # the flag OFF these stay bit-identical to the historical fixed mix
+        # (0.55 / 0.25 / 0.12 / 0.08), so the rng stream and branch structure
+        # -- and therefore the FAST_EVAL equivalence shadow check -- are
+        # unchanged. With the flag ON, `_anneal` reweights them from a sliding
+        # window of per-family acceptance x mean accepted improvement.
+        self._adaptive_moves = os.environ.get("FLOORSET_SA_ADAPTIVE", "0") == "1"
+        self._move_base = [0.55, 0.25, 0.12, 0.08]  # relocate/swap/reorder/subgrp
+        self._move_cum = _cumulative(self._move_base)
+        self._last_move_type = -1  # family index set by every _random_move call
+
+        # --- M1c: PARSAC-style constraint-fixing move (FLOORSET_SA_CFIX) -----
+        # With small probability, when soft violations remain, perform a
+        # targeted boundary-repair move and accept it unconditionally. Hard
+        # legality is by construction, so this can never break it.
+        self._cfix = os.environ.get("FLOORSET_SA_CFIX", "0") == "1"
+        self._cfix_p = 0.001
+
+        # --- M3: post-SA column width re-optimization (FLOORSET_WIDTH_OPT) ---
+        # After the SA fixes the column assignment, coordinate-descend the
+        # per-column widths (golden-section over a bounded multiplier) to trim
+        # HPWL, exploiting the exact-area / free-aspect soft blocks. Runs on
+        # the from-scratch `_layout_widths` path so it never poisons the
+        # FAST_EVAL cache. Optional JSONL pre/post log via FLOORSET_WIDTH_OPT_LOG.
+        self._width_opt = os.environ.get("FLOORSET_WIDTH_OPT", "0") == "1"
+        self._width_opt_log = os.environ.get("FLOORSET_WIDTH_OPT_LOG", "")
 
         self._build_hpwl_arrays(b2b, p2b, pins)
         self._build_soft_norm()
@@ -1174,11 +1216,17 @@ class _ColumnOptimizer:
         occ[:] = merged
 
     # ------------------------------------------------------------------
-    def _solve_column(self, ulist, x, pos):
+    def _solve_column(self, ulist, x, pos, w_force=None):
         """Compute one column's width and stack its units into `pos` at left
         offset `x`. Returns (w, placed, occupied, col_top). Pure function of
         (ulist, x, units-state, locked_rects); writes only pos[block] for the
-        blocks in this column."""
+        blocks in this column.
+
+        M3 width re-optimization: when `w_force` is given the derived width is
+        skipped and the column is stacked at exactly that width (clamped up to
+        the widest rigid member so hard shapes still fit). The widen-retry loop
+        is also skipped -- the width pass owns feasibility and rejects a width
+        whose returned col_top exceeds the frame height."""
         H = self.H
         has_locked = bool(self.locked_rects)
         units = self.units
@@ -1191,6 +1239,10 @@ class _ColumnOptimizer:
             rigid_h += u.eff_rigid_h
             if u.max_rigid_w > max_w:
                 max_w = u.max_rigid_w
+        if w_force is not None:
+            w = max(w_force, max_w, 0.5)
+            placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
+            return w, placed, occupied, col_top
         avail = H - rigid_h
         if avail < 0.05 * H:
             avail = 0.05 * H
@@ -1277,6 +1329,41 @@ class _ColumnOptimizer:
             x += w
         self._col_spans = col_spans
         return self._finish_layout(pos, col_records, x)
+
+    def _layout_widths(self, cols, widths):
+        """M3: layout that forces each column to widths[ci] (None = derive as
+        usual). Always the from-scratch path -- it never touches the FAST_EVAL
+        `_col_cache`, so no width-blind cache entry can be written or reused;
+        the cache stays correct for the SA's own (derived-width) queries.
+        Returns (pos, x_right, y_top, col_tops) where col_tops[ci] is the raw
+        stacked height of column ci (before the top-lift post-pass) so the
+        width pass can check per-column frame feasibility."""
+        n = self.n
+        pos = np.zeros((n, 4))
+        for i in range(n):
+            if self.kind[i] == 2:
+                pos[i] = (self.lx[i], self.ly[i], self.rw[i], self.rh[i])
+        x = 0.0
+        col_records = []
+        col_spans = []
+        col_tops = [0.0] * len(cols)
+        unit_col = self._unit_col
+        for ci, ulist in enumerate(cols):
+            if not ulist:
+                col_records.append(None)
+                col_spans.append(None)
+                continue
+            for k in ulist:
+                unit_col[k] = ci
+            wf = widths[ci] if ci < len(widths) else None
+            w, placed, occupied, col_top = self._solve_column(ulist, x, pos, w_force=wf)
+            col_records.append((x, w, placed, occupied))
+            col_spans.append((x, x + w))
+            col_tops[ci] = col_top
+            x += w
+        self._col_spans = col_spans
+        pos, x_right, y_top = self._finish_layout(pos, col_records, x)
+        return pos, x_right, y_top, col_tops
 
     def _finish_layout(self, pos, col_records, x_right):
         """Global post-passes shared by the slow and fast layout paths:
@@ -1512,7 +1599,9 @@ class _ColumnOptimizer:
         if not nonempty:
             return None
         r = rng.random()
-        if r < 0.55:
+        cum = self._move_cum
+        if r < cum[0]:
+            self._last_move_type = 0
             sc = rng.choice(nonempty)
             si = rng.randrange(len(cols[sc]))
             k = cols[sc][si]
@@ -1568,7 +1657,8 @@ class _ColumnOptimizer:
                 cols[tc].pop(ti)
                 cols[sc].insert(si, k)
             return undo
-        elif r < 0.80:
+        elif r < cum[1]:
+            self._last_move_type = 1
             if len(nonempty) < 2:
                 return None
             c1, c2 = rng.sample(nonempty, 2)
@@ -1589,7 +1679,8 @@ class _ColumnOptimizer:
             def undo():
                 cols[c1][i1], cols[c2][i2] = k1, k2
             return undo
-        elif r < 0.92:
+        elif r < cum[2]:
+            self._last_move_type = 2
             cands = [i for i in nonempty if len(cols[i]) >= 2]
             if not cands:
                 return None
@@ -1606,6 +1697,7 @@ class _ColumnOptimizer:
                 cols[c1].insert(si, k)
             return undo
         else:
+            self._last_move_type = 3
             # internal reorder of a multi-part unit
             multi = [k for k, u in enumerate(self.units) if len(u.subgroups) >= 2
                      or any(len(sg) >= 2 for sg in u.subgroups)]
@@ -1648,6 +1740,40 @@ class _ColumnOptimizer:
             self._refresh_unit(u)
         return cols
 
+    # ------------------------------------------------------------------
+    # M1c: adaptive-move bookkeeping. Sliding window over recent proposals;
+    # every window we reweight the move mix by (acceptance x mean accepted
+    # improvement) with a per-family probability floor.
+    def _adaptive_reset(self):
+        self._am_prop = [0, 0, 0, 0]     # proposals per family this window
+        self._am_acc = [0, 0, 0, 0]      # accepted per family this window
+        self._am_impr = [0.0, 0.0, 0.0, 0.0]  # summed positive improvement
+        self._am_since = 0               # moves since last reweight
+        self._am_window = 200            # ~200 total proposals per update
+
+    def _adaptive_reweight(self):
+        floor = 0.05
+        n_fam = len(self._move_base)
+        scores = []
+        for t in range(n_fam):
+            prop = self._am_prop[t]
+            if prop <= 0:
+                scores.append(0.0)
+                continue
+            acc_rate = self._am_acc[t] / prop
+            mean_impr = (self._am_impr[t] / self._am_acc[t]) if self._am_acc[t] else 0.0
+            scores.append(acc_rate * mean_impr)
+        s = sum(scores)
+        if s <= 0.0:
+            # no signal this window -- keep the current mix, just reset counters
+            self._adaptive_reset()
+            return
+        free = 1.0 - floor * n_fam
+        weights = [floor + free * (sc / s) for sc in scores]
+        self._move_base = weights
+        self._move_cum = _cumulative(weights)
+        self._adaptive_reset()
+
     def _anneal(self, cols, deadline, cur_cost, t0=0.02, t1=0.0008, recalibrate=False):
         rng = self.rng
         best_cost = cur_cost
@@ -1656,6 +1782,8 @@ class _ColumnOptimizer:
         start = time.time()
         span = max(deadline - start, 1e-6)
         recal_at = [start + 0.25 * span, start + 0.55 * span] if recalibrate else []
+        if self._adaptive_moves:
+            self._adaptive_reset()
         while True:
             now = time.time()
             if now >= deadline:
@@ -1677,18 +1805,104 @@ class _ColumnOptimizer:
             frac = min((now - start) / span, 1.0)
             T = t0 * (t1 / t0) ** frac
             for _ in range(24):
+                # M1c: PARSAC-style constraint-fixing move. Rare, targeted,
+                # accepted unconditionally; only fires while soft violations
+                # remain. Hard legality is by construction so this is safe.
+                if self._cfix and rng.random() < self._cfix_p:
+                    new_cols = self._cfix_move(cols, cur_cost)
+                    if new_cols is not None:
+                        cols[:] = new_cols
+                        cur_cost, _ = self._evaluate(cols)
+                        if cur_cost < best_cost:
+                            best_cost = cur_cost
+                            best = self._snapshot(cols)
+                    continue
                 undo = self._random_move(cols)
                 if undo is None:
                     continue
+                mt = self._last_move_type
+                if self._adaptive_moves:
+                    self._am_prop[mt] += 1
+                    self._am_since += 1
                 new_cost, _pos = self._evaluate(cols)
                 if new_cost <= cur_cost or rng.random() < math.exp((cur_cost - new_cost) / T):
+                    if self._adaptive_moves:
+                        self._am_acc[mt] += 1
+                        if new_cost < cur_cost:
+                            self._am_impr[mt] += (cur_cost - new_cost)
                     cur_cost = new_cost
                     if new_cost < best_cost:
                         best_cost = new_cost
                         best = self._snapshot(cols)
                 else:
                     undo()
+                if self._adaptive_moves and self._am_since >= self._am_window:
+                    self._adaptive_reweight()
         return best, best_cost
+
+    # ------------------------------------------------------------------
+    def _cfix_move(self, cols, cur_cost):
+        """PARSAC-style targeted boundary repair for the SA inner loop.
+
+        Fires only when soft violations remain (V>0). Finds one unit whose
+        bottom/top-tagged block misses its edge and relocates that unit to the
+        head/tail of a column that currently lacks a same-tag unit (so it can
+        actually reach the wall), preferring the column whose current x is
+        nearest the unit's connectivity target. Returns the mutated column
+        lists (a fresh copy) or None when there is nothing to fix. The caller
+        accepts the result unconditionally; only `cols` (unit ordering) is
+        mutated, never subgroup geometry, so hard legality is untouched."""
+        pos, _xr, _yt = self._layout(cols)
+        if self._violations(pos) <= 0:
+            return None
+        py0 = pos[:, 1]
+        py1 = py0 + pos[:, 3]
+        y_min = float(py0.min())
+        y_max = float(py1.max())
+        bad = []  # (unit, tag) tag: 'B' bottom-miss, 'T' top-miss
+        for i, code in zip(self._bnd_idx, self._bnd_codes):
+            k = self.blk_unit[int(i)]
+            if k < 0:
+                continue
+            if (int(code) & 8) and abs(float(py0[i]) - y_min) >= 1e-6:
+                bad.append((k, 'B'))
+            elif (int(code) & 4) and abs(float(py1[i]) - y_max) >= 1e-6:
+                bad.append((k, 'T'))
+        if not bad:
+            return None
+        k, tag = self.rng.choice(bad)
+        u = self.units[k]
+        sc = self._unit_col[k]
+        C = len(cols)
+        if sc >= C:
+            return None
+        try:
+            si = cols[sc].index(k)
+        except ValueError:
+            return None
+        # candidate target columns that currently have no same-tag unit
+        cands = []
+        for tc in range(C):
+            if tc == sc:
+                continue
+            if u.force == 'L' and tc != 0:
+                continue
+            if u.force == 'R' and tc != C - 1:
+                continue
+            has_same = any(
+                (self.units[k2].hasB if tag == 'B' else self.units[k2].hasT)
+                for k2 in cols[tc])
+            if not has_same:
+                cands.append(tc)
+        if not cands:
+            return None
+        # nearest column to the unit's seed x (cheap connectivity proxy)
+        tc = min(cands, key=lambda c: abs(c - sc))
+        new_cols = [list(c) for c in cols]
+        new_cols[sc].pop(si)
+        ti = 0 if tag == 'B' else len(new_cols[tc])
+        new_cols[tc].insert(ti, k)
+        return new_cols
 
     # ------------------------------------------------------------------
     def locked_only(self) -> bool:
@@ -1721,6 +1935,44 @@ class _ColumnOptimizer:
         self._best_probe = results[0]
         return results[0][0]
 
+    # ------------------------------------------------------------------
+    # M3 racing: short round-1 anneal that returns a cheap picklable snapshot
+    # of the column state plus raw metrics, and a round-2 warm-started finish.
+    def race_round1(self, C, variant, t_budget):
+        """Bootstrap columns at count C (init variant 0 or 1), run a short
+        warm anneal for t_budget seconds, and return (snapshot, hp, area, V)
+        where snapshot is plain lists/ints (picklable). Does not depend on
+        `prepare()` having chosen C0."""
+        C = max(2, min(18, int(C)))
+        self.C0 = C
+        cols = self._init_columns(C)
+        if variant == 1:
+            # alternate init: reverse each column's unit order (still legal,
+            # ordering-only) so the two variants explore different basins
+            for c in cols:
+                c.reverse()
+        c0, _ = self._evaluate_bootstrap(cols)
+        deadline = time.time() + max(t_budget, 0.05)
+        snap, _bc = self._anneal(cols, deadline, c0, t0=0.05, t1=0.008)
+        cols_b = self._restore(snap)
+        pos, xr, yt = self._layout(cols_b)
+        hp = self._hpwl(pos)
+        V = self._violations(pos)
+        area = (xr - float(pos[:, 0].min())) * (yt - float(pos[:, 1].min()))
+        return snap, hp, area, V
+
+    def race_round2(self, snapshot, C, deadline):
+        """Warm-start `finish` from a round-1 snapshot for the rest of the
+        budget. Restores the snapshot into `_cols`, disables the probe path,
+        and runs a single anneal + polish through `finish`."""
+        self.C0 = max(2, min(18, int(C)))
+        cols = self._restore(snapshot)
+        c0, _ = self._evaluate_bootstrap(cols)
+        self._cols = cols
+        self._cost0 = c0
+        self._best_probe = None
+        return self.finish(deadline, max_runs=1)
+
     def finish(self, deadline: float, max_runs: int = 2) -> List[Rect]:
         n = self.n
         if self._best_probe is not None:
@@ -1750,15 +2002,122 @@ class _ColumnOptimizer:
                 best_cols = [list(c) for c in cols_c]
                 best_snap = snap
         cols = self._restore(best_snap)
-        cols = self._greedy_polish(cols, best_c, deadline)
+        # M3: carve a small width-opt slice out of the polish budget so the
+        # total per-case wall clock is unchanged (only when the flag is on).
+        width_reserve = 0.0
+        if self._width_opt:
+            width_reserve = min(0.20 * max(deadline - time.time(), 0.0), 2.0)
+        cols = self._greedy_polish(cols, best_c, deadline - width_reserve)
         pos, x_right, y_top = self._layout(cols)
         hp = self._hpwl(pos)
         V = self._violations(pos)
         area = (x_right - float(pos[:, 0].min())) * (y_top - float(pos[:, 1].min()))
+        if self._width_opt and width_reserve > 0.0:
+            wres = self._width_optimize(cols, deadline)
+            if wres is not None:
+                _widths, pos, x_right, y_top, _c, hp = wres
+                V = self._violations(pos)
+                area = (x_right - float(pos[:, 0].min())) * (y_top - float(pos[:, 1].min()))
         self.final_metrics = (hp, area, V)
         out = [(float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2]), float(pos[i, 3]))
                for i in range(n)]
         return _ensure_no_overlap(out, [self.kind[i] == 2 for i in range(n)])
+
+    # ------------------------------------------------------------------
+    def _width_optimize(self, cols, deadline):
+        """M3: coordinate-descent the per-column widths for HPWL after the SA
+        fixes the column assignment.
+
+        Returns (widths, pos, x_right, y_top, cost, hp) for the best width
+        vector found, or None when nothing beat the SA's own derived widths.
+        Objective is the full numpy HPWL of the re-stacked layout; acceptance
+        is additionally gated on the full cost (violations + area) not
+        regressing, so the pass can never trade a soft violation or a bbox
+        blowup for wirelength. Every trial goes through `_layout_widths`, which
+        bypasses the FAST_EVAL cache, so no width-blind entry can leak into it.
+        Bounded to 2 sweeps and its own deadline."""
+        C = len(cols)
+        # baseline derived widths + cost
+        pos0, xr0, yt0, _tops0 = self._layout_widths(cols, [None] * C)
+        base_c, base_hp, _a0, _v0 = self._cost(pos0, xr0, yt0)
+        w0 = [(sp[1] - sp[0]) if sp is not None else None
+              for sp in self._col_spans[:C]]
+        widths = list(w0)
+        best_pos, best_xr, best_yt = pos0, xr0, yt0
+        best_c, best_hp = base_c, base_hp
+        H = self.H
+        gr = 0.6180339887498949  # golden ratio conjugate
+        lo_mult, hi_mult = 0.7, 1.4
+
+        def trial(ci, w_try):
+            saved = widths[ci]
+            widths[ci] = w_try
+            pos, xr, yt, tops = self._layout_widths(cols, widths)
+            widths[ci] = saved
+            # feasibility: the re-widthed column must still fit the frame
+            if tops[ci] > H * 1.0005:
+                return None
+            c, hp, area, V = self._cost(pos, xr, yt)
+            return c, hp, pos, xr, yt
+
+        improved_any = False
+        for _sweep in range(2):
+            sweep_improved = False
+            for ci in range(C):
+                if time.time() >= deadline:
+                    break
+                if widths[ci] is None:  # empty column
+                    continue
+                w_base = widths[ci]
+                lo = lo_mult * w_base
+                hi = hi_mult * w_base
+                # golden-section minimize HPWL on [lo, hi]
+                a, b = lo, hi
+                x1 = b - gr * (b - a)
+                x2 = a + gr * (b - a)
+                r1 = trial(ci, x1)
+                r2 = trial(ci, x2)
+                f1 = r1[1] if r1 is not None else float('inf')
+                f2 = r2[1] if r2 is not None else float('inf')
+                for _it in range(6):
+                    if f1 <= f2:
+                        b, x2, f2, r2 = x2, x1, f1, r1
+                        x1 = b - gr * (b - a)
+                        r1 = trial(ci, x1)
+                        f1 = r1[1] if r1 is not None else float('inf')
+                    else:
+                        a, x1, f1, r1 = x1, x2, f2, r2
+                        x2 = a + gr * (b - a)
+                        r2 = trial(ci, x2)
+                        f2 = r2[1] if r2 is not None else float('inf')
+                cand = r1 if f1 <= f2 else r2
+                if cand is None:
+                    continue
+                c_c, hp_c, pos_c, xr_c, yt_c = cand
+                # accept only a strict full-cost improvement for this column
+                if c_c < best_c - 1e-9:
+                    widths[ci] = (x1 if f1 <= f2 else x2)
+                    best_c, best_hp = c_c, hp_c
+                    best_pos, best_xr, best_yt = pos_c, xr_c, yt_c
+                    improved_any = True
+                    sweep_improved = True
+            if not sweep_improved or time.time() >= deadline:
+                break
+        if self._width_opt_log:
+            try:
+                import json
+                with open(self._width_opt_log, "a") as fh:
+                    fh.write(json.dumps({
+                        "stage": "width_opt", "n": self.n, "C": C,
+                        "pre_hpwl": base_hp, "post_hpwl": best_hp,
+                        "pre_cost": base_c, "post_cost": best_c,
+                        "improved": improved_any,
+                    }) + "\n")
+            except Exception:
+                pass
+        if not improved_any:
+            return None
+        return widths, best_pos, best_xr, best_yt, best_c, best_hp
 
     def run(self) -> List[Rect]:
         if self.locked_only():
@@ -2154,8 +2513,240 @@ def _worker_solve(args):
         return None
 
 
+def _build_worker_opt(args, deadline, seed, v_weight):
+    """Rebuild a `_ColumnOptimizer` from a numpy payload inside a worker.
+    Shared by the racing round-1/round-2 workers. Returns (opt, orient)."""
+    (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np, orient) = args
+    at = torch.from_numpy(areas_np)
+    cons = torch.from_numpy(cons_np) if cons_np is not None else None
+    tpos = torch.from_numpy(tpos_np) if tpos_np is not None else None
+    b2b = torch.from_numpy(b2b_np) if b2b_np is not None else None
+    p2b = torch.from_numpy(p2b_np) if p2b_np is not None else None
+    pins = torch.from_numpy(pins_np) if pins_np is not None else None
+    rs = rects
+    if orient == 'T':
+        rs, cons, tpos, pins = _transpose_inputs(rects, cons, tpos, pins)
+    opt = _ColumnOptimizer(rs, at, cons, tpos, b2b, p2b, pins, deadline,
+                           seed=seed, v_weight=v_weight)
+    return opt, orient
+
+
+def _worker_race_r1(args):
+    """M3 racing round 1: a short warm anneal returning a cheap picklable
+    snapshot + raw metrics + the config index. `args` = (payload_core, cfg)
+    where cfg = (orient, C, variant, seed, v_weight, cfg_id, t_budget)."""
+    try:
+        payload_core, cfg = args
+        orient, C, variant, seed, v_weight, cfg_id, t_budget = cfg
+        opt, _o = _build_worker_opt(payload_core + (orient,), time.time() + t_budget + 1.0,
+                                    seed, v_weight)
+        if opt.locked_only():
+            return (cfg_id, None, 0.0, 0.0, 0)
+        snap, hp, area, V = opt.race_round1(C, variant, t_budget)
+        # snap is ([list[list[int]]], {int: [list[int]]}) -- all builtins
+        return (cfg_id, snap, float(hp), float(area), int(V))
+    except Exception:
+        return None
+
+
+def _worker_race_r2(args):
+    """M3 racing round 2: warm-start `finish` from a round-1 snapshot for the
+    rest of the budget. `args` = (payload_core, cfg, snapshot, C, deadline)."""
+    try:
+        payload_core, cfg, snapshot, C, deadline = args
+        orient, _C0, _variant, seed, v_weight, _cfg_id, _t = cfg
+        opt, orient = _build_worker_opt(payload_core + (orient,), deadline, seed, v_weight)
+        if opt.locked_only():
+            out = opt.locked_positions()
+            return (out, 0.0, 0.0, 0)
+        out = opt.race_round2(snapshot, C, deadline)
+        hp, area, V = opt.final_metrics
+        if orient == 'T':
+            out = [(y, x, h, w) for (x, y, w, h) in out]
+        return (out, hp, area, V)
+    except Exception:
+        return None
+
+
+def _race_configs(opt1, seed, allow_t, n_slots):
+    """Build the round-1 config list: column counts C0-3..C0+3 (clamped) x
+    orientations (T only when allow_t) x v_weight {1.0, 2.5} x 2 init variants,
+    truncated to n_slots (target 18-24). Returns list of
+    (orient, C, variant, seed, v_weight, cfg_id, t_budget=None)."""
+    avg_area = opt1.total_area / max(opt1.n, 1)
+    C0 = max(2, min(18, int(round(opt1.W_est / max(math.sqrt(avg_area), 2.0)))))
+    col_counts = sorted({max(2, min(18, C0 + d)) for d in (-3, -2, -1, 0, 1, 2, 3)})
+    orients = ['N', 'T'] if allow_t else ['N']
+    v_weights = [1.0, 2.5]
+    variants = [0, 1]
+    cfgs = []
+    cfg_id = 0
+    # interleave so the truncation keeps a diverse spread (not all one C)
+    for variant in variants:
+        for vw in v_weights:
+            for orient in orients:
+                for C in col_counts:
+                    cfgs.append((orient, C, variant, seed + 7 * cfg_id + 3,
+                                 vw, cfg_id, None))
+                    cfg_id += 1
+    # spread by striding so a prefix cut still samples all axes
+    stride = max(1, len(cfgs) // max(n_slots, 1))
+    picked = cfgs[::stride][:n_slots]
+    if len(picked) < min(n_slots, len(cfgs)):
+        seen = {c[5] for c in picked}
+        for c in cfgs:
+            if c[5] not in seen:
+                picked.append(c)
+                seen.add(c[5])
+            if len(picked) >= n_slots:
+                break
+    # guarantee at least one v_weight=2.5 config is present
+    if not any(abs(c[4] - 2.5) < 1e-9 for c in picked) and \
+            any(abs(c[4] - 2.5) < 1e-9 for c in cfgs):
+        vw25 = next(c for c in cfgs if abs(c[4] - 2.5) < 1e-9)
+        if picked:
+            picked[-1] = vw25
+        else:
+            picked.append(vw25)
+    return picked
+
+
+def _parallel_solve_racing(opt1, rects, area_targets, constraints,
+                           target_positions, b2b, p2b, pins, deadline, seed):
+    """M3 two-round successive-halving racing (FLOORSET_SA_RACING).
+
+    Round 1: 18-24 diverse configs each at ~25% of the worker budget, returning
+    a picklable snapshot + raw metrics. Round 2: the top few (warm-started from
+    their snapshots) run the remaining budget; at least one v_weight=2.5 config
+    is force-promoted (slow-convergence protection). Both rounds preserve the
+    straggler `_shutdown_pool` failure path and `worker_deadline = deadline -
+    0.30`. Per-worker round costs are logged (JSONL) when FLOORSET_SA_RACING_LOG
+    is set so the scheduler can run the selection-quality sign test."""
+    hard_n = sum(1 for u in opt1.units if u.hasB) + sum(1 for u in opt1.units if u.hasT)
+    hard_t = sum(1 for u in opt1.units if u.force == 'L') + \
+        sum(1 for u in opt1.units if u.force == 'R')
+    allow_t = hard_t <= hard_n + 2
+
+    n_slots = min(24, max(18, _POOL_SIZE * 3))
+    configs = _race_configs(opt1, seed, allow_t, n_slots)
+    area_ref = opt1.area_ref
+    n_soft = opt1.n_soft_den
+
+    def np_of(t):
+        return None if t is None else t.detach().cpu().numpy()
+
+    payload_core = (list(rects), np_of(area_targets), np_of(constraints),
+                    np_of(target_positions), np_of(b2b), np_of(p2b), np_of(pins))
+
+    worker_deadline = deadline - 0.30
+    total_budget = max(worker_deadline - time.time(), 0.2)
+    # Budget accounting: each of the len(configs) round-1 configs runs on the
+    # shared pool, so a worker handles ceil(n_configs / n_workers) of them
+    # SEQUENTIALLY. Round 1 should consume ~25% of the total wall clock, so a
+    # single config's budget is 25% of the total divided by that per-worker
+    # config count; round 2 (the survivors) then gets the remaining ~75%.
+    n_workers = max(_POOL_SIZE, 1)
+    cfg_per_worker = max(1, (len(configs) + n_workers - 1) // n_workers)
+    r1_wall = 0.25 * total_budget
+    r1_budget = max(r1_wall / cfg_per_worker, 0.05)   # per-config anneal time
+    # the pool needs r1_budget x cfg_per_worker wall to drain round 1
+    r1_deadline = time.time() + r1_budget * cfg_per_worker + 1.0
+
+    log_path = os.environ.get("FLOORSET_SA_RACING_LOG", "")
+
+    def _log(rows):
+        if not log_path:
+            return
+        try:
+            import json
+            with open(log_path, "a") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+        except Exception:
+            pass
+
+    # ------- round 1 -------
+    r1_payloads = [(payload_core, (c[0], c[1], c[2], c[3], c[4], c[5], r1_budget))
+                   for c in configs]
+    res1 = _POOL.map_async(_worker_race_r1, r1_payloads)
+    try:
+        outs1 = res1.get(timeout=max(r1_deadline - time.time(), 0.1) + 2.5)
+    except Exception:
+        _shutdown_pool()
+        raise
+    outs1 = [o for o in outs1 if o is not None]
+    if not outs1:
+        raise RuntimeError("all racing round-1 workers failed")
+
+    cfg_by_id = {c[5]: c for c in configs}
+    # round-1 tuple layout: (cfg_id, snap, hp, area, V) -> indices 0..4
+    usable1 = [o for o in outs1 if o[1] is not None]
+    if not usable1:
+        raise RuntimeError("racing round-1 produced no usable snapshots")
+    hp_ref1 = max(min(o[2] for o in usable1), 1e-9)
+
+    def score1(o):
+        _cid, _snap, hp, area, V = o
+        return (1.0 + 0.5 * ((hp - hp_ref1) / hp_ref1
+                             + max(0.0, area / area_ref - 1.0))) \
+            * math.exp(2.0 * V / n_soft)
+
+    ranked = sorted(usable1, key=score1)
+
+    _log([{"stage": "race_r1", "cfg_id": o[0], "config": cfg_by_id[o[0]][:5],
+           "hp": o[2], "area": o[3], "V": o[4], "score": score1(o)}
+          for o in usable1])
+
+    # ------- pick top 4-6, force in a v_weight=2.5 config -------
+    n_top = min(len(ranked), max(4, min(6, _POOL_SIZE)))
+    top = ranked[:n_top]
+    top_ids = {o[0] for o in top}
+    if not any(abs(cfg_by_id[o[0]][4] - 2.5) < 1e-9 for o in top):
+        vw25 = next((o for o in ranked if abs(cfg_by_id[o[0]][4] - 2.5) < 1e-9), None)
+        if vw25 is not None and vw25[0] not in top_ids:
+            top[-1] = vw25  # slow-convergence protection
+            top_ids = {o[0] for o in top}
+
+    # ------- round 2: warm-start the survivors -------
+    r2_payloads = []
+    for o in top:
+        cid, snap, _hp, _area, _V = o
+        cfg = cfg_by_id[cid]
+        r2_payloads.append((payload_core, cfg, snap, cfg[1], worker_deadline))
+    res2 = _POOL.map_async(_worker_race_r2, r2_payloads)
+    try:
+        outs2 = res2.get(timeout=max(deadline - time.time(), 0.1) + 2.5)
+    except Exception:
+        _shutdown_pool()
+        raise
+    outs2 = [o for o in outs2 if o is not None]
+    if not outs2:
+        raise RuntimeError("all racing round-2 workers failed")
+
+    hp_ref2 = max(min(o[1] for o in outs2), 1e-9)
+
+    def score2(o):
+        _out, hp, area, V = o
+        return (1.0 + 0.5 * ((hp - hp_ref2) / hp_ref2
+                             + max(0.0, area / area_ref - 1.0))) \
+            * math.exp(2.0 * V / n_soft)
+
+    _log([{"stage": "race_r2", "cfg_id": top[i][0],
+           "config": cfg_by_id[top[i][0]][:5],
+           "hp": outs2[i][1], "area": outs2[i][2], "V": outs2[i][3],
+           "score": score2(outs2[i])}
+          for i in range(min(len(top), len(outs2)))])
+
+    best = min(outs2, key=score2)
+    return best[0]
+
+
 def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                     b2b, p2b, pins, deadline, seed):
+    if os.environ.get("FLOORSET_SA_RACING", "0") == "1":
+        return _parallel_solve_racing(opt1, rects, area_targets, constraints,
+                                      target_positions, b2b, p2b, pins,
+                                      deadline, seed)
     avg_area = opt1.total_area / max(opt1.n, 1)
     C0 = max(2, min(18, int(round(opt1.W_est / max(math.sqrt(avg_area), 2.0)))))
     hard_n = sum(1 for u in opt1.units if u.hasB) + sum(1 for u in opt1.units if u.hasT)
