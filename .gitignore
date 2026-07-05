@@ -3,6 +3,10 @@
 Thumbs.db
 .nfs*
 
+# Partner reference checkpoint (178MB, unusable without partner's
+# diffusion_data/diffusion_model modules)
+partner/*.pt
+
 # Python
 __pycache__/
 *.py[cod]
