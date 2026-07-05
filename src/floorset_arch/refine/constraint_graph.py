@@ -7,8 +7,9 @@ constraint bit semantics (fixed/preplaced/mib/cluster/boundary columns).
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from floorset_arch.legalizer.column_slicing import _parse_constraints, _target
 
@@ -157,3 +158,109 @@ def build_axis_dags(
             # else: corner-only, no edge.
 
     return gx, gy
+
+
+# ---------------------------------------------------------------------------
+# Edge-edit + reachability helpers for topology-changing local search (M2).
+#
+# An AxisGraph.edges is a list of (u, v, gap) tuples meaning coord[v] >=
+# coord[u] + gap. The topo_search inner loop mutates this list in place via
+# small reversible edit scripts. Each Edit is a tagged tuple:
+#     ("add", u, v, gap)  -- append (u, v, gap) to graph.edges
+#     ("del", u, v, gap)  -- remove the first exact (u, v, gap) match
+# apply_edits returns the exact inverse script; undo_edits replays it so the
+# graph is restored byte-identically (list order preserved for "add"; "del"
+# re-inserts at the end -- edge *order* is irrelevant to project_axis, which
+# rebuilds preds/succs from scratch, and to acyclicity, so this is a faithful
+# logical undo).
+# ---------------------------------------------------------------------------
+
+Edit = Tuple[str, int, int, float]
+
+
+def _adjacency(edges: Sequence[Tuple[int, int, float]], n: int) -> Dict[int, List[int]]:
+    """Successor adjacency (u -> [v, ...]) from an edge list."""
+    succ: Dict[int, List[int]] = {i: [] for i in range(n)}
+    for u, v, _g in edges:
+        succ[u].append(v)
+    return succ
+
+
+def reachable(
+    edges: Sequence[Tuple[int, int, float]],
+    n: int,
+    src: int,
+    dst: int,
+    skip_edge: Optional[Tuple[int, int]] = None,
+) -> bool:
+    """True iff `dst` is reachable from `src` via a directed path, optionally
+    ignoring one edge (u, v) == skip_edge (used when testing whether reversing
+    that edge would create a cycle: reverse (u, v) is acyclic-safe iff v cannot
+    already reach u through the OTHER edges)."""
+    if src == dst:
+        return True
+    succ = _adjacency(edges, n)
+    seen: Set[int] = {src}
+    dq = deque([src])
+    while dq:
+        cur = dq.popleft()
+        for nxt in succ.get(cur, ()):
+            if skip_edge is not None and (cur, nxt) == skip_edge:
+                continue
+            if nxt == dst:
+                return True
+            if nxt not in seen:
+                seen.add(nxt)
+                dq.append(nxt)
+    return False
+
+
+def has_edge(
+    edges: Sequence[Tuple[int, int, float]], u: int, v: int
+) -> bool:
+    """True iff any (u, v, *) edge exists (either direction is a separate call)."""
+    for a, b, _g in edges:
+        if a == u and b == v:
+            return True
+    return False
+
+
+def apply_edits(graph: AxisGraph, edits: Sequence[Edit]) -> List[Edit]:
+    """Mutate graph.edges in place per `edits`; return the inverse script.
+
+    A failed "del" (no exact match found) is a programming error in the move
+    generator; we skip it and emit no inverse for it so undo stays exact for
+    the edits that DID apply. (topo_search always validates its own scripts
+    before applying, so this branch should not trigger in practice.)
+    """
+    inverse: List[Edit] = []
+    for op, u, v, gap in edits:
+        if op == "add":
+            graph.edges.append((u, v, gap))
+            inverse.append(("del", u, v, gap))
+        elif op == "del":
+            removed = False
+            for idx, (a, b, g) in enumerate(graph.edges):
+                if a == u and b == v and g == gap:
+                    graph.edges.pop(idx)
+                    removed = True
+                    break
+            if removed:
+                inverse.append(("add", u, v, gap))
+        else:  # pragma: no cover - defensive
+            raise ValueError(f"unknown edit op: {op!r}")
+    # Inverse must be replayed in reverse order to exactly undo add/del pairs.
+    inverse.reverse()
+    return inverse
+
+
+def undo_edits(graph: AxisGraph, inverse: Sequence[Edit]) -> None:
+    """Replay an inverse script (from apply_edits) to restore graph.edges."""
+    for op, u, v, gap in inverse:
+        if op == "add":
+            graph.edges.append((u, v, gap))
+        elif op == "del":
+            for idx, (a, b, g) in enumerate(graph.edges):
+                if a == u and b == v and g == gap:
+                    graph.edges.pop(idx)
+                    break

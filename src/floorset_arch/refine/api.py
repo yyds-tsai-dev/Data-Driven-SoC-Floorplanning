@@ -185,11 +185,20 @@ def refine_layout(
     pins,
     deadline: Optional[float] = None,
     enable_aspect: bool = False,
+    topo_deadline: Optional[float] = None,
 ) -> List[Rect]:
     """Phase-1 slack-redistribution refiner. Translates blocks only (dims
     and bbox frozen); returns the ORIGINAL rects on any exception, failed
     re-check, or deadline hit. `enable_aspect` is accepted for forward
-    compatibility with Phase 2 but is a no-op in Step 1."""
+    compatibility with Phase 2 but is a no-op in Step 1.
+
+    `topo_deadline` (M2, FLOORSET_TOPO_SEARCH): when non-None, a
+    topology-changing local-search stage runs FIRST (before the slack
+    projection below) with that wall-clock sub-budget, so the projection
+    polishes whatever new topology it produces. The stage is failure-contained
+    (returns its input on any doubt); its input becomes the projection's
+    input. When None (default / flag off) the stage is skipped and behavior is
+    byte-identical to Phase 1."""
     original = list(rects)
     log_path = os.environ.get("FLOORSET_SLACK_REFINE_LOG")
     block_count = len(rects)
@@ -215,7 +224,31 @@ def refine_layout(
         v_boundary_before, v_grouping_before, v_mib_before = soft_violations(
             original, constraints)
 
-        gx, gy = build_axis_dags(original, constraints, target_positions, b2b, p2b, pins)
+        # --- M2 topology-changing local search (runs BEFORE slack projection).
+        # Produces `stage_input`: either a strictly-better new topology (guard-
+        # passed inside refine_topo) or `original` unchanged. Everything below
+        # then treats stage_input as the layout to translate-polish, while the
+        # final acceptance clause still compares against the pre-topo baselines
+        # (hpwl_before etc.), so the true input remains the hard floor.
+        stage_input = original
+        topo_detail = None
+        if topo_deadline is not None:
+            try:
+                from .topo_search import refine_topo
+
+                topo_out, topo_detail = refine_topo(
+                    original, area_targets, constraints, target_positions,
+                    b2b_edges, p2b_edges, pin_list,
+                    deadline=topo_deadline, log_path=log_path,
+                )
+                # refine_topo already guard-checks (hard_legal + soft + bbox +
+                # strict HPWL) against `original`; trust its accepted output.
+                if topo_out != original:
+                    stage_input = topo_out
+            except Exception:
+                stage_input = original
+
+        gx, gy = build_axis_dags(stage_input, constraints, target_positions, b2b, p2b, pins)
 
         if os.environ.get("FLOORSET_SLACK_REFINE_DUMP"):
             try:
@@ -239,13 +272,17 @@ def refine_layout(
                        rejection_reason="deadline")
             return original
 
-        n = len(original)
-        xs = [r[0] for r in original]
-        ys = [r[1] for r in original]
-        ws = [r[2] for r in original]
-        hs = [r[3] for r in original]
+        # Coordinates/dims/anchors come from stage_input (the topo output, or
+        # `original` when topo is off / made no change). dims are byte-identical
+        # to `original` either way (topo never resizes), so the Phase-1 dims
+        # invariant against `original` still holds.
+        n = len(stage_input)
+        xs = [r[0] for r in stage_input]
+        ys = [r[1] for r in stage_input]
+        ws = [r[2] for r in stage_input]
+        hs = [r[3] for r in stage_input]
 
-        anchors_x = _build_anchors(n, 0, original, b2b_edges, p2b_edges, pin_list)
+        anchors_x = _build_anchors(n, 0, stage_input, b2b_edges, p2b_edges, pin_list)
         new_xs, sweeps_x = project_axis(gx, xs, ws, anchors_x)
 
         # Recompute anchor centroids for the y-solve using the just-updated
@@ -308,9 +345,27 @@ def refine_layout(
             if diag:
                 detail.update(diag)
 
+        # When the slack projection is rejected, fall back to `stage_input`
+        # (the topo output), NOT `original`: refine_topo already guard-passed
+        # stage_input against original, so it is a legal, no-worse layout, and
+        # discarding it here would silently throw away the topology gain the
+        # whole M2 stage exists to capture. When topo is off, stage_input IS
+        # original, so this is byte-identical to the prior behavior.
+        topo_applied = stage_input is not original
+        stage_input_hpwl = (
+            hpwl(stage_input, b2b_edges, p2b_edges, pin_list)
+            if topo_applied else hpwl_before
+        )
+        stage_input_bbox = _bbox_area(stage_input) if topo_applied else bbox_before
+        stage_input_soft = (
+            soft_violations(stage_input, constraints)
+            if topo_applied
+            else (v_boundary_before, v_grouping_before, v_mib_before)
+        )
+
         phase1_accepted = rejection_reason is None
-        phase1_out = candidate if phase1_accepted else original
-        phase1_hpwl = hpwl_after if phase1_accepted else hpwl_before
+        phase1_out = candidate if phase1_accepted else stage_input
+        phase1_hpwl = hpwl_after if phase1_accepted else stage_input_hpwl
 
         aspect_applied = False
         final_out = phase1_out
@@ -331,9 +386,9 @@ def refine_layout(
                     phase1_soft = (
                         (v_boundary_after, v_grouping_after, v_mib_after)
                         if phase1_accepted
-                        else (v_boundary_before, v_grouping_before, v_mib_before)
+                        else stage_input_soft
                     )
-                    phase1_bbox = bbox_after if phase1_accepted else bbox_before
+                    phase1_bbox = bbox_after if phase1_accepted else stage_input_bbox
                     if (
                         aspect_hpwl < phase1_hpwl - EPS
                         and aspect_bbox <= phase1_bbox + 1e-6
@@ -375,8 +430,20 @@ def refine_layout(
             except Exception:
                 pass
         detail["vsnap_applied"] = vsnap_applied
+        detail["topo_applied"] = topo_applied
+        if topo_detail is not None:
+            detail["topo_n_proposed"] = topo_detail.get("n_proposed")
+            detail["topo_n_accepted"] = topo_detail.get("n_accepted")
+            detail["topo_pre_hpwl"] = topo_detail.get("pre_hpwl")
+            detail["topo_post_hpwl"] = topo_detail.get("post_hpwl")
+            detail["topo_elapsed"] = topo_detail.get("elapsed")
+            detail["topo_guard_result"] = topo_detail.get("guard_result")
 
-        if phase1_accepted or aspect_applied or vsnap_applied:
+        # `topo_applied` also counts as an accepted change: even if the slack
+        # projection / aspect / vsnap all made no further progress, the topo
+        # stage's guard-passed layout is strictly better than `original` and
+        # must be returned (via final_out, which flows from stage_input).
+        if phase1_accepted or aspect_applied or vsnap_applied or topo_applied:
             accepted = True
             _log_call(log_path, block_count, hpwl_before, final_hpwl,
                        bbox_before, _bbox_area(final_out), sweeps_total, True,
