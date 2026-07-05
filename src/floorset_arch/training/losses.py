@@ -194,6 +194,145 @@ def pairwise_relation_loss(
     return loss, acc
 
 
+# Decoder class order (must match gen_decoder_probe.build_order_dags):
+#   0 = i left-of j   (x-axis, dx > 0)
+#   1 = j left-of i   (x-axis, dx < 0)
+#   2 = i below j     (y-axis, dy > 0)
+#   3 = j below i     (y-axis, dy < 0)
+PAIR_AXIS4_CLASSES = 4
+
+
+def build_order_axis4_targets(
+    fp_sol: torch.Tensor,
+    pairs: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Composite 4-class order label per pair (i, j), i<j, matching the
+    order-faithful decoder's ``build_order_dags`` rule EXACTLY:
+
+      * centroids from the (golden) hint layout,
+      * separating axis = the one with the LARGER NORMALIZED centroid
+        separation ``|d_axis| / (half_i + half_j)`` on that axis,
+      * tie (sep_x >= sep_y) resolves to the x-axis,
+      * direction = sign of the centroid delta on the chosen axis, with the
+        ``d==0`` degenerate case resolved to ``i-before-j`` (i<j always here).
+
+    ``fp_sol`` rows are (width, height, x, y) as elsewhere in this module.
+    Returns per-pair integer class labels and a near-tie weight in [1, 2] that
+    up-weights pairs where the two normalized separations are close (the hard
+    cases the geometric extractor still resolves but a weak head fumbles).
+    Every pair is labelled — there is no clear-ratio mask.
+    """
+    device = fp_sol.device
+    if pairs.numel() == 0:
+        empty_l = torch.empty((0,), dtype=torch.long, device=device)
+        empty_f = torch.empty((0,), dtype=torch.float32, device=device)
+        return {"label": empty_l, "tie_weight": empty_f}
+    gt = fp_sol.float()
+    width = gt[:, 0]
+    height = gt[:, 1]
+    cx = gt[:, 2] + width / 2.0
+    cy = gt[:, 3] + height / 2.0
+    hx = width / 2.0
+    hy = height / 2.0
+    i = pairs[:, 0].to(device)
+    j = pairs[:, 1].to(device)
+    dx = cx[j] - cx[i]
+    dy = cy[j] - cy[i]
+    sum_hx = (hx[i] + hx[j]).clamp_min(0.0)
+    sum_hy = (hy[i] + hy[j]).clamp_min(0.0)
+    sep_x = torch.where(sum_hx > 0, dx.abs() / sum_hx, torch.zeros_like(dx))
+    sep_y = torch.where(sum_hy > 0, dy.abs() / sum_hy, torch.zeros_like(dy))
+    use_x = sep_x >= sep_y  # tie -> x-axis, matching the decoder
+    # Direction: dx>0 (or dx==0 with i<j) -> i before j on x -> class 0 else 1.
+    x_i_first = (dx > 0) | (dx == 0)
+    y_i_first = (dy > 0) | (dy == 0)
+    label = torch.where(
+        use_x,
+        torch.where(x_i_first, torch.zeros_like(i), torch.ones_like(i)),
+        torch.where(y_i_first, torch.full_like(i, 2), torch.full_like(i, 3)),
+    ).long()
+    # Near-tie weight: 1 when the losing axis has ~0 separation, up to 2 when the
+    # two normalized separations are equal (max ambiguity).
+    max_sep = torch.maximum(sep_x, sep_y).clamp_min(1e-9)
+    min_sep = torch.minimum(sep_x, sep_y)
+    tie_weight = 1.0 + (min_sep / max_sep).clamp(0.0, 1.0)
+    return {"label": label, "tie_weight": tie_weight}
+
+
+def pair_edge_weights(
+    pairs: torch.Tensor,
+    valid_b2b: torch.Tensor,
+    block_count: int,
+    alpha: float,
+) -> torch.Tensor:
+    """Per-pair multiplier ``1 + alpha * norm_netweight`` where norm_netweight is
+    the (log1p, mean-normalized) b2b connectivity weight between the pair's two
+    blocks, or 0 when they share no net. Returns ones when alpha<=0."""
+    device = pairs.device
+    if pairs.numel() == 0:
+        return torch.empty((0,), dtype=torch.float32, device=device)
+    if alpha <= 0.0 or valid_b2b is None or valid_b2b.numel() == 0:
+        return torch.ones((pairs.shape[0],), dtype=torch.float32, device=device)
+    net: dict[tuple[int, int], float] = {}
+    for i_f, j_f, w_f in valid_b2b.tolist():
+        i, j, w = int(i_f), int(j_f), max(float(w_f), 0.0)
+        if 0 <= i < block_count and 0 <= j < block_count and i != j:
+            key = (i, j) if i < j else (j, i)
+            net[key] = net.get(key, 0.0) + w
+    if net:
+        vals = torch.tensor(list(net.values()), dtype=torch.float32)
+        log_mean = torch.log1p(vals).mean().clamp_min(1e-6)
+    else:
+        log_mean = torch.tensor(1.0)
+    out = torch.ones((pairs.shape[0],), dtype=torch.float32, device=device)
+    for idx, (i_f, j_f) in enumerate(pairs.tolist()):
+        i, j = int(i_f), int(j_f)
+        key = (i, j) if i < j else (j, i)
+        w = net.get(key)
+        if w is not None:
+            out[idx] = 1.0 + alpha * float(
+                (torch.log1p(torch.tensor(w)) / log_mean).item()
+            )
+    return out
+
+
+def order_axis4_loss(
+    pair_axis4_logits: torch.Tensor,
+    targets: dict[str, torch.Tensor],
+    class_weight: torch.Tensor | None = None,
+    edge_weight: torch.Tensor | None = None,
+    tie_alpha: float = 0.0,
+) -> tuple[torch.Tensor, float, float]:
+    """Class-weighted cross-entropy over the 4 decoder classes on ALL sampled
+    pairs. Returns (loss, composite-accuracy, axis-accuracy). Accuracies are the
+    consumer-facing metrics: composite = axis+direction agreement with the
+    decoder label; axis = agreement on x-vs-y only.
+    """
+    label = targets["label"].to(pair_axis4_logits.device)
+    if label.numel() == 0:
+        return pair_axis4_logits.sum() * 0.0, 1.0, 1.0
+    per = F.cross_entropy(
+        pair_axis4_logits,
+        label,
+        weight=class_weight.to(pair_axis4_logits.device) if class_weight is not None else None,
+        reduction="none",
+    )
+    weight = torch.ones_like(per)
+    if tie_alpha > 0.0 and "tie_weight" in targets:
+        weight = weight * (
+            1.0 + tie_alpha * (targets["tie_weight"].to(per.device) - 1.0)
+        )
+    if edge_weight is not None:
+        weight = weight * edge_weight.to(per.device)
+    loss = (per * weight).sum() / weight.sum().clamp_min(1e-6)
+    pred = pair_axis4_logits.argmax(dim=1)
+    composite_acc = float((pred == label).float().mean().item())
+    pred_axis = (pred >= 2).long()
+    true_axis = (label >= 2).long()
+    axis_acc = float((pred_axis == true_axis).float().mean().item())
+    return loss, composite_acc, axis_acc
+
+
 def edge_delta_loss(
     pred_anchor: torch.Tensor, target_anchor: torch.Tensor, valid_b2b: torch.Tensor
 ) -> torch.Tensor:

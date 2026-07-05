@@ -34,10 +34,13 @@ from floorset_arch.training.promote_checkpoint import (
 from floorset_arch.training.selection import append_metric_record, read_metric_records
 from floorset_arch.training.losses import (
     build_anchor_targets,
+    build_order_axis4_targets,
     build_pairwise_relation_targets,
     compute_anchor_losses,
     constraint_weights,
     fp_sol_soft_violations,
+    order_axis4_loss,
+    pair_edge_weights,
     pairwise_relation_loss,
     sample_pairs,
 )
@@ -326,6 +329,18 @@ def _prepare_training_sample(sample, model, device: torch.device, args):
     }, is_clean
 
 
+def _pair_class_weight(args, device):
+    """Optional CE class weight over the 4 decoder classes. When pair_class_weight
+    is empty, returns None (uniform)."""
+    raw = getattr(args, "pair_class_weight", "")
+    if not raw:
+        return None
+    parts = [float(p) for p in str(raw).split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError("pair_class_weight must be 4 comma-separated floats")
+    return torch.tensor(parts, dtype=torch.float32, device=device)
+
+
 def _loss_for_prepared_sample(pred, prepared, args):
     inst = prepared["inst"]
     pairs = prepared["pairs"]
@@ -336,8 +351,35 @@ def _loss_for_prepared_sample(pred, prepared, args):
         inst.valid_b2b,
         prepared["loss_args"],
     )
+    device = pred["anchor"].device
+    if getattr(args, "pair_v2", False):
+        # Order-faithful 4-class supervision matching the decoder's rule exactly.
+        pair_targets = build_order_axis4_targets(
+            prepared["fp_sol"][: inst.block_count].to(device),
+            pairs,
+        )
+        class_weight = _pair_class_weight(args, device)
+        edge_w = pair_edge_weights(
+            pairs.to(device),
+            inst.valid_b2b,
+            inst.block_count,
+            float(getattr(args, "pair_edge_alpha", 0.0)),
+        )
+        pair_loss, comp_acc, axis_acc = order_axis4_loss(
+            pred["pair_axis4_logits"],
+            pair_targets,
+            class_weight=class_weight,
+            edge_weight=edge_w,
+            tie_alpha=float(getattr(args, "pair_tie_alpha", 0.0)),
+        )
+        effective_pair_loss = prepared["pairwise_weight_multiplier"] * pair_loss
+        loss = loss + float(getattr(args, "pair_weight", args.pairwise_weight)) * effective_pair_loss
+        loss = loss * prepared["sample_weight"]
+        # Report composite (axis+direction) agreement as the consumer metric;
+        # keep axis-only agreement alongside it.
+        return loss, parts, effective_pair_loss, comp_acc, axis_acc
     pair_targets = build_pairwise_relation_targets(
-        prepared["fp_sol"][: inst.block_count].to(pred["anchor"].device),
+        prepared["fp_sol"][: inst.block_count].to(device),
         pairs,
         min_gap=args.min_order_gap * max(float(prepared["scale"]), 1.0),
         clear_ratio=args.clear_ratio,
@@ -346,10 +388,10 @@ def _loss_for_prepared_sample(pred, prepared, args):
     effective_pair_loss = prepared["pairwise_weight_multiplier"] * pair_loss
     loss = loss + args.pairwise_weight * effective_pair_loss
     loss = loss * prepared["sample_weight"]
-    return loss, parts, effective_pair_loss, pair_acc
+    return loss, parts, effective_pair_loss, pair_acc, 1.0
 
 
-def _add_sample_stats(sums, loss, parts, effective_pair_loss, pair_acc) -> None:
+def _add_sample_stats(sums, loss, parts, effective_pair_loss, pair_acc, axis_acc) -> None:
     sums["loss"] += float(loss.item())
     sums["anchor"] += float(parts["anchor"].item())
     sums["aspect"] += float(parts["aspect"].item())
@@ -360,6 +402,7 @@ def _add_sample_stats(sums, loss, parts, effective_pair_loss, pair_acc) -> None:
     sums["ord_acc"] += float(parts["ord_acc"])
     sums["pairwise"] += float(effective_pair_loss.item())
     sums["pair_acc"] += float(pair_acc)
+    sums["pair_axis_acc"] += float(axis_acc)
 
 
 def run_epoch(
@@ -379,6 +422,7 @@ def run_epoch(
             "ord_acc",
             "pairwise",
             "pair_acc",
+            "pair_axis_acc",
         )
     }
     count = 0
@@ -470,11 +514,17 @@ def run_epoch(
                         "log_aspect": pred["log_aspect"][block_start:block_end],
                         "pair_logits": pred["pair_logits"][pair_start:pair_end],
                     }
-                    loss, parts, effective_pair_loss, pair_acc = _loss_for_prepared_sample(
+                    if "pair_axis4_logits" in pred:
+                        sample_pred["pair_axis4_logits"] = pred["pair_axis4_logits"][
+                            pair_start:pair_end
+                        ]
+                    loss, parts, effective_pair_loss, pair_acc, pair_axis_acc = _loss_for_prepared_sample(
                         sample_pred, prepared, args
                     )
                     batch_loss = batch_loss + loss
-                    _add_sample_stats(sums, loss, parts, effective_pair_loss, pair_acc)
+                    _add_sample_stats(
+                        sums, loss, parts, effective_pair_loss, pair_acc, pair_axis_acc
+                    )
                     last_loss = loss
                     last_parts = parts
                     last_pair_acc = pair_acc
@@ -509,14 +559,16 @@ def run_epoch(
                     hgt_edge_attr=prepared["hgt_edge_attr"],
                     pairs=prepared["pairs"],
                 )
-                loss, parts, effective_pair_loss, pair_acc = _loss_for_prepared_sample(
+                loss, parts, effective_pair_loss, pair_acc, pair_axis_acc = _loss_for_prepared_sample(
                     pred, prepared, args
                 )
                 if train:
                     (loss / accumulation_steps).backward()
                     pending_samples += 1
                     maybe_step(force=False)
-            _add_sample_stats(sums, loss, parts, effective_pair_loss, pair_acc)
+            _add_sample_stats(
+                sums, loss, parts, effective_pair_loss, pair_acc, pair_axis_acc
+            )
             count += 1
             if train and args.print_every > 0 and count % args.print_every == 0:
                 print(
@@ -601,6 +653,12 @@ def load_resume_model(
     args.encoder = encoder_type
     args.num_heads = num_heads
 
+    # pair_head_version comes from CLI args, NOT the resume checkpoint: warm-start
+    # from a v1 checkpoint (encoder + anchor heads via strict=False) while
+    # instantiating a fresh v2 pair head.
+    pair_head_version = 2 if bool(getattr(args, "pair_v2", False)) else int(
+        payload.get("pair_head_version", 1)
+    )
     model = FloorplanGNN(
         node_feat_dim=node_feat_dim,
         hidden_dim=hidden_dim,
@@ -613,8 +671,16 @@ def load_resume_model(
         hgt_node_feat_dims=hgt_node_feat_dims,
         hgt_relation_specs=hgt_relation_specs,
         hgt_relation_gate_min=hgt_relation_gate_min,
+        pair_head_version=pair_head_version,
     ).to(device)
-    model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if pair_head_version == 2:
+        pair_v2_missing = [k for k in missing if k.startswith("pair_head_v2")]
+        print(
+            f"Warm-start: {len(missing)} missing / {len(unexpected)} unexpected keys "
+            f"(pair_head_v2 fresh: {len(pair_v2_missing)} params)",
+            flush=True,
+        )
     resume_epoch = int(payload.get("epoch", 0))
     print(f"Loaded resume checkpoint from {checkpoint_path}", flush=True)
     print(f"Resume checkpoint epoch = {resume_epoch}", flush=True)
@@ -757,6 +823,27 @@ def _load_optimizer_state_if_compatible(
     return True
 
 
+def _pair_head_v2_param_names(model) -> set[str]:
+    return {name for name, _ in model.named_parameters() if name.startswith("pair_head_v2")}
+
+
+def _set_encoder_trainable(model, trainable: bool) -> None:
+    """Freeze/unfreeze everything EXCEPT the v2 pair head. Phase 1 trains only the
+    fresh pair head on top of frozen warm-started embeddings + anchor heads;
+    phase 2 unfreezes the rest for a low-LR joint refine."""
+    v2_names = _pair_head_v2_param_names(model)
+    for name, param in model.named_parameters():
+        if name in v2_names:
+            param.requires_grad = True
+        else:
+            param.requires_grad = trainable
+
+
+def _build_phase_optimizer(model, lr: float, weight_decay: float):
+    params = [p for p in model.parameters() if p.requires_grad]
+    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+
 def main(args) -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -834,8 +921,42 @@ def main(args) -> None:
         print(f"  resume checkpoint= {args.resume_checkpoint}")
     print("=" * 72, flush=True)
 
+    two_phase = bool(getattr(args, "pair_v2", False)) and int(getattr(args, "pair_phase1_epochs", 0)) > 0
+    current_phase = 0  # 0 = not yet configured, 1 = head-only, 2 = joint
+
+    def _configure_phase(local_epoch: int):
+        nonlocal optimizer, current_phase
+        if not two_phase or model is None:
+            return
+        phase = 1 if local_epoch <= int(args.pair_phase1_epochs) else 2
+        if phase == current_phase:
+            return
+        current_phase = phase
+        if phase == 1:
+            _set_encoder_trainable(model, trainable=False)
+            optimizer = _build_phase_optimizer(
+                model, float(args.pair_phase1_lr), args.weight_decay
+            )
+            print(
+                f"[pair-v2] phase 1: encoder FROZEN, pair-head only, lr={args.pair_phase1_lr}",
+                flush=True,
+            )
+        else:
+            _set_encoder_trainable(model, trainable=True)
+            optimizer = _build_phase_optimizer(
+                model, float(args.pair_phase2_lr), args.weight_decay
+            )
+            print(
+                f"[pair-v2] phase 2: encoder UNFROZEN, joint, lr={args.pair_phase2_lr}",
+                flush=True,
+            )
+
+    if model is not None:
+        _configure_phase(1)
+
     for local_epoch in range(1, args.epochs + 1):
         epoch = resume_epoch_offset + local_epoch
+        _configure_phase(local_epoch)
         train_start = choose_window_start(
             total, args.num_samples, args.seed, epoch, args.window_start
         )
@@ -890,6 +1011,7 @@ def main(args) -> None:
                 hgt_node_feat_dims=hgt_node_feat_dims,
                 hgt_relation_specs=hgt_relation_specs,
                 hgt_relation_gate_min=args.hgt_relation_gate_min,
+                pair_head_version=2 if bool(getattr(args, "pair_v2", False)) else 1,
             ).to(device)
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -904,6 +1026,8 @@ def main(args) -> None:
                 args.batch_size,
             )
             print(f"Created model with node_feat_dim={node_feat.shape[1]}", flush=True)
+            current_phase = 0
+            _configure_phase(local_epoch)
 
         train_stats = run_epoch(
             model, optimizer, train_loader, device, args, epoch, train=True
@@ -917,6 +1041,7 @@ def main(args) -> None:
             f"priority={train_stats['priority']:.5f} order={train_stats['order']:.5f} "
             f"edge={train_stats['edge']:.5f} pair={train_stats['pairwise']:.5f} "
             f"ord_acc={train_stats['ord_acc']:.3f} pair_acc={train_stats['pair_acc']:.3f} "
+            f"pair_axis_acc={train_stats['pair_axis_acc']:.3f} "
             f"used={train_stats['used']:.0f} clean={train_stats['clean']:.0f} "
             f"dirty={train_stats['dirty']:.0f} skipped={train_stats['skipped']:.0f}",
             flush=True,
@@ -927,6 +1052,7 @@ def main(args) -> None:
             f"priority={val_stats['priority']:.5f} order={val_stats['order']:.5f} "
             f"edge={val_stats['edge']:.5f} pair={val_stats['pairwise']:.5f} "
             f"ord_acc={val_stats['ord_acc']:.3f} pair_acc={val_stats['pair_acc']:.3f} "
+            f"pair_axis_acc={val_stats['pair_axis_acc']:.3f} "
             f"used={val_stats['used']:.0f} clean={val_stats['clean']:.0f} "
             f"dirty={val_stats['dirty']:.0f} skipped={val_stats['skipped']:.0f}",
             flush=True,
@@ -1031,6 +1157,57 @@ def parse_args():
     parser.add_argument("--edge-weight", type=float, default=0.08)
     parser.add_argument("--pairwise-weight", type=float, default=0.20)
     parser.add_argument("--pairwise-pairs", type=int, default=4096)
+    # --- Pair-head v2 (order-faithful 4-class decoder head) ---
+    parser.add_argument(
+        "--pair-v2",
+        action="store_true",
+        help=(
+            "Train the v2 pair head: a single 4-class softmax over the decoder's "
+            "composite order decision {i-left,j-left,i-below,j-below}, supervised "
+            "on ALL sampled pairs with the exact build_order_dags rule."
+        ),
+    )
+    parser.add_argument(
+        "--pair-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight on the v2 pair CE (falls back to --pairwise-weight if unset).",
+    )
+    parser.add_argument(
+        "--pair-class-weight",
+        default="",
+        help="Optional 4 comma-separated CE class weights for {i-left,j-left,i-below,j-below}.",
+    )
+    parser.add_argument(
+        "--pair-edge-alpha",
+        type=float,
+        default=0.25,
+        help="Per-pair weight = 1 + alpha * normalized b2b net weight between i,j.",
+    )
+    parser.add_argument(
+        "--pair-tie-alpha",
+        type=float,
+        default=0.5,
+        help="Up-weight near-tie pairs: weight *= 1 + alpha*(tie_weight-1), tie_weight in [1,2].",
+    )
+    parser.add_argument(
+        "--pair-phase1-epochs",
+        type=int,
+        default=0,
+        help="Epochs to train with encoder FROZEN (pair head only). 0 disables two-phase.",
+    )
+    parser.add_argument(
+        "--pair-phase1-lr",
+        type=float,
+        default=1e-3,
+        help="LR for phase 1 (frozen encoder, pair head only).",
+    )
+    parser.add_argument(
+        "--pair-phase2-lr",
+        type=float,
+        default=2e-5,
+        help="LR for phase 2 (unfrozen encoder, joint refine).",
+    )
     parser.add_argument(
         "--clean-sample-policy",
         default="weighted",

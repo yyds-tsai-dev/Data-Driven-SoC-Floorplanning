@@ -228,10 +228,13 @@ class FloorplanGNN(nn.Module):
         hgt_node_feat_dims: dict[str, int] | None = None,
         hgt_relation_specs: tuple[tuple[str, str, str], ...] | list[tuple[str, str, str]] | None = None,
         hgt_relation_gate_min: float = 0.10,
+        pair_head_version: int = 1,
     ):
         super().__init__()
         if encoder_type not in {"mpnn", "graph-transformer", "hgt"}:
             raise ValueError(f"Unsupported encoder_type: {encoder_type}")
+        if pair_head_version not in {1, 2}:
+            raise ValueError(f"Unsupported pair_head_version: {pair_head_version}")
         self.node_feat_dim = node_feat_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -243,6 +246,7 @@ class FloorplanGNN(nn.Module):
         self.hgt_node_feat_dims = dict(hgt_node_feat_dims or {"block": node_feat_dim})
         self.hgt_relation_specs = tuple(tuple(relation) for relation in (hgt_relation_specs or ()))
         self.hgt_relation_gate_min = float(hgt_relation_gate_min)
+        self.pair_head_version = int(pair_head_version)
 
         self.node_in = nn.Sequential(
             nn.Linear(node_feat_dim, hidden_dim),
@@ -330,6 +334,10 @@ class FloorplanGNN(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
         pair_in = hidden_dim * 4
+        # v1 pair head: two independent logits (x_side, y_side), legacy contract.
+        # Kept unconditionally so `has_pair_head` stays True and the live
+        # relative_order.py consumer (which unpacks a 2-tuple) keeps working for
+        # v1 checkpoints byte-for-byte.
         self.pair_head = nn.Sequential(
             nn.Linear(pair_in, hidden_dim),
             nn.SiLU(),
@@ -337,6 +345,18 @@ class FloorplanGNN(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 2),
         )
+        # v2 pair head: single 4-class softmax over the decoder's composite
+        # order decision {i-left-of-j, j-left-of-i, i-below-j, j-below-i}. Only
+        # instantiated when requested so v1 checkpoints load without extra keys.
+        self.pair_head_v2 = None
+        if self.pair_head_version == 2:
+            self.pair_head_v2 = nn.Sequential(
+                nn.Linear(pair_in, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim // 2, 4),
+            )
 
     def encode(
         self,
@@ -441,8 +461,31 @@ class FloorplanGNN(nn.Module):
         if pairs is not None:
             if pairs.numel() == 0:
                 output["pair_logits"] = h.new_empty((0, 2))
+                if self.pair_head_v2 is not None:
+                    output["pair_axis4_logits"] = h.new_empty((0, 4))
             else:
                 src = h[pairs[:, 0]]
                 dst = h[pairs[:, 1]]
-                output["pair_logits"] = self.pair_head(torch.cat([src, dst, dst - src, (dst - src).abs()], dim=1))
+                # Order-aware pair feature: signed (dst-src) breaks i<->j
+                # symmetry so direction is learnable; |dst-src| gives an
+                # order-invariant magnitude channel.
+                pair_feat = torch.cat([src, dst, dst - src, (dst - src).abs()], dim=1)
+                if self.pair_head_v2 is not None:
+                    axis4 = self.pair_head_v2(pair_feat)
+                    output["pair_axis4_logits"] = axis4
+                    # Synthesize the legacy 2-logit (x_side, y_side) contract from
+                    # the 4-class logits so the live relative_order.py consumer
+                    # (x_logit - y_logit axis bias) keeps a valid signal without
+                    # any change there. class order: 0=i-left,1=j-left (x-axis),
+                    # 2=i-below,3=j-below (y-axis). x_side = P(i-left-side) proxy,
+                    # y_side = P(i-below-side) proxy; both routed through the
+                    # x/y axis mass so the axis bias reflects the head's axis pick.
+                    x_mass = torch.logsumexp(axis4[:, 0:2], dim=1)
+                    y_mass = torch.logsumexp(axis4[:, 2:4], dim=1)
+                    # x_logit high => x-axis chosen with j to the right of i.
+                    x_logit = x_mass + (axis4[:, 0] - axis4[:, 1])
+                    y_logit = y_mass + (axis4[:, 2] - axis4[:, 3])
+                    output["pair_logits"] = torch.stack([x_logit, y_logit], dim=1)
+                else:
+                    output["pair_logits"] = self.pair_head(pair_feat)
         return output

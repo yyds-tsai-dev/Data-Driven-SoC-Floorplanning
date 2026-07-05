@@ -864,6 +864,7 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
                     hgt_relation_gate_min=float(
                         payload.get("hgt_relation_gate_min", 0.10)
                     ),
+                    pair_head_version=int(payload.get("pair_head_version", 1)),
                 )
                 model.load_state_dict(payload["model_state_dict"], strict=False)
                 self._checkpoint_config = {

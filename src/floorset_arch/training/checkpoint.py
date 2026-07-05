@@ -64,6 +64,8 @@ def anchor_checkpoint_payload(
             else []
         ),
         "has_pair_head": hasattr(model, "pair_head"),
+        "pair_head_version": int(getattr(model, "pair_head_version", 1)),
+        "pair_head_classes": 4 if int(getattr(model, "pair_head_version", 1)) == 2 else 2,
         "epoch": epoch,
         "train_stats": train_stats,
         "val_stats": val_stats,

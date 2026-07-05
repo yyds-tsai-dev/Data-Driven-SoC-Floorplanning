@@ -58,6 +58,7 @@ class GnnHintProvider:
                 tuple(r) for r in payload.get("hgt_relation_specs", ())
             ),
             "hgt_relation_gate_min": float(payload.get("hgt_relation_gate_min", 0.10)),
+            "pair_head_version": int(payload.get("pair_head_version", 1)),
         }
         model = FloorplanGNN(
             node_feat_dim=self.cfg["node_feat_dim"],
@@ -71,6 +72,7 @@ class GnnHintProvider:
             hgt_node_feat_dims=self.cfg["hgt_node_feat_dims"],
             hgt_relation_specs=self.cfg["hgt_relation_specs"],
             hgt_relation_gate_min=self.cfg["hgt_relation_gate_min"],
+            pair_head_version=self.cfg["pair_head_version"],
         )
         model.load_state_dict(payload["model_state_dict"], strict=False)
         model.eval()
