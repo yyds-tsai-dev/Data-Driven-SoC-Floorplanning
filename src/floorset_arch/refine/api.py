@@ -232,7 +232,8 @@ def refine_layout(
         # (hpwl_before etc.), so the true input remains the hard floor.
         stage_input = original
         topo_detail = None
-        if topo_deadline is not None:
+        window_detail = None
+        if topo_deadline is not None and os.environ.get("FLOORSET_TOPO_SEARCH", "0") == "1":
             try:
                 from .topo_search import refine_topo
 
@@ -247,6 +248,27 @@ def refine_layout(
                     stage_input = topo_out
             except Exception:
                 stage_input = original
+
+        # --- M5 windowed re-pack (LNS-style local class escape). Runs at the
+        # same point as topo_search (before slack projection), on whatever the
+        # topo stage produced (or `original`). Shares the topo_deadline reserve.
+        # Failure-contained: returns its input unchanged on any doubt, and its
+        # own full-layout guard chain re-validates every accepted window, so
+        # `stage_input` remains a strictly-better, legal layout w.r.t. its
+        # input (transitively w.r.t. `original`, since topo_out is too).
+        if topo_deadline is not None and os.environ.get("FLOORSET_WINDOW_REPACK", "0") == "1":
+            try:
+                from .window_repack import refine_window
+
+                window_out, window_detail = refine_window(
+                    stage_input, area_targets, constraints, target_positions,
+                    b2b_edges, p2b_edges, pin_list,
+                    deadline=topo_deadline, log_path=log_path,
+                )
+                if window_out != stage_input:
+                    stage_input = window_out
+            except Exception:
+                pass
 
         gx, gy = build_axis_dags(stage_input, constraints, target_positions, b2b, p2b, pins)
 
@@ -306,9 +328,15 @@ def refine_layout(
         hpwl_after = hpwl(candidate, b2b_edges, p2b_edges, pin_list)
         bbox_after = _bbox_area(candidate)
 
-        # Dims must be byte-identical to input (Phase 1 invariant).
+        # Dims must be byte-identical to the projection's INPUT (stage_input),
+        # not `original`: the slack projection itself never resizes, but the
+        # window-repack stage (M5) legitimately resizes soft blocks, so
+        # stage_input dims can differ from `original`. Comparing to stage_input
+        # keeps the "projection translates only" invariant while letting slack
+        # polish sit on top of a window resize. When topo/window are off,
+        # stage_input IS original, so this is byte-identical to before.
         dims_ok = all(
-            candidate[i][2] == original[i][2] and candidate[i][3] == original[i][3]
+            candidate[i][2] == stage_input[i][2] and candidate[i][3] == stage_input[i][3]
             for i in range(n)
         )
 
@@ -438,6 +466,14 @@ def refine_layout(
             detail["topo_post_hpwl"] = topo_detail.get("post_hpwl")
             detail["topo_elapsed"] = topo_detail.get("elapsed")
             detail["topo_guard_result"] = topo_detail.get("guard_result")
+        if window_detail is not None:
+            detail["window_n_tried"] = window_detail.get("n_windows_tried")
+            detail["window_n_accepted"] = window_detail.get("n_windows_accepted")
+            detail["window_mean_k"] = window_detail.get("mean_k")
+            detail["window_pre_hpwl"] = window_detail.get("pre_hpwl")
+            detail["window_post_hpwl"] = window_detail.get("post_hpwl")
+            detail["window_elapsed"] = window_detail.get("elapsed")
+            detail["window_guard_result"] = window_detail.get("guard_result")
 
         # `topo_applied` also counts as an accepted change: even if the slack
         # projection / aspect / vsnap all made no further progress, the topo

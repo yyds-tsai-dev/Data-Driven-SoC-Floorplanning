@@ -191,9 +191,17 @@ def solve_with_column_backbone(
     # The topo stage lives INSIDE refine_layout, so it only runs when the
     # slack refiner is also enabled; carving its reserve without the refiner on
     # would just waste SA time. Require both flags.
+    # Shared with M5 windowed re-pack (FLOORSET_WINDOW_REPACK): both the
+    # topo-search stage and the window-repack stage live inside refine_layout,
+    # run before the slack projection, and draw from the SAME `topo_reserve`
+    # sub-budget (they never both need it -- window-repack is the successor
+    # bet). Activate the reserve when EITHER flag is on.
     topo_reserve = 0.0
     if (
-        os.environ.get("FLOORSET_TOPO_SEARCH", "0") == "1"
+        (
+            os.environ.get("FLOORSET_TOPO_SEARCH", "0") == "1"
+            or os.environ.get("FLOORSET_WINDOW_REPACK", "0") == "1"
+        )
         and os.environ.get("FLOORSET_SLACK_REFINE", "0") == "1"
         and block_count >= 60
     ):
