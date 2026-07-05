@@ -154,6 +154,25 @@ def _run_case(sample, tag: str, budget: float):
 
     opt._random_move = counting_move  # bound-method override on the instance
 
+    # cache hit-rate: count column solves (misses) vs total non-empty columns
+    # evaluated (hits + misses). Only meaningful in FAST mode.
+    miss = [0]
+    total_cols = [0]
+    if getattr(opt, "_fast_eval", False):
+        real_solve_col = opt._solve_column
+        real_layout_fast = opt._layout_fast
+
+        def counting_solve(ulist, x, pos):
+            miss[0] += 1
+            return real_solve_col(ulist, x, pos)
+
+        def counting_layout_fast(cols_):
+            total_cols[0] += sum(1 for c in cols_ if c)
+            return real_layout_fast(cols_)
+
+        opt._solve_column = counting_solve
+        opt._layout_fast = counting_layout_fast
+
     prof = cProfile.Profile()
     t0 = time.time()
     prof.enable()
@@ -173,6 +192,7 @@ def _run_case(sample, tag: str, budget: float):
         "elapsed": elapsed,
         "mps": moves[0] / max(elapsed, 1e-9),
         "locked": len(opt.locked_rects),
+        "hit_rate": (1.0 - miss[0] / total_cols[0]) if total_cols[0] else None,
         "cum": cum,
         "stats": st,
     }
@@ -208,12 +228,17 @@ def main():
         eval_ct = cum.get("_evaluate", 0.0)
         loop_ref = max(eval_ct, res["elapsed"] * 0.5)
         frac = layout_fam / max(eval_ct, 1e-9)
+        hit = res.get("hit_rate")
+        hit_s = f"{hit:.1%}" if hit is not None else "n/a"
+        viol_ct = cum.get("_violations", 0.0)
+        hpwl_ct = cum.get("_hpwl", 0.0)
         hdr = (f"\n=== case {idx} [{label}] n={res['n']} locked={res['locked']} "
                f"{mode} ===\n"
                f"  moves={res['moves']}  elapsed={res['elapsed']:.2f}s  "
-               f"moves/s={res['mps']:.1f}\n"
+               f"moves/s={res['mps']:.1f}  cache_hit_rate={hit_s}\n"
                f"  cum(_layout+_stack_column)={layout_fam:.3f}s  "
-               f"cum(_evaluate)={eval_ct:.3f}s  layout/evaluate={frac:.2%}")
+               f"cum(_evaluate)={eval_ct:.3f}s  layout/evaluate={frac:.2%}\n"
+               f"  cum(_violations)={viol_ct:.3f}s  cum(_hpwl)={hpwl_ct:.3f}s")
         print(hdr)
         out_lines.append(hdr)
         print("  hot-function cumulative times:")

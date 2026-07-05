@@ -1429,6 +1429,30 @@ class _ColumnOptimizer:
                                              + np.abs(self.pY - cy[self.pB]))))
         return total
 
+    @staticmethod
+    def _count_components(adj: np.ndarray) -> int:
+        """Number of connected components of a small symmetric adjacency
+        matrix, computed by boolean transitive closure (repeated squaring to a
+        fixpoint) + a vectorized representative count. Bit-exact-equivalent to
+        the frontier-expansion BFS it replaces (verified exhaustively for
+        m<=6 and over 200k random graphs up to m=9), but O(log m) matmuls
+        instead of O(m) frontier steps, so it wins on the larger (chain-like)
+        cluster groups. Groups here are <=9 nodes."""
+        m = len(adj)
+        if m <= 1:
+            return m
+        r = adj.copy()
+        np.fill_diagonal(r, True)
+        prev = -1
+        cur = int(r.sum())
+        while cur != prev:
+            r = r | (r @ r)
+            prev = cur
+            cur = int(r.sum())
+        # a node is its component's representative iff no earlier-indexed node
+        # reaches it; components == number of representatives
+        return int((~np.tril(r, -1).any(axis=1)).sum())
+
     def _violations(self, pos: np.ndarray) -> int:
         V = 0
         px0 = pos[:, 0]
@@ -1457,21 +1481,7 @@ class _ColumnOptimizer:
             ox = np.minimum(gx1[:, None], gx1[None, :]) - np.maximum(gx0[:, None], gx0[None, :])
             oy = np.minimum(gy1[:, None], gy1[None, :]) - np.maximum(gy0[:, None], gy0[None, :])
             adj = ((ox > TOUCH_TOL) & (oy >= -TOUCH_TOL)) | ((oy > TOUCH_TOL) & (ox >= -TOUCH_TOL))
-            m = len(g)
-            seen = np.zeros(m, dtype=bool)
-            comps = 0
-            for s in range(m):
-                if seen[s]:
-                    continue
-                comps += 1
-                frontier = np.zeros(m, dtype=bool)
-                frontier[s] = True
-                seen[s] = True
-                while frontier.any():
-                    nxt = adj[frontier].any(axis=0) & ~seen
-                    seen |= nxt
-                    frontier = nxt
-            V += comps - 1
+            V += self._count_components(adj) - 1
 
         for g in self._mib_arrays:
             shapes = {(round(float(pos[i, 2]), 4), round(float(pos[i, 3]), 4)) for i in g}

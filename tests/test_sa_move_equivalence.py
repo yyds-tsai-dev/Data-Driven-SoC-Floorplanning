@@ -43,8 +43,11 @@ except Exception as exc:  # pragma: no cover - dataset absence
 
 # (test_id, label): small preplaced case, a MIB/cluster-heavy mid case, and a
 # large case. All validation cases carry clusters/MIB groups; case 4 (n=25) is
-# the canonical single-preplaced-obstacle case named in the plan.
-CASES = [(4, "n25-preplaced"), (9, "n30-2locked"), (47, "n68-mid"), (94, "n115-large")]
+# the canonical single-preplaced-obstacle case named in the plan. Case 90 has
+# the largest locked-cluster groups (9,9,8) -- it exercises the vectorized
+# connected-components violation count (M1.3) at its worst.
+CASES = [(4, "n25-preplaced"), (9, "n30-2locked"), (47, "n68-mid"),
+         (90, "n111-clusters"), (94, "n115-large")]
 SEED = 20260705
 
 
@@ -239,3 +242,139 @@ def test_cache_invalidates_on_subgroup_reorder():
     cf, _, _, vf = opt._cost(pf, xrf, ytf)
     assert np.allclose(pf, ps, atol=1e-9, rtol=0.0)
     _assert_cost_eq(cf, cs_, vf, vs, "subgroup-reorder", "reorder")
+
+
+# ---------------------------------------------------------------------------
+# M1.3 -- vectorized _violations connected-components count
+# ---------------------------------------------------------------------------
+def _bfs_components(adj: np.ndarray) -> int:
+    """Reference: the frontier-expansion BFS that _count_components replaced."""
+    m = len(adj)
+    seen = np.zeros(m, dtype=bool)
+    comps = 0
+    for s in range(m):
+        if seen[s]:
+            continue
+        comps += 1
+        frontier = np.zeros(m, dtype=bool)
+        frontier[s] = True
+        seen[s] = True
+        while frontier.any():
+            nxt = adj[frontier].any(axis=0) & ~seen
+            seen |= nxt
+            frontier = nxt
+    return comps
+
+
+def test_count_components_exhaustive_small():
+    """_count_components must equal the reference BFS for EVERY symmetric graph
+    up to m=6 (diagonal forced True, matching the touch/overlap relation)."""
+    import itertools
+    for m in range(1, 7):
+        pairs = list(itertools.combinations(range(m), 2))
+        for bits in range(1 << len(pairs)):
+            adj = np.zeros((m, m), dtype=bool)
+            np.fill_diagonal(adj, True)
+            for b, (i, j) in enumerate(pairs):
+                if bits >> b & 1:
+                    adj[i, j] = adj[j, i] = True
+            assert cs._ColumnOptimizer._count_components(adj) == _bfs_components(adj)
+
+
+def test_count_components_random_up_to_9():
+    """Random symmetric graphs up to m=9 (the largest cluster-group size in the
+    validation set): vectorized closure == BFS."""
+    rng = np.random.default_rng(20260705)
+    for _ in range(50000):
+        m = int(rng.integers(1, 10))
+        adj = rng.random((m, m)) < 0.3
+        adj = adj | adj.T
+        np.fill_diagonal(adj, True)
+        assert cs._ColumnOptimizer._count_components(adj) == _bfs_components(adj)
+
+
+@pytest.mark.skipif(_DS is None, reason="LiteTensorDataTest unavailable")
+def test_violations_match_reference_bfs_on_cluster_case():
+    """On the case with the largest locked-cluster groups (90: 9,9,8), the
+    vectorized _violations must yield the SAME integer count as a from-scratch
+    reference that uses the BFS, across a real move sequence."""
+    opt = _build(90)
+    if opt is None or not opt._clu_arrays:
+        pytest.skip("case 90 has no locked-cluster groups in this build")
+
+    def viol_reference(pos):
+        # replicate _violations but with the BFS component count
+        V = 0
+        px0 = pos[:, 0]; py0 = pos[:, 1]
+        px1 = px0 + pos[:, 2]; py1 = py0 + pos[:, 3]
+        x_min = px0.min(); y_min = py0.min()
+        x_max = px1.max(); y_max = py1.max()
+        eps = 1e-6
+        b = opt._bnd_idx
+        if len(b):
+            c = opt._bnd_codes
+            bad = ((c & 1) != 0) & (np.abs(px0[b] - x_min) >= eps)
+            bad |= ((c & 2) != 0) & (np.abs(px1[b] - x_max) >= eps)
+            bad |= ((c & 4) != 0) & (np.abs(py1[b] - y_max) >= eps)
+            bad |= ((c & 8) != 0) & (np.abs(py0[b] - y_min) >= eps)
+            V += int(bad.sum())
+        for g in opt._clu_arrays:
+            gx0 = px0[g]; gy0 = py0[g]; gx1 = px1[g]; gy1 = py1[g]
+            ox = np.minimum(gx1[:, None], gx1[None, :]) - np.maximum(gx0[:, None], gx0[None, :])
+            oy = np.minimum(gy1[:, None], gy1[None, :]) - np.maximum(gy0[:, None], gy0[None, :])
+            adj = ((ox > cs.TOUCH_TOL) & (oy >= -cs.TOUCH_TOL)) | \
+                  ((oy > cs.TOUCH_TOL) & (ox >= -cs.TOUCH_TOL))
+            V += _bfs_components(adj) - 1
+        for g in opt._mib_arrays:
+            shapes = {(round(float(pos[i, 2]), 4), round(float(pos[i, 3]), 4)) for i in g}
+            V += len(shapes) - 1
+        return V
+
+    cols = [list(c) for c in opt._cols]
+    n_checked = 0
+    for _step in range(600):
+        undo = opt._random_move(cols)
+        if undo is None:
+            continue
+        pos, _xr, _yt = opt._layout_fast([list(c) for c in cols])
+        assert opt._violations(pos) == viol_reference(pos)
+        n_checked += 1
+    assert n_checked > 100
+
+
+@pytest.mark.skipif(_DS is None, reason="LiteTensorDataTest unavailable")
+@pytest.mark.parametrize("idx,label", [(4, "n25-preplaced"), (90, "n111-clusters")])
+def test_rejected_move_rollback_keeps_fast_path_consistent(idx, label):
+    """The SA loop calls undo() on rejected moves. After any accept/reject
+    interleaving the memoized layout must still equal the from-scratch layout
+    (the version counters + column-content keys must survive rollback). We do
+    NOT keep incremental HPWL state (M1.2 was measured not worth it), so there
+    is no per-edge cache to revert -- but the cache-key correctness under
+    rollback is still asserted here."""
+    opt = _build(idx)
+    if opt is None:
+        pytest.skip(f"case {idx} locked-only")
+    cols = [list(c) for c in opt._cols]
+    rng = opt.rng
+    n_checked = 0
+    for _step in range(500):
+        undo = opt._random_move(cols)
+        if undo is None:
+            continue
+        # decide accept/reject deterministically from the rng stream
+        if rng.random() < 0.5:
+            undo()  # reject: state must be exactly restored
+        # after either branch, fast vs scratch must agree on the CURRENT cols
+        pf, xrf, ytf = opt._layout_fast([list(c) for c in cols])
+        cf, _, _, vf = opt._cost(pf, xrf, ytf)
+        opt._fast_eval = False
+        try:
+            ps, xrs, yts = opt._layout([list(c) for c in cols])
+        finally:
+            opt._fast_eval = True
+        cs_, _, _, vs = opt._cost(ps, xrs, yts)
+        assert np.allclose(pf, ps, atol=1e-9, rtol=0.0), (
+            f"{label}: rollback pos mismatch (max |d|={np.abs(pf - ps).max():.2e})")
+        _assert_cost_eq(cf, cs_, vf, vs, label, "rollback")
+        n_checked += 1
+    assert n_checked > 100
