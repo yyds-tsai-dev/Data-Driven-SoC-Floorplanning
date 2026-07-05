@@ -206,7 +206,15 @@ def solve_with_column_backbone(
         and block_count >= 60
     ):
         remaining_budget = max(0.0, budget - refine_reserve)
-        topo_reserve = min(3.0, 0.25 * remaining_budget)
+        if os.environ.get("FLOORSET_TOPO_SEARCH", "0") == "1":
+            topo_reserve = min(3.0, 0.25 * remaining_budget)
+        else:
+            # Window-repack only: the stage is fast (measured <=0.9s at
+            # n=120); a 3s carve-out taxes the SA far more than the stage
+            # uses (full-run gate: SA avg_rt fell 4.46->4.00 and the stage
+            # gains were eaten by the SA-budget loss). Reserve only what
+            # the stage actually consumes.
+            topo_reserve = min(1.0, 0.10 * remaining_budget)
 
     area_targets = area_targets[:block_count].detach().float().cpu()
     constraints = constraints[:block_count].detach().float().cpu()
