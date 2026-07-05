@@ -156,6 +156,12 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
         self._diffusion_checkpoint_key: Optional[Path] = None
         self._diffusion_model = None
         self.last_solve_metadata: dict[str, object] = {}
+        # FLOORSET_COLUMN_BACKBONE=1 opts into the vendored column-slicing legalizer
+        # backbone (src/floorset_arch/legalizer/) in place of the v5/v11 priors;
+        # default "0" keeps the existing production path unchanged.
+        if os.environ.get("FLOORSET_COLUMN_BACKBONE", "0") == "1":
+            from floorset_arch.legalizer.column_backbone import warm_worker_pool
+            warm_worker_pool()
 
     def solve(
         self,
@@ -167,6 +173,12 @@ class ArchitectureV11Optimizer(FloorplanOptimizer):
         constraints: torch.Tensor,
         target_positions: Optional[torch.Tensor] = None,
     ) -> List[Tuple[float, float, float, float]]:
+        if os.environ.get("FLOORSET_COLUMN_BACKBONE", "0") == "1":
+            from floorset_arch.legalizer.column_backbone import solve_with_column_backbone
+            return solve_with_column_backbone(
+                block_count, area_targets, b2b_connectivity, p2b_connectivity,
+                pins_pos, constraints, target_positions,
+            )
         inst = parse_instance(
             block_count,
             area_targets,
