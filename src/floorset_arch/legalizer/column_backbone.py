@@ -179,6 +179,27 @@ def solve_with_column_backbone(
     if os.environ.get("FLOORSET_SLACK_REFINE", "0") == "1":
         refine_reserve = min(2.0, 0.3 + 0.012 * block_count, 0.4 * budget)
 
+    # Topology-search reserve (M2, FLOORSET_TOPO_SEARCH, default OFF). For
+    # larger cases (n >= 60) carve an additional slice out of the SA share so
+    # the topo_search stage in the refiner has its own wall-clock allowance.
+    # The reserve is measured against the budget REMAINING after the slack
+    # refiner's own reserve is set aside, so the two carve-outs never
+    # double-count. Total per-case wall clock is unchanged: SA is simply
+    # handed a shorter deadline and the freed time is spent inside the refine
+    # window instead. When the flag is off, topo_reserve stays 0.0 and every
+    # downstream deadline is byte-identical to the pre-M2 behavior.
+    # The topo stage lives INSIDE refine_layout, so it only runs when the
+    # slack refiner is also enabled; carving its reserve without the refiner on
+    # would just waste SA time. Require both flags.
+    topo_reserve = 0.0
+    if (
+        os.environ.get("FLOORSET_TOPO_SEARCH", "0") == "1"
+        and os.environ.get("FLOORSET_SLACK_REFINE", "0") == "1"
+        and block_count >= 60
+    ):
+        remaining_budget = max(0.0, budget - refine_reserve)
+        topo_reserve = min(3.0, 0.25 * remaining_budget)
+
     area_targets = area_targets[:block_count].detach().float().cpu()
     constraints = constraints[:block_count].detach().float().cpu()
     target_positions = (
@@ -193,10 +214,15 @@ def solve_with_column_backbone(
     try:
         seed_rects = _heuristic_init(area_targets, constraints, target_positions, b2b, p2b, pins)
 
+        # SA gets a deadline shortened by BOTH reserves so the refiner (slack
+        # projection + optional topo_search) inherits the freed tail. The
+        # `worker_deadline = deadline - 0.30` slack inside legalize_rectangles
+        # is preserved automatically -- it is applied to whatever deadline we
+        # pass here, and we only ever shrink it, never grow the total.
         out = legalize_rectangles(
             seed_rects, area_targets, constraints, target_positions,
             b2b_connectivity=b2b, p2b_connectivity=p2b, pins_pos=pins,
-            deadline=deadline - refine_reserve,
+            deadline=deadline - refine_reserve - topo_reserve,
         )
         if os.environ.get("FLOORSET_SLACK_REFINE", "0") == "1":
             from floorset_arch.refine.api import refine_layout
@@ -208,14 +234,21 @@ def solve_with_column_backbone(
             # pure numpy, single-core, bounded by MAX_SWEEPS and n<=120, so
             # its own pass costs at most tens of ms -- give it a small
             # dedicated allowance instead of inheriting the spent deadline.
-            refine_deadline = time.time() + max(refine_reserve, 0.1)
+            refine_deadline = time.time() + max(refine_reserve + topo_reserve, 0.1)
             # FLOORSET_SLACK_REFINE_VSNAP=1 (default off) enables a further
             # Phase-V violation-snap post-pass inside refine_layout itself
             # (read directly from os.environ there, not threaded through as a
             # parameter) -- see src/floorset_arch/refine/vsnap.py.
+            # topo_search (if enabled) runs FIRST inside refine_layout and gets
+            # its own sub-deadline (now + topo_reserve) so it cannot starve the
+            # downstream slack projection of the refine window. When
+            # FLOORSET_TOPO_SEARCH is off, topo_reserve == 0.0 and
+            # topo_deadline is None (no stage runs) -- byte-identical to before.
+            topo_deadline = (time.time() + topo_reserve) if topo_reserve > 0.0 else None
             out = refine_layout(out, area_targets, constraints, target_positions,
                                 b2b, p2b, pins, deadline=refine_deadline,
-                                enable_aspect=os.environ.get("FLOORSET_SLACK_REFINE_ASPECT", "0") == "1")
+                                enable_aspect=os.environ.get("FLOORSET_SLACK_REFINE_ASPECT", "0") == "1",
+                                topo_deadline=topo_deadline)
         return out
     except Exception:
         return _fallback_row(area_targets, constraints, target_positions)
