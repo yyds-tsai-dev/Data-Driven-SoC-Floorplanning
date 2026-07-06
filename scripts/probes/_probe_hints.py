@@ -78,7 +78,13 @@ class GnnHintProvider:
         model.eval()
         self.model = model
 
-    def hints(self, sample, n: int) -> List[Rect]:
+    def _run(self, sample, n: int, want_pairs: bool):
+        """Single forward pass. Returns (pred_dict, scale, pairs_or_None).
+
+        When ``want_pairs`` and the checkpoint carries a v2 pair head, all
+        i<j pairs (in the exact ``sample_pairs`` enumeration order used by
+        training) are scored and ``pred['pair_axis4_logits']`` is populated.
+        """
         from floorset_arch.features import (
             build_anchor_edge_tensors,
             build_anchor_hgt_graph_inputs,
@@ -87,6 +93,12 @@ class GnnHintProvider:
         )
         inst = _inst_from_sample(sample, n)
         dev = torch.device("cpu")
+        pairs = None
+        if want_pairs and self.cfg.get("pair_head_version", 1) == 2:
+            pairs = torch.tensor(
+                [(i, j) for i in range(n) for j in range(i + 1, n)],
+                dtype=torch.long,
+            )
         with torch.no_grad():
             node_feat, scale = build_anchor_node_features(inst, device=dev)
             edge_type = structural_feat = None
@@ -109,8 +121,11 @@ class GnnHintProvider:
                 node_feat, edge_index, edge_attr,
                 edge_type=edge_type, structural_feat=structural_feat,
                 hgt_node_features=hgt_nf, hgt_edge_index=hgt_ei,
-                hgt_edge_attr=hgt_ea, pairs=None,
+                hgt_edge_attr=hgt_ea, pairs=pairs,
             )
+        return pred, scale, pairs, inst
+
+    def _rects_from_pred(self, pred, scale, inst, n: int) -> List[Rect]:
         anchors = pred["anchor"].detach().cpu() * max(float(scale), 1.0)
         log_aspect = pred.get("log_aspect")
         out: List[Rect] = []
@@ -131,6 +146,32 @@ class GnnHintProvider:
             # golden-hint format the decoder consumes (it recomputes centroids).
             out.append((cx - w / 2.0, cy - h / 2.0, w, h))
         return out
+
+    def hints(self, sample, n: int) -> List[Rect]:
+        pred, scale, _pairs, inst = self._run(sample, n, want_pairs=False)
+        return self._rects_from_pred(pred, scale, inst, n)
+
+    def hints_and_pairs(self, sample, n: int):
+        """Return (hint_rects, pair_map) where pair_map is a dict keyed by the
+        ordered index pair (i, j) with i<j -> (pred_class:int, conf:float),
+        or None if this checkpoint has no v2 pair head.
+
+        Class semantics match losses.PAIR_AXIS4_CLASSES / build_order_dags:
+          0 = i left-of j   1 = j left-of i
+          2 = i below j     3 = j below i
+        """
+        pred, scale, pairs, inst = self._run(sample, n, want_pairs=True)
+        rects = self._rects_from_pred(pred, scale, inst, n)
+        if pairs is None or "pair_axis4_logits" not in pred:
+            return rects, None
+        logits = pred["pair_axis4_logits"].detach().cpu()
+        sm = torch.softmax(logits, dim=1)
+        conf, cls = sm.max(dim=1)
+        pair_map: dict = {}
+        pl = pairs.tolist()
+        for k, (i, j) in enumerate(pl):
+            pair_map[(int(i), int(j))] = (int(cls[k]), float(conf[k]))
+        return rects, pair_map
 
 
 # =============================================================================
