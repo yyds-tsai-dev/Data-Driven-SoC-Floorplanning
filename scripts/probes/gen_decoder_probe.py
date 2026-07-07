@@ -21,8 +21,9 @@ concept is the bottleneck and we learn which constraint kills it.
 Self-contained: imports only refine.{guards,slack_solve,constraint_graph,
 wirelength}, legalizer.column_slicing._parse_constraints/_target, and the
 official evaluator's evaluate_solution/compute_total_score. Does NOT import
-refine.api, floorset_arch.optimizer, legalizer.column_backbone (mid-edit
-hazard). No FLOORSET env changes, no src/ edits.
+refine.api or floorset_arch.optimizer; legalizer.column_backbone is imported
+ONLY lazily by the production hint provider (golden/gnn/diffusion paths never
+touch it). No src/ edits.
 
 Usage (from repo root, tcsh):
   cd FloorSet/iccad2026contest
@@ -33,6 +34,10 @@ Hint sources:
   --hints golden        E1: golden bbox layout as hints (the gate)
   --hints gnn           E2: Anchor-GNN anchor+aspect heads as hints
   --hints diffusion     E3: v11 diffusion samples as hints
+  --hints production    D1: production column-backbone layout as hints
+                        (decoder-as-polish; reports paired baseline/decoded/
+                        portfolio(min) totals -- portfolio(min) is the
+                        strict-better deployment semantics)
 """
 
 from __future__ import annotations
@@ -671,6 +676,9 @@ def run(args) -> None:
             steps=args.diffusion_steps,
             n_samples=args.diffusion_samples,
         )
+    elif args.hints == "production":
+        from _probe_hints import ProductionHintProvider
+        hint_provider = ProductionHintProvider(args.production_cache)
 
     rows = []
     costs = []
@@ -685,10 +693,21 @@ def run(args) -> None:
         infer_ms = 0.0
         if args.hints == "golden":
             hints = golden_hints(sample, n)
+        elif args.hints == "production":
+            ti = time.time()
+            hints = hint_provider.hints(sample, n, idx=idx)
+            infer_ms = 1000.0 * (time.time() - ti)
         else:
             ti = time.time()
             hints = hint_provider.hints(sample, n)
             infer_ms = 1000.0 * (time.time() - ti)
+
+        # D1 paired baseline: the production hints ARE a legal layout; score
+        # them as-is so baseline vs decoded is a same-layout comparison (no
+        # cross-run SA noise).
+        base_sc = None
+        if args.hints == "production":
+            base_sc = score_case(sample, hints, n)
 
         dt0 = time.time()
         # diffusion: multiple samples -> keep best by decoded HPWL proxy.
@@ -718,14 +737,22 @@ def run(args) -> None:
         row = {"idx": idx, "n": n, "band": _band(n),
                "dec_ms": round(dec_ms, 1), "infer_ms": round(infer_ms, 1),
                **sc, **{f"tr_{k}": v for k, v in tr.items()}}
+        if base_sc is not None:
+            row["base_cost"] = base_sc["cost"]
+            row["base_hpwl_gap"] = base_sc["hpwl_gap"]
+            row["base_area_gap"] = base_sc["area_gap"]
+            row["base_v_rel"] = base_sc["v_rel"]
         rows.append(row)
         costs.append(sc["cost"])
         bcs.append(n)
         if args.verbose:
+            extra = (f" base={base_sc['cost']:.4f}" if base_sc is not None
+                     else "")
             print(f"  idx={idx:3d} n={n:3d} cost={sc['cost']:.4f} "
                   f"feas={int(sc['feasible'])} hpwl_gap={sc['hpwl_gap']:+.3f} "
                   f"area_gap={sc['area_gap']:+.3f} v_rel={sc['v_rel']:.3f} "
-                  f"ovl={sc['overlap']} dec_ms={dec_ms:.0f}", flush=True)
+                  f"ovl={sc['overlap']} dec_ms={dec_ms:.0f}{extra}",
+                  flush=True)
 
     total = compute_total_score(costs, bcs)
     elapsed = time.time() - t0
@@ -757,6 +784,18 @@ def run(args) -> None:
           f"mean hpwl_gap = {mean_hgap:+.3f}   mean area_gap = {mean_agap:+.3f}")
     print(f"  legal-fallback fired = {fb_fired}/{len(rows)}   "
           f"decode {mean_dec:.0f} ms/case   inference {mean_inf:.0f} ms/case")
+    if args.hints == "production" and rows and "base_cost" in rows[0]:
+        base_costs = [r["base_cost"] for r in rows]
+        port_costs = [min(r["cost"], r["base_cost"]) for r in rows]
+        base_total = compute_total_score(base_costs, bcs)
+        port_total = compute_total_score(port_costs, bcs)
+        wins = sum(1 for r in rows if r["cost"] < r["base_cost"] - 1e-9)
+        losses = sum(1 for r in rows if r["cost"] > r["base_cost"] + 1e-9)
+        print(f"  D1 PAIRED: baseline(production)={base_total:.4f}   "
+              f"decoded={total:.4f}   portfolio(min)={port_total:.4f}")
+        print(f"  D1 PAIRED: decoder wins {wins} / loses {losses} / "
+              f"ties {len(rows) - wins - losses} of {len(rows)}   "
+              f"(deploy delta = {port_total - base_total:+.4f})")
     print("-" * 78)
     for band in ("n<60", "60-99", ">=100"):
         if band not in band_stats:
@@ -791,8 +830,12 @@ def run(args) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hints", choices=["golden", "gnn", "diffusion"],
+    ap.add_argument("--hints",
+                    choices=["golden", "gnn", "diffusion", "production"],
                     default="golden")
+    ap.add_argument("--production-cache", default=None,
+                    help="JSON cache of production layouts keyed by case idx "
+                         "(D1 probe: retests reuse identical layouts)")
     ap.add_argument("--cases", type=int, default=0,
                     help="0 = all 100; else stratified subsample of size N")
     ap.add_argument("--data-path", default=os.environ.get("FLOORSET_DATA_PATH", "../"))

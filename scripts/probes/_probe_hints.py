@@ -1,14 +1,17 @@
-"""Hint providers for gen_decoder_probe: Anchor-GNN (E2) and v11 diffusion (E3).
+"""Hint providers for gen_decoder_probe: Anchor-GNN (E2), v11 diffusion (E3),
+and the production column-backbone layout (D1 decoder-as-polish probe).
 
 Replicates the model-inference call sequences from
 src/floorset_arch/optimizer.py (_try_anchor_guidance / _try_diffusion_prior)
 WITHOUT importing optimizer.py or refine.api (mid-edit hazard). Imports only
 parser, features, nn.model, diffusion.{graph_inputs,sampling,concretize},
-training.checkpoint -- all safe.
+training.checkpoint -- all safe. The production provider additionally does a
+lazy import of legalizer.column_backbone (the golden/gnn/diffusion paths never
+touch it).
 
-A "hint" is a per-block (cx, cy, w, h) tuple. Providers return either one hint
-list (GNN) or a list-of-hint-lists (diffusion, one per sample) that the probe
-decodes and best-selects.
+A "hint" is a per-block (x, y, w, h) tuple (lower-left corner). Providers
+return either one hint list (GNN/production) or a list-of-hint-lists
+(diffusion, one per sample) that the probe decodes and best-selects.
 """
 
 from __future__ import annotations
@@ -172,6 +175,76 @@ class GnnHintProvider:
         for k, (i, j) in enumerate(pl):
             pair_map[(int(i), int(j))] = (int(cls[k]), float(conf[k]))
         return rects, pair_map
+
+
+# =============================================================================
+# D1: production column-backbone layout as hints (decoder-as-polish probe)
+# =============================================================================
+class ProductionHintProvider:
+    """Feed the PRODUCTION layout back to the decoder as hints.
+
+    D1 probe: the decoder re-derives coordinates from the layout's own
+    pairwise order (longest-path re-compaction, de-quantizing the column
+    representation) and boundary-snaps residual wall violations. The driver
+    reports paired baseline/decoded/portfolio(min) totals -- portfolio(min)
+    is the deployment semantics (strict-better gate).
+
+    Env parity with the promoted production path (.env defaults) is applied
+    via setdefault so a bare run matches scripts/eval_total.sh behavior.
+    Layouts are cached to ``cache_path`` (JSON keyed by case idx) so a retest
+    (e.g. after wiring repair_pin_order) reuses identical layouts instead of
+    re-running the ~5s/case SA.
+    """
+
+    _ENV_PARITY = (
+        ("FLOORSET_COLUMN_BACKBONE", "1"),
+        ("FLOORSET_SLACK_REFINE", "1"),
+        ("FLOORSET_SLACK_REFINE_ASPECT", "1"),
+        ("FLOORSET_SLACK_REFINE_VSNAP", "1"),
+        ("FLOORSET_FAST_EVAL", "1"),
+        ("FLOORSET_WINDOW_REPACK", "1"),
+    )
+
+    def __init__(self, cache_path: Optional[str] = None):
+        import json
+
+        for k, v in self._ENV_PARITY:
+            os.environ.setdefault(k, v)
+        self.cache_path = cache_path
+        self._cache: dict = {}
+        if cache_path and os.path.exists(cache_path):
+            with open(cache_path) as f:
+                self._cache = {int(k): v for k, v in json.load(f).items()}
+
+    def _save(self) -> None:
+        import json
+
+        if not self.cache_path:
+            return
+        tmp = self.cache_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({str(k): v for k, v in self._cache.items()}, f)
+        os.replace(tmp, self.cache_path)
+
+    def hints(self, sample, n: int, idx: Optional[int] = None) -> List[Rect]:
+        if idx is not None and idx in self._cache:
+            return [tuple(r) for r in self._cache[idx]]
+        # Lazy import: keeps the golden/gnn/diffusion probe paths free of any
+        # column_backbone dependency (see module docstring).
+        from floorset_arch.legalizer.column_backbone import (
+            solve_with_column_backbone,
+        )
+        from gen_decoder_probe import _golden_rects, _opt_target_positions
+
+        at, b2b, p2b, pins, cons = sample["input"]
+        golden = _golden_rects(sample, n)
+        tpos = _opt_target_positions(sample, n, golden)
+        rects = solve_with_column_backbone(n, at, b2b, p2b, pins, cons, tpos)
+        out = [tuple(float(v) for v in r) for r in rects[:n]]
+        if idx is not None:
+            self._cache[idx] = [list(r) for r in out]
+            self._save()
+        return out
 
 
 # =============================================================================
