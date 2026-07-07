@@ -222,6 +222,8 @@ def test_checkpoint_model_is_cached_between_solves(tmp_path, monkeypatch):
     checkpoint = tmp_path / "cached.pt"
     _write_anchor_checkpoint(checkpoint)
     monkeypatch.setenv("FLOORSET_GNN_CHECKPOINT", str(checkpoint))
+    # GNN checkpoints load only on the legacy path; the .env-default column backbone skips them.
+    monkeypatch.setenv("FLOORSET_COLUMN_BACKBONE", "0")
 
     import floorset_arch.training.checkpoint as checkpoint_module
 

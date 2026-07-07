@@ -48,6 +48,8 @@ def test_repair_delta_reports_average_motion_and_quality_delta():
 def test_optimizer_writes_repair_trace_jsonl(tmp_path, monkeypatch):
     trace_path = tmp_path / "trace.jsonl"
     monkeypatch.setenv("FLOORSET_REPAIR_TRACE_JSONL", str(trace_path))
+    # Repair traces only exist on the legacy path; the .env-default column backbone skips them.
+    monkeypatch.setenv("FLOORSET_COLUMN_BACKBONE", "0")
 
     problem = {
         "block_count": 2,

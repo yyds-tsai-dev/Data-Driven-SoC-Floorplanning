@@ -55,6 +55,9 @@ def _tiny_problem():
 
 
 def test_v11_falls_back_when_diffusion_checkpoint_is_missing(monkeypatch):
+    # Legacy-path test: __init__ loads .env, which defaults FLOORSET_COLUMN_BACKBONE=1;
+    # setenv wins because the dotenv load uses override=False.
+    monkeypatch.setenv("FLOORSET_COLUMN_BACKBONE", "0")
     monkeypatch.delenv("FLOORSET_DIFFUSION_CHECKPOINT", raising=False)
     optimizer = ArchitectureV11Optimizer()
 
@@ -65,6 +68,8 @@ def test_v11_falls_back_when_diffusion_checkpoint_is_missing(monkeypatch):
 
 
 def test_v11_uses_diffusion_prior_without_anchor_guidance(monkeypatch):
+    # Legacy-path test: keep the column backbone off so solve() reaches the diffusion path.
+    monkeypatch.setenv("FLOORSET_COLUMN_BACKBONE", "0")
     optimizer = ArchitectureV11Optimizer()
 
     def fake_prior(inst):
