@@ -108,6 +108,10 @@ _Avoid_: "free time" schemes that slow a subset of cases on the assumption of a 
 `Cost = min((1 + 0.5·(HPWL_gap + Area_bbox_gap)) · e^(2·Violations_rel) · max(0.7, RuntimeFactor^0.3), 10−1e−6)`; infeasible = 10. Total Score = Σ λ_i·Cost_i with λ_i ∝ e^(n_i/12) (normalized). Consequences: quality-gap improvements enter at HALF weight (α=0.5); the violation term is a multiplicative exponential, so v_rel on heavy-weight tail cases is worth far more than the same v_rel on average cases; block-area tolerance is two-sided `|w·h − a|/a ≤ 0.01` (Eq.1 p.4) — under-area up to 1% is feasible by rule.
 _Avoid_: valuing a lever as a 1:1 gap delta (forgets α=0.5); reading "violation line closed on average" as "no per-case violation headroom on the weighted tail".
 
+**Hidden-Test Hardware (official QA A2/A3, verified 2026-07-07)**:
+The evaluation server is an ICELAKE CPU with 48 cores, an A100 80GB GPU, and 128GB RAM; test cases are evaluated sequentially, and per-sample multiprocessing/multithreading is explicitly allowed. Consequences: the historical worker-pool formula `min(12, cores//2)` leaves ~36 cores idle on the test machine, so restart-portfolio widening (`FLOORSET_SA_WORKERS`/`FLOORSET_SA_CONFIGS`, best-of-workers order statistics) is a zero-wall-clock quality lever; the A100 is idle under the pure-CPU production path. The evaluator's `timeout: float = 60.0` parameter is dead code (declared, never consumed) — no hard per-case time limit exists in the provided kit, and slowness is penalized only through the RuntimeFactor.
+_Avoid_: sizing the parallel portfolio to the local machine instead of the 48-core target, treating the dead 60s parameter as an enforced limit (it is, however, the only "limit-shaped" signal in the kit — keep worst-case per-case runtime under it for submission-risk hygiene).
+
 **Conservative Runtime Budget**:
 The submission-oriented policy that permits extra sample-local search only when reusable v10 risk signals justify the raw runtime cost.
 _Avoid_: ignoring runtime after a no-runtime score win, enabling every opt-in portfolio by default.
