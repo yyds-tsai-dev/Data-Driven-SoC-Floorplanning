@@ -185,16 +185,24 @@ def decode_shapes(
     mib: List[int],
     target_positions: torch.Tensor,
     n: int,
+    shape_hints: Optional[List[Rect]] = None,
 ) -> Tuple[List[float], List[float]]:
     """Step 3: exact-area soft sizing with hint aspect; fixed/preplaced exact;
+
+    Gate: ``shape_hints`` decouples the SHAPE source from the (order-channel)
+    hint source. When provided, the per-block aspect used to derive ws/hs is
+    read from ``shape_hints`` instead of ``hints`` (default None = unchanged
+    behavior, aspect from ``hints``). Orthogonal to ``order_hints`` in
+    ``build_order_dags``.
     MIB groups share one aspect (area-weighted mean log-aspect)."""
     ws = [0.0] * n
     hs = [0.0] * n
 
-    # Per-block preferred log-aspect from hint.
+    # Per-block preferred log-aspect from hint (or shape_hints when given).
+    shape_src = shape_hints if shape_hints is not None else hints
     log_a = [0.0] * n
     for i in range(n):
-        hw, hh = hints[i][2], hints[i][3]
+        hw, hh = shape_src[i][2], shape_src[i][3]
         if hw > 1e-9 and hh > 1e-9:
             la = math.log(hw / hh)
         else:
@@ -236,6 +244,7 @@ def build_order_dags(
     ws: List[float],
     hs: List[float],
     n: int,
+    order_hints: Optional[List[Rect]] = None,
 ) -> Tuple[List[Tuple[int, int, float]], List[Tuple[int, int, float]]]:
     """Steps 2+4 setup: for every pair, pick the SEPARATING AXIS as the one
     with larger normalized centroid separation, direction from the hint. Emit
@@ -244,9 +253,23 @@ def build_order_dags(
     Normalized separation on an axis = |d_axis| / (half_u + half_v) so the axis
     whose overlap is 'more resolved' wins. Deterministic tie-break by index.
     Every pair separated on exactly ONE axis => overlap-free by construction.
+
+    Gate 0 (order-channel upper-bound probe): ``order_hints`` decouples the
+    ORDER source from the SHAPE source. Pair CENTROIDS (dx, dy -> which axis
+    separates, which side) come from ``order_hints`` when provided, else from
+    ``hints`` (unchanged default). The normalized-separation DENOMINATOR
+    (half_u + half_v) and the emitted edge GAPS (ws[u]/hs[u]) always come from
+    the production ws/hs -- i.e. golden centroids are scored against PRODUCTION
+    shapes. Semantic consequence: with golden centroids x production shapes the
+    axis-selection can differ from a pure-golden run wherever a pair's golden
+    separation is small relative to the production half-extents; the *direction*
+    (sign of dx/dy) is still taken from the golden geometry, so the extracted
+    pairwise relative order is golden-faithful while the overlap-resolution
+    threshold is set by the shapes the compaction will actually realize.
     """
-    cx = [hints[i][0] + hints[i][2] / 2.0 for i in range(n)]
-    cy = [hints[i][1] + hints[i][3] / 2.0 for i in range(n)]
+    src = order_hints if order_hints is not None else hints
+    cx = [src[i][0] + src[i][2] / 2.0 for i in range(n)]
+    cy = [src[i][1] + src[i][3] / 2.0 for i in range(n)]
     x_edges: List[Tuple[int, int, float]] = []
     y_edges: List[Tuple[int, int, float]] = []
     for i in range(n):
@@ -462,9 +485,22 @@ def decode(
     n: int,
     b2b_e, p2b_e, pin_l,
     do_polish: bool = True,
+    order_source: str = "self",
+    shape_source: str = "self",
 ) -> Tuple[Optional[List[Rect]], Dict[str, object]]:
     """Full order-faithful exact decoder. Returns (rects, per-step trace).
-    rects is None only on a hard structural failure (cycle)."""
+    rects is None only on a hard structural failure (cycle).
+
+    order_source: "self" -> pair order extracted from ``hints`` centroids
+    (default, zero behavior change). "golden" -> pair order extracted from the
+    golden bbox centroids while shapes/decode/snap/polish all stay on ``hints``
+    (Gate 0 order-channel upper-bound probe). See build_order_dags docstring
+    for the golden-centroids x production-shapes semantics.
+
+    shape_source: "self" -> ws/hs aspect extracted from ``hints`` (default,
+    zero behavior change). "golden" -> ws/hs aspect extracted from the golden
+    bbox instead, while order/decode/snap/polish stay driven by ``hints``
+    (independent from order_source; both may be set simultaneously)."""
     at = sample["input"][0][:n]
     cons = sample["input"][4][:n]
     golden = _golden_rects(sample, n)
@@ -474,9 +510,12 @@ def decode(
     area_targets = [float(at[i]) for i in range(n)]
 
     trace: Dict[str, object] = {}
+    trace["shape_source"] = shape_source
 
     # Step 3: shapes.
-    ws, hs = decode_shapes(hints, area_targets, fixed, preplaced, mib, tpos, n)
+    shape_hints = golden if shape_source == "golden" else None
+    ws, hs = decode_shapes(hints, area_targets, fixed, preplaced, mib, tpos, n,
+                           shape_hints=shape_hints)
 
     # Step 5a: preplaced blocks are pinned to EXACT golden coordinates and act
     # as immovable anchors INSIDE the compaction (not snapped afterward, which
@@ -491,8 +530,13 @@ def decode(
                 x_pins[i] = float(tx)
                 y_pins[i] = float(ty)
 
-    # Steps 2+4: order DAGs + pin-aware longest-path compaction.
-    x_edges, y_edges = build_order_dags(hints, ws, hs, n)
+    # Steps 2+4: order DAGs + pin-aware longest-path compaction. Gate 0:
+    # optionally take pair CENTROIDS from golden geometry (order channel) while
+    # ws/hs (shapes) stay on the --hints source.
+    order_hints = golden if order_source == "golden" else None
+    trace["order_source"] = order_source
+    x_edges, y_edges = build_order_dags(hints, ws, hs, n,
+                                        order_hints=order_hints)
     xc = longest_path_coords(n, x_edges, x_pins)
     yc = longest_path_coords(n, y_edges, y_pins)
     if xc is None or yc is None:
@@ -710,21 +754,30 @@ def run(args) -> None:
             base_sc = score_case(sample, hints, n)
 
         dt0 = time.time()
-        # diffusion: multiple samples -> keep best by decoded HPWL proxy.
+        # diffusion: multiple samples -> keep best by --select criterion:
+        # "hpwl" (default, legacy proxy) or "cost" (evaluator-faithful
+        # score_case cost; E-lever best-of-N selection upgrade).
         if isinstance(hints, list) and len(hints) and isinstance(hints[0], list):
             best = None
             for h in hints:
                 pos, tr = decode(h, sample, n, b2b_e, p2b_e, pin_l,
-                                 do_polish=not args.no_polish)
+                                 do_polish=not args.no_polish,
+                                 order_source=args.order_hints,
+                                 shape_source=args.shape_hints)
                 if pos is None:
                     continue
-                proxy = hpwl(pos, b2b_e, p2b_e, pin_l)
+                if args.select == "cost":
+                    proxy = score_case(sample, pos, n)["cost"]
+                else:
+                    proxy = hpwl(pos, b2b_e, p2b_e, pin_l)
                 if best is None or proxy < best[2]:
                     best = (pos, tr, proxy)
             pos, tr = (best[0], best[1]) if best else (None, {"fail": "all_cycle"})
         else:
             pos, tr = decode(hints, sample, n, b2b_e, p2b_e, pin_l,
-                             do_polish=not args.no_polish)
+                             do_polish=not args.no_polish,
+                             order_source=args.order_hints,
+                             shape_source=args.shape_hints)
         dec_ms = 1000.0 * (time.time() - dt0)
 
         if pos is None:
@@ -777,7 +830,9 @@ def run(args) -> None:
     mean_inf = sum(r["infer_ms"] for r in rows) / max(1, len(rows))
 
     print("\n" + "=" * 78)
-    print(f"HINTS={args.hints}  cases={len(rows)}  polish={not args.no_polish}")
+    print(f"HINTS={args.hints}  ORDER={args.order_hints}  "
+          f"SHAPES={args.shape_hints}  SELECT={args.select}  "
+          f"cases={len(rows)}  polish={not args.no_polish}")
     print(f"WEIGHTED TOTAL (exp(n/12), no-runtime) = {total:.4f}   "
           f"feasible={feas}/{len(rows)}   wall={elapsed:.1f}s")
     print(f"  feasible-only mean cost = {feas_mean:.4f}   "
@@ -833,6 +888,25 @@ def main() -> None:
     ap.add_argument("--hints",
                     choices=["golden", "gnn", "diffusion", "production"],
                     default="golden")
+    ap.add_argument("--order-hints", dest="order_hints",
+                    choices=["self", "golden"], default="self",
+                    help="Gate 0: source of the PAIR ORDER (centroids). 'self' "
+                         "(default, zero behavior change) = order from --hints; "
+                         "'golden' = order from golden geometry while shapes / "
+                         "decode / snap / polish stay on --hints. Measures the "
+                         "order-channel upper bound (golden centroids x "
+                         "production shapes).")
+    ap.add_argument("--shape-hints", dest="shape_hints",
+                    choices=["self", "golden"], default="self",
+                    help="Source of the SHAPE (ws/hs aspect). 'self' "
+                         "(default, zero behavior change) = shapes from "
+                         "--hints; 'golden' = aspect from golden geometry "
+                         "while order/decode/snap/polish stay on --hints. "
+                         "Orthogonal to --order-hints.")
+    ap.add_argument("--select", choices=["hpwl", "cost"], default="hpwl",
+                    help="Multi-sample (diffusion) selection criterion: "
+                         "'hpwl' (default, legacy proxy) or 'cost' "
+                         "(evaluator-faithful score_case cost per sample).")
     ap.add_argument("--production-cache", default=None,
                     help="JSON cache of production layouts keyed by case idx "
                          "(D1 probe: retests reuse identical layouts)")
