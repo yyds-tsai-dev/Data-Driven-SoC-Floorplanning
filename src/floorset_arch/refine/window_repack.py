@@ -79,6 +79,10 @@ DEFAULT_ENUM_K = 4               # exhaustive order enumeration for k <= this
 DEFAULT_SEED = 12345
 DEFAULT_ASPECT_CAP = 4.0         # max soft-block aspect (bound the resize)
 DEFAULT_MAX_ROUNDS = 3           # re-rank + re-sweep rounds while budget remains
+# M5 v3 sequence-pair enumeration (see sp_pack.py). Gate FLOORSET_WINDOW_SP_PACK
+# (default OFF); FLOORSET_WINDOW_SP_K caps the exhaustive (k!)^2 enumeration
+# (module hard-caps at 6); FLOORSET_WINDOW_SP_TOPN bounds candidates handed to
+# _consider() per window.
 
 
 def _envf(name: str, default: float) -> float:
@@ -776,7 +780,7 @@ def _repack_window(
     restarts: int,
     enum_k: int,
     aspect_cap: float,
-) -> Optional[Tuple[List[Rect], float, bool]]:
+) -> Optional[Tuple[List[Rect], float, bool, str, float]]:
     """Repack the window blocks inside `win`, minimizing anchored HPWL.
 
     Uses a randomized recursive SLICING packer that flexes soft-block aspects
@@ -793,8 +797,12 @@ def _repack_window(
     rejects the whole window. Snapping the boundary blocks flush to the window
     wall (a pure translation, overlap-revalidated) recovers those windows.
 
-    Returns (new_boxes_local_order, window_hpwl, used_wall_snap) for the best
-    packing found, or None.
+    Returns (new_boxes_local_order, window_hpwl, used_wall_snap, packer_src,
+    classic_hpwl) for the best packing found, or None. `packer_src` attributes
+    the winning candidate to "classic" (slicing/strip) or "sp" (sequence-pair
+    enumeration, FLOORSET_WINDOW_SP_PACK); `classic_hpwl` is the counterfactual
+    the same selection rule would have chosen from classic candidates alone,
+    so one SP-on run self-attributes the SP marginal gain in the JSONL log.
     """
     k = len(selected)
     if k < 2:
@@ -837,6 +845,10 @@ def _repack_window(
     best_raw_hpwl = base_hpwl
     best_snap: Optional[List[Rect]] = None
     best_snap_hpwl = base_hpwl
+    # Attribution for the paired JSONL log: which generator produced each
+    # incumbent ("classic" = slicing/strip, "sp" = sequence-pair enumeration).
+    raw_src = "classic"
+    snap_src = "classic"
 
     # Anchor-sorted orders (x-pull, y-pull) bias the pack toward the netlist;
     # random restarts explore the slicing space.
@@ -874,8 +886,10 @@ def _repack_window(
                 return False
         return True
 
-    def _consider(placed_map: Optional[Dict[int, Rect]]) -> None:
+    def _consider(placed_map: Optional[Dict[int, Rect]],
+                  src: str = "classic") -> None:
         nonlocal best_raw, best_raw_hpwl, best_snap, best_snap_hpwl
+        nonlocal raw_src, snap_src
         if not placed_map or len(placed_map) != k:
             return
         boxes = [placed_map[kk] for kk in range(k)]
@@ -886,6 +900,7 @@ def _repack_window(
         if h < best_raw_hpwl - EPS:
             best_raw_hpwl = h
             best_raw = boxes
+            raw_src = src
         # Snapped optimum: glue boundary blocks flush to their owned wall, then
         # re-score. Overlap-revalidated inside _wall_snap.
         if bound_local and wall_snap_on:
@@ -895,6 +910,7 @@ def _repack_window(
                 if hs < best_snap_hpwl - EPS:
                     best_snap_hpwl = hs
                     best_snap = snapped
+                    snap_src = src
 
     n_restarts = max(1, restarts)
     orders_pool = list(base_orders)
@@ -923,14 +939,47 @@ def _repack_window(
             _consider(_pack_strip(order, win, nrows, fixed_shape,
                                   areas_local, horizontal=False))
 
+    # Classic-only incumbents snapshot: the SP stage below may improve on
+    # these; logging both lets a single SP-on run attribute the SP marginal
+    # gain per window (classic counterfactual) without a second noisy run.
+    classic_raw_hpwl = best_raw_hpwl
+    classic_snap_hpwl = best_snap_hpwl
+
+    # M5 v3 (FLOORSET_WINDOW_SP_PACK, default OFF): exhaustive sequence-pair
+    # topology enumeration for tiny k with the INCOMING shapes (no resize --
+    # exact-area / MIB-shape / dims invariants hold by construction). The
+    # slicing/strip generators above own the aspect-flex dimension but can
+    # only realize slicing tilings; the SP generator covers every overlap-free
+    # topology (pinwheels included) plus ASAP/ALAP wall justifications. Same
+    # _consider() path, so guards and selection semantics are unchanged and
+    # enabling it can only ADD candidates. Contained: an SP failure must never
+    # cost the classic candidates.
+    if os.environ.get("FLOORSET_WINDOW_SP_PACK", "0") == "1":
+        sp_k = _envi("FLOORSET_WINDOW_SP_K", 5)
+        sp_topn = _envi("FLOORSET_WINDOW_SP_TOPN", 24)
+        if k <= sp_k:
+            try:
+                from .sp_pack import sp_enumerate
+                cur_shapes = [(rects[selected[kk]][2], rects[selected[kk]][3])
+                              for kk in range(k)]
+                for placed_sp in sp_enumerate(cur_shapes, win, internal,
+                                              external, top_n=sp_topn,
+                                              max_k=sp_k):
+                    _consider(placed_sp, src="sp")
+            except Exception:
+                pass
+
     # Selection: for a boundary window, return the snapped optimum when one
     # exists (it is the only wall-consistent packing that can pass the soft
     # guard); otherwise the raw optimum. Non-boundary windows have no snapped
-    # variant and always take the raw optimum.
+    # variant and always take the raw optimum. `classic_hpwl` is what the
+    # SAME selection rule would have chosen from classic candidates alone
+    # (base_hpwl when classic found nothing) -- the per-window counterfactual
+    # for SP attribution in the JSONL log.
     if bound_local and best_snap is not None:
-        return list(best_snap), best_snap_hpwl, True
+        return list(best_snap), best_snap_hpwl, True, snap_src, classic_snap_hpwl
     if best_raw is not None:
-        return list(best_raw), best_raw_hpwl, False
+        return list(best_raw), best_raw_hpwl, False, raw_src, classic_raw_hpwl
     return None
 
 
@@ -1004,6 +1053,7 @@ def refine_window(
         cur_hpwl = pre_hpwl
         n_tried = 0
         n_accepted = 0
+        n_sp_accepted = 0
         k_sum = 0
         used_regions: set = set()
 
@@ -1059,9 +1109,11 @@ def refine_window(
                     _log(log_path, win_rec)
                     continue
 
-                new_boxes, win_post, used_snap = repacked
+                new_boxes, win_post, used_snap, packer_src, classic_hpwl = repacked
                 win_rec["win_post_hpwl"] = win_post
                 win_rec["wall_snap"] = bool(used_snap)
+                win_rec["packer"] = packer_src
+                win_rec["classic_best_hpwl"] = classic_hpwl
 
                 # Build the candidate full layout: splice re-packed boxes back in.
                 cand = list(cur)
@@ -1104,6 +1156,8 @@ def refine_window(
                 cur = cand
                 cur_hpwl = cand_hpwl
                 n_accepted += 1
+                if packer_src == "sp":
+                    n_sp_accepted += 1
                 used_regions.add(frozenset(selected))
                 win_rec["guard_result"] = "accepted"
                 win_rec["full_post_hpwl"] = cand_hpwl
@@ -1118,6 +1172,7 @@ def refine_window(
         detail["n_rounds"] = n_rounds
         detail["n_windows_tried"] = n_tried
         detail["n_windows_accepted"] = n_accepted
+        detail["n_sp_accepted"] = n_sp_accepted
         detail["mean_k"] = (k_sum / n_tried) if n_tried else 0.0
         detail["post_hpwl"] = cur_hpwl
         detail["elapsed"] = time.time() - stage_start
