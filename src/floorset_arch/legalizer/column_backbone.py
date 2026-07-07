@@ -27,9 +27,31 @@ BUDGET_MAX = 24.0
 
 def _time_budget(block_count: int) -> float:
     """Exponential per-case budget: ~0.8 s for the smallest cases up to
-    ~24 s for n=120; averages about 5 s over the validation set."""
+    ~24 s for n=120; averages about 5 s over the validation set.
+
+    Dormant E2 tail-budget escape hatch (default neutral, mirrors the N1
+    FLOORSET_AREA_SCALE convention): FLOORSET_TAIL_BUDGET_SCALE (float,
+    default 1.0) multiplies the clamped budget for cases with
+    block_count >= FLOORSET_TAIL_BUDGET_N (int, default 116), applied AFTER
+    the clamp so it can lift the 24s ceiling on the tail. Malformed env
+    values fall back to the default silently. With scale == 1.0 (the
+    default) this is byte-identical to the old formula for every n.
+    """
     b = BUDGET_SCALE * math.exp(block_count / BUDGET_TAU)
-    return max(BUDGET_MIN, min(BUDGET_MAX, b))
+    budget = max(BUDGET_MIN, min(BUDGET_MAX, b))
+
+    try:
+        tail_scale = float(os.environ.get("FLOORSET_TAIL_BUDGET_SCALE", "1.0"))
+    except ValueError:
+        tail_scale = 1.0
+    try:
+        tail_n = int(os.environ.get("FLOORSET_TAIL_BUDGET_N", "116"))
+    except ValueError:
+        tail_n = 116
+
+    if block_count >= tail_n and tail_scale != 1.0:
+        budget *= tail_scale
+    return budget
 
 
 def _heuristic_init(
@@ -156,8 +178,22 @@ def _fallback_row(
 
 def warm_worker_pool() -> None:
     """Spawn the parallel-restart worker pool ahead of time so worker
-    startup cost is not charged to any test case."""
-    init_worker_pool(max(2, min(12, (os.cpu_count() or 4) // 2)))
+    startup cost is not charged to any test case.
+
+    Dormant W1 widening flag: FLOORSET_SA_WORKERS (int, default 0 = keep the
+    historical formula min(12, cores//2)). The hidden-test machine has 48
+    cores (official QA A3) while the formula caps the pool at 12 workers;
+    setting FLOORSET_SA_WORKERS raises the pool so a wider restart portfolio
+    (FLOORSET_SA_CONFIGS in column_slicing._parallel_solve) can actually run.
+    Malformed values fall back to the default silently."""
+    try:
+        w = int(os.environ.get("FLOORSET_SA_WORKERS", "0"))
+    except ValueError:
+        w = 0
+    if w > 0:
+        init_worker_pool(max(2, w))
+    else:
+        init_worker_pool(max(2, min(12, (os.cpu_count() or 4) // 2)))
 
 
 def solve_with_column_backbone(

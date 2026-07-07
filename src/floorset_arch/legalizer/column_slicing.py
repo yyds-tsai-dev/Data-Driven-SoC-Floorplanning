@@ -2829,6 +2829,27 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         configs[5] = ('T', None, seed + 66, 1.0)
         configs[7] = ('T', None, seed + 88, 2.5)
         configs[9] = ('T', C0 + 1, seed + 110, 1.0)
+    # Dormant W1 widening flag: FLOORSET_SA_CONFIGS (int, default 0 = keep the
+    # historical 12-entry list byte-identical). Values > 12 extend the
+    # portfolio with a diversified (column-count x v_weight x orientation)
+    # grid of fresh seeds -- an order-statistics lever for many-core hosts
+    # (official QA A3: 48-core hidden-test machine; the pool formula caps at
+    # 12, so raising this only matters with FLOORSET_SA_WORKERS raised too).
+    # Entries beyond the pool size are still truncated below, so defaults are
+    # unchanged when the flags are unset.
+    try:
+        _n_cfg = int(os.environ.get("FLOORSET_SA_CONFIGS", "0"))
+    except ValueError:
+        _n_cfg = 0
+    if _n_cfg > len(configs):
+        _deltas = (None, -1, 1, -2, 2, -3, 3, 0)
+        while len(configs) < _n_cfg:
+            _i = len(configs)
+            _d = _deltas[_i % len(_deltas)]
+            _c = None if _d is None else max(2, min(18, C0 + _d))
+            _vw = 2.5 if _i % 4 == 3 else 1.0
+            _orient = 'T' if (allow_t and _i % 5 == 4) else 'N'
+            configs.append((_orient, _c, seed + 11 * (_i + 1), _vw))
     configs = configs[:max(2, _POOL_SIZE)]
 
     def np_of(t):
