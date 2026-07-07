@@ -205,6 +205,34 @@ class _ColumnOptimizer:
         self.ly = [0.0] * n
         self._resolve_shapes()
 
+        # --- N1: exploit the two-sided +/-1% block-area tolerance ------------
+        # The official evaluator accepts |w*h - target| / target <= 0.01 for
+        # soft blocks (contest PDF Eq.1 p.4; the evaluator check is a symmetric
+        # abs -- see CONTEXT.md "Official Cost Function"). Scaling soft-block
+        # areas to (1 - eps) shrinks every column and the die bbox by
+        # construction, lowering Area_gap and absolute HPWL at zero runtime
+        # cost. Applied AFTER _resolve_shapes so fixed/preplaced (kind 1/2)
+        # and MIB members promoted to a hard shape are untouched; additionally
+        # ALL soft members of an MIB group containing any hard-shaped member
+        # are excluded (scaling them would break the group's shape equality).
+        # All-soft MIB groups scale uniformly, preserving their equal-area
+        # (hence equal-shape) invariant.
+        # FLOORSET_AREA_SCALE: multiplier on soft areas, default 1.0 (off).
+        # Keep above 0.9905 -- refine guards enforce a stricter 0.95% band
+        # (guards.AREA_GUARD = 0.0095) than the evaluator's 1%.
+        try:
+            _ascale = float(os.environ.get("FLOORSET_AREA_SCALE", "1.0") or 1.0)
+        except ValueError:
+            _ascale = 1.0
+        if _ascale != 1.0 and 0.9905 < _ascale <= 1.0:
+            _no_scale: set = set()
+            for _idxs in self.mib_groups.values():
+                if any(self.kind[_i] != 0 for _i in _idxs):
+                    _no_scale.update(_idxs)
+            for _i in range(n):
+                if self.kind[_i] == 0 and _i not in _no_scale:
+                    self.areas[_i] *= _ascale
+
         self.locked_rects: List[Rect] = [
             (self.lx[i], self.ly[i], self.rw[i], self.rh[i])
             for i in range(n) if self.kind[i] == 2
@@ -219,6 +247,17 @@ class _ColumnOptimizer:
         # workers/pickle).
         self._fast_eval = os.environ.get("FLOORSET_FAST_EVAL", "0") == "1"
         self._col_cache: Dict[tuple, tuple] = {}
+        # Vectorized locked-block initialization for the per-eval pos array
+        # (replaces an n-iteration Python loop in _layout_fast; bit-exact).
+        _lids = [i for i in range(n) if self.kind[i] == 2]
+        if _lids:
+            self._locked_ids_np = np.array(_lids, dtype=np.int64)
+            self._locked_vals_np = np.array(
+                [(self.lx[i], self.ly[i], self.rw[i], self.rh[i])
+                 for i in _lids], dtype=np.float64)
+        else:
+            self._locked_ids_np = None
+            self._locked_vals_np = None
 
         # --- M1c: adaptive move probabilities (FLOORSET_SA_ADAPTIVE) ---------
         # The move selector in `_random_move` picks a family from a single
@@ -1368,12 +1407,18 @@ class _ColumnOptimizer:
     def _finish_layout(self, pos, col_records, x_right):
         """Global post-passes shared by the slow and fast layout paths:
         compute the frame extent, lift top-tagged units flush to the top
-        edge, and right-align right-tagged blocks. Operates on the same
-        col_records shape ((x0, w, placed, occupied) or None) and gives
-        bit-identical results regardless of how pos/col_records were built."""
+        edge, and right-align right-tagged blocks. Operates on col_records
+        of shape (x0, w, placed, occupied) or the FAST_EVAL-extended
+        (x0, w, placed, occupied, col_top, top_item) -- the extended fields
+        are exactly max(yt) over placed and argmax(placed, key=yt), so both
+        shapes give bit-identical results."""
         y_top = 0.0
         for rec in col_records:
             if rec is None:
+                continue
+            if len(rec) > 4:
+                if rec[4] > y_top:
+                    y_top = rec[4]
                 continue
             for (_k, _yb, yt) in rec[2]:
                 y_top = max(y_top, yt)
@@ -1385,8 +1430,11 @@ class _ColumnOptimizer:
         for rec in col_records:
             if rec is None or not rec[2]:
                 continue
-            cx0, cw, placed, occupied = rec
-            k, yb, yt = max(placed, key=lambda t: t[2])
+            cx0, cw, placed, occupied = rec[0], rec[1], rec[2], rec[3]
+            if len(rec) > 4:
+                k, yb, yt = rec[5]
+            else:
+                k, yb, yt = max(placed, key=lambda t: t[2])
             u = self.units[k]
             top_block = u.blocks[-1]
             if not (self.boundary[top_block] & 4):
@@ -1452,13 +1500,13 @@ class _ColumnOptimizer:
     def _layout_fast(self, cols):
         n = self.n
         pos = np.zeros((n, 4))
-        for i in range(n):
-            if self.kind[i] == 2:
-                pos[i] = (self.lx[i], self.ly[i], self.rw[i], self.rh[i])
+        if self._locked_ids_np is not None:
+            pos[self._locked_ids_np] = self._locked_vals_np
 
         has_obs = bool(self._obs_x)
         cache = self._col_cache
         unit_col = self._unit_col
+        units = self.units
         col_records = []
         col_spans = []
         x = 0.0
@@ -1469,7 +1517,7 @@ class _ColumnOptimizer:
                 continue
             for k in ulist:
                 unit_col[k] = ci
-            key = (tuple(ulist), tuple(self.units[k].version for k in ulist))
+            key = (tuple(ulist), tuple([units[k].version for k in ulist]))
             ent = cache.get(key)
             # An obstacle-touching column depends on absolute x: only reuse a
             # cached entry when it was solved at (nearly) the same x AND the
@@ -1481,23 +1529,38 @@ class _ColumnOptimizer:
                 old_touch = ent[4]
                 new_touch = self._col_touches_obstacle(x, x + ent_w)
                 if old_touch or new_touch:
-                    reuse = abs(ent_x - x) <= 1e-9 and old_touch == new_touch
+                    if not (abs(ent_x - x) <= 1e-9 and old_touch == new_touch):
+                        # Secondary lookup: the same column content solved at
+                        # THIS exact x before (SA oscillations revisit x's).
+                        # Entries under (key, x) are only written for
+                        # obstacle-sensitive columns, so this recovers hits
+                        # the primary latest-x entry cannot serve.
+                        ent = cache.get((key, round(x, 9)))
+                        reuse = ent is not None
             if reuse:
-                _ex, w, ids, rel, _touch, placed, occupied = ent
+                (_ex, w, ids, rel, _touch, placed, occupied,
+                 col_top, top_item) = ent
                 # rigid x-shift + fixed y (base geometry `rel` is relative to
                 # the column's left edge); recompose by a single vectorized
                 # block copy plus the x offset (rel is never mutated).
                 pos[ids] = rel
                 pos[ids, 0] += x
             else:
-                w, placed, occupied, _col_top = self._solve_column(ulist, x, pos)
-                ids = np.array([i for k in ulist for i in self.units[k].blocks],
+                w, placed, occupied, col_top = self._solve_column(ulist, x, pos)
+                ids = np.array([i for k in ulist for i in units[k].blocks],
                                dtype=np.int64)
                 rel = pos[ids].copy()
                 rel[:, 0] -= x
                 touch = self._col_touches_obstacle(x, x + w) if has_obs else False
-                cache[key] = (x, w, ids, rel, touch, placed, occupied)
-            col_records.append((x, w, placed, occupied))
+                # top_item mirrors max(placed, key=yt) for _finish_layout's
+                # lift pass; placed is never empty here (ulist non-empty).
+                top_item = max(placed, key=lambda t: t[2])
+                ent = (x, w, ids, rel, touch, placed, occupied,
+                       col_top, top_item)
+                cache[key] = ent
+                if touch:
+                    cache[(key, round(x, 9))] = ent
+            col_records.append((x, w, placed, occupied, col_top, top_item))
             col_spans.append((x, x + w))
             x += w
         self._col_spans = col_spans
