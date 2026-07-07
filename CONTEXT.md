@@ -100,6 +100,14 @@ _Avoid_: soft-first acceptance that allows HPWL or bbox area to regress substant
 The local evaluator score that uses each validation runtime divided by the solver's own validation-run median runtime.
 _Avoid_: treating it as the official contest runtime factor.
 
+**Official RuntimeFactor (contest rule, verified 2026-07-07)**:
+Per-case ratio `your_runtime / median_runtime_of_ALL_SUBMISSIONS_on_that_case` (docs/official/FloorplanningContest_ICCAD_2026_v10.pdf p.5 footnote 3: "computed independently for each test design, using that individual test case's median runtime as the sole reference point"; same statement in the vendored evaluator comment, FloorSet/iccad2026contest/iccad2026_evaluate.py ~L925-931). Enters cost as `max(0.7, RuntimeFactor^0.3)` — the slowness penalty is uncapped upward, the speed benefit is capped at 0.7. The reference median is other teams' runtimes per case and is unknowable locally, so local optimization targets the **No-Runtime Quality Score** and runtime work is submission-time risk management.
+_Avoid_: "free time" schemes that slow a subset of cases on the assumption of a cross-case median — every case is compared to the field independently, and the slowest (highest-weight) cases are exactly where extra runtime is punished; treating the local runtime-included total as an official-score estimate.
+
+**Official Cost Function (Eq.2, contest PDF p.5, verified 2026-07-07)**:
+`Cost = min((1 + 0.5·(HPWL_gap + Area_bbox_gap)) · e^(2·Violations_rel) · max(0.7, RuntimeFactor^0.3), 10−1e−6)`; infeasible = 10. Total Score = Σ λ_i·Cost_i with λ_i ∝ e^(n_i/12) (normalized). Consequences: quality-gap improvements enter at HALF weight (α=0.5); the violation term is a multiplicative exponential, so v_rel on heavy-weight tail cases is worth far more than the same v_rel on average cases; block-area tolerance is two-sided `|w·h − a|/a ≤ 0.01` (Eq.1 p.4) — under-area up to 1% is feasible by rule.
+_Avoid_: valuing a lever as a 1:1 gap delta (forgets α=0.5); reading "violation line closed on average" as "no per-case violation headroom on the weighted tail".
+
 **Conservative Runtime Budget**:
 The submission-oriented policy that permits extra sample-local search only when reusable v10 risk signals justify the raw runtime cost.
 _Avoid_: ignoring runtime after a no-runtime score win, enabling every opt-in portfolio by default.
