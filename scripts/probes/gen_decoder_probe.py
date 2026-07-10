@@ -186,6 +186,7 @@ def decode_shapes(
     target_positions: torch.Tensor,
     n: int,
     shape_hints: Optional[List[Rect]] = None,
+    keep_valid_hint_shapes: bool = False,
 ) -> Tuple[List[float], List[float]]:
     """Step 3: exact-area soft sizing with hint aspect; fixed/preplaced exact;
 
@@ -194,7 +195,16 @@ def decode_shapes(
     read from ``shape_hints`` instead of ``hints`` (default None = unchanged
     behavior, aspect from ``hints``). Orthogonal to ``order_hints`` in
     ``build_order_dags``.
-    MIB groups share one aspect (area-weighted mean log-aspect)."""
+    MIB groups share one aspect (area-weighted mean log-aspect).
+
+    ``keep_valid_hint_shapes`` (faithful-realize mode, default False = unchanged):
+    when the hint's OWN (w,h) is already a valid exact-area shape we reproduce it
+    verbatim instead of re-deriving ws/hs from a clamped/MIB-shared aspect. A
+    block qualifies only when its hint area matches the target within tol, its
+    log-aspect is within the clamp, and (for MIB members) the whole group shares
+    one identical shape in the hint. This is what makes a production/golden
+    round-trip land on identity shapes; blocks that fail any test fall back to
+    the exact-area recompute so legality is never sacrificed."""
     ws = [0.0] * n
     hs = [0.0] * n
 
@@ -225,11 +235,45 @@ def decode_shapes(
             den += a
         shared_la[g] = num / den if den > 0 else 0.0
 
+    # Faithful mode: decide per free block whether the hint's own (w,h) is a
+    # valid exact-area shape we can keep verbatim (identity round-trip).
+    keep = [False] * n
+    if keep_valid_hint_shapes:
+        # MIB group hint-consistency: all members share one shape within tol.
+        mib_group_ok: Dict[int, bool] = {}
+        for g, members in mib_members.items():
+            w0, h0 = shape_src[members[0]][2], shape_src[members[0]][3]
+            mib_group_ok[g] = all(
+                abs(shape_src[m][2] - w0) <= 1e-6
+                and abs(shape_src[m][3] - h0) <= 1e-6
+                for m in members
+            )
+        for i in range(n):
+            if fixed[i] or preplaced[i]:
+                continue
+            hw, hh = shape_src[i][2], shape_src[i][3]
+            if hw <= 1e-9 or hh <= 1e-9:
+                continue
+            a = float(area_targets[i])
+            if abs(hw * hh - a) > 1e-6 * max(1.0, a):
+                continue
+            # No aspect-clamp gate here: the clamp only bounds the RECOMPUTE
+            # path; a hint's own shape is already legal in the (feasible) hint,
+            # so reproducing it verbatim is safe at any aspect. Clamping-reject
+            # here would force a recompute mismatch on legitimately-thin blocks.
+            if mib[i] > 0 and not mib_group_ok.get(mib[i], False):
+                continue
+            keep[i] = True
+
     for i in range(n):
         tx, ty, tw, th = _target(target_positions, i)
         if (fixed[i] or preplaced[i]) and tw > 0 and th > 0:
             ws[i] = float(tw)
             hs[i] = float(th)
+            continue
+        if keep[i]:
+            ws[i] = float(shape_src[i][2])
+            hs[i] = float(shape_src[i][3])
             continue
         a = float(area_targets[i])
         la = shared_la[mib[i]] if mib[i] > 0 else log_a[i]
@@ -245,6 +289,7 @@ def build_order_dags(
     hs: List[float],
     n: int,
     order_hints: Optional[List[Rect]] = None,
+    geo_faithful: bool = False,
 ) -> Tuple[List[Tuple[int, int, float]], List[Tuple[int, int, float]]]:
     """Steps 2+4 setup: for every pair, pick the SEPARATING AXIS as the one
     with larger normalized centroid separation, direction from the hint. Emit
@@ -282,6 +327,24 @@ def build_order_dags(
             sep_x = abs(dx) / (hxi + hxj) if (hxi + hxj) > 0 else 0.0
             sep_y = abs(dy) / (hyi + hyj) if (hyi + hyj) > 0 else 0.0
             use_x = sep_x >= sep_y  # tie -> x-axis (deterministic)
+            if geo_faithful:
+                # Faithful mode: emit the edge on the axis the pair is ACTUALLY
+                # separated on in the (order) hint's own boxes, so the hint
+                # coordinates already satisfy the edge (=> hint-floored longest
+                # path reproduces the hint). Only overlapping (noisy) or
+                # corner-separated pairs fall back to the centroid heuristic.
+                xov = (min(src[i][0] + src[i][2], src[j][0] + src[j][2])
+                       - max(src[i][0], src[j][0]))
+                yov = (min(src[i][1] + src[i][3], src[j][1] + src[j][3])
+                       - max(src[i][1], src[j][1]))
+                xsep = xov <= SEP_TOL
+                ysep = yov <= SEP_TOL
+                if xsep and not ysep:
+                    use_x = True
+                elif ysep and not xsep:
+                    use_x = False
+                # else (both separated = corner, or neither = overlap): keep the
+                # centroid-heuristic use_x computed above.
             if use_x:
                 if dx > 0 or (dx == 0 and i < j):
                     u, v = i, j          # block i is left of j
@@ -320,6 +383,7 @@ def longest_path_coords(
     n: int,
     edges: List[Tuple[int, int, float]],
     pins: Optional[Dict[int, float]] = None,
+    floor: Optional[List[float]] = None,
 ) -> Optional[List[float]]:
     """Step 4/5: pin-aware longest-path compaction. Separation constraint is
     coord[v] >= coord[u] + gap; a subset of nodes is pinned to EXACT values.
@@ -347,6 +411,24 @@ def longest_path_coords(
     for u, v, g in edges:
         pred[v].append((u, g))
         succ[u].append((v, g))
+
+    if floor is not None:
+        # Faithful realization (default None => byte-identical ASAP/ALAP below):
+        # seed each free node at its hint-coordinate floor and relax forward over
+        # the DAG. Still overlap-free by construction (every edge coord[v] >=
+        # coord[u] + gap holds after the pass); pins stay exact. When the hint
+        # already satisfies every edge (geometry-faithful extraction on a legal
+        # hint) this returns the hint coordinates unchanged.
+        out = [0.0] * n
+        for u in order:
+            if u in pins:
+                out[u] = pins[u]
+                continue
+            c = floor[u]
+            for p, g in pred[u]:
+                c = max(c, out[p] + g)
+            out[u] = c
+        return out
 
     INF = float("inf")
     # (a) ASAP lower bounds with pin floors.
@@ -487,9 +569,24 @@ def decode(
     do_polish: bool = True,
     order_source: str = "self",
     shape_source: str = "self",
+    do_repair: bool = False,
+    do_refine: bool = False,
+    refine_deadline: float = 2.0,
+    realize: str = "compact",
 ) -> Tuple[Optional[List[Rect]], Dict[str, object]]:
     """Full order-faithful exact decoder. Returns (rects, per-step trace).
     rects is None only on a hard structural failure (cycle).
+
+    realize: "compact" (default, byte-identical to the legacy path) or
+    "faithful". Faithful mode makes the decoder a COORD-RESPECTING realizer for
+    already-good hints (production / golden / analytic): it keeps the hint's own
+    valid exact-area shapes, extracts the separating axis from the hint geometry,
+    and floors the longest-path at the hint coordinates -- so a legal, exact-area
+    hint round-trips to itself (measured tax +0.000 on the production cache). It
+    also SKIPS boundary_snap / polish / repair / refine (all no-ops or
+    net-harmful on a coord-faithful layout) but keeps the final legality
+    fallback, so a noisy hint (overlapping / wrong-area) degrades gracefully via
+    per-block/per-pair fallbacks + the shelf floor rather than crashing.
 
     order_source: "self" -> pair order extracted from ``hints`` centroids
     (default, zero behavior change). "golden" -> pair order extracted from the
@@ -500,7 +597,21 @@ def decode(
     shape_source: "self" -> ws/hs aspect extracted from ``hints`` (default,
     zero behavior change). "golden" -> ws/hs aspect extracted from the golden
     bbox instead, while order/decode/snap/polish stay driven by ``hints``
-    (independent from order_source; both may be set simultaneously)."""
+    (independent from order_source; both may be set simultaneously).
+
+    ML-realization end (both default OFF => byte-identical to the original
+    decode path):
+      do_repair -- when the decoded/polished layout is hard-ILLEGAL, rebuild a
+        legal layout from the SAME order edges via the v2 pin-order + aspect
+        repair (repair_pin_shapes) before resorting to the shelf floor, and
+        insert the non-destructive eviction floor ahead of the shelf pack.
+        Converts the pin-overlap fallback cases (41-66% on GNN/diffusion hints)
+        into real layouts.
+      do_refine -- run the production refine stack (slack projection + aspect +
+        vsnap, evaluator-faithful guards) on the hard-legal layout, accepted
+        only when it does not raise the evaluator cost (realization-faithful
+        non-regression). Cuts the boundary/grouping/MIB violation tax (the D1
+        mechanism)."""
     at = sample["input"][0][:n]
     cons = sample["input"][4][:n]
     golden = _golden_rects(sample, n)
@@ -509,13 +620,16 @@ def decode(
     fixed, preplaced, mib, cluster, boundary = _parse_constraints(cons, n)
     area_targets = [float(at[i]) for i in range(n)]
 
+    faithful = realize == "faithful"
     trace: Dict[str, object] = {}
     trace["shape_source"] = shape_source
+    trace["realize"] = realize
 
     # Step 3: shapes.
     shape_hints = golden if shape_source == "golden" else None
     ws, hs = decode_shapes(hints, area_targets, fixed, preplaced, mib, tpos, n,
-                           shape_hints=shape_hints)
+                           shape_hints=shape_hints,
+                           keep_valid_hint_shapes=faithful)
 
     # Step 5a: preplaced blocks are pinned to EXACT golden coordinates and act
     # as immovable anchors INSIDE the compaction (not snapped afterward, which
@@ -536,9 +650,16 @@ def decode(
     order_hints = golden if order_source == "golden" else None
     trace["order_source"] = order_source
     x_edges, y_edges = build_order_dags(hints, ws, hs, n,
-                                        order_hints=order_hints)
-    xc = longest_path_coords(n, x_edges, x_pins)
-    yc = longest_path_coords(n, y_edges, y_pins)
+                                        order_hints=order_hints,
+                                        geo_faithful=faithful)
+    # Faithful mode floors the longest path at the hint coordinates (the order
+    # source's own boxes) so a legal hint round-trips to itself; compact mode
+    # keeps floor=None (plain ASAP), byte-identical to the legacy path.
+    order_src = golden if order_source == "golden" else hints
+    xfloor = [order_src[i][0] for i in range(n)] if faithful else None
+    yfloor = [order_src[i][1] for i in range(n)] if faithful else None
+    xc = longest_path_coords(n, x_edges, x_pins, floor=xfloor)
+    yc = longest_path_coords(n, y_edges, y_pins, floor=yfloor)
     if xc is None or yc is None:
         trace["fail"] = "cycle"
         return None, trace
@@ -548,13 +669,18 @@ def decode(
     # Step 5b: boundary wall-snap. Move boundary-tagged blocks to their wall
     # where slack allows (greedy, overlap-guarded). Kept only if still hard
     # legal (it always is: snap never creates overlaps by construction, and
-    # never touches preplaced/fixed dims).
-    snapped = boundary_snap(rects, boundary, preplaced, n)
-    if refine_guards.hard_legal(snapped, at, cons, tpos):
-        rects = snapped
-        trace["snap_applied"] = True
-    else:
+    # never touches preplaced/fixed dims). Skipped in faithful mode: on a
+    # coord-faithful layout the boundary tags are already satisfied and snapping
+    # only trades HPWL (measured +0.027 regression).
+    if faithful:
         trace["snap_applied"] = False
+    else:
+        snapped = boundary_snap(rects, boundary, preplaced, n)
+        if refine_guards.hard_legal(snapped, at, cons, tpos):
+            rects = snapped
+            trace["snap_applied"] = True
+        else:
+            trace["snap_applied"] = False
     trace["hpwl_after_snap"] = hpwl(rects, b2b_e, p2b_e, pin_l)
 
     # Step 6 (opt-in): weighted-median projection HPWL polish. This is the
@@ -563,7 +689,7 @@ def decode(
     # only via do_polish and kept only if hard legal (v_rel regression is
     # measured, not blocked, so we can attribute it).
     projected = rects
-    if do_polish:
+    if do_polish and not faithful:
         try:
             gx, gy = build_axis_dags(rects, cons, tpos, b2b_e, p2b_e, pin_l)
             dimx = [rects[i][2] for i in range(n)]
@@ -585,23 +711,124 @@ def decode(
             trace["polish_applied"] = False
             trace["polish_error"] = repr(e)
 
-    # Final legality guarantee. Noisy hints (GNN/diffusion) can produce a
+    # (A) Repair floor (do_repair): when the polished layout is hard-illegal,
+    # rebuild a legal layout from the SAME order edges via the v2 pin-order +
+    # aspect repair (repair_pin_shapes), then re-snap. This is the primary
+    # fallback-conversion lever: the residual overlaps on noisy hints are
+    # preplaced-pin penetrations that the order/shape repair resolves, turning a
+    # 10.0 shelf case into a real layout. Lazy import avoids the _probe_repair
+    # <-> gen_decoder_probe import cycle. Default OFF => block skipped entirely.
+    if (do_repair and not faithful
+            and not refine_guards.hard_legal(projected, at, cons, tpos)):
+        try:
+            from _probe_repair import repair_pin_shapes  # noqa: PLC0415
+            rep, rtr = repair_pin_shapes(
+                hints, x_edges, y_edges, ws, hs, x_pins, y_pins,
+                preplaced, fixed, mib, area_targets, n,
+                hpwl_fn=hpwl, hpwl_args=(b2b_e, p2b_e, pin_l),
+            )
+            trace["repair_status"] = rtr.get("status")
+            trace["repair_reshaped"] = rtr.get("reshaped")
+            if rep is not None:
+                rep_snap = boundary_snap(rep, boundary, preplaced, n)
+                if refine_guards.hard_legal(rep_snap, at, cons, tpos):
+                    rep = rep_snap
+                if refine_guards.hard_legal(rep, at, cons, tpos):
+                    projected = rep
+                    trace["repair_applied"] = True
+        except Exception as e:  # noqa: BLE001
+            trace["repair_error"] = repr(e)
+
+    # (B) Refine (do_refine): production refine stack (slack projection + aspect
+    # + boundary/grouping vsnap) on the legal layout, evaluator-gated. Factored
+    # into apply_refine() so the "selected" mode can defer it to the multi-sample
+    # winner. In "on" mode do_refine is True here and refine runs per sample.
+    if do_refine and not faithful:
+        projected, _rtr = apply_refine(
+            projected, sample, n, b2b_e, p2b_e, pin_l, refine_deadline
+        )
+        trace.update(_rtr)
+
+    # (C) Final legality guarantee. Noisy hints (GNN/diffusion) can produce a
     # preplaced-pin-vs-order infeasibility that the order-DAG cannot resolve
     # (the hint puts a soft block on the wrong side of a hard pin). Rather than
     # let one overlap cost the whole case the M-penalty (which would mask hint
     # quality), fall back to a guaranteed-legal shelf pack in hint-centroid
     # order that keeps preplaced exact. This is a floor, not the decoder's
-    # quality result; trace records whether it fired.
+    # quality result; trace records whether it fired. With do_repair, the
+    # non-destructive eviction floor (park only the still-overlapping soft
+    # blocks; keeps the good ~95%) is tried BEFORE the whole-layout shelf pack
+    # (v2 ordering: evict scores far better than shelf's flat 10.0). Default OFF
+    # => only the original shelf pack runs, byte-identical to before.
     if not refine_guards.hard_legal(projected, at, cons, tpos):
-        fb = _legal_shelf_fallback(hints, at, cons, tpos, preplaced, fixed,
-                                   mib, area_targets, n)
-        if fb is not None and refine_guards.hard_legal(fb, at, cons, tpos):
-            projected = fb
-            trace["legal_fallback"] = True
-        else:
-            trace["legal_fallback"] = "failed"
+        if do_repair:
+            try:
+                from _probe_repair import evict_overlaps  # noqa: PLC0415
+                ev, n_ev = evict_overlaps(projected, preplaced, n)
+                if refine_guards.hard_legal(ev, at, cons, tpos):
+                    projected = ev
+                    trace["legal_fallback"] = "evict"
+                    trace["evicted"] = n_ev
+            except Exception as e:  # noqa: BLE001
+                trace["evict_error"] = repr(e)
+        if not refine_guards.hard_legal(projected, at, cons, tpos):
+            fb = _legal_shelf_fallback(hints, at, cons, tpos, preplaced, fixed,
+                                       mib, area_targets, n)
+            if fb is not None and refine_guards.hard_legal(fb, at, cons, tpos):
+                projected = fb
+                trace["legal_fallback"] = True
+            else:
+                trace["legal_fallback"] = "failed"
     trace["hpwl_final"] = hpwl(projected, b2b_e, p2b_e, pin_l)
     return projected, trace
+
+
+def apply_refine(
+    projected: List[Rect],
+    sample,
+    n: int,
+    b2b_e, p2b_e, pin_l,
+    refine_deadline: float,
+) -> Tuple[List[Rect], Dict[str, object]]:
+    """Evaluator-gated production refine on a hard-legal layout.
+
+    Returns (layout, trace_updates). No-op (returns its input, empty-ish trace)
+    when the input is not hard-legal. refine_layout is a pure, guard-gated
+    function (returns its input on any doubt); we additionally accept ONLY when
+    the official evaluator cost does not increase, so a guard/evaluator mismatch
+    can never regress the realized score. Shared by decode()'s "on" path and the
+    multi-sample "selected" path (refine only the selected winner)."""
+    at = sample["input"][0][:n]
+    cons = sample["input"][4][:n]
+    golden = _golden_rects(sample, n)
+    tpos = _opt_target_positions(sample, n, golden)
+    tr: Dict[str, object] = {}
+    if not refine_guards.hard_legal(projected, at, cons, tpos):
+        return projected, tr
+    try:
+        from floorset_arch.refine.api import refine_layout  # noqa: PLC0415
+        b2b_t = sample["input"][1]
+        p2b_t = sample["input"][2]
+        pins_t = sample["input"][3]
+        dl = time.time() + refine_deadline
+        refined = refine_layout(
+            projected, at, cons, tpos, b2b_t, p2b_t, pins_t,
+            deadline=dl, enable_aspect=True,
+        )
+        if (refined is not projected
+                and refine_guards.hard_legal(refined, at, cons, tpos)):
+            base_cost = score_case(sample, projected, n)["cost"]
+            ref_cost = score_case(sample, refined, n)["cost"]
+            tr["refine_cost_delta"] = ref_cost - base_cost
+            if ref_cost <= base_cost + 1e-12:
+                tr["refine_applied"] = True
+                return refined, tr
+            tr["refine_applied"] = False
+        else:
+            tr["refine_applied"] = False
+    except Exception as e:  # noqa: BLE001
+        tr["refine_error"] = repr(e)
+    return projected, tr
 
 
 def _legal_shelf_fallback(hints, area_targets_t, cons, tpos, preplaced, fixed,
@@ -696,6 +923,11 @@ def _band(n: int) -> str:
 
 def run(args) -> None:
     os.environ.setdefault("FLOORSET_COLUMN_BACKBONE", "1")
+    if args.refine != "off":
+        # Enable the boundary/grouping violation snap inside refine_layout (the
+        # slack projection + aspect stages run unconditionally). Kept OFF unless
+        # --refine is requested, so the default path's env is untouched.
+        os.environ.setdefault("FLOORSET_SLACK_REFINE_VSNAP", "1")
     from lite_dataset_test import FloorplanDatasetLiteTest
     ds = FloorplanDatasetLiteTest(str(args.data_path))
 
@@ -760,10 +992,17 @@ def run(args) -> None:
         if isinstance(hints, list) and len(hints) and isinstance(hints[0], list):
             best = None
             for h in hints:
+                # "selected" mode defers refine to the winner: per-sample decode
+                # runs repair (if on) but NOT refine, so selection sees the
+                # repaired-but-unrefined layout. "on" runs refine per sample.
                 pos, tr = decode(h, sample, n, b2b_e, p2b_e, pin_l,
                                  do_polish=not args.no_polish,
                                  order_source=args.order_hints,
-                                 shape_source=args.shape_hints)
+                                 shape_source=args.shape_hints,
+                                 do_repair=args.repair == "on",
+                                 do_refine=args.refine == "on",
+                                 refine_deadline=args.refine_deadline,
+                                 realize=args.realize)
                 if pos is None:
                     continue
                 if args.select == "cost":
@@ -773,11 +1012,22 @@ def run(args) -> None:
                 if best is None or proxy < best[2]:
                     best = (pos, tr, proxy)
             pos, tr = (best[0], best[1]) if best else (None, {"fail": "all_cycle"})
+            # "selected": refine ONCE on the chosen winner (evaluator-gated, so
+            # the final score is min(refined, selected) by construction).
+            if args.refine == "selected" and pos is not None:
+                pos, _rtr = apply_refine(pos, sample, n, b2b_e, p2b_e, pin_l,
+                                         args.refine_deadline)
+                tr.update(_rtr)
         else:
+            # Single-sample path: "selected" is equivalent to "on".
             pos, tr = decode(hints, sample, n, b2b_e, p2b_e, pin_l,
                              do_polish=not args.no_polish,
                              order_source=args.order_hints,
-                             shape_source=args.shape_hints)
+                             shape_source=args.shape_hints,
+                             do_repair=args.repair == "on",
+                             do_refine=args.refine in ("on", "selected"),
+                             refine_deadline=args.refine_deadline,
+                             realize=args.realize)
         dec_ms = 1000.0 * (time.time() - dt0)
 
         if pos is None:
@@ -839,6 +1089,19 @@ def run(args) -> None:
           f"mean hpwl_gap = {mean_hgap:+.3f}   mean area_gap = {mean_agap:+.3f}")
     print(f"  legal-fallback fired = {fb_fired}/{len(rows)}   "
           f"decode {mean_dec:.0f} ms/case   inference {mean_inf:.0f} ms/case")
+    if args.repair == "on" or args.refine != "off":
+        rep_applied = sum(1 for r in rows if r.get("tr_repair_applied") is True)
+        evicted = sum(1 for r in rows if r.get("tr_legal_fallback") == "evict")
+        shelf = sum(1 for r in rows if r.get("tr_legal_fallback") is True)
+        ref_applied = sum(1 for r in rows if r.get("tr_refine_applied") is True)
+        deltas = [r["tr_refine_cost_delta"] for r in rows
+                  if isinstance(r.get("tr_refine_cost_delta"), (int, float))]
+        mean_delta = sum(deltas) / len(deltas) if deltas else float("nan")
+        print(f"  REALIZE: repair->legal = {rep_applied}/{len(rows)}   "
+              f"evict floor = {evicted}   shelf floor = {shelf}   "
+              f"(fallback conversion = repair+evict = {rep_applied + evicted})")
+        print(f"  REALIZE: refine applied = {ref_applied}/{len(rows)}   "
+              f"mean refine cost delta (attempted) = {mean_delta:+.4f}")
     if args.hints == "production" and rows and "base_cost" in rows[0]:
         base_costs = [r["base_cost"] for r in rows]
         port_costs = [min(r["cost"], r["base_cost"]) for r in rows]
@@ -907,6 +1170,38 @@ def main() -> None:
                     help="Multi-sample (diffusion) selection criterion: "
                          "'hpwl' (default, legacy proxy) or 'cost' "
                          "(evaluator-faithful score_case cost per sample).")
+    ap.add_argument("--repair", choices=["off", "on"], default="off",
+                    help="ML-realization end: when a decoded/polished layout is "
+                         "hard-illegal, rebuild it legal via the v2 pin-order + "
+                         "aspect repair (repair_pin_shapes) and add the "
+                         "non-destructive eviction floor before the shelf pack. "
+                         "Default off => byte-identical to the legacy path. "
+                         "Composes per-sample with multi-sample + --select.")
+    ap.add_argument("--refine", choices=["off", "on", "selected"], default="off",
+                    help="ML-realization end: run the production refine stack "
+                         "(slack projection + aspect + vsnap) on the hard-legal "
+                         "layout, accepted only when the evaluator cost does not "
+                         "increase. 'on' refines EVERY sample; 'selected' refines "
+                         "ONLY the multi-sample winner (chosen by --select on the "
+                         "repaired-but-unrefined layout) -- ~1/S the refine cost "
+                         "for S samples, evaluator-gated so the final score is "
+                         "min(refined, selected). Single-sample: 'selected'=='on'. "
+                         "Default off => byte-identical.")
+    ap.add_argument("--refine-deadline", dest="refine_deadline", type=float,
+                    default=2.0,
+                    help="per-case wall-clock budget (s) for the --refine pass")
+    ap.add_argument("--realize", choices=["compact", "faithful"],
+                    default="compact",
+                    help="realization mode. 'compact' (default, byte-identical "
+                         "to the legacy path) = ASAP longest-path recompaction. "
+                         "'faithful' = coord-respecting realizer for already-good "
+                         "hints (production / golden / analytic): keeps the "
+                         "hint's valid exact-area shapes, extracts the separating "
+                         "axis from the hint geometry, floors the longest path at "
+                         "the hint coordinates, and skips snap/polish/repair/"
+                         "refine so a legal exact-area hint round-trips to itself. "
+                         "Noisy hints degrade gracefully via per-block fallbacks "
+                         "+ the shelf legality floor.")
     ap.add_argument("--production-cache", default=None,
                     help="JSON cache of production layouts keyed by case idx "
                          "(D1 probe: retests reuse identical layouts)")
