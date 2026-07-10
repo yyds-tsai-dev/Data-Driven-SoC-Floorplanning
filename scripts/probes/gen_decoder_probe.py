@@ -561,6 +561,111 @@ def _anchors_by_block(
     return anchors
 
 
+def _rescale_centroid(hint_c: List[float], skel_c: List[float]) -> List[float]:
+    """Linearly map hint centroids onto the skeleton centroid range (per axis)
+    so the hint's RELATIVE structure is expressed in the compact (skeleton)
+    frame. Without this, a hint frame larger than the ASAP-compact skeleton would
+    pull most blocks past the frozen wall and pile them up at the boundary."""
+    hlo, hhi = min(hint_c), max(hint_c)
+    slo, shi = min(skel_c), max(skel_c)
+    hspan = hhi - hlo
+    if hspan <= 1e-9:
+        return list(skel_c)
+    scale = (shi - slo) / hspan
+    return [slo + (h - hlo) * scale for h in hint_c]
+
+
+def _anchored_project(
+    skel: List[Rect],
+    hints: List[Rect],
+    ws: List[float],
+    hs: List[float],
+    cons,
+    tpos,
+    at,
+    boundary: List[int],
+    b2b_e, p2b_e, pin_l,
+    n: int,
+    hint_weight: float,
+    wall_weight: float,
+) -> Tuple[List[Rect], Dict[str, object]]:
+    """Anchored (compaction-capable) realization. On the ASAP-compact skeleton,
+    run the refine weighted-median projected sweep (project_axis) inside the
+    refine constraint graph (build_axis_dags: boundary wall-pins + cluster rigid
+    groups + preplaced pins + the frozen skeleton bbox as universal walls),
+    pulling each block toward BOTH its net partners (HPWL anchors) AND its
+    rescaled hint coordinate (weight ``hint_weight``).
+
+    The skeleton fixes a COMPACT bbox (ASAP is the pointwise minimum of the
+    geo-faithful order DAG, so bbox <= the hint's); project_axis then redistributes
+    blocks toward the hint structure inside that compact frame -- two-sided, unlike
+    faithful's monotone-up ratchet. Returns (rects, trace); returns the skeleton
+    unchanged on any guard failure (illegal skeleton, project exception, or an
+    illegal projected candidate) so it never regresses below the skeleton."""
+    tr: Dict[str, object] = {}
+    if not refine_guards.hard_legal(skel, at, cons, tpos):
+        tr["anchored_applied"] = False
+        tr["anchored_reject"] = "skeleton_illegal"
+        return skel, tr
+    try:
+        gx, gy = build_axis_dags(skel, cons, tpos, b2b_e, p2b_e, pin_l)
+        xs = [skel[i][0] for i in range(n)]
+        ys = [skel[i][1] for i in range(n)]
+        ax = _anchors_by_block(n, skel, b2b_e, p2b_e, pin_l, axis=0)
+        ay = _anchors_by_block(n, skel, b2b_e, p2b_e, pin_l, axis=1)
+        if hint_weight > 0:
+            rx = _rescale_centroid(
+                [hints[i][0] + ws[i] / 2.0 for i in range(n)],
+                [xs[i] + ws[i] / 2.0 for i in range(n)])
+            ry = _rescale_centroid(
+                [hints[i][1] + hs[i] / 2.0 for i in range(n)],
+                [ys[i] + hs[i] / 2.0 for i in range(n)])
+            for i in range(n):
+                ax[i][0].append(rx[i])
+                ax[i][1].append(hint_weight)
+                ay[i][0].append(ry[i])
+                ay[i][1].append(hint_weight)
+        # Explicit wall-target anchors for boundary-tagged blocks. build_axis_dags
+        # only wall-PINS blocks already touching the wall, so on a bottom-left
+        # ASAP skeleton it cannot CREATE wall adhesion -- we add a high-weight
+        # anchor at the (compact) wall coordinate so the projected sweep pulls the
+        # tagged edge to the wall wherever slack allows (faithful has no snap; the
+        # wall adhesion must be supplied on the hint/anchor side).
+        if wall_weight > 0:
+            x0 = min(xs)
+            x1 = max(xs[i] + ws[i] for i in range(n))
+            y0 = min(ys)
+            y1 = max(ys[i] + hs[i] for i in range(n))
+            for i in range(n):
+                code = boundary[i]
+                if code == 0:
+                    continue
+                if code & BOUND_LEFT:
+                    ax[i][0].append(x0 + ws[i] / 2.0)
+                    ax[i][1].append(wall_weight)
+                if code & BOUND_RIGHT:
+                    ax[i][0].append(x1 - ws[i] / 2.0)
+                    ax[i][1].append(wall_weight)
+                if code & BOUND_BOTTOM:
+                    ay[i][0].append(y0 + hs[i] / 2.0)
+                    ay[i][1].append(wall_weight)
+                if code & BOUND_TOP:
+                    ay[i][0].append(y1 - hs[i] / 2.0)
+                    ay[i][1].append(wall_weight)
+        nx, _ = project_axis(gx, xs, ws, ax)
+        ny, _ = project_axis(gy, ys, hs, ay)
+        cand = [(nx[i], ny[i], ws[i], hs[i]) for i in range(n)]
+        if refine_guards.hard_legal(cand, at, cons, tpos):
+            tr["anchored_applied"] = True
+            return cand, tr
+        tr["anchored_applied"] = False
+        tr["anchored_reject"] = "not_hard_legal"
+    except Exception as e:  # noqa: BLE001
+        tr["anchored_applied"] = False
+        tr["anchored_error"] = repr(e)
+    return skel, tr
+
+
 def decode(
     hints: List[Rect],
     sample,
@@ -573,12 +678,27 @@ def decode(
     do_refine: bool = False,
     refine_deadline: float = 2.0,
     realize: str = "compact",
+    anchor_hint_weight: float = 2.0,
+    anchor_wall_weight: float = 8.0,
 ) -> Tuple[Optional[List[Rect]], Dict[str, object]]:
     """Full order-faithful exact decoder. Returns (rects, per-step trace).
     rects is None only on a hard structural failure (cycle).
 
-    realize: "compact" (default, byte-identical to the legacy path) or
-    "faithful". Faithful mode makes the decoder a COORD-RESPECTING realizer for
+    realize: "compact" (default, byte-identical to the legacy path), "faithful",
+    or "anchored". Anchored is the compaction-capable soft-anchor realizer: it
+    keeps the faithful verified parts (keep-valid-hint-shapes + geo-faithful axis
+    extraction) but realizes coordinates TWO-SIDED -- an ASAP longest-path (floor
+    0) gives a COMPACT skeleton (restores packing), then a weighted-median
+    projected sweep (_anchored_project) pulls each block toward its net partners
+    AND its rescaled hint coordinate inside the refine constraint graph
+    (boundary wall-pins + cluster groups + frozen skeleton bbox). Unlike faithful
+    (a monotone-up ratchet), anchored can compact below the hint. Boundary/
+    grouping come from build_axis_dags; pin-order illegality falls back to the
+    repair + evict floors (enabled implicitly in anchored). ``anchor_hint_weight``
+    sets the hint-anchor weight relative to the unit net-anchor weights (0 =>
+    pure HPWL polish inside the compact frame).
+
+    Faithful mode makes the decoder a COORD-RESPECTING realizer for
     already-good hints (production / golden / analytic): it keeps the hint's own
     valid exact-area shapes, extracts the separating axis from the hint geometry,
     and floors the longest-path at the hint coordinates -- so a legal, exact-area
@@ -621,15 +741,17 @@ def decode(
     area_targets = [float(at[i]) for i in range(n)]
 
     faithful = realize == "faithful"
+    anchored = realize == "anchored"
     trace: Dict[str, object] = {}
     trace["shape_source"] = shape_source
     trace["realize"] = realize
 
-    # Step 3: shapes.
+    # Step 3: shapes. Faithful and anchored both keep the hint's valid exact-area
+    # shapes (anchored's ASAP skeleton + hint anchoring rely on the same frame).
     shape_hints = golden if shape_source == "golden" else None
     ws, hs = decode_shapes(hints, area_targets, fixed, preplaced, mib, tpos, n,
                            shape_hints=shape_hints,
-                           keep_valid_hint_shapes=faithful)
+                           keep_valid_hint_shapes=(faithful or anchored))
 
     # Step 5a: preplaced blocks are pinned to EXACT golden coordinates and act
     # as immovable anchors INSIDE the compaction (not snapped afterward, which
@@ -651,10 +773,11 @@ def decode(
     trace["order_source"] = order_source
     x_edges, y_edges = build_order_dags(hints, ws, hs, n,
                                         order_hints=order_hints,
-                                        geo_faithful=faithful)
+                                        geo_faithful=(faithful or anchored))
     # Faithful mode floors the longest path at the hint coordinates (the order
-    # source's own boxes) so a legal hint round-trips to itself; compact mode
-    # keeps floor=None (plain ASAP), byte-identical to the legacy path.
+    # source's own boxes) so a legal hint round-trips to itself; compact AND
+    # anchored keep floor=None (plain ASAP) -- anchored wants the compact skeleton
+    # as the pointwise-minimum base for its two-sided hint pull.
     order_src = golden if order_source == "golden" else hints
     xfloor = [order_src[i][0] for i in range(n)] if faithful else None
     yfloor = [order_src[i][1] for i in range(n)] if faithful else None
@@ -672,7 +795,10 @@ def decode(
     # never touches preplaced/fixed dims). Skipped in faithful mode: on a
     # coord-faithful layout the boundary tags are already satisfied and snapping
     # only trades HPWL (measured +0.027 regression).
-    if faithful:
+    if faithful or anchored:
+        # faithful: walls already satisfied (identity). anchored: the projected
+        # sweep re-pins boundary blocks to the (compact) walls via build_axis_dags,
+        # so a greedy pre-snap would only fight the projection.
         trace["snap_applied"] = False
     else:
         snapped = boundary_snap(rects, boundary, preplaced, n)
@@ -689,7 +815,25 @@ def decode(
     # only via do_polish and kept only if hard legal (v_rel regression is
     # measured, not blocked, so we can attribute it).
     projected = rects
-    if do_polish and not faithful:
+    if anchored:
+        # Skeleton choice: when the hint (with keep-shapes) is ALREADY a legal
+        # layout (the SA seed, or a legal move), use it directly so the projection
+        # PRESERVES its boundary adhesion + cluster grouping. Re-ASAP-ing a good
+        # layout scrambles boundary blocks off their walls (measured: idx95 0->21
+        # boundary violations), which the projection only partially restores. Only
+        # an overlapping hint needs the ASAP-compact skeleton.
+        rects_hint = [(hints[i][0], hints[i][1], ws[i], hs[i]) for i in range(n)]
+        if refine_guards.hard_legal(rects_hint, at, cons, tpos):
+            skel = rects_hint
+            trace["anchored_skeleton"] = "hint"
+        else:
+            skel = rects
+            trace["anchored_skeleton"] = "asap"
+        projected, _antr = _anchored_project(
+            skel, hints, ws, hs, cons, tpos, at, boundary,
+            b2b_e, p2b_e, pin_l, n, anchor_hint_weight, anchor_wall_weight)
+        trace.update(_antr)
+    elif do_polish and not faithful:
         try:
             gx, gy = build_axis_dags(rects, cons, tpos, b2b_e, p2b_e, pin_l)
             dimx = [rects[i][2] for i in range(n)]
@@ -718,7 +862,7 @@ def decode(
     # preplaced-pin penetrations that the order/shape repair resolves, turning a
     # 10.0 shelf case into a real layout. Lazy import avoids the _probe_repair
     # <-> gen_decoder_probe import cycle. Default OFF => block skipped entirely.
-    if (do_repair and not faithful
+    if ((do_repair or anchored) and not faithful
             and not refine_guards.hard_legal(projected, at, cons, tpos)):
         try:
             from _probe_repair import repair_pin_shapes  # noqa: PLC0415
@@ -743,7 +887,7 @@ def decode(
     # + boundary/grouping vsnap) on the legal layout, evaluator-gated. Factored
     # into apply_refine() so the "selected" mode can defer it to the multi-sample
     # winner. In "on" mode do_refine is True here and refine runs per sample.
-    if do_refine and not faithful:
+    if do_refine and not faithful and not anchored:
         projected, _rtr = apply_refine(
             projected, sample, n, b2b_e, p2b_e, pin_l, refine_deadline
         )
@@ -761,7 +905,7 @@ def decode(
     # (v2 ordering: evict scores far better than shelf's flat 10.0). Default OFF
     # => only the original shelf pack runs, byte-identical to before.
     if not refine_guards.hard_legal(projected, at, cons, tpos):
-        if do_repair:
+        if do_repair or anchored:
             try:
                 from _probe_repair import evict_overlaps  # noqa: PLC0415
                 ev, n_ev = evict_overlaps(projected, preplaced, n)
@@ -1002,7 +1146,9 @@ def run(args) -> None:
                                  do_repair=args.repair == "on",
                                  do_refine=args.refine == "on",
                                  refine_deadline=args.refine_deadline,
-                                 realize=args.realize)
+                                 realize=args.realize,
+                                 anchor_hint_weight=args.anchor_hint_weight,
+                                 anchor_wall_weight=args.anchor_wall_weight)
                 if pos is None:
                     continue
                 if args.select == "cost":
@@ -1027,7 +1173,9 @@ def run(args) -> None:
                              do_repair=args.repair == "on",
                              do_refine=args.refine in ("on", "selected"),
                              refine_deadline=args.refine_deadline,
-                             realize=args.realize)
+                             realize=args.realize,
+                             anchor_hint_weight=args.anchor_hint_weight,
+                             anchor_wall_weight=args.anchor_wall_weight)
         dec_ms = 1000.0 * (time.time() - dt0)
 
         if pos is None:
@@ -1190,7 +1338,16 @@ def main() -> None:
     ap.add_argument("--refine-deadline", dest="refine_deadline", type=float,
                     default=2.0,
                     help="per-case wall-clock budget (s) for the --refine pass")
-    ap.add_argument("--realize", choices=["compact", "faithful"],
+    ap.add_argument("--anchor-hint-weight", dest="anchor_hint_weight",
+                    type=float, default=2.0,
+                    help="anchored mode: weight of the (rescaled) hint anchor "
+                         "relative to unit net anchors in the projected sweep. "
+                         "0 => pure HPWL polish inside the compact frame.")
+    ap.add_argument("--anchor-wall-weight", dest="anchor_wall_weight",
+                    type=float, default=8.0,
+                    help="anchored mode: weight of the wall-target anchor for "
+                         "boundary-tagged blocks (0 => no explicit wall pull).")
+    ap.add_argument("--realize", choices=["compact", "faithful", "anchored"],
                     default="compact",
                     help="realization mode. 'compact' (default, byte-identical "
                          "to the legacy path) = ASAP longest-path recompaction. "
