@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from floorset_arch.diffusion.contracts import DIFFUSION_FEATURE_VERSION
 from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
 from floorset_arch.diffusion.model import GraphConditionedPlacementDiffusion
 from floorset_arch.diffusion.sampling import load_diffusion_checkpoint
@@ -247,6 +248,7 @@ def test_load_diffusion_checkpoint_prefers_ema_weights_for_inference(tmp_path):
             "hidden_dim": 16,
             "layers": 1,
             "loss_config": {"max_steps": 32, "noise_schedule": "cosine"},
+            "feature_version": DIFFUSION_FEATURE_VERSION,
         },
         checkpoint,
     )
@@ -256,6 +258,29 @@ def test_load_diffusion_checkpoint_prefers_ema_weights_for_inference(tmp_path):
 
     assert torch.allclose(inference_model.state_dict()[floating_key], ema_state[floating_key])
     assert torch.allclose(raw_model.state_dict()[floating_key], raw_state[floating_key])
+
+
+def test_load_diffusion_checkpoint_rejects_feature_version_mismatch(tmp_path):
+    import pytest
+
+    graph = build_diffusion_graph_inputs(_tiny_instance())
+    model = GraphConditionedPlacementDiffusion.from_graph_inputs(
+        graph, variant="raw", hidden_dim=16, layers=1
+    )
+    checkpoint = tmp_path / "legacy.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "variant": "raw",
+            "hidden_dim": 16,
+            "layers": 1,
+            "loss_config": {"max_steps": 32, "noise_schedule": "cosine"},
+            # No feature_version key -> treated as legacy v1.
+        },
+        checkpoint,
+    )
+    with pytest.raises(ValueError, match="feature_version mismatch"):
+        load_diffusion_checkpoint(checkpoint, graph)
 
 
 def test_diffusion_training_eval_env_uses_diffusion_checkpoint(tmp_path, monkeypatch):

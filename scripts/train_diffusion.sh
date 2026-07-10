@@ -34,6 +34,7 @@ NET_WEIGHT="${NET_WEIGHT:-0.01}"
 CLUSTER_WEIGHT="${CLUSTER_WEIGHT:-0.02}"
 BOUNDARY_WEIGHT="${BOUNDARY_WEIGHT:-0.02}"
 MIB_WEIGHT="${MIB_WEIGHT:-0.02}"
+DIRTY_ORDER_WEIGHT="${DIRTY_ORDER_WEIGHT:-0.35}"
 DEVICE="${DEVICE:-cuda}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 PRINT_EVERY="${PRINT_EVERY:-1000}"
@@ -128,6 +129,7 @@ uv run -m floorset_arch.training.train_diffusion \
   --cluster-weight "$CLUSTER_WEIGHT" \
   --boundary-weight "$BOUNDARY_WEIGHT" \
   --mib-weight "$MIB_WEIGHT" \
+  --dirty-order-weight "$DIRTY_ORDER_WEIGHT" \
   --num-workers "$NUM_WORKERS" \
   --checkpoint-prefix "$CHECKPOINT_PREFIX" \
   --print-every "$PRINT_EVERY" \

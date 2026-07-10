@@ -1,11 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 
 
 Relation = tuple[str, str, str]
+
+# Feature/conditioning schema version for the diffusion graph inputs and the
+# checkpoints trained on them. Bump when the raw_block / global feature layout
+# or the coordinate normalization frame changes in a way that alters model
+# input dims or target semantics. v1 = isotropic sqrt(area) coordinate scale,
+# 18-dim raw block features, 10-dim globals. v2 = frame-aware zero-mean
+# coordinate normalization, per-block pin I/O direction features, and a
+# de-degenerated global vector (see graph_inputs.build_diffusion_graph_inputs).
+DIFFUSION_FEATURE_VERSION = 2
 
 
 def _require_shape(condition: bool, name: str, expected: str, actual: tuple[int, ...]) -> None:
@@ -124,10 +133,26 @@ class DiffusionGraphInputs:
     cluster_ids: torch.Tensor
     mib_ids: torch.Tensor
     global_features: torch.Tensor
+    frame: torch.Tensor = None  # type: ignore[assignment]
+    feature_version: int = DIFFUSION_FEATURE_VERSION
 
     def __post_init__(self) -> None:
         block_count = int(self.area.shape[0]) if self.area.dim() == 1 else -1
         _require_shape(self.area.dim() == 1, "area", "[N]", tuple(self.area.shape))
+        if self.frame is None:
+            # Legacy/isotropic fallback: a square frame with side sqrt(sum area).
+            side = float(self.area.float().clamp_min(1.0).sum().clamp_min(1.0).sqrt().item())
+            object.__setattr__(
+                self,
+                "frame",
+                torch.tensor([side, side], dtype=torch.float32, device=self.area.device),
+            )
+        _require_shape(
+            self.frame.dim() == 1 and int(self.frame.shape[0]) == 2,
+            "frame",
+            "[2]",
+            tuple(self.frame.shape),
+        )
         for name, value, dtype in (
             ("fixed_mask", self.fixed_mask, torch.bool),
             ("preplaced_mask", self.preplaced_mask, torch.bool),
@@ -180,8 +205,28 @@ class DiffusionGraphInputs:
                 ("cluster_ids", self.cluster_ids),
                 ("mib_ids", self.mib_ids),
                 ("global_features", self.global_features),
+                ("frame", self.frame),
             )
         )
+
+    def to(self, device: torch.device | str) -> "DiffusionGraphInputs":
+        """Move every tensor to ``device``. Bypasses __post_init__ re-validation
+        (the inputs were already validated at build time) so per-sample device
+        moves in the training loop do not incur GPU sync from the shape/index
+        checks."""
+        device = torch.device(device)
+
+        def _move(value):
+            if isinstance(value, torch.Tensor):
+                return value.to(device)
+            if isinstance(value, dict):
+                return {key: _move(item) for key, item in value.items()}
+            return value
+
+        moved = object.__new__(DiffusionGraphInputs)
+        for field in fields(self):
+            object.__setattr__(moved, field.name, _move(getattr(self, field.name)))
+        return moved
 
     @property
     def block_count(self) -> int:

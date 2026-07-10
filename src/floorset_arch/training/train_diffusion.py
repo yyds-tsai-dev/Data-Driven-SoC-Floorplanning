@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.utils.data import DataLoader
 
+from floorset_arch.diffusion.contracts import DIFFUSION_FEATURE_VERSION
 from floorset_arch.diffusion.graph_inputs import build_diffusion_graph_inputs
 from floorset_arch.diffusion.model import GraphConditionedPlacementDiffusion
 from floorset_arch.diffusion.sampling import load_diffusion_checkpoint
@@ -25,12 +27,15 @@ from floorset_arch.training.train import (
     TRAINING_EVAL_ENV_OVERRIDES,
     _parse_train_eval_tail_ids,
     choose_window_start,
+    floorplan_collate,
     iter_batch_samples,
     make_loader,
     maybe_init_wandb,
     refresh_evaluator_best_checkpoint,
+    unpack_batch,
     valid_block_count,
 )
+from floorset_arch.training.losses import fp_sol_soft_violations
 from floorset_arch.training.promote_checkpoint import checkpoint_metric_from_eval_json
 from floorset_arch.training.selection import append_metric_record
 
@@ -86,6 +91,7 @@ def _checkpoint_payload(
         "val_stats": dict(val_stats),
         "args": vars(args),
         "loss_config": asdict(loss_config),
+        "feature_version": int(DIFFUSION_FEATURE_VERSION),
     }
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
@@ -146,6 +152,112 @@ def _prepare_diffusion_sample(sample, device: torch.device):
     graph = build_diffusion_graph_inputs(inst, device=device)
     targets = build_diffusion_targets(inst, graph, fp_sol, tree_sol, metrics_sol)
     return graph, targets
+
+
+class _PreparedDiffusionDataset(torch.utils.data.Dataset):
+    """Builds the diffusion graph + targets inside the DataLoader worker so the
+    pure-Python graph construction (Instance parse, hetero-graph edges, O(n^2)
+    pair features) is parallelized across ``num_workers`` instead of running
+    single-threaded in the main training loop. Tensors are built on CPU (CUDA
+    tensors cannot be created safely in fork workers); the main process moves
+    the returned graph/targets to the training device via ``.to(device)``.
+    """
+
+    def __init__(self, base, indices: list[int], args) -> None:
+        self.base = base
+        self.indices = list(indices)
+        self.args = args
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, k: int):
+        # FloorplanDatasetLite.__getitem__ returns a dict; floorplan_collate is
+        # what extracts/pads the 8 tensor fields. Collate this single item, then
+        # unbatch to the (area, b2b, p2b, pins, cons, tree, fp, metrics) tuple.
+        raw = self.base[self.indices[k]]
+        sample = unpack_batch(floorplan_collate([raw]))
+        try:
+            graph, targets = _prepare_diffusion_sample(sample, torch.device("cpu"))
+        except ValueError:
+            return None
+        order_weight = _sample_order_weight(sample, self.args)
+        return graph, targets, float(order_weight)
+
+
+def _prepared_collate(items):
+    # Keep prepared objects (and skip-markers) as a plain list; the training
+    # loop iterates and moves each to the device.
+    return list(items)
+
+
+def _make_prepared_loader(
+    dataset,
+    start: int,
+    count: int,
+    shuffle: bool,
+    seed: int,
+    num_workers: int,
+    batch_size: int,
+    args,
+) -> tuple[DataLoader, int, int]:
+    total = len(dataset)
+    n = min(max(1, count), total)
+    start = max(0, min(start, total - n)) if total > n else 0
+    indices = list(range(start, start + n))
+    if shuffle:
+        random.Random(seed).shuffle(indices)
+    loader = DataLoader(
+        _PreparedDiffusionDataset(dataset, indices, args),
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        collate_fn=_prepared_collate,
+        num_workers=max(0, int(num_workers)),
+        persistent_workers=False,
+    )
+    return loader, start, start + n - 1
+
+
+def _iter_training_items(loader, device: torch.device, args, train: bool):
+    """Yield (graph, targets, order_weight) on ``device`` (or None to skip),
+    from either the worker-prepared loader (list batches) or a raw-tensor loader
+    (synthetic-smoke / eval-probe fallbacks)."""
+    for batch in loader:
+        if isinstance(batch, list):
+            for item in batch:
+                if item is None:
+                    yield None
+                    continue
+                graph, targets, order_weight = item
+                yield graph.to(device), targets.to(device), float(order_weight)
+        else:
+            for sample in iter_batch_samples(batch):
+                try:
+                    graph, targets = _prepare_diffusion_sample(sample, device)
+                except ValueError:
+                    yield None
+                    continue
+                order_weight = _sample_order_weight(sample, args) if train else 1.0
+                yield graph, targets, float(order_weight)
+
+
+def _sample_order_weight(sample, args) -> float:
+    """Down-weight relative-order (pair/tree) supervision on soft-violating
+    golden layouts. Geometry (center/aspect) supervision stays full-weight;
+    only the order labels derived from a dirty ``fp_sol`` are suppressed, per
+    the Constraint-Clean Training Sample convention. Returns 1.0 on any failure
+    or when weighting is disabled (``--dirty-order-weight 1.0``)."""
+    dirty_weight = float(getattr(args, "dirty_order_weight", 1.0))
+    if dirty_weight == 1.0:
+        return 1.0
+    area_targets, b2b, p2b, pins, constraints, _tree_sol, fp_sol, _metrics = sample
+    try:
+        violations = fp_sol_soft_violations(
+            fp_sol, area_targets, b2b, p2b, pins, constraints
+        )
+    except Exception:
+        return 1.0
+    return dirty_weight if sum(int(v) for v in violations) > 0 else 1.0
 
 
 def _clone_ema_state(model: GraphConditionedPlacementDiffusion) -> dict[str, torch.Tensor]:
@@ -226,60 +338,59 @@ def run_epoch(
     if train:
         optimizer.zero_grad(set_to_none=True)
 
-    for batch in loader:
-        for sample in iter_batch_samples(batch):
-            try:
-                graph, targets = _prepare_diffusion_sample(sample, device)
-            except ValueError:
-                skipped += 1
-                continue
+    for item in _iter_training_items(loader, device, args, train):
+        if item is None:
+            skipped += 1
+            continue
+        graph, targets, order_weight = item
 
-            seed = int(args.seed) + int(epoch) * 1_000_003 + count
-            with torch.set_grad_enabled(train):
-                loss, parts = diffusion_training_loss(
+        seed = int(args.seed) + int(epoch) * 1_000_003 + count
+        with torch.set_grad_enabled(train):
+            loss, parts = diffusion_training_loss(
+                model,
+                graph,
+                targets,
+                seed=seed,
+                config=loss_config,
+                order_weight=order_weight,
+            )
+            if train:
+                (loss / accumulation_steps).backward()
+                pending_samples += 1
+                pending_samples = _optimizer_step(
                     model,
-                    graph,
-                    targets,
-                    seed=seed,
-                    config=loss_config,
+                    optimizer,
+                    args,
+                    pending_samples,
+                    force=False,
+                    ema_state=ema_state,
+                    ema_decay=ema_decay,
                 )
-                if train:
-                    (loss / accumulation_steps).backward()
-                    pending_samples += 1
-                    pending_samples = _optimizer_step(
-                        model,
-                        optimizer,
-                        args,
-                        pending_samples,
-                        force=False,
-                        ema_state=ema_state,
-                        ema_decay=ema_decay,
-                    )
 
-            sums["loss"] += float(loss.detach().cpu().item())
-            sums["denoise"] += float(parts["denoise"])
-            sums["pair"] += float(parts["pair"])
-            sums["tree"] += float(parts["tree"])
-            sums["quality"] += float(parts["quality"])
-            sums["aspect"] += float(parts["aspect"])
-            sums["layout_overlap"] += float(parts["layout_overlap"])
-            sums["layout_bbox"] += float(parts["layout_bbox"])
-            sums["layout_net"] += float(parts["layout_net"])
-            sums["layout_cluster"] += float(parts["layout_cluster"])
-            sums["layout_boundary"] += float(parts["layout_boundary"])
-            sums["layout_mib"] += float(parts["layout_mib"])
-            sums["timestep_mean"] += float(parts["timestep_mean"])
-            count += 1
+        sums["loss"] += float(loss.detach().cpu().item())
+        sums["denoise"] += float(parts["denoise"])
+        sums["pair"] += float(parts["pair"])
+        sums["tree"] += float(parts["tree"])
+        sums["quality"] += float(parts["quality"])
+        sums["aspect"] += float(parts["aspect"])
+        sums["layout_overlap"] += float(parts["layout_overlap"])
+        sums["layout_bbox"] += float(parts["layout_bbox"])
+        sums["layout_net"] += float(parts["layout_net"])
+        sums["layout_cluster"] += float(parts["layout_cluster"])
+        sums["layout_boundary"] += float(parts["layout_boundary"])
+        sums["layout_mib"] += float(parts["layout_mib"])
+        sums["timestep_mean"] += float(parts["timestep_mean"])
+        count += 1
 
-            if train and args.print_every > 0 and count % int(args.print_every) == 0:
-                print(
-                    f"[epoch {epoch:03d} step {count:05d}] "
-                    f"loss={loss.item():.5f} denoise={parts['denoise']:.5f} "
-                    f"pair={parts['pair']:.5f} tree={parts['tree']:.5f} "
-                    f"quality={parts['quality']:.5f} aspect={parts['aspect']:.5f} "
-                    f"overlap={parts['layout_overlap']:.5f} t={parts['timestep_mean']:.1f}",
-                    flush=True,
-                )
+        if train and args.print_every > 0 and count % int(args.print_every) == 0:
+            print(
+                f"[epoch {epoch:03d} step {count:05d}] "
+                f"loss={loss.item():.5f} denoise={parts['denoise']:.5f} "
+                f"pair={parts['pair']:.5f} tree={parts['tree']:.5f} "
+                f"quality={parts['quality']:.5f} aspect={parts['aspect']:.5f} "
+                f"overlap={parts['layout_overlap']:.5f} t={parts['timestep_mean']:.1f}",
+                flush=True,
+            )
 
     if train:
         _optimizer_step(
@@ -360,7 +471,7 @@ def _make_loaders(args):
     val_start = choose_window_start(
         total, args.val_samples, args.seed + 777, 0, args.val_start
     )
-    val_loader, vs, ve = make_loader(
+    val_loader, vs, ve = _make_prepared_loader(
         dataset,
         val_start,
         args.val_samples,
@@ -368,11 +479,12 @@ def _make_loaders(args):
         args.seed,
         args.num_workers,
         args.batch_size,
+        args,
     )
     train_start = choose_window_start(
         total, args.num_samples, args.seed, 1, args.window_start
     )
-    train_loader, ts, te = make_loader(
+    train_loader, ts, te = _make_prepared_loader(
         dataset,
         train_start,
         args.num_samples,
@@ -380,14 +492,20 @@ def _make_loaders(args):
         args.seed + 1,
         args.num_workers,
         args.batch_size,
+        args,
     )
     return train_loader, val_loader, ts, te, vs, ve, total
 
 
 def _first_graph(loader, device: torch.device):
     for batch in loader:
-        for sample in iter_batch_samples(batch):
-            return _prepare_diffusion_sample(sample, device)[0]
+        if isinstance(batch, list):
+            for item in batch:
+                if item is not None:
+                    return item[0].to(device)
+        else:
+            for sample in iter_batch_samples(batch):
+                return _prepare_diffusion_sample(sample, device)[0]
     raise RuntimeError("diffusion training loader is empty")
 
 
@@ -610,7 +728,7 @@ def main(args) -> None:
             train_start = choose_window_start(
                 len(dataset), args.num_samples, args.seed, epoch, args.window_start
             )
-            train_loader, ts, te = make_loader(
+            train_loader, ts, te = _make_prepared_loader(
                 dataset,
                 train_start,
                 args.num_samples,
@@ -618,6 +736,7 @@ def main(args) -> None:
                 args.seed + epoch,
                 args.num_workers,
                 args.batch_size,
+                args,
             )
             print(f"Epoch {epoch:03d}: train window {ts}..{te}", flush=True)
 
@@ -772,6 +891,16 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--cluster-weight", type=float, default=0.02)
     parser.add_argument("--boundary-weight", type=float, default=0.02)
     parser.add_argument("--mib-weight", type=float, default=0.02)
+    parser.add_argument(
+        "--dirty-order-weight",
+        type=float,
+        default=0.35,
+        help=(
+            "Weight applied to pair/tree (relative-order) losses on soft-violating "
+            "golden layouts. 1.0 disables clean-sample weighting; 0.35 matches the "
+            "Anchor-GNN dirty-order default. Geometry losses stay full-weight."
+        ),
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)

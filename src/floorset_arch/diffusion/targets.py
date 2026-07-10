@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from floorset_arch.diffusion.contracts import DiffusionGraphInputs
+from floorset_arch.diffusion.layout_losses import normalize_center
 from floorset_arch.models import Instance
 
 
@@ -30,6 +31,18 @@ class DiffusionTargets:
     tree_side_label: torch.Tensor
     instance_stats: torch.Tensor
     quality_labels: torch.Tensor
+
+    def to(self, device: torch.device | str) -> "DiffusionTargets":
+        device = torch.device(device)
+        return DiffusionTargets(
+            center=self.center.to(device),
+            log_aspect=self.log_aspect.to(device),
+            pair_axis_label=self.pair_axis_label.to(device),
+            tree_pair_mask=self.tree_pair_mask.to(device),
+            tree_side_label=self.tree_side_label.to(device),
+            instance_stats=self.instance_stats.to(device),
+            quality_labels=self.quality_labels.to(device),
+        )
 
 
 def parse_tree_sol_edges(tree_sol: torch.Tensor | None, block_count: int) -> TreeEdges:
@@ -132,10 +145,10 @@ def build_diffusion_targets(
         raise ValueError("graph_inputs block_count must match instance block_count")
 
     xywh = _fp_sol_xywh(fp_sol, block_count, device)
-    scale = max(float(graph_inputs.scale), 1.0)
-    center = torch.stack(
+    raw_center = torch.stack(
         (xywh[:, 0] + 0.5 * xywh[:, 2], xywh[:, 1] + 0.5 * xywh[:, 3]), dim=1
-    ) / scale
+    )
+    center = normalize_center(graph_inputs, raw_center)
     log_aspect = torch.log(xywh[:, 2] / xywh[:, 3].clamp_min(1e-6))
     tree_edges = parse_tree_sol_edges(tree_sol, block_count)
     pair_axis_label, tree_pair_mask, tree_side_label = _pair_axis_labels(

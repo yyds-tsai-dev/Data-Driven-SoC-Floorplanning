@@ -7,9 +7,11 @@ from pathlib import Path
 import torch
 
 from floorset_arch.diffusion.contracts import (
+    DIFFUSION_FEATURE_VERSION,
     DiffusionGraphInputs,
     DiffusionPlacementPrior,
 )
+from floorset_arch.diffusion.layout_losses import denormalize_center
 from floorset_arch.diffusion.model import GraphConditionedPlacementDiffusion
 from floorset_arch.diffusion.training import DiffusionLossConfig, _alpha_bar
 
@@ -94,8 +96,7 @@ def _rect_tensors(
     graph: DiffusionGraphInputs,
     x0: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    scale = max(float(graph.scale), 1.0)
-    centers = x0[:, :, :2] * scale
+    centers = denormalize_center(graph, x0[:, :, :2])
     log_aspect = x0[:, :, 2].clamp(-2.5, 2.5)
     area = graph.area.float().to(x0.device).view(1, -1).clamp_min(1.0)
     aspect = torch.exp(log_aspect)
@@ -294,7 +295,7 @@ def sample_diffusion_prior(
         x_t = prev_alpha.sqrt() * x0 + (1.0 - prev_alpha).sqrt() * eps
         pair_logits = out["pairwise_axis_logits"]
         quality = out["quality_pred"]
-    centers = x_t[:, :, :2] * max(float(graph.scale), 1.0)
+    centers = denormalize_center(graph, x_t[:, :, :2])
     log_aspect = x_t[:, :, 2].clamp(-2.5, 2.5)
     return DiffusionPlacementPrior(
         centers=centers,
@@ -315,6 +316,16 @@ def load_diffusion_checkpoint(
     use_ema: bool = True,
 ) -> GraphConditionedPlacementDiffusion:
     payload = torch.load(path, map_location=map_location)
+    ckpt_version = int(payload.get("feature_version", 1))
+    graph_version = int(getattr(graph, "feature_version", DIFFUSION_FEATURE_VERSION))
+    if ckpt_version != graph_version:
+        raise ValueError(
+            "diffusion feature_version mismatch: checkpoint was trained with "
+            f"feature_version={ckpt_version} but the graph inputs are "
+            f"feature_version={graph_version}. Rebuild the graph inputs with the "
+            "matching version (legacy checkpoints without the field are v1), or "
+            "retrain under the current schema."
+        )
     variant = str(payload.get("variant", "raw"))
     hidden_dim = int(payload.get("hidden_dim", 128))
     layers = int(payload.get("layers", 2))

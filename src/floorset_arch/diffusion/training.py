@@ -72,6 +72,7 @@ def diffusion_training_loss(
     targets: DiffusionTargets,
     seed: int | None = 0,
     config: DiffusionLossConfig | None = None,
+    order_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     config = config or DiffusionLossConfig()
     generator = torch.Generator(device=graph.area.device)
@@ -147,10 +148,11 @@ def diffusion_training_loss(
     layout_boundary = boundary_loss(graph, x0_pred).mean()
     layout_mib = mib_aspect_loss(graph, x0_pred).mean()
 
+    order_weight = float(order_weight)
     loss = (
         denoise
-        + float(config.pair_weight) * pair_loss
-        + float(config.tree_weight) * tree_loss
+        + order_weight * float(config.pair_weight) * pair_loss
+        + order_weight * float(config.tree_weight) * tree_loss
         + float(config.quality_weight) * quality_loss
         + float(config.aspect_weight) * aspect_loss
         + float(config.overlap_weight) * layout_overlap
@@ -178,4 +180,5 @@ def diffusion_training_loss(
         else 0.0,
         "timestep_mean": float(timestep.float().detach().cpu().mean().item()),
         "noise_schedule": config.noise_schedule,
+        "order_weight": order_weight,
     }

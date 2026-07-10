@@ -5,12 +5,39 @@ import torch
 from floorset_arch.diffusion.contracts import DiffusionGraphInputs
 
 
+def _frame_half(graph: DiffusionGraphInputs, device: torch.device) -> tuple[float, float]:
+    frame = graph.frame.to(device).float()
+    return max(float(frame[0].item()), 1.0) / 2.0, max(float(frame[1].item()), 1.0) / 2.0
+
+
+def normalize_center(graph: DiffusionGraphInputs, center: torch.Tensor) -> torch.Tensor:
+    """Real coordinates -> model space. v2 = frame-aware zero-mean (~[-1,1]);
+    v1 = legacy isotropic sqrt(area) scale."""
+    if int(getattr(graph, "feature_version", 1)) >= 2:
+        hx, hy = _frame_half(graph, center.device)
+        nx = (center[..., 0] - hx) / hx
+        ny = (center[..., 1] - hy) / hy
+        return torch.stack((nx, ny), dim=-1)
+    scale = max(float(graph.scale), 1.0)
+    return center / scale
+
+
+def denormalize_center(graph: DiffusionGraphInputs, ncenter: torch.Tensor) -> torch.Tensor:
+    """Model space -> real coordinates (inverse of ``normalize_center``)."""
+    if int(getattr(graph, "feature_version", 1)) >= 2:
+        hx, hy = _frame_half(graph, ncenter.device)
+        cx = ncenter[..., 0] * hx + hx
+        cy = ncenter[..., 1] * hy + hy
+        return torch.stack((cx, cy), dim=-1)
+    scale = max(float(graph.scale), 1.0)
+    return ncenter * scale
+
+
 def rect_tensors_from_x0(
     graph: DiffusionGraphInputs,
     x0: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    scale = max(float(graph.scale), 1.0)
-    centers = x0[:, :, :2] * scale
+    centers = denormalize_center(graph, x0[:, :, :2])
     log_aspect = x0[:, :, 2].clamp(-2.5, 2.5)
     area = graph.area.float().to(x0.device).view(1, -1).clamp_min(1.0)
     aspect = torch.exp(log_aspect)
