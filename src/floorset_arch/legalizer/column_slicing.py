@@ -65,6 +65,37 @@ def _cumulative(weights: List[float]) -> List[float]:
     return cum
 
 
+def _fastsa_temp(frac: float, t0: float, t1: float,
+                 k: float, c: float, steps: float) -> float:
+    """Fast-SA three-stage temperature law (Chen-Chang ISPD'05), mapped onto
+    our wall-clock fraction axis and ANCHORED to the caller's geometric
+    endpoints t0 (hot) / t1 (cold) so the acceptance regime stays in the range
+    our Metropolis criterion + cost scale are already tuned for. Shape (not
+    absolute scale) is what the port reproduces.
+
+    The paper indexes temperature steps by an integer n and uses
+        T_1 = Δavg / ln P                      (stage 1, hot random walk)
+        T_n = T_1·|Δcost| / (n·c),  2 <= n <= k (stage 2, fast quench ~greedy)
+        T_n = T_1·|Δcost| / n,      n > k       (stage 3, reheat + 1/n cooling)
+    We (a) map frac in [0,1] linearly to a continuous index n in [1, steps],
+    (b) replace the online Δavg/|Δcost| scale by an anchor A = t1·steps so the
+    stage-3 kernel A/n lands exactly on t1 at frac=1, and (c) hold stage 1 at
+    the hot anchor t0. This preserves the three invariants that DEFINE the
+    schedule -- the ×c deep quench of stage 2, the ~c-fold reheat jump at n=k,
+    and the 1/n stage-3 tail -- while leaving t0/t1 (hence the accept curve)
+    untouched. With steps=41, k=7 the reheat lands at frac≈0.15, so ~15% of the
+    run is hot exploration + quench and ~85% is the low-T 1/n hill-climb, the
+    paper's iteration split. Pure function; no per-move cost (called once per
+    outer loop, same as the geometric law it replaces)."""
+    n = 1.0 + (steps - 1.0) * frac
+    A = t1 * steps
+    if n < 2.0:
+        return t0                    # stage 1: high-T random exploration
+    if n <= k:
+        return A / (n * c)           # stage 2: fast quench to pseudo-greedy
+    return A / n                     # stage 3: reheat, then 1/n cooling to t1
+
+
 # =============================================================================
 # Constraint parsing helpers (API kept for my_opt_claude.py)
 # =============================================================================
@@ -287,6 +318,52 @@ class _ColumnOptimizer:
         # FAST_EVAL cache. Optional JSONL pre/post log via FLOORSET_WIDTH_OPT_LOG.
         self._width_opt = os.environ.get("FLOORSET_WIDTH_OPT", "0") == "1"
         self._width_opt_log = os.environ.get("FLOORSET_WIDTH_OPT_LOG", "")
+
+        # --- E2-adaptive per-chain early stop (mounted by the caller) --------
+        # `stall_window` (seconds) and `stall_eps` (relative) are NOT read from
+        # os.environ here: the window is derived from the case's BASE budget,
+        # which the env-forked workers do not know, so the main process
+        # (legalize_rectangles / _parallel_solve) sets these on the optimizer
+        # after construction and threads them into the worker payload. Left as
+        # None the early stop is disabled and every SA chain is byte-identical
+        # to the pre-adaptive behavior. `_anneal_stalled` records whether the
+        # most recent `_anneal` chain broke on the stall condition so `finish`
+        # can cap its wrap-up (polish/width-opt) to a bounded window instead of
+        # the generous adaptive ceiling.
+        self.stall_window: Optional[float] = None
+        self.stall_eps: float = 0.003
+        self._anneal_stalled = False
+
+        # --- Fast-SA cooling schedule (FLOORSET_SA_SCHEDULE, default off) -----
+        # "geometric" (default) keeps the historical wall-clock geometric law
+        # in `_anneal` byte-identical -- the schedule branch is a single string
+        # compare per outer loop and never touches the rng stream. "fastsa"
+        # swaps ONLY the T(frac) curve for the Chen-Chang three-stage law
+        # (`_fastsa_temp`); the move set, Metropolis accept, recalibration and
+        # finish/polish are all untouched. k / c / steps mirror the paper's
+        # (k=7, c=100) plus the frac->index span; malformed values fall back.
+        self._sa_schedule = os.environ.get("FLOORSET_SA_SCHEDULE", "geometric")
+        if self._sa_schedule not in ("geometric", "fastsa"):
+            self._sa_schedule = "geometric"
+        try:
+            self._fastsa_k = float(os.environ.get("FLOORSET_SA_FASTSA_K", "7"))
+        except ValueError:
+            self._fastsa_k = 7.0
+        try:
+            self._fastsa_c = float(os.environ.get("FLOORSET_SA_FASTSA_C", "100"))
+        except ValueError:
+            self._fastsa_c = 100.0
+        try:
+            self._fastsa_steps = float(os.environ.get("FLOORSET_SA_FASTSA_STEPS", "41"))
+        except ValueError:
+            self._fastsa_steps = 41.0
+        # guard degenerate params so the law stays well-formed (steps > k >= 2)
+        if self._fastsa_k < 2.0:
+            self._fastsa_k = 2.0
+        if self._fastsa_steps <= self._fastsa_k:
+            self._fastsa_steps = self._fastsa_k + 1.0
+        if self._fastsa_c <= 0.0:
+            self._fastsa_c = 100.0
 
         self._build_hpwl_arrays(b2b, p2b, pins)
         self._build_soft_norm()
@@ -1847,6 +1924,16 @@ class _ColumnOptimizer:
         recal_at = [start + 0.25 * span, start + 0.55 * span] if recalibrate else []
         if self._adaptive_moves:
             self._adaptive_reset()
+        # E2-adaptive early stop: when a stall window is configured, break out
+        # of this chain once best_cost has not improved by >= stall_eps
+        # (relative) within the last stall_window seconds. The check hangs on
+        # the existing per-outer-loop time read, so it adds no per-move cost.
+        # Disabled (byte-identical) when self.stall_window is None.
+        self._anneal_stalled = False
+        stall_win = self.stall_window
+        stall_eps = self.stall_eps
+        stall_ref_cost = best_cost   # best_cost at the last window reset
+        stall_ref_time = start
         while True:
             now = time.time()
             if now >= deadline:
@@ -1865,8 +1952,25 @@ class _ColumnOptimizer:
                 if best_cost < cur_cost:
                     cols = bcols
                     cur_cost = best_cost
+                # a recalibration rescales the cost; re-anchor the stall window
+                # so the shift is not misread as an improvement or a stall.
+                stall_ref_cost = best_cost
+                stall_ref_time = now
+            if stall_win is not None:
+                # improvement is measured from the last reset; a sign-safe
+                # absolute test avoids the relative form breaking near zero.
+                if stall_ref_cost - best_cost >= stall_eps * abs(stall_ref_cost):
+                    stall_ref_cost = best_cost
+                    stall_ref_time = now
+                elif now - stall_ref_time >= stall_win:
+                    self._anneal_stalled = True
+                    break
             frac = min((now - start) / span, 1.0)
-            T = t0 * (t1 / t0) ** frac
+            if self._sa_schedule == "fastsa":
+                T = _fastsa_temp(frac, t0, t1, self._fastsa_k,
+                                 self._fastsa_c, self._fastsa_steps)
+            else:
+                T = t0 * (t1 / t0) ** frac
             for _ in range(24):
                 # M1c: PARSAC-style constraint-fixing move. Rare, targeted,
                 # accepted unconditionally; only fires while soft violations
@@ -2048,11 +2152,13 @@ class _ColumnOptimizer:
         total = max(t_end - now, 0.1)
         runs = 2 if (total > 6.0 and max_runs >= 2) else 1
         snaps = []
+        stalled = False
         for r in range(runs):
             cols_r = self._restore(start_snap)
             c_r, _ = self._evaluate(cols_r)
             snap, _bc = self._anneal(cols_r, now + total * (r + 1) / runs, c_r,
                                      recalibrate=True)
+            stalled = stalled or self._anneal_stalled
             snaps.append(snap)
         # pick the better run under one common (final) normalizer
         best_cols = None
@@ -2065,18 +2171,30 @@ class _ColumnOptimizer:
                 best_cols = [list(c) for c in cols_c]
                 best_snap = snap
         cols = self._restore(best_snap)
+        # E2-adaptive wrap-up cap: `deadline` here is the generous adaptive
+        # ceiling (base * CAP). Once the SA chain has stalled, letting the
+        # greedy polish / width-opt run to that ceiling would throw away the
+        # runtime the early stop just saved (and revive the worst-case tail the
+        # feature exists to avoid). Cap the wrap-up to one stall window past the
+        # anneal instead -- ample for the bounded, fast-converging polish, while
+        # keeping the whole episode ~= stall_point + one window. When the stall
+        # window is unset (adaptive off) or no chain stalled, eff_deadline ==
+        # deadline, so this is byte-identical to the pre-adaptive path.
+        eff_deadline = deadline
+        if self.stall_window is not None and stalled:
+            eff_deadline = min(deadline, time.time() + self.stall_window)
         # M3: carve a small width-opt slice out of the polish budget so the
         # total per-case wall clock is unchanged (only when the flag is on).
         width_reserve = 0.0
         if self._width_opt:
-            width_reserve = min(0.20 * max(deadline - time.time(), 0.0), 2.0)
-        cols = self._greedy_polish(cols, best_c, deadline - width_reserve)
+            width_reserve = min(0.20 * max(eff_deadline - time.time(), 0.0), 2.0)
+        cols = self._greedy_polish(cols, best_c, eff_deadline - width_reserve)
         pos, x_right, y_top = self._layout(cols)
         hp = self._hpwl(pos)
         V = self._violations(pos)
         area = (x_right - float(pos[:, 0].min())) * (y_top - float(pos[:, 1].min()))
         if self._width_opt and width_reserve > 0.0:
-            wres = self._width_optimize(cols, deadline)
+            wres = self._width_optimize(cols, eff_deadline)
             if wres is not None:
                 _widths, pos, x_right, y_top, _c, hp = wres
                 V = self._violations(pos)
@@ -2543,7 +2661,8 @@ def _worker_solve(args):
     """One independent (orientation, column count, seed) restart."""
     try:
         (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
-         orient, c_force, seed, deadline, v_weight) = args
+         orient, c_force, seed, deadline, v_weight,
+         stall_window, stall_eps) = args
         at = torch.from_numpy(areas_np)
         cons = torch.from_numpy(cons_np) if cons_np is not None else None
         tpos = torch.from_numpy(tpos_np) if tpos_np is not None else None
@@ -2555,6 +2674,8 @@ def _worker_solve(args):
             rs, cons, tpos, pins = _transpose_inputs(rects, cons, tpos, pins)
         opt = _ColumnOptimizer(rs, at, cons, tpos, b2b, p2b, pins, deadline,
                                seed=seed, v_weight=v_weight)
+        opt.stall_window = stall_window
+        opt.stall_eps = stall_eps
         if opt.locked_only():
             out = opt.locked_positions()
             return (out, 0.0, 0.0, 0)
@@ -2805,7 +2926,8 @@ def _parallel_solve_racing(opt1, rects, area_targets, constraints,
 
 
 def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
-                    b2b, p2b, pins, deadline, seed):
+                    b2b, p2b, pins, deadline, seed,
+                    stall_window=None, stall_eps=0.003):
     if os.environ.get("FLOORSET_SA_RACING", "0") == "1":
         return _parallel_solve_racing(opt1, rects, area_targets, constraints,
                                       target_positions, b2b, p2b, pins,
@@ -2856,9 +2978,13 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         return None if t is None else t.detach().cpu().numpy()
 
     worker_deadline = deadline - 0.30
+    # E2-adaptive: each worker inherits the SAME stall window / eps; the window
+    # is derived from the case base budget in the main process (workers, forked
+    # at pool warmup, cannot recompute it), so it rides the payload alongside
+    # the deadline. None keeps the per-worker early stop disabled.
     payloads = [(list(rects), np_of(area_targets), np_of(constraints),
                  np_of(target_positions), np_of(b2b), np_of(p2b), np_of(pins),
-                 orient, cf, sd, worker_deadline, vw)
+                 orient, cf, sd, worker_deadline, vw, stall_window, stall_eps)
                 for (orient, cf, sd, vw) in configs]
     res = _POOL.map_async(_worker_solve, payloads)
     try:
@@ -2936,6 +3062,8 @@ def legalize_rectangles(
     pins_pos: Optional[torch.Tensor] = None,
     deadline: Optional[float] = None,
     seed: int = 0,
+    stall_window: Optional[float] = None,
+    stall_eps: float = 0.003,
 ) -> List[Rect]:
     n = len(rects)
     if n == 0:
@@ -2946,6 +3074,9 @@ def legalize_rectangles(
         rects, area_targets, constraints, target_positions,
         b2b_connectivity, p2b_connectivity, pins_pos, deadline, seed=seed,
     )
+    # E2-adaptive early stop: None keeps every SA chain byte-identical.
+    opt1.stall_window = stall_window
+    opt1.stall_eps = stall_eps
     if opt1.locked_only():
         return opt1.locked_positions()
     budget = deadline - time.time()
@@ -2954,7 +3085,8 @@ def legalize_rectangles(
         try:
             return _parallel_solve(opt1, rects, area_targets, constraints,
                                    target_positions, b2b_connectivity,
-                                   p2b_connectivity, pins_pos, deadline, seed)
+                                   p2b_connectivity, pins_pos, deadline, seed,
+                                   stall_window, stall_eps)
         except Exception:
             pass  # fall back to the sequential path below
 
@@ -2978,6 +3110,8 @@ def legalize_rectangles(
         rects_t, area_targets, cons_t, tpos_t,
         b2b_connectivity, p2b_connectivity, pins_t, deadline, seed=seed + 1,
     )
+    opt2.stall_window = stall_window
+    opt2.stall_eps = stall_eps
     opt1.prepare()
     opt2.prepare()
     opt2.hp_ref = opt1.hp_ref

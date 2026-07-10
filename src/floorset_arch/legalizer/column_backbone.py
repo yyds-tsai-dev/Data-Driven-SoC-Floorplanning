@@ -25,9 +25,23 @@ BUDGET_MIN = 0.8
 BUDGET_MAX = 24.0
 
 
+def _base_budget(block_count: int) -> float:
+    """The unscaled, clamped exponential per-case budget (no tail multiplier).
+    ~0.8 s for the smallest cases up to ~24 s for n=120; averages about 5 s
+    over the validation set."""
+    b = BUDGET_SCALE * math.exp(block_count / BUDGET_TAU)
+    return max(BUDGET_MIN, min(BUDGET_MAX, b))
+
+
+def _tail_n() -> int:
+    try:
+        return int(os.environ.get("FLOORSET_TAIL_BUDGET_N", "116"))
+    except ValueError:
+        return 116
+
+
 def _time_budget(block_count: int) -> float:
-    """Exponential per-case budget: ~0.8 s for the smallest cases up to
-    ~24 s for n=120; averages about 5 s over the validation set.
+    """Per-case wall-clock budget for the SA legalizer.
 
     Dormant E2 tail-budget escape hatch (default neutral, mirrors the N1
     FLOORSET_AREA_SCALE convention): FLOORSET_TAIL_BUDGET_SCALE (float,
@@ -36,22 +50,69 @@ def _time_budget(block_count: int) -> float:
     the clamp so it can lift the 24s ceiling on the tail. Malformed env
     values fall back to the default silently. With scale == 1.0 (the
     default) this is byte-identical to the old formula for every n.
+
+    E2-adaptive (FLOORSET_TAIL_BUDGET_ADAPTIVE=1, default 0): instead of the
+    flat SCALE, give the tail a *generous ceiling* base * FLOORSET_TAIL_BUDGET_CAP
+    (float, default 3.0) and let each SA worker self-stop when its own best-cost
+    trajectory stalls (see `_anneal` early-stop in column_slicing.py). ADAPTIVE
+    takes PRECEDENCE over FLOORSET_TAIL_BUDGET_SCALE: when it is on, CAP replaces
+    SCALE as the sole tail multiplier here, and the per-worker stall window
+    (see `_tail_stall_window`) is what actually reins runtime back in below the
+    ceiling. With ADAPTIVE unset this branch is skipped entirely, so the flat-
+    SCALE path is byte-identical to the pre-adaptive formula.
     """
-    b = BUDGET_SCALE * math.exp(block_count / BUDGET_TAU)
-    budget = max(BUDGET_MIN, min(BUDGET_MAX, b))
+    budget = _base_budget(block_count)
 
     try:
         tail_scale = float(os.environ.get("FLOORSET_TAIL_BUDGET_SCALE", "1.0"))
     except ValueError:
         tail_scale = 1.0
-    try:
-        tail_n = int(os.environ.get("FLOORSET_TAIL_BUDGET_N", "116"))
-    except ValueError:
-        tail_n = 116
+    tail_n = _tail_n()
 
-    if block_count >= tail_n and tail_scale != 1.0:
+    if os.environ.get("FLOORSET_TAIL_BUDGET_ADAPTIVE", "0") == "1":
+        try:
+            tail_cap = float(os.environ.get("FLOORSET_TAIL_BUDGET_CAP", "3.0"))
+        except ValueError:
+            tail_cap = 3.0
+        if block_count >= tail_n and tail_cap != 1.0:
+            budget *= tail_cap
+    elif block_count >= tail_n and tail_scale != 1.0:
         budget *= tail_scale
     return budget
+
+
+def _tail_stall_window(block_count: int) -> Optional[float]:
+    """E2-adaptive per-worker stall window (seconds) for this case, or None
+    when adaptive is off / the case is below the tail threshold (so the SA
+    early-stop stays disabled and byte-identical).
+
+    The window is a fraction (FLOORSET_TAIL_STALL_WINDOW, default 0.25) of the
+    BASE (unscaled, clamped) per-case budget, so it scales with case size the
+    same way the budget does: ~2.2 s at n=100 up to ~6 s at n=120. A worker
+    stops its chain once its best cost has not improved by >= the relative eps
+    (FLOORSET_TAIL_STALL_EPS) within one window. Malformed values fall back to
+    the default silently."""
+    if os.environ.get("FLOORSET_TAIL_BUDGET_ADAPTIVE", "0") != "1":
+        return None
+    if block_count < _tail_n():
+        return None
+    try:
+        frac = float(os.environ.get("FLOORSET_TAIL_STALL_WINDOW", "0.25"))
+    except ValueError:
+        frac = 0.25
+    return max(frac * _base_budget(block_count), 0.05)
+
+
+def _tail_stall_eps() -> float:
+    """Relative best-cost improvement below which a stall window counts as
+    'stalled' (FLOORSET_TAIL_STALL_EPS, default 0.003 == 0.3%). The SA cost is
+    positive by construction (>= ~1.0), so a relative threshold is well posed;
+    this is the primary knob for the adaptive stop and should be swept in the
+    paired measurement."""
+    try:
+        return float(os.environ.get("FLOORSET_TAIL_STALL_EPS", "0.003"))
+    except ValueError:
+        return 0.003
 
 
 def _heuristic_init(
@@ -275,6 +336,8 @@ def solve_with_column_backbone(
             seed_rects, area_targets, constraints, target_positions,
             b2b_connectivity=b2b, p2b_connectivity=p2b, pins_pos=pins,
             deadline=deadline - refine_reserve - topo_reserve,
+            stall_window=_tail_stall_window(block_count),
+            stall_eps=_tail_stall_eps(),
         )
         if os.environ.get("FLOORSET_SLACK_REFINE", "0") == "1":
             from floorset_arch.refine.api import refine_layout
