@@ -43,12 +43,17 @@ class MyOptimizer(FloorplanOptimizer):
             "target_positions": target_positions.tolist() if target_positions is not None else None,
         }
 
+        # Hang guard only. The contest imposes NO per-case time limit (verified
+        # 2026-07-07: evaluator's timeout param is dead code; PDF/QA silent) --
+        # a slow case pays the uncapped RuntimeFactor penalty, but a timeout
+        # here raises -> infeasible -> cost 10, which is strictly worse. Keep
+        # this far above any realistic solve (E2 tail budget ~47s + ~2s spawn).
         proc = subprocess.run(
             [str(self.bin_path)],
             input=json.dumps(payload),
             text=True,
             capture_output=True,
-            timeout=60,
+            timeout=300,
             check=True,
         )
 
