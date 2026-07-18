@@ -7,6 +7,12 @@ Thumbs.db
 partner/*.pt
 partner/harness/checkpoints/
 
+# Partner training checkpoints: direct_v2 snapshots are 1.7GB each and the
+# periodic step_*.pt ladder alone is ~31GB. Never let these reach git.
+partner/checkpoints/
+partner/direct_v2/
+partner/**/*.pt
+
 # Python
 __pycache__/
 *.py[cod]
