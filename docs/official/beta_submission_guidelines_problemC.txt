@@ -1,0 +1,146 @@
+ICCAD 2026 FloorSet Challenge — Beta Submission Guidelines
+===========================================================
+Based on feedback from Alpha submissions.
+
+!!! IMPORTANT NOTICE !!!
+---------------------------------------------------------------
+The Alpha evaluation was a PIPELINE EXERCISE only. Submissions were NOT
+run on the actual hidden test cases. The emphasis was on validating that
+the submission package, directory structure, dependencies, and optimizer
+interface are correct end-to-end.
+
+For Beta submissions:
+  - Evaluations WILL be run on the actual hidden test cases.
+  - Each submission is evaluated individually on a dedicated machine
+    with 48 CPU cores and an NVIDIA A100 80GB GPU. All resources are
+    available exclusively to your submission during evaluation.
+  - Faster feedback will be provided PROVIDED these guidelines are
+    followed exactly.
+  - Any violation of the guidelines below (incorrect structure, missing
+    files, broken dependencies, etc.) will result in DISQUALIFICATION
+    of that submission from Beta evaluation.
+
+Please review and address all issues noted in your Alpha feedback before
+re-submitting.
+---------------------------------------------------------------
+
+---------------------------------------------------------------
+1. SUBMISSION PACKAGE STRUCTURE
+---------------------------------------------------------------
+all_submission.tar.gz
+        cadc<team_id>.tar.gz
+        cadc<team_id>.tar.gz
+        ...
+
+NOTE: The contest organizer is responsible for assembling all_submission.tar.gz
+from the individual team archives. Each team submits only their own
+cadc<team_id>.tar.gz.
+
+Each team archive must unpack to a flat directory named cadc<team_id>/ with
+the following layout:
+
+    cadc<team_id>/
+        op_wrapper.py          REQUIRED. The optimizer file passed to --evaluate.
+                               This is the standard entry point based on Alpha
+                               submission experience.
+        op_src.py              Optional but strongly recommended. Full source code
+                               used if op_wrapper.py fails or cannot run standalone.
+        requirements.txt       REQUIRED (may be empty). See Section 2.
+        README.md              Optional. Only if your submission needs special
+                               instructions. Keep it brief.
+        <any other files>      Allowed (model weights, data files, helper modules).
+                               All referenced paths must be relative to the
+                               cadc<team_id>/ directory. Do NOT use absolute paths.
+
+IMPORTANT — No nesting:
+    - op_wrapper.py, op_src.py, and requirements.txt must be directly inside cadc<team_id>/.
+    - Do NOT place them in subdirectories.
+    - All other helper files may be in subdirectories but must be referenced
+      via relative paths from cadc<team_id>/.
+
+IMPORTANT — Keep the package clean:
+    - Do NOT include files unrelated to the submission (e.g., personal scripts,
+      test outputs, result JSONs, checkpoint files from other projects,
+      scratch notebooks, log files, or other approaches tried).
+    - Do NOT include redundant or duplicate .py files. Submit exactly one
+      op_wrapper.py and at most one op_src.py. No other optimizer .py files.
+    - Large binary files (model weights, etc.) are allowed only if they are
+      actively used by your optimizer. Remove any unused assets.
+    - Violations of cleanliness requirements may lead to disqualification.
+
+
+---------------------------------------------------------------
+2. requirements.txt
+---------------------------------------------------------------
+
+Case A — No custom dependencies:
+    Leave requirements.txt EMPTY (zero bytes). The contest evaluation
+    environment already provides: numpy, torch, scipy, numba, tqdm,
+    shapely, threadpoolctl, and all packages in the contest requirements.txt.
+
+Case B — Custom dependencies:
+    Provide a COMPLETE requirements.txt that includes every package your
+    optimizer needs, including transitive dependencies. The evaluation
+    environment will create a fresh virtual environment using ONLY this file:
+
+        python3 -m venv .venv_eval
+        .venv_eval/bin/pip install -r requirements.txt
+
+    A partial requirements.txt (listing only the packages you added but
+    omitting standard dependencies) is a common cause of failures seen in
+    Alpha submissions. Do not assume any package is pre-installed.
+
+
+---------------------------------------------------------------
+3. NAMING CONVENTIONS
+---------------------------------------------------------------
+
+    Primary optimizer : op_wrapper.py   (REQUIRED, exact name)
+    Source code       : op_src.py       (optional, exact name)
+
+    The evaluator tries op_wrapper.py first. If that fails,
+    it falls back to op_src.py. Submissions with neither will be skipped.
+
+
+---------------------------------------------------------------
+4. COMMON ISSUES FROM ALPHA SUBMISSIONS
+---------------------------------------------------------------
+
+  a) Partial requirements.txt — listed only new packages, omitted numpy/scipy/
+     etc. Caused pip install to resolve incompatible versions.
+
+  b) Absolute paths in code — hardcoded /home/<user>/... paths that do not
+     exist in the evaluation environment.
+
+  c) Optimizer file placed in a subdirectory — evaluator could not find it.
+
+  d) Missing requirements.txt entirely — evaluator could not determine whether
+     a venv was needed.
+
+  e) Incorrect optimizer filename — file named my_optimizer.py or other
+     non-standard names could not be identified as the entry point.
+     Use op_wrapper.py (required exact name) for Beta.
+
+
+---------------------------------------------------------------
+5. EVALUATION COMMAND
+---------------------------------------------------------------
+
+The evaluator runs:
+
+    python iccad2026_evaluate.py --evaluate op_wrapper.py
+
+from inside the cadc<team_id>/ directory. Your optimizer must implement a
+class that subclasses FloorplanOptimizer (see contest README for API).
+
+
+---------------------------------------------------------------
+6. CHECKLIST BEFORE SUBMITTING
+---------------------------------------------------------------
+
+  [ ] Archive named cadc<team_id>.tar.gz
+  [ ] cadc<team_id>/ is flat — op_wrapper.py, requirements.txt at top level
+  [ ] requirements.txt present (empty if no custom deps, complete if custom)
+  [ ] No absolute paths in code
+  [ ] Tested locally: python iccad2026_evaluate.py --evaluate op_wrapper.py
+  [ ] op_wrapper.py runs all 100 validation cases without crashing
