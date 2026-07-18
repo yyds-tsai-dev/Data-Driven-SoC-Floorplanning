@@ -1,0 +1,1 @@
+{"avg_runtime": 7.293597132693976, "checkpoint": "checkpoints/diffusion_latest_0710_ns4000_ep1_diffhgt_lite_h256_l4_steps1000_acc16_bs4.pt", "epoch": 1, "feasible": 100, "metric_source": "diffusion_training_full_eval", "soft_violations": 6, "tail_weighted_no_runtime": 1.1586112581665704, "total_score_no_runtime": 1.2147374184086657, "val_loss": null}
