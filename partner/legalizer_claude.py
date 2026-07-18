@@ -40,6 +40,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+import os as _os
+_RDEBUG = bool(_os.environ.get("REFINER_DEBUG"))
+
 Rect = Tuple[float, float, float, float]
 
 EPS = 1e-9
@@ -111,7 +114,7 @@ def rectangles_from_z(
 class _Unit:
     __slots__ = ("uid", "subgroups", "blocks", "soft_area", "rigid_h", "max_rigid_w",
                  "area_total", "force", "anchors", "seed_x", "seed_y", "hasB", "hasT",
-                 "bands", "eff_soft", "eff_rigid_h")
+                 "bands", "eff_soft", "eff_rigid_h", "banded", "hcache", "dyn", "pairable")
 
     def __init__(self, uid: int):
         self.uid = uid
@@ -163,11 +166,16 @@ class _ColumnOptimizer:
         pins: Optional[torch.Tensor],
         deadline: Optional[float],
         seed: int = 0,
+        v_weight: float = 1.0,
+        h_scale: float = 1.0,
+        pinned: Optional[Dict[int, Rect]] = None,
     ):
         self.n = len(rects)
         self.rects = rects
         self.deadline = deadline if deadline is not None else time.time() + 3.0
         self.rng = random.Random(seed)
+        self.v_weight = v_weight  # >1: search prioritizes killing violations
+        self.h_scale = h_scale    # portfolio diversity: stretch/squash frame H
 
         n = self.n
         self.areas = [max(float(area_targets[i]), 1e-9) for i in range(n)]
@@ -181,6 +189,7 @@ class _ColumnOptimizer:
         self.rh = [0.0] * n
         self.lx = [0.0] * n
         self.ly = [0.0] * n
+        self._pinned = pinned or {}
         self._resolve_shapes()
 
         self.locked_rects: List[Rect] = [
@@ -221,6 +230,13 @@ class _ColumnOptimizer:
                 if self.kind[i] == 0 and abs(w * h - self.areas[i]) / self.areas[i] <= MIB_AREA_GUARD:
                     self.kind[i] = 1
                     self.rw[i], self.rh[i] = w, h
+        # perimeter-pack pins (see _perimeter_pack): lock the packed
+        # boundary blocks flush on their walls
+        for i, (px, py, pw, ph) in self._pinned.items():
+            if self.kind[i] == 2:
+                continue
+            self.kind[i] = 2
+            self.lx[i], self.ly[i], self.rw[i], self.rh[i] = px, py, pw, ph
 
     # ------------------------------------------------------------------
     def _build_hpwl_arrays(self, b2b, p2b, pins):
@@ -295,7 +311,7 @@ class _ColumnOptimizer:
                 if dx > 1.0 and dy > 1.0:
                     aspect = max(0.35, min(2.8, dx / dy))
         frame_area = self.total_area / UTIL_TARGET_FRAME
-        H = math.sqrt(frame_area / aspect)
+        H = math.sqrt(frame_area / aspect) * self.h_scale
         # A preplaced block tagged "touch top" reveals the intended frame
         # height exactly — pin H to it so the tag is satisfiable.
         pinned_H = None
@@ -409,6 +425,9 @@ class _ColumnOptimizer:
         self.units = units
         for u in units:
             self._refresh_unit(u)
+            u.pairable = (len(u.blocks) == 1 and self.kind[u.blocks[0]] == 0
+                          and u.force is None and not u.hasB and not u.hasT
+                          and not u.anchors)
         self.blk_unit = [-1] * n
         for k, u in enumerate(units):
             for i in u.blocks:
@@ -505,7 +524,7 @@ class _ColumnOptimizer:
         return merged
 
     def _unit_height(self, u: _Unit, w: float) -> float:
-        return u.rigid_h + u.soft_area / w
+        return self._unit_h(u, w)
 
     def _partition_subgroup(self, sg: List[int]) -> List[List[int]]:
         """Split a cluster with several bottom/top-tagged members into
@@ -516,29 +535,66 @@ class _ColumnOptimizer:
         bnd = self.boundary
         B = [i for i in sg if bnd[i] & 8]
         T = [i for i in sg if (bnd[i] & 4) and not (bnd[i] & 8)]
-        m = min(max(len(B), len(T)), len(sg), 4)
+        hasL = any(bnd[i] & 1 for i in sg)
+        hasR = any(bnd[i] & 2 for i in sg)
+        m = max(len(B), len(T))
+        # a single left/right-tagged member should not force the whole
+        # cluster into one full-width stack — flatten it into chunks and put
+        # that member on the outer edge
+        if (hasL or hasR) and len(sg) >= 3:
+            m = max(m, min(3, len(sg) - 1))
         if m < 2:
             return [sg]
         if any(self.kind[i] == 0 and self.mib[i] > 0 for i in sg):
             return [sg]
+        m = min(m, len(sg), 4)
 
         def blk_area(i):
             return self.areas[i] if self.kind[i] == 0 else self.rw[i] * self.rh[i]
 
         chunks: List[List[int]] = [[] for _ in range(m)]
         areas = [0.0] * m
-        for c, i in enumerate(B[:m]):
+        assigned = set()
+        for i in sg:
+            if bnd[i] & 1:
+                chunks[0].append(i)
+                areas[0] += blk_area(i)
+                assigned.add(i)
+            elif bnd[i] & 2:
+                chunks[m - 1].append(i)
+                areas[m - 1] += blk_area(i)
+                assigned.add(i)
+        b_seen = [any(bnd[i] & 8 for i in ch) for ch in chunks]
+        for i in B:
+            if i in assigned:
+                continue
+            free = [c for c in range(m) if not b_seen[c]]
+            c = free[0] if free else min(range(m), key=lambda cc: areas[cc])
             chunks[c].append(i)
             areas[c] += blk_area(i)
-        used = set(B[:m]) | set(T[:m])
-        mid = [i for i in sg if i not in used]
-        for i in sorted(mid, key=lambda j: -blk_area(j)):
+            b_seen[c] = True
+            assigned.add(i)
+        t_seen = [any(bnd[i] & 4 for i in ch) for ch in chunks]
+        for i in T:
+            if i in assigned:
+                continue
+            free = [c for c in range(m) if not t_seen[c]]
+            c = free[0] if free else min(range(m), key=lambda cc: areas[cc])
+            chunks[c].append(i)
+            areas[c] += blk_area(i)
+            t_seen[c] = True
+            assigned.add(i)
+        for i in sorted((j for j in sg if j not in assigned), key=lambda j: -blk_area(j)):
             c = min(range(m), key=lambda cc: areas[cc])
             chunks[c].append(i)
             areas[c] += blk_area(i)
-        for c, i in enumerate(T[:m]):
-            chunks[c].append(i)
-            areas[c] += blk_area(i)
+
+        def blk_rank(i):
+            b = bnd[i]
+            return (0 if (b & 8) else (2 if (b & 4) else 1))
+
+        for ch in chunks:
+            ch.sort(key=blk_rank)
         return [c for c in chunks if c]
 
     def _refresh_unit(self, u: _Unit):
@@ -566,6 +622,14 @@ class _ColumnOptimizer:
         u.bands = bands
         u.eff_soft = eff_s
         u.eff_rigid_h = eff_r
+        # bands eligible for width-dependent splitting at layout time: a
+        # single stack of >=2 blocks without soft-MIB members (those need one
+        # shared width for identical shapes)
+        u.dyn = [len(b) == 1 and len(b[0][0]) >= 2
+                 and not any(self.kind[e[0]] == 0 and self.mib[e[0]] > 0 for e in b[0][0])
+                 for b in bands]
+        u.banded = any(len(b) > 1 for b in bands) or any(u.dyn)
+        u.hcache = None
 
     def _solve_band(self, band, w: float):
         """Find the band height h so the chunk widths sum to w. Mixed chunks
@@ -573,14 +637,22 @@ class _ColumnOptimizer:
         width. Returns (h, widths) or None if infeasible at this width."""
         pure_w = 0.0
         lo = 0.0
+        all_soft = True
         for (_pl, sa, rh, rmw) in band:
             if sa <= 0.0:
                 pure_w += rmw
+                all_soft = False
+            elif rh > 0.0:
+                all_soft = False
             if rh > lo:
                 lo = rh
         avail = w - pure_w
         if avail <= 1e-6:
             return None
+        if all_soft:
+            total = sum(ch[1] for ch in band)
+            h = total / w
+            return h, [ch[1] / h for ch in band]
         lo += 1e-9
 
         def width_at(h):
@@ -615,20 +687,106 @@ class _ColumnOptimizer:
                 widths.append(rmw)
         return h, widths
 
-    def _unit_h(self, u: _Unit, w: float) -> float:
+    def _merge_band_once(self, band):
+        """Merge the two adjacent chunks with the smallest combined area."""
+        def chunk_area(ch):
+            a = ch[1]
+            for (_i, soft, _a, bw, bh) in ch[0]:
+                if not soft:
+                    a += bw * bh
+            return a
+        areas = [chunk_area(ch) for ch in band]
+        j = min(range(len(band) - 1), key=lambda t: areas[t] + areas[t + 1])
+        a, b = band[j], band[j + 1]
+        bnd = self.boundary
+
+        def rank(entry):
+            code = bnd[entry[0]]
+            return 0 if (code & 8) else (2 if (code & 4) else 1)
+
+        pl = sorted(a[0] + b[0], key=rank)
+        merged = (pl, a[1] + b[1], a[2] + b[2], max(a[3], b[3]))
+        return band[:j] + [merged] + band[j + 2:]
+
+    def _band_solutions(self, u: _Unit, w: float):
+        """(w, unit_height, per-band placement plan) with a one-slot cache.
+        Each plan entry is (effective_band, solution): when a chunk layout is
+        infeasible at this width, chunks are merged progressively instead of
+        collapsing the whole band into one stack."""
+        if u.hcache is not None and u.hcache[0] == w:
+            return u.hcache
+        plan = []
         h = 0.0
-        for band in u.bands:
-            if len(band) == 1:
-                ch = band[0]
-                h += ch[2] + (ch[1] / w if ch[1] > 0.0 else 0.0)
+        for band, dyn_ok in zip(u.bands, u.dyn):
+            eff = band
+            sol = None
+            if len(eff) == 1 and dyn_ok:
+                d = self._dyn_split(eff[0], w)
+                if d is not None:
+                    eff = d
+            if len(eff) > 1:
+                sol = self._solve_band(eff, w)
+                while sol is None and len(eff) > 2:
+                    eff = self._merge_band_once(eff)
+                    sol = self._solve_band(eff, w)
+            if sol is None:
+                if len(eff) > 1:
+                    eff = [(sorted((e for ch in eff for e in ch[0]),
+                                   key=lambda t: 0 if (self.boundary[t[0]] & 8)
+                                   else (2 if (self.boundary[t[0]] & 4) else 1)),
+                            sum(ch[1] for ch in eff),
+                            sum(ch[2] for ch in eff),
+                            max(ch[3] for ch in eff))]
+                ch = eff[0]
+                hb = ch[2] + (ch[1] / w if ch[1] > 0.0 else 0.0)
             else:
-                sol = self._solve_band(band, w)
-                if sol is None:
-                    for ch in band:
-                        h += ch[2] + (ch[1] / w if ch[1] > 0.0 else 0.0)
-                else:
-                    h += sol[0]
-        return h
+                hb = sol[0]
+            plan.append((eff, sol))
+            h += hb
+        u.hcache = (w, h, plan)
+        return u.hcache
+
+    def _dyn_split(self, ch, w: float):
+        """Split a wide single-stack chunk into side-by-side chunks so slice
+        aspect stays reasonable. Order-preserving, so cluster chains remain
+        connected (adjacent chunks touch along their full shared edge)."""
+        pl = ch[0]
+        total = ch[1]
+        for (_i, soft, _a, bw, bh) in pl:
+            if not soft:
+                total += bw * bh
+        avg = total / len(pl)
+        m = int(w / max(1.35 * math.sqrt(max(avg, 1e-9)), 1e-6))
+        if m < 2:
+            return None
+        m = min(m, len(pl), 4)
+        target = total / m
+        parts = []
+        cur = []
+        acc = 0.0
+        for e in pl:
+            cur.append(e)
+            acc += e[2] if e[1] else e[3] * e[4]
+            if acc >= target - 1e-9 and len(parts) < m - 1:
+                parts.append(cur)
+                cur = []
+                acc = 0.0
+        if cur:
+            parts.append(cur)
+        if len(parts) < 2:
+            return None
+        chunks = []
+        for part in parts:
+            sa = sum(e[2] for e in part if e[1])
+            rh = sum(e[4] for e in part if not e[1])
+            rmw = max((e[3] for e in part if not e[1]), default=0.0)
+            chunks.append((part, sa, rh, rmw))
+        return chunks
+
+    def _unit_h(self, u: _Unit, w: float) -> float:
+        if not u.banded:
+            return u.eff_rigid_h + u.eff_soft / w
+        return self._band_solutions(u, w)[1]
 
     def _place_chunk_up(self, pl, xj, wj, y0, pos, full_w=None):
         y = y0
@@ -643,10 +801,9 @@ class _ColumnOptimizer:
             y += bh
         return y
 
-    def _place_band_up(self, band, x0, w, y, pos):
+    def _place_band_up(self, band, x0, w, y, pos, sol=None):
         if len(band) == 1:
             return self._place_chunk_up(band[0][0], x0, w, y, pos, full_w=w)
-        sol = self._solve_band(band, w)
         if sol is None:
             yy = y
             for ch in band:
@@ -659,7 +816,7 @@ class _ColumnOptimizer:
             xj += wj
         return y + h_b
 
-    def _place_band_down(self, band, x0, w, ytop, pos):
+    def _place_band_down(self, band, x0, w, ytop, pos, sol=None):
         if len(band) == 1:
             y = ytop
             for (i, soft, a, bw, bh) in reversed(band[0][0]):
@@ -672,7 +829,6 @@ class _ColumnOptimizer:
                 pos[i, 2] = bw
                 pos[i, 3] = bh
             return y
-        sol = self._solve_band(band, w)
         if sol is None:
             y = ytop
             for ch in reversed(band):
@@ -703,15 +859,27 @@ class _ColumnOptimizer:
         return ytop - h_b
 
     def _place_unit_up(self, u: _Unit, x0: float, w: float, y0: float, pos: np.ndarray) -> float:
+        if not u.banded:
+            y = y0
+            for band in u.bands:
+                y = self._place_band_up(band, x0, w, y, pos)
+            return y
+        plan = self._band_solutions(u, w)[2]
         y = y0
-        for band in u.bands:
-            y = self._place_band_up(band, x0, w, y, pos)
+        for band_eff, sol in plan:
+            y = self._place_band_up(band_eff, x0, w, y, pos, sol)
         return y
 
     def _place_unit_down(self, u: _Unit, x0: float, w: float, ytop: float, pos: np.ndarray) -> float:
+        if not u.banded:
+            y = ytop
+            for band in reversed(u.bands):
+                y = self._place_band_down(band, x0, w, y, pos)
+            return y
+        plan = self._band_solutions(u, w)[2]
         y = ytop
-        for band in reversed(u.bands):
-            y = self._place_band_down(band, x0, w, y, pos)
+        for band_eff, sol in reversed(plan):
+            y = self._place_band_down(band_eff, x0, w, y, pos, sol)
         return y
 
     def _stack_column(self, ulist, x, w, pos):
@@ -728,7 +896,7 @@ class _ColumnOptimizer:
             u = units[k]
             done = False
             if u.anchors and has_locked:
-                uh = u.rigid_h + u.soft_area / w
+                uh = self._unit_h(u, w)
                 for (ax, ay, aw, ah) in u.anchors:
                     if not (ax < x + w - 1e-9 and ax + aw > x + 1e-9):
                         continue
@@ -765,34 +933,116 @@ class _ColumnOptimizer:
                     mids.append(k)
             normal = bottoms + mids + tops
 
+        # bottom pre-pass: when the column bottom is blocked by an obstacle, a
+        # bottom-tagged unit can still stand at y=0 in the strip beside it
+        if occupied and normal:
+            for k in list(normal):
+                u = units[k]
+                if not u.hasB or u.hasT:
+                    break
+                uh = self._unit_h(u, w)
+                if self._interval_free(occupied, 0.0, uh):
+                    break  # bottom is open; the normal flow handles it
+                if u.force is not None:
+                    break
+                sw = None
+                probe_h = uh
+                for _ in range(3):
+                    strip = self._band_strip(x, w, 0.0, probe_h, placed)
+                    if strip is None:
+                        sw = None
+                        break
+                    sw = strip
+                    nh = self._unit_h(u, strip[1])
+                    if abs(nh - probe_h) < 1e-6:
+                        probe_h = nh
+                        break
+                    probe_h = nh
+                if sw is None or u.max_rigid_w > sw[1] + 1e-9:
+                    break
+                final = self._band_strip(x, w, 0.0, probe_h, placed)
+                if final is None or final[1] < sw[1] - 1e-6:
+                    break
+                yt = self._place_unit_up(u, sw[0], sw[1], 0.0, pos)
+                self._add_interval(occupied, 0.0, yt)
+                placed.append((k, 0.0, yt))
+                normal.remove(k)
+                break
+
         col_top = 0.0
         if not occupied:
             cy = 0.0
-            for k in normal:
+            i = 0
+            nn = len(normal)
+            while i < nn:
+                k = normal[i]
                 u = units[k]
+                # pair two flat unconstrained soft singles side by side:
+                # exact fill, near-square blocks, half the stack height
+                if i + 1 < nn:
+                    k2 = normal[i + 1]
+                    u2 = units[k2]
+                    if (len(u.blocks) == 1 and len(u2.blocks) == 1
+                            and u.pairable and u2.pairable):
+                        a1 = u.soft_area
+                        a2 = u2.soft_area
+                        hp = (a1 + a2) / w
+                        if hp <= 0.85 * w:
+                            w1 = a1 / hp
+                            if 1.0 <= w1 <= w - 1.0:
+                                i1 = u.blocks[0]
+                                i2 = u2.blocks[0]
+                                pos[i1, 0] = x
+                                pos[i1, 1] = cy
+                                pos[i1, 2] = w1
+                                pos[i1, 3] = a1 / w1
+                                pos[i2, 0] = x + w1
+                                pos[i2, 1] = cy
+                                pos[i2, 2] = w - w1
+                                pos[i2, 3] = a2 / (w - w1)
+                                top = cy + hp
+                                placed.append((k, cy, top))
+                                placed.append((k2, cy, top))
+                                cy = top
+                                i += 2
+                                continue
                 yt = self._place_unit_up(u, x, w, cy, pos)
                 placed.append((k, cy, yt))
                 cy = yt
+                i += 1
             col_top = cy
         else:
-            segs = []
+            # Free segments, including "narrow" segments beside obstacles that
+            # only partially cover the column (the strip next to a preplaced
+            # block is usable at reduced width instead of being wasted).
+            segs = []  # (start, end, xoff, width)
             cur = 0.0
             for s, e in occupied:
                 if s > cur + 1e-9:
-                    segs.append((cur, s))
+                    segs.append((cur, s, x, w))
+                band_lo, band_hi = max(cur, s), e
+                strip = self._band_strip(x, w, band_lo, band_hi, placed)
+                if strip is not None:
+                    segs.append((band_lo, band_hi, strip[0], strip[1]))
                 cur = max(cur, e)
-            segs.append((cur, float('inf')))
+            segs.append((cur, float('inf'), x, w))
 
             si = 0
             cy = segs[0][0]
             pending = list(normal)
             while pending:
-                seg_end = segs[si][1]
+                _s, seg_end, seg_x, seg_w = segs[si]
                 pick = None
                 # first unit that fits the current gap (look ahead a few)
-                for t in range(min(len(pending), 8)):
+                narrow = seg_x > x + 1e-9 or seg_w < w - 1e-9
+                for t in range(min(len(pending), 10)):
                     u = units[pending[t]]
-                    if cy + u.rigid_h + u.soft_area / w <= seg_end + 1e-9:
+                    if u.max_rigid_w > seg_w + 1e-9:
+                        continue
+                    # left/right-forced units must keep the column's edge x
+                    if narrow and u.force is not None:
+                        continue
+                    if cy + self._unit_h(u, seg_w) <= seg_end + 1e-9:
                         pick = t
                         break
                 if pick is None:
@@ -801,13 +1051,43 @@ class _ColumnOptimizer:
                     continue
                 k = pending.pop(pick)
                 u = units[k]
-                yt = self._place_unit_up(u, x, w, cy, pos)
+                yt = self._place_unit_up(u, seg_x, seg_w, cy, pos)
                 placed.append((k, cy, yt))
                 cy = yt
             for (_k, _yb, yt) in placed:
                 if yt > col_top:
                     col_top = yt
         return placed, occupied, col_top
+
+    def _band_strip(self, x, w, lo, hi, placed_units):
+        """Widest free x-strip inside column [x, x+w] over the y-band
+        [lo, hi). Anchored units already placed span the full column width,
+        so any overlap with them blocks the band entirely. Returns
+        (xoff, width) or None when the strip is too narrow to be useful."""
+        if hi <= lo + 1e-6:
+            return None
+        for (_k, yb, yt) in placed_units:
+            if yb < hi - 1e-9 and yt > lo + 1e-9:
+                return None
+        left = x + w
+        right = x
+        for (ox, oy, ow, oh) in self.locked_rects:
+            if ox < x + w - 1e-9 and ox + ow > x + 1e-9 and oy < hi - 1e-9 and oy + oh > lo + 1e-9:
+                if ox < left:
+                    left = ox
+                if ox + ow > right:
+                    right = ox + ow
+        if right <= x:
+            return None
+        left_w = left - x
+        right_w = (x + w) - right
+        if right_w >= left_w:
+            xoff, sw = right, right_w
+        else:
+            xoff, sw = x, left_w
+        if sw < 0.30 * w or sw < 2.0:
+            return None
+        return (xoff, sw)
 
     @staticmethod
     def _interval_free(occ: List[List[float]], s: float, e: float) -> bool:
@@ -857,8 +1137,8 @@ class _ColumnOptimizer:
             max_w = 0.0
             for k in ulist:
                 u = units[k]
-                soft_a += u.soft_area
-                rigid_h += u.rigid_h
+                soft_a += u.eff_soft
+                rigid_h += u.eff_rigid_h
                 if u.max_rigid_w > max_w:
                     max_w = u.max_rigid_w
             avail = H - rigid_h
@@ -875,7 +1155,11 @@ class _ColumnOptimizer:
                     obs_h = 0.0
                     for s, e in obs:
                         if e > 0.0 and s < H:
-                            obs_h += (e if e < H else H) - (s if s > 0.0 else 0.0)
+                            span = (e if e < H else H) - (s if s > 0.0 else 0.0)
+                            strip = self._band_strip(x, w, s, e, ())
+                            if strip is not None:
+                                span *= 1.0 - strip[1] / w
+                            obs_h += span
                     avail = H - rigid_h - obs_h
                     if avail < 0.05 * H:
                         avail = 0.05 * H
@@ -894,7 +1178,7 @@ class _ColumnOptimizer:
             # only the soft part shrinks with width, so solve for it exactly
             if soft_a > 0:
                 tries = 0
-                while col_top > H * 1.003 and tries < 2:
+                while col_top > H * 1.0005 and tries < 3:
                     overhead = col_top - soft_a / w
                     if overhead < H * 0.98:
                         w2 = soft_a / (H - overhead)
@@ -956,13 +1240,20 @@ class _ColumnOptimizer:
                 for i in u.blocks:
                     if self.boundary[i] & 2:
                         nx = x_right - pos[i, 2]
-                        ok = True
-                        for (ox, oy, ow, oh) in self.locked_rects:
-                            if (nx < ox + ow - 1e-7 and ox < nx + pos[i, 2] - 1e-7
-                                    and pos[i, 1] < oy + oh - 1e-7 and oy < pos[i, 1] + pos[i, 3] - 1e-7):
-                                ok = False
-                                break
-                        if ok:
+                        if nx <= pos[i, 0] + 1e-9:
+                            continue
+                        # collision check against every other block (chunked
+                        # units may have siblings to the right)
+                        nx0, ny0 = nx, pos[i, 1]
+                        nx1, ny1 = x_right, pos[i, 1] + pos[i, 3]
+                        px0 = pos[:, 0]
+                        py0 = pos[:, 1]
+                        clash = ((px0 < nx1 - 1e-7)
+                                 & (px0 + pos[:, 2] > nx0 + 1e-7)
+                                 & (py0 < ny1 - 1e-7)
+                                 & (py0 + pos[:, 3] > ny0 + 1e-7))
+                        clash[i] = False
+                        if not clash.any():
                             pos[i, 0] = nx
 
         return pos, x_right, y_top
@@ -1036,7 +1327,7 @@ class _ColumnOptimizer:
         area = (x_right - x_min) * (y_top - y_min)
         V = self._violations(pos)
         c = (1.0 + 0.5 * ((hp / self.hp_ref - 1.0) + max(0.0, area / self.area_ref - 1.0))) \
-            * math.exp(2.0 * V / self.n_soft_den)
+            * math.exp(2.0 * self.v_weight * V / self.n_soft_den)
         return c, hp, area, V
 
     def _evaluate(self, cols):
@@ -1197,10 +1488,35 @@ class _ColumnOptimizer:
         start = time.time()
         span = max(deadline - start, 1e-6)
         recal_at = [start + 0.25 * span, start + 0.55 * span] if recalibrate else []
+        # Late-phase violation-weight annealing (PARTNER_VW_ANNEAL > current
+        # v_weight enables): run most of the anneal at the true cost, then
+        # reprice violations upward near the end to squeeze the survivors
+        # out while there is still time to recover wirelength.  The weight
+        # is restored (and best_cost re-scored) before returning, so
+        # cross-restart selection stays weight-consistent.
+        vw0 = self.v_weight
+        try:
+            vw_end = float(_os.environ.get("PARTNER_VW_ANNEAL", "0") or 0)
+            vw_frac = float(_os.environ.get("PARTNER_VW_ANNEAL_AT", "0.7"))
+        except ValueError:
+            vw_end, vw_frac = 0.0, 0.7
+        vw_at = (start + vw_frac * span) if vw_end > vw0 else None
         while True:
             now = time.time()
             if now >= deadline:
                 break
+            if vw_at is not None and now >= vw_at:
+                vw_at = None
+                pos, xr, yt = self._layout(cols)
+                if self._violations(pos) > 0:
+                    self.v_weight = vw_end
+                    cur_cost, _, _, _ = self._cost(pos, xr, yt)
+                    bcols = self._restore(best)
+                    bpos, bxr, byt = self._layout(bcols)
+                    best_cost, _, _, _ = self._cost(bpos, bxr, byt)
+                    if best_cost < cur_cost:
+                        cols = bcols
+                        cur_cost = best_cost
             if recal_at and now >= recal_at[0]:
                 recal_at.pop(0)
                 # tighten the HPWL normalizer toward the (unknown) baseline so
@@ -1229,6 +1545,13 @@ class _ColumnOptimizer:
                         best = self._snapshot(cols)
                 else:
                     undo()
+        if self.v_weight != vw0:
+            # restore the true-cost weight and re-score the returned best so
+            # callers compare restarts on a consistent objective
+            self.v_weight = vw0
+            bcols = self._restore(best)
+            bpos, bxr, byt = self._layout(bcols)
+            best_cost, _, _, _ = self._cost(bpos, bxr, byt)
         return best, best_cost
 
     # ------------------------------------------------------------------
@@ -1262,19 +1585,62 @@ class _ColumnOptimizer:
         self._best_probe = results[0]
         return results[0][0]
 
-    def finish(self, deadline: float) -> List[Rect]:
+    def finish(self, deadline: float, max_runs: int = 2) -> List[Rect]:
         n = self.n
         if self._best_probe is not None:
-            cur_cost = self._best_probe[0]
-            cols = self._restore(self._best_probe[1])
+            start_snap = self._best_probe[1]
         else:
-            cur_cost = self._cost0
-            cols = self._cols
-        polish_t = min(0.25 * max(deadline - time.time(), 0.0), 5.0)
-        snap, bc = self._anneal(cols, deadline - polish_t, cur_cost, recalibrate=True)
-        cols = self._restore(snap)
-        cols = self._greedy_polish(cols, bc, deadline)
-        pos, _xr, _yt = self._layout(cols)
+            start_snap = self._snapshot(self._cols)
+        rem = max(deadline - time.time(), 0.0)
+        import os as _os
+        _rf = float(_os.environ.get('REFINE_FRAC', 0.30))
+        _rc = float(_os.environ.get('REFINE_CAP', 7.0))
+        refine_t = min(_rf * rem, _rc) if rem > 1.0 else 0.0
+        polish_t = min(0.28 * max(rem - refine_t, 0.0), 6.5)
+        t_end = deadline - polish_t - refine_t
+        now = time.time()
+        total = max(t_end - now, 0.1)
+        runs = 2 if (total > 6.0 and max_runs >= 2) else 1
+        snaps = []
+        for r in range(runs):
+            cols_r = self._restore(start_snap)
+            c_r, _ = self._evaluate(cols_r)
+            snap, _bc = self._anneal(cols_r, now + total * (r + 1) / runs, c_r,
+                                     recalibrate=True)
+            snaps.append(snap)
+        # pick the better run under one common (final) normalizer
+        best_cols = None
+        best_c = None
+        for snap in snaps:
+            cols_c = self._restore(snap)
+            c_c, _ = self._evaluate(cols_c)
+            if best_c is None or c_c < best_c:
+                best_c = c_c
+                best_cols = [list(c) for c in cols_c]
+                best_snap = snap
+        cols = self._restore(best_snap)
+        cols = self._greedy_polish(cols, best_c, deadline - refine_t)
+        pos, x_right, y_top = self._layout(cols)
+        # stage-2 continuous refinement (constraint-graph / weighted-median);
+        # accepted only if the shared proxy cost does not regress
+        if refine_t > 0.05 and time.time() < deadline - 0.1:
+            try:
+                from refiner_claude import refine_positions
+                pos2 = refine_positions(self, pos, deadline - 0.05,
+                                        seed=self.rng.randrange(1 << 30))
+                if pos2 is not None:
+                    c_old, _, _, _ = self._cost(pos, x_right, y_top)
+                    xr2 = float((pos2[:, 0] + pos2[:, 2]).max())
+                    yt2 = float((pos2[:, 1] + pos2[:, 3]).max())
+                    c_new, _, _, _ = self._cost(pos2, xr2, yt2)
+                    if c_new <= c_old:
+                        pos, x_right, y_top = pos2, xr2, yt2
+            except Exception:
+                pass
+        hp = self._hpwl(pos)
+        V = self._violations(pos)
+        area = (x_right - float(pos[:, 0].min())) * (y_top - float(pos[:, 1].min()))
+        self.final_metrics = (hp, area, V)
         out = [(float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2]), float(pos[i, 3]))
                for i in range(n)]
         return _ensure_no_overlap(out, [self.kind[i] == 2 for i in range(n)])
@@ -1326,11 +1692,172 @@ class _ColumnOptimizer:
                         cur_cost = c
         return cur_cost
 
+    def _repair_boundary(self, cols, cur_cost, deadline):
+        """Relocate units whose bottom/top-tagged blocks miss their edge."""
+        pos, _xr, _yt = self._layout(cols)
+        py0 = pos[:, 1]
+        py1 = py0 + pos[:, 3]
+        y_min = py0.min()
+        y_max = py1.max()
+        bad_units = []
+        for i, code in zip(self._bnd_idx, self._bnd_codes):
+            k = self.blk_unit[int(i)]
+            if k < 0:
+                continue
+            if (code & 8) and abs(py0[i] - y_min) >= 1e-6:
+                bad_units.append((k, 0))
+            elif (code & 4) and abs(py1[i] - y_max) >= 1e-6:
+                bad_units.append((k, -1))
+        seen = set()
+        for k, where in bad_units:
+            if k in seen or time.time() >= deadline:
+                continue
+            seen.add(k)
+            u = self.units[k]
+            sc = self._unit_col[k]
+            if sc >= len(cols):
+                continue
+            try:
+                si = cols[sc].index(k)
+            except ValueError:
+                continue
+            best = None
+            for tc in range(len(cols)):
+                if u.force == 'L' and tc != 0:
+                    continue
+                if u.force == 'R' and tc != len(cols) - 1:
+                    continue
+                cols[sc].pop(si)
+                ti = 0 if where == 0 else len(cols[tc])
+                cols[tc].insert(ti, k)
+                c, _ = self._evaluate(cols)
+                cols[tc].pop(ti)
+                cols[sc].insert(si, k)
+                if c < cur_cost - 1e-9 and (best is None or c < best[0]):
+                    best = (c, tc, ti)
+            if best is not None:
+                c, tc, ti = best
+                cols[sc].pop(si)
+                cols[tc].insert(ti, k)
+                cur_cost = c
+        return cur_cost
+
+    def _order_pass(self, cols, cur_cost, deadline):
+        """Reorder each column by the connectivity-weighted target y of its
+        units, and try swapping adjacent columns; keep strict improvements."""
+        pos, _xr, _yt = self._layout(cols)
+        n = self.n
+        cy = pos[:, 1] + pos[:, 3] * 0.5
+        num = np.zeros(n)
+        den = np.zeros(n)
+        if len(self.eI):
+            np.add.at(num, self.eI, self.eW * cy[self.eJ])
+            np.add.at(den, self.eI, self.eW)
+            np.add.at(num, self.eJ, self.eW * cy[self.eI])
+            np.add.at(den, self.eJ, self.eW)
+        if len(self.pB):
+            np.add.at(num, self.pB, self.pW * self.pY)
+            np.add.at(den, self.pB, self.pW)
+        pull = np.where(den > 1e-12, num / np.maximum(den, 1e-12), cy)
+        for ci in range(len(cols)):
+            if len(cols[ci]) < 3 or time.time() >= deadline:
+                continue
+            def tkey(k):
+                u = self.units[k]
+                s = 0.0
+                a = 0.0
+                for i in u.blocks:
+                    ai = self.areas[i]
+                    s += ai * pull[i]
+                    a += ai
+                return s / max(a, 1e-9)
+            new_order = sorted(cols[ci], key=tkey)
+            if new_order != cols[ci]:
+                old = cols[ci][:]
+                cols[ci][:] = new_order
+                c, _ = self._evaluate(cols)
+                if c < cur_cost - 1e-9:
+                    cur_cost = c
+                else:
+                    cols[ci][:] = old
+        for ci in range(len(cols) - 1):
+            if time.time() >= deadline:
+                break
+            # never displace edge-forced units from their edge column
+            if any(self.units[k].force for k in cols[ci]) or \
+                    any(self.units[k].force for k in cols[ci + 1]):
+                continue
+            cols[ci], cols[ci + 1] = cols[ci + 1], cols[ci]
+            c, _ = self._evaluate(cols)
+            if c < cur_cost - 1e-9:
+                cur_cost = c
+            else:
+                cols[ci], cols[ci + 1] = cols[ci + 1], cols[ci]
+        return cur_cost
+
+    def _reduce_overflow(self, cols, cur_cost, deadline):
+        """When columns rise past the (possibly pinned) frame height, move
+        their topmost unit somewhere cheaper."""
+        units = self.units
+        for _round in range(6):
+            if time.time() >= deadline:
+                break
+            pos, _xr, yt = self._layout(cols)
+            if yt <= self.H * 1.0001:
+                break
+            moved = False
+            tops = []
+            for ci, ulist in enumerate(cols):
+                if not ulist:
+                    continue
+                top = max(pos[i, 1] + pos[i, 3] for k in ulist for i in units[k].blocks)
+                if top > self.H * 1.0001:
+                    tops.append((top, ci))
+            tops.sort(reverse=True)
+            for _t, sc in tops[:2]:
+                ktop = max(cols[sc],
+                           key=lambda k: max(pos[i, 1] + pos[i, 3] for i in units[k].blocks))
+                si = cols[sc].index(ktop)
+                u = units[ktop]
+                best = None
+                for tc in range(len(cols)):
+                    if tc == sc:
+                        continue
+                    if u.force == 'L' and tc != 0:
+                        continue
+                    if u.force == 'R' and tc != len(cols) - 1:
+                        continue
+                    for ti in (0, len(cols[tc])):
+                        cols[sc].pop(si)
+                        ti2 = min(ti, len(cols[tc]))
+                        cols[tc].insert(ti2, ktop)
+                        c, _ = self._evaluate(cols)
+                        cols[tc].pop(ti2)
+                        cols[sc].insert(si, ktop)
+                        if c < cur_cost - 1e-9 and (best is None or c < best[0]):
+                            best = (c, tc, ti2)
+                if best is not None:
+                    c, tc, ti2 = best
+                    cols[sc].pop(si)
+                    cols[tc].insert(ti2, ktop)
+                    cur_cost = c
+                    moved = True
+            if not moved:
+                break
+        return cur_cost
+
     def _greedy_polish(self, cols, cur_cost, deadline):
         """Final best-improvement sweeps: for every unit try a handful of
         (column, position) relocations and keep strict improvements."""
         cur_cost, _ = self._evaluate(cols)
+        cur_cost = self._reduce_overflow(cols, cur_cost, deadline)
+        cur_cost = self._repair_boundary(cols, cur_cost, deadline)
         cur_cost = self._spread_tagged(cols, cur_cost, deadline)
+        for _ in range(3):
+            before = cur_cost
+            cur_cost = self._order_pass(cols, cur_cost, deadline)
+            if cur_cost > before - 1e-9 or time.time() >= deadline:
+                break
         rng = self.rng
         order = list(range(len(self.units)))
         improved = True
@@ -1419,6 +1946,850 @@ def _ensure_no_overlap(rects: List[Rect], locked: List[bool]) -> List[Rect]:
 
 
 # =============================================================================
+# Parallel restart pool
+# =============================================================================
+_POOL = None
+_POOL_SIZE = 0
+_POOL_READY = False
+
+
+def _worker_init():
+    import os
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+
+def _worker_ping(_i):
+    time.sleep(0.2)
+    return True
+
+
+def init_worker_pool(n_workers: int = 8, warmup_timeout: float = 180.0):
+    """Create the restart pool once and wait until every worker has finished
+    importing (call from optimizer __init__ so the spawn/import cost is not
+    charged to any test case)."""
+    global _POOL, _POOL_SIZE, _POOL_READY
+    if _POOL is not None or n_workers < 2:
+        return
+    try:
+        import multiprocessing as mp
+        # fork: no re-import of __main__, no per-worker torch import cost.
+        # Workers never touch CUDA, so forking a CUDA-initialized parent is
+        # safe (same pattern as torch DataLoader workers).
+        ctx = mp.get_context('fork')
+        _POOL = ctx.Pool(n_workers, initializer=_worker_init)
+        _POOL_SIZE = n_workers
+        r = _POOL.map_async(_worker_ping, range(n_workers * 3), chunksize=1)
+        r.get(timeout=warmup_timeout)
+        _POOL_READY = True
+    except Exception:
+        _shutdown_pool()
+
+
+def _shutdown_pool():
+    global _POOL, _POOL_SIZE, _POOL_READY
+    try:
+        if _POOL is not None:
+            _POOL.terminate()
+    except Exception:
+        pass
+    _POOL = None
+    _POOL_SIZE = 0
+    _POOL_READY = False
+
+
+def _perimeter_pack(opt, seed_rects, max_aspect=8.0):
+    """Explicit perimeter packing for boundary-coded blocks.
+
+    The worst validation cases are boundary-dense and wall-saturated
+    (25-30% of blocks carry wall codes, wall demand at 85-95% of
+    capacity); the legalization ladder drops tag pins there and the SA
+    move set cannot recover.  This solves each wall line explicitly:
+    corner-coded blocks sit exactly in their corners, single-wall blocks
+    pack along the wall in seed order (net pull), soft blocks shrink
+    along the wall (exact area, aspect-capped) when a line overflows,
+    and the frame grows minimally when shrinking is not enough (unless a
+    preplaced boundary block pins that dimension).
+
+    Returns ({i: (x, y, w, h)}, W, H, n_unpacked) or None when the
+    instance has no useful perimeter structure.
+    """
+    n = opt.n
+    movable_bnd = [(i, opt.boundary[i]) for i in range(n)
+                   if opt.boundary[i] > 0 and opt.kind[i] != 2]
+    if len(movable_bnd) < 4:
+        return None
+    W = float(opt.W_est)
+    H = float(opt.H)
+    # preplaced boundary blocks reveal the intended frame exactly: snap to
+    # the majority extent so their own wall codes stay satisfiable (an
+    # off-majority preplaced code is structurally unsatisfiable and is a
+    # violation floor baked into the instance)
+    fx = [float(opt.lx[i] + opt.rw[i]) for i in range(n)
+          if opt.kind[i] == 2 and (opt.boundary[i] & 2)]
+    fy = [float(opt.ly[i] + opt.rh[i]) for i in range(n)
+          if opt.kind[i] == 2 and (opt.boundary[i] & 4)]
+    if fx:
+        W = max(fx)
+    if fy:
+        H = max(fy)
+    for (x, y, w, h) in opt.locked_rects:
+        W = max(W, x + w)
+        H = max(H, y + h)
+    h_pinned = bool(fy)
+    w_pinned = bool(fx)
+
+    def shape(i):
+        if opt.kind[i] == 1:
+            return float(opt.rw[i]), float(opt.rh[i])
+        x, y, w, h = seed_rects[i]
+        if w > 0 and h > 0 and abs(w * h - opt.areas[i]) < 0.5 * opt.areas[i]:
+            return float(w), float(h)
+        s = math.sqrt(opt.areas[i])
+        return s, s
+
+    def seed_c(i, axis):
+        x, y, w, h = seed_rects[i]
+        return float(x + 0.5 * w) if axis == 0 else float(y + 0.5 * h)
+
+    # --- corners: at most one block per corner (largest area wins) -----
+    corner_of = {}   # (xbit, ybit) -> block
+    unpacked = 0
+    for i, code in movable_bnd:
+        xb = code & 3
+        yb = code & 12
+        if xb in (1, 2) and yb in (4, 8):
+            key = (xb, yb)
+            j = corner_of.get(key)
+            if j is None or opt.areas[i] > opt.areas[j]:
+                if j is not None:
+                    unpacked += 1
+                corner_of[key] = i
+            else:
+                unpacked += 1
+    corner_ids = set(corner_of.values())
+
+    # --- wall membership -------------------------------------------------
+    def wall_items(bit):
+        out = []
+        for i, code in movable_bnd:
+            if i in corner_ids:
+                continue
+            if (code & 3) == bit or (code & 12) == bit:
+                # pure single-wall blocks only (odd double-x/-y codes are
+                # left to the generic machinery)
+                if code in (1, 2, 4, 8):
+                    out.append(i)
+        return out
+
+    walls = {'L': wall_items(1), 'R': wall_items(2),
+             'T': wall_items(4), 'B': wall_items(8)}
+
+    def along(i, vertical):
+        w, h = shape(i)
+        return h if vertical else w
+
+    def min_along(i, vertical):
+        if opt.kind[i] == 1:
+            return along(i, vertical)
+        return math.sqrt(opt.areas[i] / max_aspect)
+
+    # --- required span per wall (corners occupy both their walls) -------
+    def corner_span(wall):
+        s = 0.0
+        for (xb, yb), i in corner_of.items():
+            w, h = shape(i)
+            if wall == 'L' and xb == 1:
+                s += h
+            elif wall == 'R' and xb == 2:
+                s += h
+            elif wall == 'T' and yb == 4:
+                s += w
+            elif wall == 'B' and yb == 8:
+                s += w
+        return s
+
+    def locked_span(wall):
+        s = 0.0
+        eps = 1e-6
+        for i in range(n):
+            if opt.kind[i] != 2:
+                continue
+            x, y, w, h = opt.lx[i], opt.ly[i], opt.rw[i], opt.rh[i]
+            if wall == 'L' and abs(x) < eps:
+                s += h
+            elif wall == 'R' and abs(x + w - W) < eps:
+                s += h
+            elif wall == 'B' and abs(y) < eps:
+                s += w
+            elif wall == 'T' and abs(y + h - H) < eps:
+                s += w
+        return s
+
+    def line_need(wall, shrink):
+        vertical = wall in ('L', 'R')
+        tot = corner_span(wall) + locked_span(wall)
+        for i in walls[wall]:
+            tot += (min_along(i, vertical) if shrink
+                    else along(i, vertical))
+        return tot
+
+    # grow H for L/R demand, W for T/B demand (respect pins)
+    need_h = max(line_need('L', True), line_need('R', True))
+    if need_h > H + 1e-9:
+        if h_pinned:
+            return None
+        H = need_h * 1.001
+    need_w = max(line_need('T', True), line_need('B', True))
+    if need_w > W + 1e-9:
+        if w_pinned:
+            return None
+        W = need_w * 1.001
+
+    # --- place each wall line -------------------------------------------
+    pack = {}
+
+    def place_wall(wall):
+        vertical = wall in ('L', 'R')
+        span = H if vertical else W
+        # fixed occupations: corners + locked-on-wall
+        occ = []
+        for (xb, yb), i in corner_of.items():
+            w, h = shape(i)
+            on = ((wall == 'L' and xb == 1) or (wall == 'R' and xb == 2)
+                  or (wall == 'T' and yb == 4) or (wall == 'B' and yb == 8))
+            if not on:
+                continue
+            a = h if vertical else w
+            lo = 0.0 if (yb == 8 if vertical else xb == 1) else span - a
+            occ.append((lo, lo + a))
+            if i not in pack:
+                x = (0.0 if xb == 1 else W - w)
+                y = (0.0 if yb == 8 else H - h)
+                pack[i] = (x, y, w, h)
+        # anything intruding into the wall band blocks that stretch of the
+        # line: locked blocks AND ring blocks packed on earlier walls
+        # (corner regions overlap between adjacent walls)
+        depth = 0.0
+        for i in walls[wall]:
+            w0, h0 = shape(i)
+            depth = max(depth, w0 if vertical else h0)
+        obstacles = []
+        for j in range(n):
+            if opt.kind[j] == 2:
+                obstacles.append((opt.lx[j], opt.ly[j],
+                                  opt.rw[j], opt.rh[j]))
+            elif j in pack and j not in walls[wall]:
+                obstacles.append(pack[j])
+        for (x, y, w, h) in obstacles:
+            if vertical:
+                lo_p, hi_p = (0.0, depth) if wall == 'L' else (W - depth, W)
+                if min(x + w, hi_p) - max(x, lo_p) > 1e-9:
+                    occ.append((y, y + h))
+            else:
+                lo_p, hi_p = (0.0, depth) if wall == 'B' else (H - depth, H)
+                if min(y + h, hi_p) - max(y, lo_p) > 1e-9:
+                    occ.append((x, x + w))
+        occ.sort()
+        segs = []
+        cur = 0.0
+        for s, e in occ:
+            if s > cur + 1e-12:
+                segs.append([cur, min(s, span)])
+            cur = max(cur, e)
+        if cur < span - 1e-12:
+            segs.append([cur, span])
+        items = sorted(walls[wall], key=lambda i: seed_c(i, 1 if vertical else 0))
+        free = sum(e - s for s, e in segs)
+        base = sum(along(i, vertical) for i in items)
+        ratio = 1.0
+        if base > free - 1e-9:
+            lo = sum(min_along(i, vertical) for i in items)
+            if lo > free + 1e-9:
+                if _os.environ.get("PERI_DEBUG"):
+                    print(f"[peri] wall {wall}: min sizes {lo:.1f} > free "
+                          f"{free:.1f}", flush=True)
+                return False
+            # proportional shrink of the soft slack
+            slack = base - lo
+            ratio = 0.0 if slack <= 1e-12 else (free * 0.999 - lo) / slack
+
+        def eff_of(i, r):
+            a = along(i, vertical)
+            m = min_along(i, vertical)
+            return m + (a - m) * max(0.0, min(r, 1.0))
+
+        def first_fit(r):
+            si = 0
+            cursor = segs[0][0] if segs else 0.0
+            got = {}
+            for i in items:
+                a = eff_of(i, r)
+                while si < len(segs) and cursor + a > segs[si][1] + 1e-9:
+                    si += 1
+                    if si < len(segs):
+                        cursor = segs[si][0]
+                if si >= len(segs):
+                    return None
+                got[i] = (si, cursor)
+                cursor += a
+            return got
+
+        # fragmentation can defeat seed-order first-fit even when the
+        # totals fit; retry down a shrink ladder (sizes floor at the
+        # aspect-capped minimum)
+        placed = None
+        r_used = min(ratio, 1.0)
+        for r in (r_used, 0.92 * r_used, 0.82 * r_used, 0.7 * r_used,
+                  0.5 * r_used, 0.0):
+            placed = first_fit(r)
+            if placed is not None:
+                r_used = r
+                break
+        if placed is None:
+            if _os.environ.get("PERI_DEBUG"):
+                print(f"[peri] wall {wall}: first-fit fail "
+                      f"segs={[(round(s, 1), round(e, 1)) for s, e in segs]}",
+                      flush=True)
+            return False
+
+        def eff(i):
+            return eff_of(i, r_used)
+        by_seg = {}
+        for i, (sj, pos) in placed.items():
+            by_seg.setdefault(sj, []).append(i)
+        for sj, js in by_seg.items():
+            js.sort(key=lambda i: placed[i][1])
+            limit = segs[sj][1]
+            for i in reversed(js):
+                a = eff(i)
+                desired = seed_c(i, 1 if vertical else 0) - 0.5 * a
+                pos = min(max(desired, placed[i][1]), limit - a)
+                placed[i] = (sj, pos)
+                limit = pos
+        for i in items:
+            a = eff(i)
+            if opt.kind[i] == 0:
+                perp = opt.areas[i] / a
+            else:
+                w, h = shape(i)
+                perp = w if vertical else h
+            pos = placed[i][1]
+            if wall == 'L':
+                pack[i] = (0.0, pos, perp, a)
+            elif wall == 'R':
+                pack[i] = (W - perp, pos, perp, a)
+            elif wall == 'B':
+                pack[i] = (pos, 0.0, a, perp)
+            else:
+                pack[i] = (pos, H - perp, a, perp)
+        return True
+
+    for wall in ('L', 'R', 'B', 'T'):
+        if not place_wall(wall):
+            return None
+    return pack, W, H, unpacked
+
+
+def _perimeter_seed_layouts(opt, seed_rects, variants=2):
+    """Composed seed layouts for the direct-refine channel: the perimeter
+    ring solved exactly by _perimeter_pack, the interior shelf-packed into
+    the inner rectangle (seed order = net pull).  The compositions are
+    imperfect on purpose — refine_prediction's tag seeding pins the
+    already-satisfied wall blocks and its min-displacement legalization
+    cleans the interior, which is exactly the job it does for
+    direct-model predictions."""
+    got = _perimeter_pack(opt, seed_rects)
+    if got is None:
+        return []
+    pk, W, H, _un = got
+    n = opt.n
+    base = np.zeros((n, 4), dtype=np.float64)
+    for i in range(n):
+        if opt.kind[i] == 2:
+            base[i] = (opt.lx[i], opt.ly[i], opt.rw[i], opt.rh[i])
+    for i, r in pk.items():
+        base[i] = r
+    # inner rectangle: clear of every ring block's depth on its wall
+    dL = dR = dB = dT = 0.0
+    for i, (x, y, w, h) in pk.items():
+        if x <= 1e-9:
+            dL = max(dL, w)
+        if x + w >= W - 1e-6:
+            dR = max(dR, w)
+        if y <= 1e-9:
+            dB = max(dB, h)
+        if y + h >= H - 1e-6:
+            dT = max(dT, h)
+    ix0, ix1 = dL, W - dR
+    iy0, iy1 = dB, H - dT
+    if ix1 - ix0 < 1.0 or iy1 - iy0 < 1.0:
+        return []
+    interior = [i for i in range(n) if opt.kind[i] != 2 and i not in pk]
+
+    def seed_c(i, axis):
+        x, y, w, h = seed_rects[i]
+        return float(x + 0.5 * w) if axis == 0 else float(y + 0.5 * h)
+
+    def shp(i):
+        x, y, w, h = seed_rects[i]
+        if w > 0 and h > 0 and abs(w * h - opt.areas[i]) < 0.5 * opt.areas[i]:
+            return float(w), float(h)
+        s = math.sqrt(opt.areas[i])
+        return s, s
+
+    # cluster-aware entities: movable cluster members travel together as a
+    # meta-square (refine_prediction's cluster reassembly only needs the
+    # members NEAR each other to rebuild exact contact); groups that have a
+    # locked/ring member are anchored at that member instead of shelf flow
+    interior_set = set(interior)
+    entities = []       # (members, area, cx, cy)
+    anchored = []       # (members, area, ax, ay)
+    used = set()
+    for idxs in opt.cluster_groups.values():
+        mem = [i for i in idxs if i in interior_set]
+        if len(mem) < 2:
+            continue
+        used.update(mem)
+        area = sum(opt.areas[i] for i in mem)
+        mates = [i for i in idxs if i not in interior_set]
+        if mates:
+            ax = sum(float(base[i, 0] + 0.5 * base[i, 2]) for i in mates) / len(mates)
+            ay = sum(float(base[i, 1] + 0.5 * base[i, 3]) for i in mates) / len(mates)
+            anchored.append((mem, area, ax, ay))
+        else:
+            cx = sum(seed_c(i, 0) for i in mem) / len(mem)
+            cy = sum(seed_c(i, 1) for i in mem) / len(mem)
+            entities.append((mem, area, cx, cy))
+    for i in interior:
+        if i not in used:
+            entities.append(([i], opt.areas[i], seed_c(i, 0), seed_c(i, 1)))
+
+    def fill_members(P, mem, x0, y0, side):
+        """Row-fill members inside a meta-square at (x0, y0)."""
+        order = sorted(mem, key=lambda i: (seed_c(i, 1), seed_c(i, 0)))
+        cx, cy, row_h = x0, y0, 0.0
+        for i in order:
+            w, h = shp(i)
+            if cx + w > x0 + side + 1e-9 and cx > x0 + 1e-9:
+                cy += row_h
+                cx, row_h = x0, 0.0
+            P[i] = (cx, cy, w, h)
+            cx += w
+            row_h = max(row_h, h)
+
+    outs = []
+    for v in range(variants):
+        P = base.copy()
+        axis = v % 2
+        items = sorted(entities, key=lambda e: (e[2 + axis], e[3 - axis]))
+        cx, cy, run = ix0, iy0, 0.0
+        for mem, area, _sx, _sy in items:
+            side = math.sqrt(max(area, 1e-9)) * (1.15 if len(mem) > 1 else 1.0)
+            if len(mem) == 1:
+                side_w, side_h = shp(mem[0])
+            else:
+                side_w = side_h = side
+            if axis == 0:   # horizontal shelves
+                if cx + side_w > ix1 + 1e-9 and cx > ix0 + 1e-9:
+                    cy += run
+                    cx, run = ix0, 0.0
+                px, py = cx, cy
+                cx += side_w
+                run = max(run, side_h)
+            else:           # vertical shelves
+                if cy + side_h > iy1 + 1e-9 and cy > iy0 + 1e-9:
+                    cx += run
+                    cy, run = iy0, 0.0
+                px, py = cx, cy
+                cy += side_h
+                run = max(run, side_w)
+            if len(mem) == 1:
+                w, h = shp(mem[0])
+                P[mem[0]] = (px, py, w, h)
+            else:
+                fill_members(P, mem, px, py, side)
+        for mem, area, ax, ay in anchored:
+            side = math.sqrt(max(area, 1e-9)) * 1.15
+            px = min(max(ax - 0.5 * side, ix0), max(ix1 - side, ix0))
+            py = min(max(ay - 0.5 * side, iy0), max(iy1 - side, iy0))
+            fill_members(P, mem, px, py, side)
+        outs.append(P)
+    return outs
+
+
+def _worker_solve(args):
+    """One independent (orientation, column count, seed) restart."""
+    try:
+        (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
+         orient, c_force, seed, deadline, v_weight, h_scale) = args
+        at = torch.from_numpy(areas_np)
+        cons = torch.from_numpy(cons_np) if cons_np is not None else None
+        tpos = torch.from_numpy(tpos_np) if tpos_np is not None else None
+        b2b = torch.from_numpy(b2b_np) if b2b_np is not None else None
+        p2b = torch.from_numpy(p2b_np) if p2b_np is not None else None
+        pins = torch.from_numpy(pins_np) if pins_np is not None else None
+        rs = rects
+        if orient == 'T':
+            rs, cons, tpos, pins = _transpose_inputs(rects, cons, tpos, pins)
+        opt = _ColumnOptimizer(rs, at, cons, tpos, b2b, p2b, pins, deadline,
+                               seed=seed, v_weight=v_weight, h_scale=h_scale)
+        if orient == 'P':
+            got = _perimeter_pack(opt, rs)
+            if got is not None and got[0]:
+                opt = _ColumnOptimizer(rs, at, cons, tpos, b2b, p2b, pins,
+                                       deadline, seed=seed,
+                                       v_weight=v_weight, h_scale=h_scale,
+                                       pinned=got[0])
+        if opt.locked_only():
+            out = opt.locked_positions()
+            return (out, 0.0, 0.0, 0)
+        opt.prepare()
+        if c_force is not None:
+            c_use = max(2, min(18, c_force))
+            if c_use != opt.C0:
+                opt.C0 = c_use
+                cols = opt._init_columns(c_use)
+                c0, _ = opt._evaluate(cols)
+                opt._cols = cols
+                opt._cost0 = c0
+        out = opt.finish(deadline, max_runs=1)
+        hp, area, V = opt.final_metrics
+        if orient == 'T':
+            out = [(y, x, h, w) for (x, y, w, h) in out]
+        return (out, hp, area, V)
+    except Exception:
+        return None
+
+
+def _worker_refine(args):
+    """Legalize+refine one direct-model prediction with a full worker
+    budget (the in-process thread used to slice one budget across
+    candidates, so most predictions never got refined at all)."""
+    try:
+        (pred, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
+         deadline, seed, v_weight, tag_anchor) = args
+        from refiner_claude import refine_prediction, full_violations
+        at = torch.from_numpy(areas_np)
+        cons = torch.from_numpy(cons_np) if cons_np is not None else None
+        tpos = torch.from_numpy(tpos_np) if tpos_np is not None else None
+        b2b = torch.from_numpy(b2b_np) if b2b_np is not None else None
+        p2b = torch.from_numpy(p2b_np) if p2b_np is not None else None
+        pins = torch.from_numpy(pins_np) if pins_np is not None else None
+        rect_list = [tuple(map(float, pred[i])) for i in range(len(pred))]
+        opt = _ColumnOptimizer(rect_list, at, cons, tpos, b2b, p2b, pins,
+                               deadline, seed=seed, v_weight=v_weight)
+        opt._tag_anchor = bool(tag_anchor)
+        out = refine_prediction(opt, pred, deadline, seed=seed + 10)
+        if out is None:
+            return None
+        pos = np.asarray(out, dtype=np.float64)
+        hp = opt._hpwl(pos)
+        area = float(((pos[:, 0] + pos[:, 2]).max() - pos[:, 0].min())
+                     * ((pos[:, 1] + pos[:, 3]).max() - pos[:, 1].min()))
+        V = full_violations(opt, pos)
+        lst = [tuple(map(float, pos[i])) for i in range(len(pos))]
+        return (lst, hp, area, V)
+    except Exception:
+        return None
+
+
+def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
+                    b2b, p2b, pins, deadline, seed, sample_fn=None):
+    avg_area = opt1.total_area / max(opt1.n, 1)
+    C0 = max(2, min(18, int(round(opt1.W_est / max(math.sqrt(avg_area), 2.0)))))
+    hard_n = sum(1 for u in opt1.units if u.hasB) + sum(1 for u in opt1.units if u.hasT)
+    hard_t = sum(1 for u in opt1.units if u.force == 'L') + \
+        sum(1 for u in opt1.units if u.force == 'R')
+    allow_t = hard_t <= hard_n + 2
+
+    # portfolio: mixed column counts / seeds / frame heights, plus
+    # violation-averse searchers (layouts compete under true cost at selection)
+    configs = [('N', None, seed + 11, 1.0, 1.0), ('N', C0 - 1, seed + 22, 1.0, 1.0),
+               ('N', C0 + 1, seed + 33, 1.0, 1.0), ('N', None, seed + 44, 2.5, 1.0),
+               ('N', C0 - 2, seed + 55, 1.0, 1.0), ('N', C0 + 2, seed + 66, 1.0, 1.0),
+               ('N', None, seed + 77, 2.5, 1.0), ('N', C0 - 1, seed + 88, 1.0, 1.0),
+               ('N', None, seed + 99, 1.0, 1.0), ('N', C0 + 1, seed + 110, 1.0, 1.0),
+               ('N', C0, seed + 121, 2.5, 1.0), ('N', C0 - 1, seed + 132, 1.0, 1.0)]
+    if allow_t:
+        configs[5] = ('T', None, seed + 66, 1.0, 1.0)
+        configs[7] = ('T', None, seed + 88, 2.5, 1.0)
+        configs[9] = ('T', C0 + 1, seed + 110, 1.0, 1.0)
+    extra = [('N', None, seed + 143, 1.0, 0.90), ('N', C0, seed + 154, 1.0, 1.10),
+             ('N', C0 + 1, seed + 165, 2.5, 1.0), ('N', C0 - 1, seed + 176, 1.0, 0.90),
+             ('N', None, seed + 187, 1.0, 1.10), ('N', C0 + 2, seed + 198, 1.0, 1.0),
+             ('N', C0 - 2, seed + 209, 2.5, 1.0), ('N', None, seed + 220, 1.0, 0.82),
+             ('N', C0 + 1, seed + 231, 1.0, 1.20), ('N', None, seed + 242, 2.5, 1.0),
+             ('N', C0 - 1, seed + 253, 1.0, 1.0), ('N', None, seed + 264, 1.0, 1.0)]
+    if allow_t:
+        extra[3] = ('T', C0 - 1, seed + 176, 1.0, 1.0)
+        extra[7] = ('T', None, seed + 220, 1.0, 1.0)
+
+    # PARTNER_PERIMETER=1: on boundary-dense instances, spend three of the
+    # extra restarts on perimeter-first searchers (_perimeter_pack) — the
+    # wall lines are solved explicitly and locked, the SA only places the
+    # interior.  Competes under true cost like every other restart.
+    if _os.environ.get("PARTNER_PERIMETER_COL", "0") != "0":
+        n_bnd_mv = sum(1 for i in range(opt1.n)
+                       if opt1.boundary[i] > 0 and opt1.kind[i] != 2)
+        if n_bnd_mv >= max(6, int(0.08 * opt1.n)):
+            extra[9] = ('P', None, seed + 242, 1.0, 1.0)
+            extra[10] = ('P', C0, seed + 253, 1.0, 1.0)
+            extra[11] = ('P', None, seed + 264, 2.5, 1.0)
+
+    # reserve pool workers for direct-prediction refinement: each refine
+    # then gets a full worker budget instead of a slice of one thread
+    n_ref = 0
+    if sample_fn is not None:
+        n_ref = min(8, max(3, _POOL_SIZE // 3))
+        # PARTNER_NREF: rebalance pool slots toward direct-prediction
+        # refinement (the direct channel dominates tail winners); always
+        # keeps at least 6 column restarts, and only kicks in on big cases
+        # (n >= PARTNER_NREF_MIN_N, default 95) where the tail weight
+        # lives.  Same pool, same wall-clock.
+        try:
+            _nref_env = int(float(_os.environ.get("PARTNER_NREF", "0") or 0))
+            _nref_min_n = int(float(_os.environ.get(
+                "PARTNER_NREF_MIN_N", "95")))
+        except ValueError:
+            _nref_env = 0
+            _nref_min_n = 95
+        if _nref_env > 0 and opt1.n >= _nref_min_n:
+            n_ref = max(3, min(_nref_env, _POOL_SIZE - 6))
+    configs = (configs + extra)[:max(2, _POOL_SIZE - n_ref)]
+
+    def np_of(t):
+        return None if t is None else t.detach().cpu().numpy()
+
+    # PARTNER_PHASE_B (fraction, default 0=off): reserve the tail of the
+    # case budget for a parallel exploitation round that re-refines the
+    # phase-A winner with seed/v_weight/anchor variants.  The serial form
+    # of this (vkill stage2) loses to SA's own tail; eight CONCURRENT
+    # basin-hops around the incumbent are a different proposition.  Only
+    # engages on budgets long enough for a meaningful refine round.
+    t_pb = time.time()
+    try:
+        _pb_frac = float(_os.environ.get("PARTNER_PHASE_B", "0") or 0)
+        _pb_min = float(_os.environ.get("PARTNER_PHASE_B_MIN_BUDGET", "8"))
+    except ValueError:
+        _pb_frac, _pb_min = 0.0, 8.0
+    phase_b = (0.0 < _pb_frac < 0.9) and (deadline - t_pb) >= _pb_min \
+        and _POOL_READY
+    deadline_A = (t_pb + (deadline - t_pb) * (1.0 - _pb_frac)) \
+        if phase_b else deadline
+    worker_deadline = deadline_A - 0.30
+    payloads = [(list(rects), np_of(area_targets), np_of(constraints),
+                 np_of(target_positions), np_of(b2b), np_of(p2b), np_of(pins),
+                 orient, cf, sd, worker_deadline, vw, hs)
+                for (orient, cf, sd, vw, hs) in configs]
+    res = _POOL.map_async(_worker_solve, payloads)
+
+    # column restarts are already running; sample on the GPU now and hand
+    # the predictions to the reserved (idle) workers
+    ref_res = None
+    if n_ref:
+        try:
+            preds = list(sample_fn(n_ref))
+        except Exception:
+            preds = []
+        # boundary-dense instances: overlay the exactly-packed perimeter
+        # ring onto the top predictions — the model supplies the global
+        # arrangement (its strength), the ring supplies wall exactness
+        # (the model is frame-blind); the refine ladder then starts with
+        # its wall tags already satisfied and never drops the pins
+        if _os.environ.get("PARTNER_PERIMETER", "0") != "0" and preds:
+            n_bnd_mv = sum(1 for i in range(opt1.n)
+                           if opt1.boundary[i] > 0 and opt1.kind[i] != 2)
+            if n_bnd_mv >= max(6, int(0.08 * opt1.n)):
+                try:
+                    got = _perimeter_pack(opt1, list(rects))
+                except Exception:
+                    got = None
+                if got is not None and got[0]:
+                    over = []
+                    for P in preds[:2]:
+                        Q = np.asarray(P, dtype=np.float64).copy()
+                        for i, r in got[0].items():
+                            Q[i] = r
+                        over.append(Q)
+                    preds = over + preds
+        if preds:
+            # PARTNER_REFINE_VW_MIX > 0: every 3rd refine worker runs
+            # violation-averse (v_weight boosted) — portfolio diversity in
+            # the direct channel, mirroring the column restarts' 2.5-weight
+            # searchers; selection still compares raw (hp, area, V).
+            try:
+                _vw_mix = float(_os.environ.get(
+                    "PARTNER_REFINE_VW_MIX", "0") or 0)
+            except ValueError:
+                _vw_mix = 0.0
+            # PARTNER_TAG_ANCHOR_MIX=1: half the refine workers seed their
+            # wall tags against the preplaced-implied frame, half against
+            # the prediction's own extents — the two are each right on a
+            # different instance class (anchored wins when the content
+            # fits the intended frame, emergent wins when it cannot), and
+            # true-cost selection picks per case.
+            _anchor_mix = _os.environ.get(
+                "PARTNER_TAG_ANCHOR_MIX", "0") != "0"
+            # PARTNER_TAG_ANCHOR_EXTRA=k: additionally re-refine the top-k
+            # predictions with anchored tag seeding (extra draws, so the
+            # emergent-strategy draw count is untouched; the slots come out
+            # of PARTNER_NREF, i.e. the column-restart pool)
+            try:
+                _anchor_extra = int(float(_os.environ.get(
+                    "PARTNER_TAG_ANCHOR_EXTRA", "0") or 0))
+            except ValueError:
+                _anchor_extra = 0
+            _anchor_extra = max(0, min(_anchor_extra, n_ref - 1, len(preds)))
+            specs = [(P, bool(_anchor_mix and k % 2 == 1))
+                     for k, P in enumerate(preds[:n_ref - _anchor_extra])]
+            specs += [(preds[j], True) for j in range(_anchor_extra)]
+            ref_payloads = [(np.asarray(P, dtype=np.float64),
+                             np_of(area_targets), np_of(constraints),
+                             np_of(target_positions), np_of(b2b),
+                             np_of(p2b), np_of(pins),
+                             worker_deadline, seed + 301 + 7 * k,
+                             (_vw_mix if (_vw_mix > 0.0 and k % 3 == 2)
+                              else 1.0),
+                             anchor)
+                            for k, (P, anchor) in enumerate(specs)]
+            ref_res = _POOL.map_async(_worker_refine, ref_payloads)
+    try:
+        outs = res.get(timeout=max(deadline_A - time.time(), 0.1) + 2.5)
+        ref_outs = []
+        if ref_res is not None:
+            ref_outs = ref_res.get(
+                timeout=max(deadline_A - time.time(), 0.1) + 2.5)
+    except Exception:
+        # workers overran their deadline — the pool now has stragglers that
+        # would delay every later case, so drop it entirely
+        _shutdown_pool()
+        raise
+    outs = [o for o in outs if o is not None]
+    ref_outs = [o for o in ref_outs if o is not None]
+    if not outs and not ref_outs:
+        raise RuntimeError("all parallel workers failed")
+
+    area_ref = opt1.area_ref
+    n_soft = opt1.n_soft_den
+    hp_ref = max(min(o[1] for o in outs + ref_outs), 1e-9)
+
+    def score(o):
+        _out, hp, area, V = o
+        return (1.0 + 0.5 * ((hp - hp_ref) / hp_ref
+                             + max(0.0, area / area_ref - 1.0))) \
+            * math.exp(2.0 * V / n_soft)
+
+    if _RDEBUG:
+        for tag, lst in (("col", outs), ("dir", ref_outs)):
+            for o in sorted(lst, key=score)[:3]:
+                print(f"[psel] {tag} hp={o[1]:.1f} area={o[2]:.0f} "
+                      f"V={o[3]} score={score(o):.4f}", flush=True)
+    best_col = min(outs, key=score) if outs else None
+    best_dir = min(ref_outs, key=score) if ref_outs else None
+    # a direct candidate must beat the column result by a clear margin —
+    # marginal swaps are proxy-noise coin flips
+    if best_dir is not None and (
+            best_col is None
+            or score(best_dir) < 0.985 * score(best_col)):
+        win, win_is_ref = best_dir, True
+    else:
+        win, win_is_ref = best_col, False
+
+    # PARTNER_FUSION=1 (uses the phase-B carve): regional crossover of the
+    # elite candidates.  Every case computes 20-40 diverse layouts and the
+    # selection keeps ONE — candidates are routinely complementary by
+    # region (one wins the left half, another the right), and that
+    # information is free.  Cut the die, take each side from a different
+    # parent, repair the seam with the existing machinery, accept by the
+    # same true-cost score.
+    if (phase_b and _os.environ.get("PARTNER_FUSION", "0") != "0"
+            and time.time() < deadline - 1.0):
+        elites = sorted(outs + ref_outs, key=score)[:3]
+        locked = [opt1.kind[i] == 2 for i in range(opt1.n)]
+        fused_cands = []
+        for pi in range(min(2, len(elites) - 1)):
+            A, B = elites[0], elites[pi + 1]
+            PA = np.asarray([list(r) for r in A[0]], dtype=np.float64)
+            PB = np.asarray([list(r) for r in B[0]], dtype=np.float64)
+            for axis in (0, 1):
+                if time.time() >= deadline - 0.4:
+                    break
+                ca = PA[:, axis] + 0.5 * PA[:, 2 + axis]
+                lo = float(PA[:, axis].min())
+                hi = float((PA[:, axis] + PA[:, 2 + axis]).max())
+                for frac in (0.5,):
+                    cut = lo + frac * (hi - lo)
+                    take_a = ca < cut
+                    if take_a.all() or not take_a.any():
+                        continue
+                    Q = np.where(take_a[:, None], PA, PB)
+                    for i in range(opt1.n):     # locked stay canonical
+                        if locked[i]:
+                            Q[i] = (opt1.lx[i], opt1.ly[i],
+                                    opt1.rw[i], opt1.rh[i])
+                    try:
+                        rep = _ensure_no_overlap(
+                            [tuple(map(float, r)) for r in Q], locked)
+                    except Exception:
+                        continue
+                    Qr = np.asarray([list(r) for r in rep],
+                                    dtype=np.float64)
+                    from refiner_claude import full_violations as _fv
+                    hp2 = opt1._hpwl(Qr)
+                    a2 = float(((Qr[:, 0] + Qr[:, 2]).max()
+                                - Qr[:, 0].min())
+                               * ((Qr[:, 1] + Qr[:, 3]).max()
+                                  - Qr[:, 1].min()))
+                    fused_cands.append((rep, hp2, a2, _fv(opt1, Qr)))
+        if fused_cands:
+            bestf = min(fused_cands, key=score)
+            if _RDEBUG:
+                print(f"[psel] fusion win={score(win):.4f} "
+                      f"bestf={score(bestf):.4f} ({len(fused_cands)})",
+                      flush=True)
+            if score(bestf) < score(win) - 1e-12:
+                win, win_is_ref = bestf, True
+
+    if phase_b and time.time() < deadline - 1.5 \
+            and _os.environ.get("PARTNER_FUSION", "0") == "0":
+        Wnp = np.asarray([list(r) for r in win[0]], dtype=np.float64)
+        variants = ((1.0, False), (1.0, True), (2.5, False), (3.0, False),
+                    (1.0, False), (2.5, True), (1.0, True), (1.0, False))
+        wd2 = deadline - 0.30
+        pb_payloads = [(Wnp.copy(), np_of(area_targets),
+                        np_of(constraints), np_of(target_positions),
+                        np_of(b2b), np_of(p2b), np_of(pins),
+                        wd2, seed + 401 + 11 * k, vw, anc)
+                       for k, (vw, anc) in enumerate(variants)]
+        try:
+            res2 = _POOL.map_async(_worker_refine, pb_payloads)
+            outs2 = [o for o in res2.get(
+                timeout=max(deadline - time.time(), 0.1) + 2.5)
+                if o is not None]
+        except Exception:
+            _shutdown_pool()
+            raise
+        if outs2:
+            best2 = min(outs2, key=score)
+            if _RDEBUG:
+                print(f"[psel] phaseB win={score(win):.4f} "
+                      f"best2={score(best2):.4f} ({len(outs2)} cands)",
+                      flush=True)
+            if score(best2) < score(win) - 1e-12:
+                win, win_is_ref = best2, True
+
+    if win_is_ref:
+        locked = [opt1.kind[i] == 2 for i in range(opt1.n)]
+        return _ensure_no_overlap(list(win[0]), locked)
+    return win[0]
+
+
+# =============================================================================
 # Main entry point
 # =============================================================================
 _BND_TRANSPOSE = {0: 0}
@@ -1468,6 +2839,7 @@ def legalize_rectangles(
     pins_pos: Optional[torch.Tensor] = None,
     deadline: Optional[float] = None,
     seed: int = 0,
+    sample_fn=None,
 ) -> List[Rect]:
     n = len(rects)
     if n == 0:
@@ -1481,7 +2853,26 @@ def legalize_rectangles(
     if opt1.locked_only():
         return opt1.locked_positions()
     budget = deadline - time.time()
+
+    if _POOL is not None and _POOL_READY and budget > 3.0:
+        try:
+            return _parallel_solve(opt1, rects, area_targets, constraints,
+                                   target_positions, b2b_connectivity,
+                                   p2b_connectivity, pins_pos, deadline, seed,
+                                   sample_fn=sample_fn)
+        except Exception:
+            pass  # fall back to the sequential path below
+
     if budget < 4.0:
+        return opt1.run()
+
+    # count units that need a column bottom/top of their own per orientation:
+    # L/R tags are structurally cheap (edge columns have unlimited capacity),
+    # B/T tags are scarce (one per column). Transposing swaps the two.
+    hard_n = sum(1 for u in opt1.units if u.hasB) + sum(1 for u in opt1.units if u.hasT)
+    hard_t = sum(1 for u in opt1.units if u.force == 'L') + \
+        sum(1 for u in opt1.units if u.force == 'R')
+    if hard_t > hard_n + 2:
         return opt1.run()
 
     # try both orientations (HPWL / area / violations are orientation
@@ -1495,10 +2886,12 @@ def legalize_rectangles(
     opt1.prepare()
     opt2.prepare()
     opt2.hp_ref = opt1.hp_ref
-    t_probe = min(0.18 * budget, 3.6) / 6.0
+    t_probe = min(0.20 * budget, 4.2) / 6.0
     p1 = opt1.probe(t_probe)
     p2 = opt2.probe(t_probe)
-    if p2 < p1:
+    # probes are noisy; the normal orientation handles the common
+    # many-left-tags pattern structurally better, so require a clear win
+    if p2 < p1 * 0.96:
         out_t = opt2.finish(deadline)
         return [(y, x, h, w) for (x, y, w, h) in out_t]
     return opt1.finish(deadline)
