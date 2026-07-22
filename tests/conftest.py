@@ -7,3 +7,6 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+PARTNER = ROOT / "partner"
+if str(PARTNER) not in sys.path:
+    sys.path.insert(0, str(PARTNER))
