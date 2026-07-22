@@ -7,9 +7,6 @@ from dataclasses import dataclass
 import numpy as np
 
 
-_HARD_FEATURE_COLUMNS = (5, 6, 7, 8)
-
-
 @dataclass(frozen=True)
 class MatchResult:
     target_to_source: np.ndarray
@@ -75,8 +72,7 @@ def hungarian_min_cost(cost: np.ndarray) -> np.ndarray:
 
 def _standardized_soft_l1(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Return target-to-source L1 costs without overflowing finite inputs."""
-    soft_columns = np.setdiff1d(np.arange(source.shape[1]), _HARD_FEATURE_COLUMNS)
-    pooled = np.concatenate((source[:, soft_columns], target[:, soft_columns]), axis=0)
+    pooled = np.concatenate((source, target), axis=0)
     input_scale = np.maximum(np.max(np.abs(pooled), axis=0), 1.0)
     scaled = pooled / input_scale
     center = scaled.mean(axis=0)
@@ -87,36 +83,20 @@ def _standardized_soft_l1(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.abs(target_standardized[:, None, :] - source_standardized[None, :, :]).mean(axis=-1)
 
 
-def _forbidden_cost(soft_cost: np.ndarray) -> float:
-    """Return a per-edge penalty larger than any all-soft assignment sum."""
-    maximum_soft_edge = float(np.max(soft_cost))
-    return float(np.nextafter(len(soft_cost) * maximum_soft_edge, np.inf))
-
-
 def match_blocks(source_nodes, target_nodes, max_cost) -> MatchResult:
-    """Match each target node to one compatible source node.
-
-    The returned vector is indexed by target block and contains source block
-    indices.  Fixed/preplaced/group membership features are non-negotiable;
-    boundary-direction features remain part of the soft distance only.
-    """
+    """Match each target node to one source node using all-soft feature costs."""
     source = np.asarray(source_nodes, dtype=np.float64)
     target = np.asarray(target_nodes, dtype=np.float64)
     if source.ndim != 2 or target.ndim != 2 or source.shape != target.shape:
         raise ValueError("first retrieval version requires equal N and feature width")
-    if source.shape[0] == 0 or source.shape[1] <= max(_HARD_FEATURE_COLUMNS):
-        raise ValueError("retrieval node features must contain at least one compatible block")
+    if source.shape[0] == 0 or source.shape[1] == 0:
+        raise ValueError("retrieval node features must have nonzero block count and feature width")
     if not np.isfinite(source).all() or not np.isfinite(target).all():
         raise ValueError("retrieval node features must be finite")
     if not np.isfinite(max_cost):
         raise ValueError("maximum matching cost must be finite")
 
-    soft_cost = _standardized_soft_l1(source, target)
-    forbidden_cost = _forbidden_cost(soft_cost)
-    hard = np.any(
-        target[:, None, _HARD_FEATURE_COLUMNS] != source[None, :, _HARD_FEATURE_COLUMNS], axis=-1
-    )
-    cost = np.where(hard, forbidden_cost, soft_cost)
+    cost = _standardized_soft_l1(source, target)
     assignment = hungarian_min_cost(cost)
     chosen = cost[np.arange(len(assignment)), assignment]
     second = np.partition(cost, 1, axis=1)[:, 1] if len(assignment) > 1 else chosen + 1.0
@@ -126,5 +106,5 @@ def match_blocks(source_nodes, target_nodes, max_cost) -> MatchResult:
         target_to_source=assignment,
         total_cost=total,
         confidence=confidence,
-        accepted=bool(total <= max_cost and chosen.max() < forbidden_cost),
+        accepted=bool(total <= max_cost),
     )

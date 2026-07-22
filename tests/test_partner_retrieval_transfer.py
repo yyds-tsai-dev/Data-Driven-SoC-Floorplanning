@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from retrieval_matching_claude import _forbidden_cost, hungarian_min_cost, match_blocks
+from retrieval_matching_claude import hungarian_min_cost, match_blocks
 from retrieval_transfer_claude import (
     apply_d4_rectangles,
     remap_boundary_node_features,
@@ -47,32 +47,18 @@ def test_hungarian_matches_brute_force_optimum_for_deterministic_costs():
     assert cost[np.arange(3), assignment].sum() == brute_force
 
 
-def test_dynamic_forbidden_cost_beats_every_all_soft_assignment_total():
-    soft_cost = np.array(
-        [[10.0, 10.0, 10.0, 10.0], [10.0, 0.0, 10.0, 10.0],
-         [10.0, 10.0, 0.0, 10.0], [10.0, 10.0, 10.0, 0.0]],
-        dtype=np.float64,
-    )
-    static_cost = soft_cost.copy()
-    static_cost[0, 0] = np.nextafter(soft_cost.max(), np.inf)
-    static_assignment = hungarian_min_cost(static_cost)
-    guarded_cost = soft_cost.copy()
-    guarded_cost[0, 0] = _forbidden_cost(soft_cost)
-    guarded_assignment = hungarian_min_cost(guarded_cost)
-
-    assert static_assignment.tolist() == [0, 1, 2, 3]
-    assert guarded_assignment[0] != 0
-    assert guarded_cost[np.arange(4), guarded_assignment].sum() == 20.0
-
-
-def test_matching_rejects_hard_fixed_compatibility_mismatch():
+def test_matching_accepts_different_fixed_preplaced_mib_and_cluster_roles_below_threshold():
     source = np.zeros((2, 16), dtype=np.float64)
-    target = source.copy()
-    target[0, 5] = 1.0
+    source[0, 5:9] = [1.0, 0.0, 7.0, 3.0]
+    source[1, 5:9] = [0.0, 1.0, 0.0, 0.0]
+    target = source[::-1].copy()
+    target[0, 5:9] = [0.0, 0.0, 2.0, 9.0]
+    target[1, 5:9] = [1.0, 1.0, 4.0, 6.0]
 
-    result = match_blocks(source, target, max_cost=1e9)
+    result = match_blocks(source, target, max_cost=10.0)
 
-    assert not result.accepted
+    assert result.accepted
+    assert 0.0 < result.total_cost <= 10.0
 
 
 def test_matching_accepts_extreme_finite_soft_feature_correspondence():
@@ -153,15 +139,21 @@ def test_d4_helpers_reject_unknown_transform(function):
         function(values, "rotate_90")
 
 
-def test_transfer_overrides_known_fixed_dimensions_and_preplaced_position():
+def test_role_mismatched_matching_then_transfer_overrides_target_fixed_and_preplaced_anchors():
     source = np.array([[0, 0, 2, 2], [3, 0, 2, 2]], dtype=np.float64)
     constraints = np.array([[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]], dtype=np.float64)
     target_positions = np.array([[0, 0, 3, 5], [7, 11, 4, 6]], dtype=np.float64)
+    source_nodes = np.zeros((2, 16), dtype=np.float64)
+    source_nodes[:, 5:9] = [[0, 1, 3, 8], [1, 0, 0, 0]]
+    target_nodes = np.zeros((2, 16), dtype=np.float64)
+    target_nodes[:, 5:9] = [[1, 0, 9, 2], [0, 1, 5, 7]]
+    match = match_blocks(source_nodes, target_nodes, max_cost=10.0)
 
     got = transfer_layout(
-        source, np.array([0, 1]), np.array([4.0, 4.0]), constraints, target_positions, "identity"
+        source, match.target_to_source, np.array([4.0, 4.0]), constraints, target_positions, "identity"
     )
 
+    assert match.accepted
     np.testing.assert_allclose(got[:, 2:4], [[3, 5], [4, 6]])
     np.testing.assert_allclose(got[1, :2], [7, 11], atol=0.0)
 
