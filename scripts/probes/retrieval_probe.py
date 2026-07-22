@@ -43,7 +43,26 @@ def _target_arrays(sample: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
     n = int((area != -1).sum())
     if n <= 0:
         raise ValueError("evaluation sample has no active blocks")
-    return area[:n], b2b, p2b, pins, constraints[:n], np.full((n, 4), -1.0, dtype=np.float32)
+    polygons, _metrics = sample["label"]
+    polygon_array = polygons.cpu().numpy()
+    target_positions = np.full((n, 4), -1.0, dtype=np.float32)
+    for block_index in range(n):
+        block = np.asarray(polygon_array[block_index], dtype=np.float32)
+        valid = block[block[:, 0] != -1]
+        if len(valid) == 0:
+            x, y, width, height = 0.0, 0.0, 1.0, 1.0
+        else:
+            minimum = valid.min(axis=0)
+            maximum = valid.max(axis=0)
+            x, y = float(minimum[0]), float(minimum[1])
+            width, height = float(maximum[0] - minimum[0]), float(maximum[1] - minimum[1])
+        fixed = constraints[block_index, 0] != 0 if constraints.shape[1] > 0 else False
+        preplaced = constraints[block_index, 1] != 0 if constraints.shape[1] > 1 else False
+        if preplaced:
+            target_positions[block_index] = (x, y, width, height)
+        elif fixed:
+            target_positions[block_index, 2:4] = (width, height)
+    return area[:n], b2b, p2b, pins, constraints[:n], target_positions
 
 
 def _overlap_proxy(rectangles: np.ndarray) -> float:

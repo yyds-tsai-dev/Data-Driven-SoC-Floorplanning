@@ -60,6 +60,22 @@ def _sample(area, floorplan=None):
     return {"input": inputs, "label": (_FakeTensor([]), _FakeTensor(floorplan), _FakeTensor([]))}
 
 
+def _evaluation_sample(area, constraints=None, polygons=None):
+    active_count = int(np.count_nonzero(np.asarray(area) != -1))
+    if constraints is None:
+        constraints = np.zeros((len(area), 5), dtype=np.float32)
+    if polygons is None:
+        polygons = np.zeros((active_count, 1, 2), dtype=np.float32)
+    inputs = (
+        _FakeTensor(area),
+        _FakeTensor([[-1, -1, -1]]),
+        _FakeTensor([[-1, -1, -1]]),
+        _FakeTensor([[0, 0]]),
+        _FakeTensor(constraints),
+    )
+    return {"input": inputs, "label": (_FakeTensor(polygons), _FakeTensor([]))}
+
+
 def test_retrieval_builder_help_is_noninteractive_and_exposes_required_flags():
     result = subprocess.run(
         [sys.executable, "scripts/build_partner_retrieval_index.py", "--help"],
@@ -214,13 +230,76 @@ def test_builder_cleans_temporary_directory_when_symlink_fallback_fails(monkeypa
     assert list(tmp_path.glob(".pilot.tmp-*")) == []
 
 
+def test_probe_uses_evaluator_aligned_polygon_anchors_for_transfer_and_proxies(monkeypatch, tmp_path):
+    probe = _load_probe_module()
+    constraints = np.array(
+        [[0, 0, 0, 0, 0], [1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 0, 0, 0]],
+        dtype=np.float32,
+    )
+    polygons = np.array(
+        [
+            [[0, 0], [4, 0], [4, 2], [-1, -1]],
+            [[2, 3], [5, 3], [5, 9], [-1, -1]],
+            [[7, 10], [11, 10], [11, 13], [-1, -1]],
+        ],
+        dtype=np.float32,
+    )
+    sample = _evaluation_sample([1.0, 1.0, 1.0, -1.0], constraints, polygons)
+    expected_targets = np.array(
+        [[-1, -1, -1, -1], [-1, -1, 3, 6], [7, 10, 4, 3]], dtype=np.float32
+    )
+
+    *_, target_positions = probe._target_arrays(sample)
+    np.testing.assert_array_equal(target_positions, expected_targets)
+
+    class FakeIndex:
+        def query(self, _block_count, _vector, top_k):
+            return SimpleNamespace(
+                source_ids=np.array([7], dtype=np.int64),
+                distances=np.array([0.25]),
+                node_features=np.zeros((1, 3, 16), dtype=np.float32),
+                fp_xywh=np.array([[[0, 0, 1, 1], [2, 0, 1, 1], [4, 0, 1, 1]]], dtype=np.float32),
+            )
+
+    observed = {}
+
+    def fake_features(area, _b2b, _p2b, _pins, _constraints, targets):
+        observed["feature_target_positions"] = targets.copy()
+        return SimpleNamespace(
+            global_vector=np.zeros(24, dtype=np.float32),
+            node_matrix=np.zeros((len(area), 16), dtype=np.float32),
+        )
+
+    def capture_overlap(rectangles):
+        observed["overlap_rectangles"] = rectangles.copy()
+        return 0.0
+
+    def capture_hpwl(rectangles, *_args):
+        observed["hpwl_rectangles"] = rectangles.copy()
+        return 0.0
+
+    monkeypatch.setattr(probe.RetrievalIndex, "load", lambda _path: FakeIndex())
+    monkeypatch.setattr(probe, "FloorplanDatasetLiteTest", lambda _path: [sample])
+    monkeypatch.setattr(probe, "extract_retrieval_features", fake_features)
+    monkeypatch.setattr(probe, "_overlap_proxy", capture_overlap)
+    monkeypatch.setattr(probe, "_hpwl_proxy", capture_hpwl)
+
+    rows = probe.run_probe(tmp_path / "index", tmp_path, cases=1, top_k=1)
+
+    assert rows[0]["status"] == "matched"
+    np.testing.assert_array_equal(observed["feature_target_positions"], expected_targets)
+    np.testing.assert_array_equal(observed["overlap_rectangles"][1, 2:4], [3, 6])
+    np.testing.assert_array_equal(observed["overlap_rectangles"][2], [7, 10, 4, 3])
+    np.testing.assert_array_equal(observed["hpwl_rectangles"], observed["overlap_rectangles"])
+
+
 def test_probe_returns_complete_matched_and_no_same_n_rows_without_mutating_index(monkeypatch, tmp_path):
     probe = _load_probe_module()
     index_path = tmp_path / "index"
     index_path.mkdir()
     manifest = index_path / "manifest.json"
     manifest.write_text("read-only")
-    dataset = [_sample([1.0, 1.0]), _sample([1.0, 1.0, 1.0])]
+    dataset = [_evaluation_sample([1.0, 1.0]), _evaluation_sample([1.0, 1.0, 1.0])]
 
     class FakeIndex:
         def query(self, block_count, _vector, top_k):
