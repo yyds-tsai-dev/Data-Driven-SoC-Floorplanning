@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from retrieval_matching_claude import hungarian_min_cost, match_blocks
+from retrieval_matching_claude import _forbidden_cost, hungarian_min_cost, match_blocks
 from retrieval_transfer_claude import (
     apply_d4_rectangles,
     remap_boundary_node_features,
@@ -47,6 +47,24 @@ def test_hungarian_matches_brute_force_optimum_for_deterministic_costs():
     assert cost[np.arange(3), assignment].sum() == brute_force
 
 
+def test_dynamic_forbidden_cost_beats_every_all_soft_assignment_total():
+    soft_cost = np.array(
+        [[10.0, 10.0, 10.0, 10.0], [10.0, 0.0, 10.0, 10.0],
+         [10.0, 10.0, 0.0, 10.0], [10.0, 10.0, 10.0, 0.0]],
+        dtype=np.float64,
+    )
+    static_cost = soft_cost.copy()
+    static_cost[0, 0] = np.nextafter(soft_cost.max(), np.inf)
+    static_assignment = hungarian_min_cost(static_cost)
+    guarded_cost = soft_cost.copy()
+    guarded_cost[0, 0] = _forbidden_cost(soft_cost)
+    guarded_assignment = hungarian_min_cost(guarded_cost)
+
+    assert static_assignment.tolist() == [0, 1, 2, 3]
+    assert guarded_assignment[0] != 0
+    assert guarded_cost[np.arange(4), guarded_assignment].sum() == 20.0
+
+
 def test_matching_rejects_hard_fixed_compatibility_mismatch():
     source = np.zeros((2, 16), dtype=np.float64)
     target = source.copy()
@@ -55,6 +73,38 @@ def test_matching_rejects_hard_fixed_compatibility_mismatch():
     result = match_blocks(source, target, max_cost=1e9)
 
     assert not result.accepted
+
+
+def test_matching_accepts_extreme_finite_soft_feature_correspondence():
+    source = np.zeros((2, 16), dtype=np.float64)
+    source[:, 0] = [0.0, 8e7]
+    target = np.zeros((2, 16), dtype=np.float64)
+    target[:, 0] = [2e7, 1e8]
+
+    result = match_blocks(source, target, max_cost=0.1)
+
+    assert result.accepted
+    assert result.target_to_source.tolist() == [0, 1]
+
+
+def test_matching_single_block_has_a_confident_compatible_assignment():
+    source = np.zeros((1, 16), dtype=np.float64)
+    source[0, 0] = 2e7
+
+    result = match_blocks(source, source.copy(), max_cost=0.0)
+
+    assert result.accepted
+    assert result.target_to_source.tolist() == [0]
+    assert result.confidence == 1.0
+
+
+def test_matching_equal_cost_ties_are_deterministic():
+    source = np.zeros((3, 16), dtype=np.float64)
+
+    result = match_blocks(source, source.copy(), max_cost=0.0)
+
+    assert result.accepted
+    assert result.target_to_source.tolist() == [0, 1, 2]
 
 
 @pytest.mark.parametrize(

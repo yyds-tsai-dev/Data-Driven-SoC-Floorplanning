@@ -8,7 +8,6 @@ import numpy as np
 
 
 _HARD_FEATURE_COLUMNS = (5, 6, 7, 8)
-_HARD_COST = 1e6
 
 
 @dataclass(frozen=True)
@@ -74,6 +73,26 @@ def hungarian_min_cost(cost: np.ndarray) -> np.ndarray:
     return assignment
 
 
+def _standardized_soft_l1(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Return target-to-source L1 costs without overflowing finite inputs."""
+    soft_columns = np.setdiff1d(np.arange(source.shape[1]), _HARD_FEATURE_COLUMNS)
+    pooled = np.concatenate((source[:, soft_columns], target[:, soft_columns]), axis=0)
+    input_scale = np.maximum(np.max(np.abs(pooled), axis=0), 1.0)
+    scaled = pooled / input_scale
+    center = scaled.mean(axis=0)
+    spread = np.sqrt(np.mean(np.square(scaled - center), axis=0))
+    standardized = (scaled - center) / np.maximum(spread, 1e-12)
+    source_standardized = standardized[: len(source)]
+    target_standardized = standardized[len(source) :]
+    return np.abs(target_standardized[:, None, :] - source_standardized[None, :, :]).mean(axis=-1)
+
+
+def _forbidden_cost(soft_cost: np.ndarray) -> float:
+    """Return a per-edge penalty larger than any all-soft assignment sum."""
+    maximum_soft_edge = float(np.max(soft_cost))
+    return float(np.nextafter(len(soft_cost) * maximum_soft_edge, np.inf))
+
+
 def match_blocks(source_nodes, target_nodes, max_cost) -> MatchResult:
     """Match each target node to one compatible source node.
 
@@ -92,11 +111,12 @@ def match_blocks(source_nodes, target_nodes, max_cost) -> MatchResult:
     if not np.isfinite(max_cost):
         raise ValueError("maximum matching cost must be finite")
 
-    cost = np.abs(target[:, None, :] - source[None, :, :]).mean(axis=-1)
+    soft_cost = _standardized_soft_l1(source, target)
+    forbidden_cost = _forbidden_cost(soft_cost)
     hard = np.any(
         target[:, None, _HARD_FEATURE_COLUMNS] != source[None, :, _HARD_FEATURE_COLUMNS], axis=-1
     )
-    cost = np.where(hard, _HARD_COST, cost)
+    cost = np.where(hard, forbidden_cost, soft_cost)
     assignment = hungarian_min_cost(cost)
     chosen = cost[np.arange(len(assignment)), assignment]
     second = np.partition(cost, 1, axis=1)[:, 1] if len(assignment) > 1 else chosen + 1.0
@@ -106,5 +126,5 @@ def match_blocks(source_nodes, target_nodes, max_cost) -> MatchResult:
         target_to_source=assignment,
         total_cost=total,
         confidence=confidence,
-        accepted=bool(total <= max_cost and chosen.max() < _HARD_COST),
+        accepted=bool(total <= max_cost and chosen.max() < forbidden_cost),
     )
