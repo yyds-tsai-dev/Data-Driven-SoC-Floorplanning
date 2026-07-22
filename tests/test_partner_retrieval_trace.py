@@ -145,12 +145,14 @@ def test_auto_selection_k_reads_live_legalizer_pool_capacity(monkeypatch):
     assert trace.resolve_selection_k(95, "auto") == 15
 
 
-def test_auto_selection_k_is_safe_when_live_pool_is_too_small(monkeypatch):
+def test_auto_selection_k_matches_production_minimum_for_small_live_pool(monkeypatch):
     trace = _load_trace_module()
-    monkeypatch.setattr(trace.legalizer_claude, "_POOL_SIZE", 0)
+    monkeypatch.setattr(trace.legalizer_claude, "_POOL_SIZE", 2)
     monkeypatch.setenv("PARTNER_NREF", "15")
+    monkeypatch.setenv("PARTNER_NREF_MIN_N", "95")
 
-    assert trace.resolve_selection_k(120, "auto") == 0
+    assert trace.resolve_selection_k(94, "auto") == 3
+    assert trace.resolve_selection_k(95, "auto") == 3
 
 
 def test_run_trace_rejects_silently_unloaded_direct_checkpoint(monkeypatch, tmp_path):

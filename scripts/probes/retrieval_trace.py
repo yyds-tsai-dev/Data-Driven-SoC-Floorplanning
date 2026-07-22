@@ -127,7 +127,7 @@ def json_safe(value: Any) -> Any:
 
 
 def resolve_selection_k(block_count: int, selection_k: str | int) -> int:
-    """Mirror the live legalizer ``n_ref`` rule without exceeding no-pool capacity."""
+    """Mirror the live legalizer ``n_ref`` rule; zero means no pool exists."""
     if selection_k != "auto":
         return int(selection_k)
     try:
@@ -136,8 +136,6 @@ def resolve_selection_k(block_count: int, selection_k: str | int) -> int:
         pool_size = 0
     if pool_size == 0:
         return 0
-    # This is the active production formula for normal pools.  The outer cap
-    # only matters if a pool has failed to initialize with its six column slots.
     resolved = min(8, max(3, pool_size // 3))
     try:
         requested = int(float(os.environ.get("PARTNER_NREF", "0") or 0))
@@ -146,7 +144,7 @@ def resolve_selection_k(block_count: int, selection_k: str | int) -> int:
         requested, min_n = 0, 95
     if requested > 0 and block_count >= min_n:
         resolved = max(3, min(requested, pool_size - 6))
-    return min(resolved, pool_size) if pool_size < 9 else resolved
+    return resolved
 
 
 def stable_candidate_id(
