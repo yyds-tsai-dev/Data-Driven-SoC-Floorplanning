@@ -11,12 +11,9 @@ conditioning, augmentation, geometry, HPWL, and large-case objectives.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 from flow_matching_claude import endpoint_from_velocity, flow_path
 
@@ -27,6 +24,21 @@ def checkpoint_method(checkpoint):
     if method != "flow_matching_v1":
         raise ValueError("checkpoint must declare training_method=flow_matching_v1")
     return method
+
+
+def validate_resume_checkpoint(args):
+    """Reject a non-flow resume checkpoint before V1 restores its state."""
+    from pathlib import Path
+
+    checkpoint_dir = Path(args.checkpoint_dir)
+    resume = args.resume
+    if not resume and not args.fresh and (checkpoint_dir / "latest.pt").exists():
+        resume = "latest"
+    if not resume:
+        return
+    path = checkpoint_dir / "latest.pt" if resume == "latest" else Path(resume)
+    if path.exists():
+        checkpoint_method(torch.load(path, map_location="cpu", weights_only=False))
 
 
 def masked_flow_loss(predicted, target, z_t, z0, t, mask):
@@ -191,6 +203,7 @@ def main():
 
     V1.parse_args = parse_flow_args
     V1.train_step = flow_train_step
+    validate_resume_checkpoint(parse_flow_args())
     V1.main()
 
 

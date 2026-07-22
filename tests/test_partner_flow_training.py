@@ -1,7 +1,12 @@
+import importlib
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
 from flow_matching_claude import flow_path
+import flow_train_claude as flow_train
 from flow_train_claude import checkpoint_method, masked_flow_loss
 
 
@@ -49,3 +54,68 @@ def test_flow_primary_loss_backpropagates_and_checkpoint_is_tagged():
     assert checkpoint_method({"args": {"training_method": "flow_matching_v1"}}) == (
         "flow_matching_v1"
     )
+
+
+def test_module_import_does_not_mutate_sys_path():
+    before = sys.path.copy()
+    sys.modules.pop("flow_train_claude", None)
+    try:
+        importlib.import_module("flow_train_claude")
+        assert sys.path == before
+    finally:
+        sys.path[:] = before
+
+
+def _v1_resume_environment(monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root / "FloorSet"))
+    monkeypatch.syspath_prepend(str(root / "FloorSet" / "iccad2026contest"))
+    import direct_train_claude as trainer
+
+    restored = False
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        def load_state_dict(self, state_dict, *args, **kwargs):
+            nonlocal restored
+            restored = True
+            raise AssertionError("V1 restored checkpoint before flow validation")
+
+    monkeypatch.setattr(trainer, "DirectDenoiser", TinyModel)
+    monkeypatch.setattr(trainer, "parse_args", trainer.parse_args)
+    monkeypatch.setattr(trainer, "train_step", trainer.train_step)
+    return trainer, lambda: restored
+
+
+@pytest.mark.parametrize(
+    "args_payload",
+    [{"training_method": "diffusion"}, {}],
+    ids=["diffusion", "untagged"],
+)
+def test_flow_cli_rejects_invalid_resume_before_v1_state_restore(
+    monkeypatch, tmp_path, args_payload
+):
+    _trainer, restored = _v1_resume_environment(monkeypatch)
+    checkpoint = tmp_path / "resume.pt"
+    torch.save({"args": args_payload, "model": {}}, checkpoint)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "flow_train_claude.py",
+            "--device",
+            "cpu",
+            "--checkpoint-dir",
+            str(tmp_path / "checkpoints"),
+            "--resume",
+            str(checkpoint),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="flow_matching_v1"):
+        flow_train.main()
+    assert not restored()
