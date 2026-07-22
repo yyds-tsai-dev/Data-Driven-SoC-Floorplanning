@@ -105,26 +105,7 @@ def test_schema_requires_candidate_metrics_and_deterministic_best_of_k():
     row = _row()
     validate_row(row)
 
-    winner = best_of_k(
-        [
-            {
-                "candidate_index": 8,
-                "raw_overlap": 0.0,
-                "raw_boundary_violations": 0,
-                "raw_group_violations": 0,
-                "raw_mib_violations": 0,
-                "raw_hpwl_proxy": 11.0,
-            },
-            {
-                "candidate_index": 3,
-                "raw_overlap": 0.0,
-                "raw_boundary_violations": 0,
-                "raw_group_violations": 0,
-                "raw_mib_violations": 0,
-                "raw_hpwl_proxy": 11.0,
-            },
-        ]
-    )
+    winner = best_of_k([_candidate(8), _candidate(3)])
 
     assert winner["candidate_index"] == 3
     with pytest.raises(ValueError, match="missing required row fields"):
@@ -133,6 +114,34 @@ def test_schema_requires_candidate_metrics_and_deterministic_best_of_k():
     malformed["candidates"] = [{"candidate_index": 0}]
     with pytest.raises(ValueError, match="candidate missing required fields"):
         validate_row(malformed)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "anchor_max_error",
+        "raw_overlap",
+        "raw_hpwl_proxy",
+        "raw_boundary_violations",
+        "raw_group_violations",
+        "raw_mib_violations",
+    ],
+)
+def test_candidate_schema_rejects_negative_raw_metrics(field):
+    candidate = _candidate()
+    candidate[field] = -0.1
+
+    with pytest.raises(ValueError, match=field):
+        probe.validate_candidate(candidate)
+
+
+@pytest.mark.parametrize("field", ["anchor_max_error", "raw_overlap", "raw_hpwl_proxy"])
+def test_best_of_k_rejects_negative_candidate_metrics(field):
+    candidate = _candidate()
+    candidate[field] = -0.1
+
+    with pytest.raises(ValueError, match=field):
+        best_of_k([candidate])
 
 
 @pytest.mark.parametrize(

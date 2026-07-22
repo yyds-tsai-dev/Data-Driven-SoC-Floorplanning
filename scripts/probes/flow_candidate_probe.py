@@ -150,8 +150,13 @@ def validate_candidate(candidate: Mapping[str, Any], *, label: str = "candidate"
         raise ValueError(f"{label} anchor_exact must be boolean")
     for field in _CANDIDATE_NUMERIC_FIELDS:
         value = candidate[field]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-            raise ValueError(f"{label} {field} must be a finite number")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value < 0
+        ):
+            raise ValueError(f"{label} {field} must be a non-negative finite number")
 
 
 def _require_nonnegative_integer(row: Mapping[str, Any], field: str, *, positive: bool = False) -> None:
@@ -231,6 +236,8 @@ def best_of_k(candidates: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     records = [dict(candidate) for candidate in candidates]
     if not records:
         raise ValueError("cannot select best-of-K from no candidates")
+    for record in records:
+        validate_candidate(record)
     return min(records, key=_candidate_key)
 
 
