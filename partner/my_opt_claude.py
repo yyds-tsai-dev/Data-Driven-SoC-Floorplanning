@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import os
 
-from candidate_supply_claude import rank_predictions
+from candidate_supply_claude import CandidateBatch, rank_predictions
 from iccad2026_evaluate import FloorplanOptimizer
 from diffusion_data import build_condition, fp_sol_to_z0, layout_scale, z_to_rectangles
 from diffusion_model import DiffusionSchedule, GraphDiffusionDenoiser, ModelConfig, ddim_refine
@@ -38,6 +38,9 @@ from legalizer_claude import (_ColumnOptimizer, _ensure_no_overlap,
                               _parse_constraints, _target, init_worker_pool,
                               legalize_rectangles, rectangles_from_z)
 from refiner_claude import full_violations, refine_prediction
+from retrieval_features_claude import extract_retrieval_features
+from retrieval_matching_claude import match_blocks
+from retrieval_transfer_claude import remap_boundary_node_features, transfer_layout
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -82,6 +85,44 @@ def _time_budget(block_count: int) -> float:
     return max(BUDGET_MIN, min(BUDGET_MAX, b))
 
 
+def _select_ranked_source_quota(
+    predictions: List[np.ndarray], sources: List[str], order: List[int],
+    total: int, retrieval_quota: int,
+) -> List[np.ndarray]:
+    """Keep ranked candidates under fixed Direct/retrieval capacity quotas."""
+    total = max(0, int(total))
+    retrieval_quota = min(total, max(0, int(retrieval_quota)))
+    direct_quota = total - retrieval_quota
+    selected: List[np.ndarray] = []
+    selected_indexes: set[int] = set()
+    direct_count = 0
+    retrieval_count = 0
+    for index in order:
+        source = sources[index]
+        if source == "retrieval":
+            if retrieval_count >= retrieval_quota:
+                continue
+            retrieval_count += 1
+        elif source == "direct":
+            if direct_count >= direct_quota:
+                continue
+            direct_count += 1
+        else:
+            continue
+        selected.append(predictions[index])
+        selected_indexes.add(index)
+
+    # A missing retrieval source must not leave direct refinement capacity idle.
+    if len(selected) < total and retrieval_count < retrieval_quota:
+        for index in order:
+            if sources[index] == "direct" and index not in selected_indexes:
+                selected.append(predictions[index])
+                selected_indexes.add(index)
+                if len(selected) == total:
+                    break
+    return selected
+
+
 class MyOptimizer(FloorplanOptimizer):
     def __init__(
         self,
@@ -102,6 +143,22 @@ class MyOptimizer(FloorplanOptimizer):
         self._load_model()
         self.direct_model = None
         self._load_direct_model()
+        self.retrieval_index = None
+        self.retrieval_slots = 0
+        configured_max_cost = _env_float("PARTNER_RETRIEVAL_MAX_COST", 2.0)
+        self.retrieval_max_cost = configured_max_cost if math.isfinite(configured_max_cost) else 2.0
+        retrieval_path = os.environ.get("PARTNER_RETRIEVAL_INDEX", "").strip()
+        requested_slots = _env_int("PARTNER_RETRIEVAL_SLOTS", 0)
+        if retrieval_path and requested_slots > 0:
+            try:
+                from retrieval_index_claude import RetrievalIndex
+                self.retrieval_index = RetrievalIndex.load(Path(retrieval_path))
+                self.retrieval_slots = requested_slots
+            except Exception as exc:
+                self.retrieval_index = None
+                self.retrieval_slots = 0
+                if self.verbose:
+                    print(f"retrieval index unavailable: {exc}")
         # spawn the parallel-restart pool now so worker startup cost is not
         # charged to any test case
         init_worker_pool(N_RESTART_WORKERS)
@@ -253,10 +310,16 @@ class MyOptimizer(FloorplanOptimizer):
                     deadline - time.time()) > _env_float(
                         "PARTNER_DIRECT_MIN", 4.5):
                 if _lg._POOL is not None and _lg._POOL_READY:
-                    sample_fn = (lambda K: self._sample_direct_preds(
-                        block_count, area_targets, constraints,
-                        target_positions, b2b, p2b, pins, K,
-                        oversample=(deadline - time.time()) > 12.0))
+                    if self.retrieval_index is not None and self.retrieval_slots > 0:
+                        sample_fn = (lambda K: self._sample_portfolio_preds(
+                            block_count, area_targets, constraints,
+                            target_positions, b2b, p2b, pins, K,
+                            oversample=(deadline - time.time()) > 12.0))
+                    else:
+                        sample_fn = (lambda K: self._sample_direct_preds(
+                            block_count, area_targets, constraints,
+                            target_positions, b2b, p2b, pins, K,
+                            oversample=(deadline - time.time()) > 12.0))
                 else:
                     # no pool: fall back to the sliced in-process thread
                     th = threading.Thread(
@@ -307,12 +370,9 @@ class MyOptimizer(FloorplanOptimizer):
         except Exception:
             return out
 
-    def _sample_direct_preds(self, n, at, cons, tpos, b2b, p2b, pins,
-                             K, oversample: bool = True) -> List[np.ndarray]:
-        """One batched DDIM pass (K layouts for ~1 layout's latency),
-        prescreen-ordered: raw HPWL plus a strong penalty on total pairwise
-        overlap (deeply overlapped predictions rarely survive the
-        legalization rungs)."""
+    def _sample_direct_raw_preds(self, n, at, cons, tpos, b2b, p2b, pins,
+                                 K, oversample: bool = True) -> List[np.ndarray]:
+        """Generate the baseline bounded Direct batch before prescreening."""
         from direct_train_claude import fast_condition
         from direct_model_claude import known_z_channels, sample_direct
         dev = self.device
@@ -363,67 +423,59 @@ class MyOptimizer(FloorplanOptimizer):
                 z_repr=self.direct_cfg.z_repr)
         preds = [rects[k, :n].cpu().numpy().astype(np.float64)
                  for k in range(K_s)]
+        return preds
 
-        w_b2b = (b2b[:n, :n].detach().cpu().numpy()
-                 if b2b is not None else None)
+    def _constraint_penalties(self, preds, n, at, cons):
+        if not os.environ.get("PARTNER_PRESCREEN_V"):
+            return None
+        _f, _p, _mib, clu, bnd = _parse_constraints(cons, n)
+        groups = {}
+        for i in range(n):
+            if clu[i] > 0:
+                groups.setdefault(clu[i], []).append(i)
+        diag = math.sqrt(max(float(at[:n].sum().item()), 1.0))
 
-        # Constraint-aware prescreen (PARTNER_PRESCREEN_V=1): the plain
-        # HPWL+overlap ranking is blind to boundary/grouping structure, so
-        # predictions that legalize into violation-free layouts can lose
-        # their refine slot to prettier-but-doomed ones.  Penalize coded
-        # blocks far from their required wall and dispersed cluster groups.
-        if os.environ.get("PARTNER_PRESCREEN_V"):
-            _f, _p, _mib, clu, bnd = _parse_constraints(cons, n)
-            groups = {}
+        def _viol_est(P):
+            x0, y0 = P[:, 0], P[:, 1]
+            x1, y1 = x0 + P[:, 2], y0 + P[:, 3]
+            X0, Y0, X1, Y1 = x0.min(), y0.min(), x1.max(), y1.max()
+            pen = 0.0
+            n_b = 0
             for i in range(n):
-                if clu[i] > 0:
-                    groups.setdefault(clu[i], []).append(i)
-            diag = math.sqrt(max(float(at[:n].sum().item()), 1.0))
+                code = bnd[i]
+                if not code:
+                    continue
+                n_b += 1
+                distance = 0.0
+                if code & 1:
+                    distance = max(distance, float(x0[i] - X0))
+                if code & 2:
+                    distance = max(distance, float(X1 - x1[i]))
+                if code & 4:
+                    distance = max(distance, float(Y1 - y1[i]))
+                if code & 8:
+                    distance = max(distance, float(y0[i] - Y0))
+                pen += min(distance / diag, 1.0)
+            if n_b:
+                pen /= n_b
+            spread = 0.0
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                group_width = float(x1[group].max() - x0[group].min())
+                group_height = float(y1[group].max() - y0[group].min())
+                group_area = float((P[group, 2] * P[group, 3]).sum())
+                spread += min(max(0.0, group_width * group_height / max(group_area, 1e-9) - 1.2), 3.0)
+            if groups:
+                spread /= max(sum(len(group) >= 2 for group in groups.values()), 1)
+            return pen + spread
 
-            def _viol_est(P):
-                x0 = P[:, 0]
-                y0 = P[:, 1]
-                x1 = x0 + P[:, 2]
-                y1 = y0 + P[:, 3]
-                X0, Y0 = x0.min(), y0.min()
-                X1, Y1 = x1.max(), y1.max()
-                pen = 0.0
-                n_b = 0
-                for i in range(n):
-                    code = bnd[i]
-                    if not code:
-                        continue
-                    n_b += 1
-                    d = 0.0
-                    if code & 1:
-                        d = max(d, float(x0[i] - X0))
-                    if code & 2:
-                        d = max(d, float(X1 - x1[i]))
-                    if code & 4:
-                        d = max(d, float(Y1 - y1[i]))
-                    if code & 8:
-                        d = max(d, float(y0[i] - Y0))
-                    pen += min(d / diag, 1.0)
-                if n_b:
-                    pen /= n_b
-                spread = 0.0
-                for g in groups.values():
-                    if len(g) < 2:
-                        continue
-                    gw = float(x1[g].max() - x0[g].min())
-                    gh = float(y1[g].max() - y0[g].min())
-                    asum = float((P[g, 2] * P[g, 3]).sum())
-                    spread += min(max(0.0, gw * gh / max(asum, 1e-9) - 1.2),
-                                  3.0)
-                if groups:
-                    spread /= max(sum(1 for g in groups.values()
-                                      if len(g) >= 2), 1)
-                return pen + spread
+        return [_viol_est(prediction) for prediction in preds]
 
-            penalties = [_viol_est(prediction) for prediction in preds]
-        else:
-            penalties = None
-        order = rank_predictions(
+    def _rank_portfolio(self, preds, n, at, cons, b2b):
+        w_b2b = b2b[:n, :n].detach().cpu().numpy() if b2b is not None else None
+        penalties = self._constraint_penalties(preds, n, at, cons)
+        return rank_predictions(
             preds,
             at[:n].detach().cpu().numpy(),
             w_b2b if w_b2b is not None else np.zeros((n, n), dtype=np.float64),
@@ -431,7 +483,126 @@ class MyOptimizer(FloorplanOptimizer):
             violation_weight=(_env_float("PARTNER_PRESCREEN_VW", 0.5)
                               if penalties is not None else 0.0),
         )
-        return [preds[k] for k in order]
+
+    def _sample_direct_preds(self, n, at, cons, tpos, b2b, p2b, pins,
+                             K, oversample: bool = True) -> List[np.ndarray]:
+        """Prescreen the Direct batch exactly as the reviewed baseline does."""
+        preds = self._sample_direct_raw_preds(n, at, cons, tpos, b2b, p2b, pins, K, oversample)
+        return [preds[index] for index in self._rank_portfolio(preds, n, at, cons, b2b)]
+
+    def _empty_retrieval_batch(self, started: float, rejected: int = 0,
+                               query_s: float = 0.0) -> CandidateBatch:
+        return CandidateBatch(
+            "retrieval", [], max(0.0, time.perf_counter() - started),
+            {"source_ids": [], "retrieval_distances": [], "transforms": [],
+             "match_costs": [], "match_confidences": [], "query_s": query_s,
+             "match_s": 0.0, "transfer_s": 0.0, "rejected": rejected},
+        )
+
+    def _sample_retrieval_preds(self, n, at, cons, tpos, b2b, p2b, pins, K) -> CandidateBatch:
+        """Query same-N training layouts and transfer one D4 match per source."""
+        started = time.perf_counter()
+        limit = min(max(0, int(K)), max(0, int(self.retrieval_slots)))
+        if limit <= 0 or self.retrieval_index is None:
+            return self._empty_retrieval_batch(started)
+
+        try:
+            area = at[:n].detach().cpu().numpy()
+            constraints = cons[:n].detach().cpu().numpy()
+            target_positions = tpos[:n].detach().cpu().numpy()
+            b2b_array = b2b.detach().cpu().numpy()
+            p2b_array = p2b.detach().cpu().numpy()
+            pins_array = pins.detach().cpu().numpy()
+            target_features = extract_retrieval_features(
+                area, b2b_array, p2b_array, pins_array, constraints, target_positions
+            )
+        except Exception:
+            return self._empty_retrieval_batch(started)
+        query_started = time.perf_counter()
+        try:
+            retrieved = self.retrieval_index.query(n, target_features.global_vector, top_k=limit)
+        except Exception:
+            return self._empty_retrieval_batch(
+                started, query_s=time.perf_counter() - query_started
+            )
+        query_s = time.perf_counter() - query_started
+
+        predictions: List[np.ndarray] = []
+        source_ids: List[int] = []
+        distances: List[float] = []
+        transforms: List[str] = []
+        match_costs: List[float] = []
+        confidences: List[float] = []
+        match_s = 0.0
+        transfer_s = 0.0
+        rejected = 0
+        transform_names = ("identity", "mirror_x", "mirror_y", "transpose")
+        for source_position in range(min(limit, len(retrieved.source_ids))):
+            choices = []
+            source_nodes = retrieved.node_features[source_position]
+            for transform_order, transform in enumerate(transform_names):
+                match_started = time.perf_counter()
+                try:
+                    result = match_blocks(
+                        remap_boundary_node_features(source_nodes, transform),
+                        target_features.node_matrix, max_cost=self.retrieval_max_cost,
+                    )
+                except Exception:
+                    result = None
+                match_s += time.perf_counter() - match_started
+                if (result is not None and result.accepted
+                        and math.isfinite(result.total_cost)):
+                    choices.append((float(result.total_cost), transform_order, transform, result))
+            if not choices:
+                rejected += 1
+                continue
+            _cost, _order, transform, result = min(choices, key=lambda item: item[:2])
+            transfer_started = time.perf_counter()
+            try:
+                prediction = transfer_layout(
+                    retrieved.fp_xywh[source_position], result.target_to_source,
+                    area, constraints, target_positions, transform,
+                )
+                fixed_or_preplaced = (constraints[:, 0] != 0) | (constraints[:, 1] != 0)
+                has_shape = fixed_or_preplaced & (target_positions[:, 2] > 0) & (target_positions[:, 3] > 0)
+                preplaced = ((constraints[:, 1] != 0) & (target_positions[:, 0] >= 0)
+                             & (target_positions[:, 1] >= 0))
+                if (prediction.shape != (n, 4) or not np.isfinite(prediction).all()
+                        or not np.array_equal(prediction[has_shape, 2:4], target_positions[has_shape, 2:4])
+                        or not np.array_equal(prediction[preplaced, :2], target_positions[preplaced, :2])):
+                    raise ValueError("invalid transferred retrieval layout")
+            except Exception:
+                transfer_s += time.perf_counter() - transfer_started
+                rejected += 1
+                continue
+            transfer_s += time.perf_counter() - transfer_started
+            predictions.append(np.asarray(prediction, dtype=np.float64))
+            source_ids.append(int(retrieved.source_ids[source_position]))
+            distances.append(float(retrieved.distances[source_position]))
+            transforms.append(transform)
+            match_costs.append(float(result.total_cost))
+            confidences.append(float(result.confidence))
+
+        return CandidateBatch(
+            "retrieval", predictions, max(0.0, time.perf_counter() - started),
+            {"source_ids": source_ids, "retrieval_distances": distances,
+             "transforms": transforms, "match_costs": match_costs,
+             "match_confidences": confidences, "query_s": query_s,
+             "match_s": match_s, "transfer_s": transfer_s, "rejected": rejected},
+        )
+
+    def _sample_portfolio_preds(self, n, at, cons, tpos, b2b, p2b, pins,
+                                K, oversample: bool = True) -> List[np.ndarray]:
+        """Use one source-neutral rank for the bounded Direct/retrieval portfolio."""
+        retrieval_quota = min(max(0, int(K)), max(0, int(self.retrieval_slots)))
+        if retrieval_quota <= 0 or self.retrieval_index is None:
+            return self._sample_direct_preds(n, at, cons, tpos, b2b, p2b, pins, K, oversample)
+        direct = self._sample_direct_raw_preds(n, at, cons, tpos, b2b, p2b, pins, K, oversample)
+        retrieved = self._sample_retrieval_preds(n, at, cons, tpos, b2b, p2b, pins, retrieval_quota)
+        predictions = direct + retrieved.predictions
+        sources = ["direct"] * len(direct) + ["retrieval"] * len(retrieved.predictions)
+        order = self._rank_portfolio(predictions, n, at, cons, b2b)
+        return _select_ranked_source_quota(predictions, sources, order, K, retrieval_quota)
 
     def _direct_worker(self, n, at, cons, tpos, b2b, p2b, pins,
                        deadline, box) -> None:
