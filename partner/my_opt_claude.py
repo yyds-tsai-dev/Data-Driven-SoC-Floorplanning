@@ -62,6 +62,9 @@ DEFAULT_CHECKPOINT = (
     Path(__file__).parent / "checkpoints" / "diffusion_stable_xywh_order_2day" / "step_00080000.pt"
 )
 DIRECT_CHECKPOINT_DIR = Path(__file__).parent / "checkpoints" / "direct_v2"
+# First R4 is intentionally fixed-capacity: retrieval may replace, but never
+# add to, more than two Direct refinement slots.
+FIRST_R4_RETRIEVAL_SLOTS = 2
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -153,7 +156,7 @@ class MyOptimizer(FloorplanOptimizer):
             try:
                 from retrieval_index_claude import RetrievalIndex
                 self.retrieval_index = RetrievalIndex.load(Path(retrieval_path))
-                self.retrieval_slots = requested_slots
+                self.retrieval_slots = min(requested_slots, FIRST_R4_RETRIEVAL_SLOTS)
             except Exception as exc:
                 self.retrieval_index = None
                 self.retrieval_slots = 0
@@ -502,7 +505,10 @@ class MyOptimizer(FloorplanOptimizer):
     def _sample_retrieval_preds(self, n, at, cons, tpos, b2b, p2b, pins, K) -> CandidateBatch:
         """Query same-N training layouts and transfer one D4 match per source."""
         started = time.perf_counter()
-        limit = min(max(0, int(K)), max(0, int(self.retrieval_slots)))
+        limit = min(
+            max(0, int(K)), max(0, int(self.retrieval_slots)),
+            FIRST_R4_RETRIEVAL_SLOTS,
+        )
         if limit <= 0 or self.retrieval_index is None:
             return self._empty_retrieval_batch(started)
 
@@ -594,7 +600,10 @@ class MyOptimizer(FloorplanOptimizer):
     def _sample_portfolio_preds(self, n, at, cons, tpos, b2b, p2b, pins,
                                 K, oversample: bool = True) -> List[np.ndarray]:
         """Use one source-neutral rank for the bounded Direct/retrieval portfolio."""
-        retrieval_quota = min(max(0, int(K)), max(0, int(self.retrieval_slots)))
+        retrieval_quota = min(
+            max(0, int(K)), max(0, int(self.retrieval_slots)),
+            FIRST_R4_RETRIEVAL_SLOTS,
+        )
         if retrieval_quota <= 0 or self.retrieval_index is None:
             return self._sample_direct_preds(n, at, cons, tpos, b2b, p2b, pins, K, oversample)
         direct = self._sample_direct_raw_preds(n, at, cons, tpos, b2b, p2b, pins, K, oversample)

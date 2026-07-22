@@ -11,7 +11,7 @@ uv run pytest tests/test_partner_retrieval_features.py \
   tests/test_partner_retrieval_scripts.py \
   tests/test_partner_retrieval_integration.py -q
 
-INDEX="artifacts/retrieval/pilot64"
+INDEX="$ROOT/artifacts/retrieval/pilot64"
 if [[ ! -d "$INDEX" ]]; then
   echo "retrieval gate requires existing train-only index: $INDEX" >&2
   exit 1

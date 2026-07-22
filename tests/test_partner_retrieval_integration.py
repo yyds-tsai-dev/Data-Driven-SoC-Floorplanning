@@ -13,7 +13,7 @@ if str(CONTEST) not in sys.path:
 
 import my_opt_claude
 from candidate_supply_claude import CandidateBatch
-from my_opt_claude import MyOptimizer, _select_ranked_source_quota
+from my_opt_claude import FIRST_R4_RETRIEVAL_SLOTS, MyOptimizer, _select_ranked_source_quota
 from retrieval_features_claude import extract_retrieval_features
 from retrieval_index_claude import RetrievalResult
 
@@ -86,6 +86,18 @@ def test_corrupt_index_fails_closed(monkeypatch):
     assert optimizer.retrieval_slots == 0
 
 
+def test_retrieval_env_slots_are_hard_capped_to_first_r4_capacity(monkeypatch):
+    monkeypatch.setattr(MyOptimizer, "_load_model", lambda self: None)
+    monkeypatch.setattr(MyOptimizer, "_load_direct_model", lambda self: None)
+    monkeypatch.setattr(my_opt_claude, "init_worker_pool", lambda _workers: None)
+    monkeypatch.setattr("retrieval_index_claude.RetrievalIndex.load", lambda _path: object())
+    monkeypatch.setenv("PARTNER_RETRIEVAL_INDEX", "pilot64")
+    monkeypatch.setenv("PARTNER_RETRIEVAL_SLOTS", "5")
+    optimizer = MyOptimizer(device="cpu")
+    assert FIRST_R4_RETRIEVAL_SLOTS == 2
+    assert optimizer.retrieval_slots == FIRST_R4_RETRIEVAL_SLOTS
+
+
 def test_retrieval_matches_soft_d4_metadata_and_hard_anchors(monkeypatch):
     area, constraints, targets, b2b, p2b, pins = _inputs()
     features = extract_retrieval_features(
@@ -138,9 +150,31 @@ def test_portfolio_disabled_is_direct_order_and_enabled_is_capacity_bounded(monk
     assert sum(float(p[0, 0]) == 9.0 for p in got) == 1
 
 
+def test_portfolio_defensively_caps_env_slots_to_two_and_keeps_three_direct(monkeypatch):
+    optimizer = _optimizer(object(), slots=5)
+    direct = [np.full((1, 4), float(i + 1)) for i in range(5)]
+    retrieved = CandidateBatch(
+        "retrieval", [np.full((1, 4), 9.0), np.full((1, 4), 10.0)], 0.0, {}
+    )
+    requests = []
+    monkeypatch.setattr(optimizer, "_sample_direct_raw_preds", lambda *args, **kwargs: direct)
+    monkeypatch.setattr(
+        optimizer, "_sample_retrieval_preds",
+        lambda *args, **kwargs: (requests.append(args[-1]), retrieved)[1],
+    )
+    monkeypatch.setattr(optimizer, "_rank_portfolio", lambda predictions, *_args: list(range(len(predictions))))
+    got = optimizer._sample_portfolio_preds(1, np.array([1.0]), None, None, None, None, None, 5)
+    assert requests == [2]
+    assert len(got) == 5
+    assert sum(float(p[0, 0]) >= 9.0 for p in got) == 2
+    assert sum(float(p[0, 0]) < 9.0 for p in got) == 3
+
+
 def test_gate_runner_uses_pilot64_two_slots_and_identical_direct_minimum():
     text = (my_opt_claude.Path(__file__).parents[1] / "scripts/probes/run_retrieval_gate.sh").read_text()
     assert "artifacts/retrieval/pilot64" in text
+    assert 'INDEX="$ROOT/artifacts/retrieval/pilot64"' in text
+    assert 'PARTNER_RETRIEVAL_INDEX="$INDEX"' in text
     assert "PARTNER_RETRIEVAL_SLOTS=2" in text
     assert text.count("PARTNER_DIRECT_MIN=2.5") == 2
     assert "iccad2026_evaluate.py" not in text
