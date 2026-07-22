@@ -144,7 +144,7 @@ def test_role_mismatched_matching_then_transfer_overrides_target_fixed_and_prepl
     constraints = np.array([[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]], dtype=np.float64)
     target_positions = np.array([[0, 0, 3, 5], [7, 11, 4, 6]], dtype=np.float64)
     source_nodes = np.zeros((2, 16), dtype=np.float64)
-    source_nodes[:, 5:9] = [[0, 1, 3, 8], [1, 0, 0, 0]]
+    source_nodes[:, 5:9] = [[0, 0, 3, 8], [0, 0, 0, 0]]
     target_nodes = np.zeros((2, 16), dtype=np.float64)
     target_nodes[:, 5:9] = [[1, 0, 9, 2], [0, 1, 5, 7]]
     match = match_blocks(source_nodes, target_nodes, max_cost=10.0)
@@ -154,6 +154,7 @@ def test_role_mismatched_matching_then_transfer_overrides_target_fixed_and_prepl
     )
 
     assert match.accepted
+    assert np.any(source_nodes[match.target_to_source, 5:7] != target_nodes[:, 5:7], axis=1).all()
     np.testing.assert_allclose(got[:, 2:4], [[3, 5], [4, 6]])
     np.testing.assert_allclose(got[1, :2], [7, 11], atol=0.0)
 
