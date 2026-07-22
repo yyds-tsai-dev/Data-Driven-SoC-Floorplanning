@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -25,6 +28,8 @@ from retrieval_index_claude import RetrievalIndex, RetrievalShard, save_index
 
 
 FEATURE_VERSION = 1
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +66,35 @@ def reservoir_indices_by_block_count(
         if replacement < max_per_n:
             bucket[replacement] = source_id
     return samples
+
+
+def _publish_directory_no_replace(temporary: Path, output: Path) -> None:
+    """Atomically publish a sibling directory only when its destination is absent.
+
+    Linux's ``renameat2(RENAME_NOREPLACE)`` is required here because ordinary
+    ``rename`` can replace an empty directory after a check-then-rename race.
+    Failing closed is preferable to risking an existing index on platforms that
+    do not expose the no-replace primitive.
+    """
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOSYS, "renameat2(RENAME_NOREPLACE) is unavailable") from error
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(temporary),
+        _AT_FDCWD,
+        os.fsencode(output),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(error_number, f"refusing to overwrite existing retrieval index: {output}")
+    raise OSError(error_number, f"atomic no-replace publication failed for {output}")
 
 
 def _sample_arrays(
@@ -139,7 +173,7 @@ def build_index(data_path: Path, output: Path, *, max_per_n: int, seed: int) -> 
         RetrievalIndex.load(temporary)
         if output.exists():
             raise FileExistsError(f"refusing to overwrite existing retrieval index: {output}")
-        temporary.rename(output)
+        _publish_directory_no_replace(temporary, output)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
