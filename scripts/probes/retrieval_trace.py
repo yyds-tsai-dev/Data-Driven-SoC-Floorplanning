@@ -34,7 +34,8 @@ for import_path in (
 
 from candidate_supply_claude import CandidateBatch
 from iccad2026_evaluate import evaluate_solution
-from legalizer_claude import _POOL_SIZE, _worker_refine
+import legalizer_claude
+from legalizer_claude import _worker_refine
 from lite_dataset_test import FloorplanDatasetLiteTest
 from my_opt_claude import FIRST_R4_RETRIEVAL_SLOTS, MyOptimizer, _select_ranked_source_quota
 
@@ -126,18 +127,26 @@ def json_safe(value: Any) -> Any:
 
 
 def resolve_selection_k(block_count: int, selection_k: str | int) -> int:
-    """Mirror legalizer_claude's active ``n_ref`` capacity rule."""
+    """Mirror the live legalizer ``n_ref`` rule without exceeding no-pool capacity."""
     if selection_k != "auto":
         return int(selection_k)
-    resolved = min(8, max(3, _POOL_SIZE // 3))
+    try:
+        pool_size = max(0, int(legalizer_claude._POOL_SIZE))
+    except (TypeError, ValueError):
+        pool_size = 0
+    if pool_size == 0:
+        return 0
+    # This is the active production formula for normal pools.  The outer cap
+    # only matters if a pool has failed to initialize with its six column slots.
+    resolved = min(8, max(3, pool_size // 3))
     try:
         requested = int(float(os.environ.get("PARTNER_NREF", "0") or 0))
         min_n = int(float(os.environ.get("PARTNER_NREF_MIN_N", "95")))
     except ValueError:
         requested, min_n = 0, 95
     if requested > 0 and block_count >= min_n:
-        resolved = max(3, min(requested, _POOL_SIZE - 6))
-    return resolved
+        resolved = max(3, min(requested, pool_size - 6))
+    return min(resolved, pool_size) if pool_size < 9 else resolved
 
 
 def stable_candidate_id(
@@ -271,13 +280,14 @@ def _case_trace(
     optimizer: MyOptimizer, sample: dict[str, object], case_id: int, *, selection_k: str | int,
     refine_seconds: float, seed: int,
 ) -> dict[str, object]:
-    from gen_decoder_probe import _opt_target_positions
+    from gen_decoder_probe import _golden_rects, _opt_target_positions
 
     at, b2b, p2b, pins, constraints = sample["input"]
     n = int((at != -1).sum().item())
     if n <= 0:
         raise ValueError("evaluation sample has no active blocks")
-    target_positions = _opt_target_positions(sample, n)
+    golden = _golden_rects(sample, n)
+    target_positions = _opt_target_positions(sample, n, golden)
     resolved_k = resolve_selection_k(n, selection_k)
     quota = min(resolved_k, optimizer.retrieval_slots, FIRST_R4_RETRIEVAL_SLOTS)
     direct = optimizer._sample_direct_raw_preds(
@@ -354,6 +364,10 @@ def run_trace(args: argparse.Namespace) -> dict[str, object]:
         optimizer = MyOptimizer(checkpoint_path=str(checkpoint_path), device=args.device)
         if optimizer.retrieval_index is None:
             raise RuntimeError("production optimizer did not load the requested retrieval index")
+        if optimizer.direct_model is None:
+            raise RuntimeError(
+                f"requested Direct checkpoint did not load: {checkpoint_path}"
+            )
         runtime_environment = {
             key: value for key, value in sorted(os.environ.items())
             if key.startswith(("PARTNER_", "DIRECT_", "CUDA_", "FLOORSET_"))

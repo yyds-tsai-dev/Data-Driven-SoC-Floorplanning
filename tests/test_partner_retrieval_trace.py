@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +97,83 @@ def test_candidate_ids_and_refinement_seeds_are_stable():
     assert candidate_id == trace.stable_candidate_id(49, "retrieval", 1, 71)
     assert candidate_id != trace.stable_candidate_id(49, "direct", 1, None)
     assert trace.refinement_seed(9001, candidate_id) == trace.refinement_seed(9001, candidate_id)
+
+
+def test_case_trace_builds_evaluator_faithful_anchors_from_golden_layout(monkeypatch):
+    trace = _load_trace_module()
+    seen_targets = []
+
+    class FakeOptimizer:
+        retrieval_slots = 0
+
+        def _sample_direct_raw_preds(self, _n, _at, _cons, targets, *_args, **_kwargs):
+            seen_targets.append(targets.clone())
+            return [_prediction(3)]
+
+        def _sample_retrieval_preds(self, *_args, **_kwargs):
+            return trace.CandidateBatch("retrieval", [], 0.0, {})
+
+        def _rank_portfolio(self, *_args):
+            return [0]
+
+    sample = {
+        "input": (
+            torch.tensor([1.0]), torch.empty((0, 3)), torch.empty((0, 3)),
+            torch.empty((0, 2)), torch.tensor([[0.0, 1.0, 0.0, 0.0, 0.0]]),
+        ),
+        "label": (
+            torch.tensor([[[4.0, 5.0], [6.0, 5.0], [6.0, 8.0], [4.0, 8.0]]]),
+            torch.empty(0),
+        ),
+    }
+    monkeypatch.setattr(trace, "_score_layout", lambda *_args: {"cost_no_runtime": 1.0})
+    monkeypatch.setattr(trace, "refine_union_candidates", lambda *_args, **_kwargs: None)
+
+    trace._case_trace(FakeOptimizer(), sample, 49, selection_k=1, refine_seconds=1.0, seed=9001)
+
+    assert len(seen_targets) == 1
+    assert seen_targets[0].tolist() == [[4.0, 5.0, 2.0, 3.0]]
+
+
+def test_auto_selection_k_reads_live_legalizer_pool_capacity(monkeypatch):
+    trace = _load_trace_module()
+    monkeypatch.setattr(trace.legalizer_claude, "_POOL_SIZE", 24)
+    monkeypatch.setenv("PARTNER_NREF", "15")
+    monkeypatch.setenv("PARTNER_NREF_MIN_N", "95")
+
+    assert trace.resolve_selection_k(94, "auto") == 8
+    assert trace.resolve_selection_k(95, "auto") == 15
+
+
+def test_auto_selection_k_is_safe_when_live_pool_is_too_small(monkeypatch):
+    trace = _load_trace_module()
+    monkeypatch.setattr(trace.legalizer_claude, "_POOL_SIZE", 0)
+    monkeypatch.setenv("PARTNER_NREF", "15")
+
+    assert trace.resolve_selection_k(120, "auto") == 0
+
+
+def test_run_trace_rejects_silently_unloaded_direct_checkpoint(monkeypatch, tmp_path):
+    trace = _load_trace_module()
+    checkpoint = tmp_path / "direct.pt"
+    checkpoint.write_bytes(b"checkpoint")
+
+    class FakeOptimizer:
+        retrieval_index = object()
+        direct_model = None
+
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(trace, "MyOptimizer", FakeOptimizer)
+    monkeypatch.setattr(trace, "index_contract", lambda _path: {"manifest_sha256": "x", "shards": {}})
+    args = SimpleNamespace(
+        index=tmp_path, checkpoint=checkpoint, device="cpu", data_path=tmp_path,
+        case_ids=[0], selection_k="auto", refine_seconds=1.0, seed=9001,
+    )
+
+    with pytest.raises(RuntimeError, match="Direct checkpoint.*did not load"):
+        trace.run_trace(args)
 
 
 def test_union_candidates_receive_identical_refinement_allowance(monkeypatch):
