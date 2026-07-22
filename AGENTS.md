@@ -27,6 +27,17 @@ Recent history uses concise Conventional-style subjects such as `docs: ...`, `re
 
 ## Agent-Specific Instructions
 
+### Subagent Model Routing
+
+When the user selects Subagent-Driven execution, use the following routing policy:
+
+- `gpt-5.6-sol` is the root Scheduler/Integrator. It decomposes the request, manages dependencies, assigns the least expensive capable executor, integrates results, and performs final verification.
+- Use a Terra deep-reasoner role with high/xhigh reasoning for bounded architecture analysis, experiment design, integration reasoning, and non-mechanical debugging. Escalate highest-risk architecture, solver-policy, subtle root-cause work, and final whole-branch review to Sol high/xhigh.
+- Use `gpt-5.6-luna` as the fast-worker for well-specified, low-ambiguity mechanical work such as applying a decided edit, running scripts/tests and reporting, renames/moves, boilerplate, documentation synchronization, and fact gathering.
+- Always specify model and reasoning effort explicitly when dispatching. `deep-reasoner` and `fast-worker` are semantic prompt roles, not formal `agent_type` values; use an available formal type such as `worker` or `default`.
+- The fish Codex CLI on this host has been verified to run `gpt-5.6-luna`. If the active `spawn_agent` interface does not advertise or accept Luna, invoke the fast-worker through an ephemeral `codex exec -m gpt-5.6-luna` file-handoff workflow. Fall back to Terra low/medium only when the CLI workflow is unsuitable.
+- Follow the Subagent-Driven review loop: fresh implementer per task, task-scoped review, fix and re-review Important/Critical findings, then a broad final whole-branch review.
+
 ### graphify
 
 This project has a knowledge graph at `graphify-out/` with god nodes, community structure, and cross-file relationships.
