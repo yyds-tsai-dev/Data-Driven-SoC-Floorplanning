@@ -9,6 +9,87 @@ from retrieval_transfer_claude import (
 )
 
 
+def _scalar_hungarian_min_cost(cost: np.ndarray) -> np.ndarray:
+    """Reference potentials implementation used to verify the vectorized solver."""
+    cost = np.asarray(cost, dtype=np.float64)
+    n = len(cost)
+    u = np.zeros(n + 1, dtype=np.float64)
+    v = np.zeros(n + 1, dtype=np.float64)
+    p = np.zeros(n + 1, dtype=np.int64)
+    way = np.zeros(n + 1, dtype=np.int64)
+    for row in range(1, n + 1):
+        p[0] = row
+        min_value = np.full(n + 1, np.inf, dtype=np.float64)
+        used = np.zeros(n + 1, dtype=bool)
+        column = 0
+        while True:
+            used[column] = True
+            active_row = p[column]
+            delta = np.inf
+            next_column = 0
+            for candidate in range(1, n + 1):
+                if used[candidate]:
+                    continue
+                reduced = cost[active_row - 1, candidate - 1] - u[active_row] - v[candidate]
+                if reduced < min_value[candidate]:
+                    min_value[candidate] = reduced
+                    way[candidate] = column
+                if min_value[candidate] < delta:
+                    delta = min_value[candidate]
+                    next_column = candidate
+            for candidate in range(n + 1):
+                if used[candidate]:
+                    u[p[candidate]] += delta
+                    v[candidate] -= delta
+                else:
+                    min_value[candidate] -= delta
+            column = next_column
+            if p[column] == 0:
+                break
+        while True:
+            previous = way[column]
+            p[column] = p[previous]
+            column = previous
+            if column == 0:
+                break
+
+    assignment = np.empty(n, dtype=np.int64)
+    for column in range(1, n + 1):
+        assignment[p[column] - 1] = column - 1
+    return assignment
+
+
+@pytest.mark.parametrize(("seed", "size"), [(0, 2), (17, 5), (71, 7)])
+def test_vectorized_hungarian_matches_scalar_reference_on_seeded_costs(seed, size):
+    cost = np.random.default_rng(seed).uniform(-10.0, 10.0, size=(size, size))
+
+    expected = _scalar_hungarian_min_cost(cost)
+    actual = hungarian_min_cost(cost)
+
+    np.testing.assert_array_equal(actual, expected)
+    assert cost[np.arange(size), actual].sum() == cost[np.arange(size), expected].sum()
+
+
+@pytest.mark.parametrize(
+    "cost",
+    [
+        np.array(
+            [[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0],
+             [1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]],
+            dtype=np.float64,
+        ),
+        np.array([[7.0]], dtype=np.float64),
+        np.array([[1e300, 2e300], [2e300, 1e300]], dtype=np.float64),
+    ],
+)
+def test_vectorized_hungarian_matches_scalar_reference_on_ties_and_finite_extremes(cost):
+    expected = _scalar_hungarian_min_cost(cost)
+    actual = hungarian_min_cost(cost)
+
+    np.testing.assert_array_equal(actual, expected)
+    assert cost[np.arange(len(cost)), actual].sum() == cost[np.arange(len(cost)), expected].sum()
+
+
 def test_matching_recovers_area_and_constraint_correspondence():
     source = np.zeros((3, 16), dtype=np.float64)
     source[:, 0] = [0.0, 1.0, 2.0]
@@ -82,6 +163,33 @@ def test_matching_single_block_has_a_confident_compatible_assignment():
     assert result.accepted
     assert result.target_to_source.tolist() == [0]
     assert result.confidence == 1.0
+
+
+def test_matching_confidence_is_normalized_for_a_unique_identity_assignment():
+    source = np.vstack((np.zeros(16), np.ones(16)))
+
+    result = match_blocks(source, source.copy(), max_cost=0.0)
+
+    assert result.target_to_source.tolist() == [0, 1]
+    assert 0.0 < result.confidence <= 1.0
+
+
+def test_matching_confidence_is_zero_for_an_all_equal_multi_node_tie():
+    source = np.zeros((3, 16), dtype=np.float64)
+
+    result = match_blocks(source, source.copy(), max_cost=0.0)
+
+    assert result.confidence == 0.0
+
+
+def test_matching_confidence_ignores_a_globally_forced_non_row_minimum():
+    source = np.vstack((np.zeros(16), np.full(16, 10.0)))
+    target = np.vstack((np.zeros(16), np.full(16, 0.1)))
+
+    result = match_blocks(source, target, max_cost=10.0)
+
+    assert result.target_to_source.tolist() == [0, 1]
+    assert result.confidence == pytest.approx(0.5)
 
 
 def test_matching_equal_cost_ties_are_deterministic():

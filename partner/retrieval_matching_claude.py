@@ -36,24 +36,23 @@ def hungarian_min_cost(cost: np.ndarray) -> np.ndarray:
         while True:
             used[column] = True
             active_row = p[column]
-            delta = np.inf
-            next_column = 0
-            for candidate in range(1, n + 1):
-                if used[candidate]:
-                    continue
-                reduced = cost[active_row - 1, candidate - 1] - u[active_row] - v[candidate]
-                if reduced < min_value[candidate]:
-                    min_value[candidate] = reduced
-                    way[candidate] = column
-                if min_value[candidate] < delta:
-                    delta = min_value[candidate]
-                    next_column = candidate
-            for candidate in range(n + 1):
-                if used[candidate]:
-                    u[p[candidate]] += delta
-                    v[candidate] -= delta
-                else:
-                    min_value[candidate] -= delta
+            candidate_columns = np.flatnonzero(~used[1:]) + 1
+            reduced = (
+                cost[active_row - 1, candidate_columns - 1]
+                - u[active_row]
+                - v[candidate_columns]
+            )
+            improved = reduced < min_value[candidate_columns]
+            improved_columns = candidate_columns[improved]
+            min_value[improved_columns] = reduced[improved]
+            way[improved_columns] = column
+
+            next_column = int(candidate_columns[np.argmin(min_value[candidate_columns])])
+            delta = min_value[next_column]
+            used_columns = np.flatnonzero(used)
+            u[p[used_columns]] += delta
+            v[used_columns] -= delta
+            min_value[~used] -= delta
             column = next_column
             if p[column] == 0:
                 break
@@ -83,6 +82,24 @@ def _standardized_soft_l1(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.abs(target_standardized[:, None, :] - source_standardized[None, :, :]).mean(axis=-1)
 
 
+def _assignment_confidence(cost: np.ndarray, assignment: np.ndarray) -> float:
+    """Return a bounded diagnostic margin for an exact target-to-source assignment."""
+    if len(assignment) == 1:
+        return 1.0
+
+    rows = np.arange(len(assignment))
+    chosen = cost[rows, assignment]
+    row_minimum = cost.min(axis=1)
+    best_alternative = np.partition(cost, 1, axis=1)[:, 1]
+    unique_row_minimum = (chosen == row_minimum) & (best_alternative > chosen)
+    margins = np.zeros(len(assignment), dtype=np.float64)
+    margins[unique_row_minimum] = (
+        (best_alternative[unique_row_minimum] - chosen[unique_row_minimum])
+        / best_alternative[unique_row_minimum]
+    )
+    return float(np.clip(margins, 0.0, 1.0).mean())
+
+
 def match_blocks(source_nodes, target_nodes, max_cost) -> MatchResult:
     """Match each target node to one source node using all-soft feature costs."""
     source = np.asarray(source_nodes, dtype=np.float64)
@@ -99,8 +116,7 @@ def match_blocks(source_nodes, target_nodes, max_cost) -> MatchResult:
     cost = _standardized_soft_l1(source, target)
     assignment = hungarian_min_cost(cost)
     chosen = cost[np.arange(len(assignment)), assignment]
-    second = np.partition(cost, 1, axis=1)[:, 1] if len(assignment) > 1 else chosen + 1.0
-    confidence = float(np.mean(second - chosen))
+    confidence = _assignment_confidence(cost, assignment)
     total = float(chosen.mean())
     return MatchResult(
         target_to_source=assignment,
