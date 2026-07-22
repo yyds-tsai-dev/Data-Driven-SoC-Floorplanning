@@ -16,6 +16,8 @@ class RetrievalFeatures:
             raise ValueError("global retrieval feature must have shape [24]")
         if self.node_matrix.shape != (self.block_count, 16):
             raise ValueError("node retrieval features must have shape [N,16]")
+        if self.global_vector.dtype != np.float32 or self.node_matrix.dtype != np.float32:
+            raise ValueError("retrieval features must have dtype float32")
         if not np.isfinite(self.global_vector).all() or not np.isfinite(self.node_matrix).all():
             raise ValueError("retrieval features must be finite")
 

@@ -1,6 +1,7 @@
 import numpy as np
+import pytest
 
-from retrieval_features_claude import extract_retrieval_features
+from retrieval_features_claude import RetrievalFeatures, extract_retrieval_features
 
 
 def _instance():
@@ -26,6 +27,15 @@ def test_feature_contract_is_finite_fixed_width_and_float32():
     assert features.node_matrix.dtype == np.float32
     assert np.isfinite(features.global_vector).all()
     assert np.isfinite(features.node_matrix).all()
+
+
+def test_direct_constructor_rejects_float64_arrays():
+    with pytest.raises(ValueError, match="float32"):
+        RetrievalFeatures(
+            np.zeros(24, dtype=np.float64),
+            np.zeros((3, 16), dtype=np.float64),
+            3,
+        )
 
 
 def test_global_features_are_block_permutation_invariant_and_nodes_follow_blocks():
