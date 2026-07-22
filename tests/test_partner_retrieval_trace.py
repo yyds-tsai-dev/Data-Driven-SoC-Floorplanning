@@ -178,6 +178,21 @@ def test_run_trace_rejects_silently_unloaded_direct_checkpoint(monkeypatch, tmp_
         trace.run_trace(args)
 
 
+def test_score_layout_uses_real_evaluator_helper_contract_on_golden_sample():
+    trace = _load_trace_module()
+    dataset = trace.FloorplanDatasetLiteTest(str(REPO_ROOT / "FloorSet"))
+    sample = dataset[0]
+    n = int((sample["input"][0] != -1).sum().item())
+    from gen_decoder_probe import _golden_rects
+
+    score = trace._score_layout(sample, np.asarray(_golden_rects(sample, n)), n)
+
+    assert np.isfinite(score["cost_no_runtime"])
+    assert isinstance(score["is_feasible"], bool)
+    for field in ("hpwl_gap", "area_gap", "violations_relative"):
+        assert np.isfinite(score[field])
+
+
 def test_union_candidates_receive_identical_refinement_allowance(monkeypatch):
     trace = _load_trace_module()
     calls = []

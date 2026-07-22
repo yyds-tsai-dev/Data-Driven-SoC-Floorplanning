@@ -33,7 +33,6 @@ for import_path in (
         sys.path.insert(0, str(import_path))
 
 from candidate_supply_claude import CandidateBatch
-from iccad2026_evaluate import evaluate_solution
 import legalizer_claude
 from legalizer_claude import _worker_refine
 from lite_dataset_test import FloorplanDatasetLiteTest
@@ -179,21 +178,17 @@ def select_policy_candidate_indexes(
 
 
 def _score_layout(sample: dict[str, object], positions: np.ndarray, n: int) -> dict[str, object]:
-    from gen_decoder_probe import _baseline, _golden_rects
+    from gen_decoder_probe import score_case
 
-    at, b2b, p2b, pins, constraints = sample["input"]
-    baseline = _baseline(sample, n, b2b, p2b, pins)
-    golden = _golden_rects(sample, n)
-    metrics = evaluate_solution(
-        {"positions": [tuple(map(float, row)) for row in positions], "runtime": 1.0},
-        baseline, constraints, b2b, p2b, pins, at[:n], golden, median_runtime=1.0,
+    metrics = score_case(
+        sample, [tuple(map(float, row)) for row in positions], n,
     )
     return {
-        "cost_no_runtime": float(metrics.cost_no_runtime),
-        "is_feasible": bool(metrics.is_feasible),
-        "hpwl_gap": float(metrics.hpwl_gap),
-        "area_gap": float(metrics.area_gap),
-        "violations_relative": float(metrics.violations_relative),
+        "cost_no_runtime": float(metrics["cost"]),
+        "is_feasible": bool(metrics["feasible"]),
+        "hpwl_gap": float(metrics["hpwl_gap"]),
+        "area_gap": float(metrics["area_gap"]),
+        "violations_relative": float(metrics["v_rel"]),
     }
 
 
