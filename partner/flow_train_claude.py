@@ -162,6 +162,8 @@ def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, am
 
 def main():
     """Configure Direct-v2 defaults, then reuse the V1 training lifecycle."""
+    import inspect
+
     import direct_train_claude as V1
 
     argv = sys.argv[1:]
@@ -203,6 +205,26 @@ def main():
 
     V1.parse_args = parse_flow_args
     V1.train_step = flow_train_step
+    official_training_loader = V1.get_training_dataloader
+    accepted = inspect.signature(official_training_loader).parameters
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in accepted.values()
+    )
+
+    def compatible_training_loader(*args, **kwargs):
+        """Forward only kwargs supported by the official train-only loader.
+
+        The official FloorSet loader has no ``num_workers`` or ``pin_memory``
+        parameters, so V1's optional throughput knobs are unavailable on this
+        subset path.  Its train-only data path, subset size, batch size, and
+        shuffle flag are forwarded unchanged.
+        """
+        if not accepts_kwargs:
+            kwargs = {name: value for name, value in kwargs.items() if name in accepted}
+        return official_training_loader(*args, **kwargs)
+
+    V1.get_training_dataloader = compatible_training_loader
     validate_resume_checkpoint(parse_flow_args())
     V1.main()
 

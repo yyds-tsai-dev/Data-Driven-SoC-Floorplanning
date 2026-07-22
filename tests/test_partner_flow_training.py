@@ -88,6 +88,9 @@ def _v1_resume_environment(monkeypatch):
     monkeypatch.setattr(trainer, "DirectDenoiser", TinyModel)
     monkeypatch.setattr(trainer, "parse_args", trainer.parse_args)
     monkeypatch.setattr(trainer, "train_step", trainer.train_step)
+    monkeypatch.setattr(
+        trainer, "get_training_dataloader", trainer.get_training_dataloader
+    )
     return trainer, lambda: restored
 
 
@@ -119,3 +122,48 @@ def test_flow_cli_rejects_invalid_resume_before_v1_state_restore(
     with pytest.raises(ValueError, match="flow_matching_v1"):
         flow_train.main()
     assert not restored()
+
+
+def test_flow_cli_num_samples_supports_official_train_loader_signature(
+    monkeypatch, tmp_path
+):
+    trainer, _restored = _v1_resume_environment(monkeypatch)
+    calls = {}
+
+    def official_train_loader(data_path, batch_size, num_samples, shuffle):
+        calls.update(
+            data_path=data_path,
+            batch_size=batch_size,
+            num_samples=num_samples,
+            shuffle=shuffle,
+        )
+        return []
+
+    monkeypatch.setattr(trainer, "get_training_dataloader", official_train_loader)
+    monkeypatch.setattr(trainer.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "flow_train_claude.py",
+            "--device",
+            "cpu",
+            "--fresh",
+            "--checkpoint-dir",
+            str(tmp_path / "checkpoints"),
+            "--num-samples",
+            "256",
+            "--num-workers",
+            "0",
+            "--max-steps",
+            "0",
+        ],
+    )
+
+    flow_train.main()
+    assert calls == {
+        "data_path": "../",
+        "batch_size": 16,
+        "num_samples": 256,
+        "shuffle": False,
+    }
