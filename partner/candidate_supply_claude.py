@@ -44,3 +44,58 @@ def allocate_quotas(
     for name in order[:left]:
         result[name] += 1
     return result
+
+
+def _hpwl_proxy(prediction: np.ndarray, b2b: np.ndarray) -> float:
+    n = prediction.shape[0]
+    centers_x = prediction[:, 0] + 0.5 * prediction[:, 2]
+    centers_y = prediction[:, 1] + 0.5 * prediction[:, 3]
+    i, j = np.nonzero(np.triu(b2b[:n, :n], 1))
+    if len(i) == 0:
+        return 0.0
+    return float((b2b[i, j] * (
+        np.abs(centers_x[i] - centers_x[j])
+        + np.abs(centers_y[i] - centers_y[j])
+    )).sum())
+
+
+def _overlap_fraction(prediction: np.ndarray, area_targets: np.ndarray) -> float:
+    n = prediction.shape[0]
+    x0, y0 = prediction[:, 0], prediction[:, 1]
+    x1 = x0 + prediction[:, 2]
+    y1 = y0 + prediction[:, 3]
+    overlap_x = np.maximum(
+        0.0, np.minimum(x1[:, None], x1[None, :]) - np.maximum(x0[:, None], x0[None, :])
+    )
+    overlap_y = np.maximum(
+        0.0, np.minimum(y1[:, None], y1[None, :]) - np.maximum(y0[:, None], y0[None, :])
+    )
+    overlap = overlap_x * overlap_y
+    overlap[np.diag_indices(n)] = 0.0
+    return float(overlap.sum()) / (2.0 * max(float(area_targets[:n].sum()), 1e-9))
+
+
+def rank_predictions(
+    predictions: Sequence[np.ndarray],
+    area_targets: np.ndarray,
+    b2b: np.ndarray,
+    constraint_penalties: Sequence[float] | None = None,
+    violation_weight: float = 0.0,
+) -> list[int]:
+    if not predictions:
+        return []
+    hpwl = [_hpwl_proxy(prediction, b2b) for prediction in predictions]
+    hpwl_ref = max(min(hpwl), 1e-9)
+    if constraint_penalties is None:
+        penalties = [0.0] * len(predictions)
+    else:
+        penalties = constraint_penalties
+    if len(penalties) != len(predictions):
+        raise ValueError("constraint penalty count must match predictions")
+    score = [
+        hpwl[k] / hpwl_ref
+        + 5.0 * _overlap_fraction(predictions[k], area_targets)
+        + violation_weight * float(penalties[k])
+        for k in range(len(predictions))
+    ]
+    return sorted(range(len(predictions)), key=lambda k: (score[k], k))
