@@ -13,6 +13,7 @@ the shared xyaspect rectangle decoder for every matrix row.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import sys
@@ -68,6 +69,16 @@ REQUIRED_CANDIDATE_FIELDS = frozenset(
     }
 )
 _CANDIDATE_NUMERIC_FIELDS = REQUIRED_CANDIDATE_FIELDS - {"candidate_index", "anchor_exact"}
+_ROW_NONNEGATIVE_NUMERIC_FIELDS = {
+    "cold_load_s",
+    "warm_latency_s",
+    "anchor_max_error",
+    "raw_overlap",
+    "raw_hpwl_proxy",
+    "raw_boundary_violations",
+    "raw_group_violations",
+    "raw_mib_violations",
+}
 
 
 def build_matrix(flow_steps: Iterable[int], solvers: Iterable[str]) -> list[tuple[str, str, int, int]]:
@@ -143,17 +154,63 @@ def validate_candidate(candidate: Mapping[str, Any], *, label: str = "candidate"
             raise ValueError(f"{label} {field} must be a finite number")
 
 
+def _require_nonnegative_integer(row: Mapping[str, Any], field: str, *, positive: bool = False) -> None:
+    value = row[field]
+    if isinstance(value, bool) or not isinstance(value, int) or value < (1 if positive else 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{field} must be a {qualifier} integer")
+
+
+def _require_nonnegative_finite_number(row: Mapping[str, Any], field: str) -> None:
+    value = row[field]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+        raise ValueError(f"{field} must be a non-negative finite number")
+
+
 def validate_row(row: Mapping[str, Any]) -> None:
+    if not isinstance(row, Mapping):
+        raise ValueError("row must be a mapping")
     missing = sorted(REQUIRED_ROW_FIELDS - set(row))
     if missing:
         raise ValueError(f"missing required row fields: {', '.join(missing)}")
+    for field in ("case_id", "nfe", "samples"):
+        _require_nonnegative_integer(row, field, positive=True)
+    _require_nonnegative_integer(row, "seed")
+    _require_nonnegative_integer(row, "peak_memory_bytes")
+    for field in _ROW_NONNEGATIVE_NUMERIC_FIELDS:
+        _require_nonnegative_finite_number(row, field)
+    if not isinstance(row["finite"], bool):
+        raise ValueError("finite must be boolean")
+    if not isinstance(row["anchor_exact"], bool):
+        raise ValueError("anchor_exact must be boolean")
+    if row["model"] not in {"direct", "flow"}:
+        raise ValueError("model must be direct or flow")
+    if row["model"] == "direct":
+        if (row["solver"], row["steps"], row["nfe"]) != ("ddim", 50, 50):
+            raise ValueError("direct rows must be DDIM-50 with NFE=50")
+    elif row["solver"] not in {"euler", "heun"}:
+        raise ValueError("flow solver must be euler or heun")
+    elif row["nfe"] != row["steps"] * (1 if row["solver"] == "euler" else 2):
+        raise ValueError("flow nfe must match the solver's exact evaluation count")
+    _require_nonnegative_integer(row, "steps", positive=True)
     if not isinstance(row["candidates"], list) or not row["candidates"]:
         raise ValueError("row candidates must be a non-empty list")
+    if len(row["candidates"]) != row["samples"]:
+        raise ValueError("candidate count must equal samples")
     if not isinstance(row["best_of_k"], Mapping):
         raise ValueError("row best_of_k must be a mapping")
     for candidate in row["candidates"]:
         validate_candidate(candidate)
     validate_candidate(row["best_of_k"], label="best_of_k")
+    indices = [candidate["candidate_index"] for candidate in row["candidates"]]
+    if sorted(indices) != list(range(row["samples"])):
+        raise ValueError("candidate indices must be exactly 0 through samples-1")
+    selected = [candidate for candidate in row["candidates"] if candidate["candidate_index"] == row["best_of_k"]["candidate_index"]]
+    if len(selected) != 1 or dict(selected[0]) != dict(row["best_of_k"]):
+        raise ValueError("best_of_k must match one candidate record")
+    repair = row["repair"]
+    if not isinstance(repair, Mapping) or not isinstance(repair.get("available"), bool) or not isinstance(repair.get("reason"), str):
+        raise ValueError("repair must contain boolean available and string reason")
 
 
 def _candidate_key(candidate: Mapping[str, Any]) -> tuple[float, int, float, int]:
@@ -363,6 +420,7 @@ def _sample_row(
     samples: int,
     cold_load_s: float,
     device: torch.device,
+    validate: bool = True,
 ) -> dict[str, Any]:
     from diffusion_data import z_to_rectangles
     from diffusion_model import DiffusionSchedule
@@ -424,7 +482,8 @@ def _sample_row(
             "reason": "No bounded partner-only repair seam is invoked; raw candidate metrics only.",
         },
     }
-    validate_row(row)
+    if validate:
+        validate_row(row)
     return row
 
 
@@ -440,6 +499,7 @@ def _warm_model(model, config, case, *, model_name: str, samples: int, device: t
         samples=samples,
         cold_load_s=0.0,
         device=device,
+        validate=False,
     )
 
 
@@ -460,6 +520,22 @@ def _summary(rows: list[Mapping[str, Any]]) -> dict[str, dict[str, float]]:
     return summary
 
 
+def _initialize_cuda_context(device: torch.device) -> None:
+    """Pay CUDA context initialization before either cold-load measurement."""
+    if device.type == "cuda":
+        torch.empty(0, device=device)
+        torch.cuda.synchronize(device)
+
+
+def _release_model(device: torch.device) -> None:
+    """Release one model before the next model's standalone residency starts."""
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+
+
 def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     if args.samples <= 0:
         raise ValueError("--samples must be positive")
@@ -470,33 +546,44 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     direct_path = _require_checkpoint(args.direct_checkpoint, "Direct")
     flow_path = _require_checkpoint(args.flow_checkpoint, "Flow")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    direct_model, direct_config, direct_load_s = _load_model(direct_path, method="direct", device=device)
-    flow_model, flow_config, flow_load_s = _load_model(flow_path, method="flow", device=device)
+    _initialize_cuda_context(device)
     loaded_cases = {case_id: _load_official_case(case_id, args.data_path) for case_id in cases}
-    _warm_model(direct_model, direct_config, loaded_cases[cases[0]], model_name="direct", samples=args.samples, device=device)
-    _warm_model(flow_model, flow_config, loaded_cases[cases[0]], model_name="flow", samples=args.samples, device=device)
-
     rows = []
-    for case_id in cases:
-        for matrix_row in matrix:
-            model_name = matrix_row[0]
-            model, config, load_s = (
-                (direct_model, direct_config, direct_load_s)
-                if model_name == "direct"
-                else (flow_model, flow_config, flow_load_s)
+    cold_load_s: dict[str, float] = {}
+    for model_name, checkpoint, method in (
+        ("direct", direct_path, "direct"),
+        ("flow", flow_path, "flow"),
+    ):
+        model, config, load_s = _load_model(checkpoint, method=method, device=device)
+        cold_load_s[model_name] = load_s
+        try:
+            _warm_model(
+                model,
+                config,
+                loaded_cases[cases[0]],
+                model_name=model_name,
+                samples=args.samples,
+                device=device,
             )
-            rows.append(
-                _sample_row(
-                    case_id=case_id,
-                    case=loaded_cases[case_id],
-                    model=model,
-                    config=config,
-                    matrix_row=matrix_row,
-                    samples=args.samples,
-                    cold_load_s=load_s,
-                    device=device,
-                )
-            )
+            for case_id in cases:
+                for matrix_row in matrix:
+                    if matrix_row[0] != model_name:
+                        continue
+                    rows.append(
+                        _sample_row(
+                            case_id=case_id,
+                            case=loaded_cases[case_id],
+                            model=model,
+                            config=config,
+                            matrix_row=matrix_row,
+                            samples=args.samples,
+                            cold_load_s=load_s,
+                            device=device,
+                        )
+                    )
+        finally:
+            model = None
+            _release_model(device)
     return {
         "metadata": {
             "device": str(device),
@@ -506,7 +593,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                 "ContestEvaluator solve-visible hard anchors only: preplaced xywh, fixed wh; "
                 "labels are not retained or used for fitting, model/checkpoint selection, or quality metrics."
             ),
-            "cold_load_s": {"direct": direct_load_s, "flow": flow_load_s},
+            "cold_load_s": cold_load_s,
+            "cold_load_order": ["direct", "flow"],
+            "model_residency": (
+                "standalone sequential residency: each model is loaded, warmed, and sampled for all rows, "
+                "then released before the other model loads; CUDA context is initialized before timed loads."
+            ),
+            "peak_memory_semantics": "standalone absolute peak for the current model plus condition/sample allocations",
             "repair": "not run; no bounded partner-only seam",
         },
         "matrix": [
@@ -522,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     result = run_probe(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    args.output.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
     print(f"wrote {args.output}")
     return 0
 

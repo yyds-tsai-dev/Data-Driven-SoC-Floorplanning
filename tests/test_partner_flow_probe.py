@@ -1,6 +1,7 @@
 import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,6 +33,34 @@ def _candidate(index: int = 0) -> dict[str, object]:
         "raw_group_violations": 0,
         "raw_mib_violations": 0,
     }
+
+
+def _row(**updates) -> dict[str, object]:
+    row = {
+        "case_id": 21,
+        "model": "flow",
+        "solver": "euler",
+        "steps": 4,
+        "nfe": 4,
+        "samples": 1,
+        "seed": 20260723,
+        "cold_load_s": 0.1,
+        "warm_latency_s": 0.2,
+        "peak_memory_bytes": 0,
+        "finite": True,
+        "anchor_exact": True,
+        "anchor_max_error": 0.0,
+        "raw_overlap": 0,
+        "raw_hpwl_proxy": 11.0,
+        "raw_boundary_violations": 0,
+        "raw_group_violations": 0,
+        "raw_mib_violations": 0,
+        "best_of_k": _candidate(),
+        "candidates": [_candidate()],
+        "repair": {"available": False, "reason": "not run"},
+    }
+    row.update(updates)
+    return row
 
 
 def test_probe_matrix_reports_nfe_not_only_steps():
@@ -73,15 +102,7 @@ def test_parser_requires_comparable_inputs_and_keeps_case_ids():
 
 
 def test_schema_requires_candidate_metrics_and_deterministic_best_of_k():
-    row = {field: 0 for field in REQUIRED_ROW_FIELDS}
-    row.update(
-        model="flow",
-        solver="euler",
-        finite=True,
-        repair={"available": False},
-        candidates=[_candidate()],
-        best_of_k=_candidate(),
-    )
+    row = _row()
     validate_row(row)
 
     winner = best_of_k(
@@ -112,6 +133,102 @@ def test_schema_requires_candidate_metrics_and_deterministic_best_of_k():
     malformed["candidates"] = [{"candidate_index": 0}]
     with pytest.raises(ValueError, match="candidate missing required fields"):
         validate_row(malformed)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("warm_latency_s", float("nan")),
+        ("warm_latency_s", float("inf")),
+        ("cold_load_s", -0.1),
+        ("samples", -1),
+        ("nfe", True),
+        ("peak_memory_bytes", True),
+        ("finite", "true"),
+        ("raw_hpwl_proxy", "eleven"),
+    ],
+)
+def test_row_schema_rejects_nonfinite_or_malformed_measurements(field, value):
+    with pytest.raises(ValueError, match=field):
+        validate_row(_row(**{field: value}))
+
+
+def test_row_schema_requires_one_candidate_per_sample_and_a_matching_best_record():
+    with pytest.raises(ValueError, match="candidate count"):
+        validate_row(_row(samples=2))
+    bad_best = _candidate()
+    bad_best["raw_hpwl_proxy"] = 12.0
+    with pytest.raises(ValueError, match="best_of_k must match"):
+        validate_row(_row(best_of_k=bad_best))
+
+
+def test_run_probe_measures_one_model_lifecycle_at_a_time(monkeypatch):
+    events = []
+    live_models = set()
+    args = SimpleNamespace(
+        samples=1,
+        flow_steps=[4],
+        solvers=["euler"],
+        cases=[21, 68],
+        direct_checkpoint=Path("direct.pt"),
+        flow_checkpoint=Path("flow.pt"),
+        data_path=Path("data"),
+    )
+
+    monkeypatch.setattr(probe, "_require_checkpoint", lambda path, _label: path)
+    monkeypatch.setattr(probe, "_load_official_case", lambda case_id, _data: ("case", case_id))
+    monkeypatch.setattr(probe, "_initialize_cuda_context", lambda _device: events.append("context"), raising=False)
+
+    def load_model(_path, *, method, device):
+        assert not live_models
+        live_models.add(method)
+        events.append(f"load:{method}")
+        return method, SimpleNamespace(), 0.1
+
+    def warm_model(model, _config, _case, *, model_name, samples, device):
+        assert model == model_name and live_models == {model_name} and samples == 1
+        events.append(f"warm:{model_name}")
+
+    def sample_row(*, case_id, model, matrix_row, **_kwargs):
+        model_name, solver, steps, nfe = matrix_row
+        assert model == model_name and live_models == {model_name}
+        events.append(f"sample:{model_name}:{case_id}")
+        return _row(
+            case_id=case_id,
+            model=model_name,
+            solver=solver,
+            steps=steps,
+            nfe=nfe,
+        )
+
+    def release_model(_device):
+        assert len(live_models) == 1
+        model = next(iter(live_models))
+        events.append(f"release:{model}")
+        live_models.clear()
+
+    monkeypatch.setattr(probe, "_load_model", load_model)
+    monkeypatch.setattr(probe, "_warm_model", warm_model)
+    monkeypatch.setattr(probe, "_sample_row", sample_row)
+    monkeypatch.setattr(probe, "_release_model", release_model, raising=False)
+
+    result = probe.run_probe(args)
+
+    assert events == [
+        "context",
+        "load:direct",
+        "warm:direct",
+        "sample:direct:21",
+        "sample:direct:68",
+        "release:direct",
+        "load:flow",
+        "warm:flow",
+        "sample:flow:21",
+        "sample:flow:68",
+        "release:flow",
+    ]
+    assert not live_models
+    assert result["metadata"]["cold_load_order"] == ["direct", "flow"]
 
 
 def test_evaluator_visible_hard_anchors_mask_non_visible_label_coordinates():
