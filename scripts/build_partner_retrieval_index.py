@@ -30,6 +30,7 @@ from retrieval_index_claude import RetrievalIndex, RetrievalShard, save_index
 FEATURE_VERSION = 1
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+_RENAMEAT2_UNSUPPORTED = (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,14 +69,8 @@ def reservoir_indices_by_block_count(
     return samples
 
 
-def _publish_directory_no_replace(temporary: Path, output: Path) -> None:
-    """Atomically publish a sibling directory only when its destination is absent.
-
-    Linux's ``renameat2(RENAME_NOREPLACE)`` is required here because ordinary
-    ``rename`` can replace an empty directory after a check-then-rename race.
-    Failing closed is preferable to risking an existing index on platforms that
-    do not expose the no-replace primitive.
-    """
+def _renameat2_no_replace(temporary: Path, output: Path) -> None:
+    """Atomically rename a directory only when its destination is absent."""
     try:
         renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
     except AttributeError as error:
@@ -95,6 +90,40 @@ def _publish_directory_no_replace(temporary: Path, output: Path) -> None:
     if error_number in (errno.EEXIST, errno.ENOTEMPTY):
         raise FileExistsError(error_number, f"refusing to overwrite existing retrieval index: {output}")
     raise OSError(error_number, f"atomic no-replace publication failed for {output}")
+
+
+def _publish_directory_no_replace(temporary: Path, output: Path) -> bool:
+    """Publish a validated sibling directory without ever replacing output.
+
+    Linux's ``renameat2(RENAME_NOREPLACE)`` is required here because ordinary
+    ``rename`` can replace an empty directory after a check-then-rename race.
+    NFS can reject that flag, so its unsupported errors use an atomic sibling
+    symlink creation instead.  The return value says whether the temporary
+    source remains as the symlink target after successful publication.
+    """
+    if temporary.parent.resolve() != output.parent.resolve():
+        raise ValueError("temporary retrieval index must be a sibling of output")
+    try:
+        _renameat2_no_replace(temporary, output)
+        return False
+    except OSError as error:
+        if error.errno not in _RENAMEAT2_UNSUPPORTED:
+            raise
+
+    try:
+        os.symlink(temporary.name, output, target_is_directory=True)
+    except OSError as error:
+        if error.errno in (errno.EEXIST, errno.ENOTEMPTY):
+            raise FileExistsError(
+                error.errno, f"refusing to overwrite existing retrieval index: {output}"
+            ) from error
+        raise
+    return True
+
+
+def _destination_exists(output: Path) -> bool:
+    """Include dangling symlinks, which ``Path.exists`` deliberately omits."""
+    return output.exists() or output.is_symlink()
 
 
 def _sample_arrays(
@@ -160,7 +189,7 @@ def _build_shards(dataset: FloorplanDatasetLite, selected: dict[int, list[int]])
 
 def build_index(data_path: Path, output: Path, *, max_per_n: int, seed: int) -> dict[str, object]:
     output = Path(output)
-    if output.exists():
+    if _destination_exists(output):
         raise FileExistsError(f"refusing to overwrite existing retrieval index: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     dataset = FloorplanDatasetLite(str(data_path))
@@ -168,14 +197,15 @@ def build_index(data_path: Path, output: Path, *, max_per_n: int, seed: int) -> 
     shards = _build_shards(dataset, selected)
 
     temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent))
+    source_retained = False
     try:
         save_index(temporary, shards, source_split="train", feature_version=FEATURE_VERSION)
         RetrievalIndex.load(temporary)
-        if output.exists():
+        if _destination_exists(output):
             raise FileExistsError(f"refusing to overwrite existing retrieval index: {output}")
-        _publish_directory_no_replace(temporary, output)
+        source_retained = _publish_directory_no_replace(temporary, output)
     finally:
-        if temporary.exists():
+        if temporary.exists() and not source_retained:
             shutil.rmtree(temporary)
 
     return {

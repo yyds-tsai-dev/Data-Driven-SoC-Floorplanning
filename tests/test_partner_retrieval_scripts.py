@@ -1,4 +1,5 @@
 import importlib.util
+import errno
 import json
 from pathlib import Path
 import subprocess
@@ -125,15 +126,55 @@ def test_atomic_publish_refuses_an_existing_empty_directory_without_touching_eit
     assert (source / "manifest.json").read_text() == "source"
 
 
+def _unsupported_renameat2(*_args):
+    raise OSError(errno.EINVAL, "renameat2 unsupported by this filesystem")
+
+
+def test_atomic_publish_falls_back_to_a_sibling_symlink_when_renameat2_is_unsupported(
+    monkeypatch, tmp_path
+):
+    builder = _load_builder_module()
+    source = tmp_path / ".temporary-index"
+    destination = tmp_path / "published-index"
+    source.mkdir()
+    (source / "manifest.json").write_text("source")
+    monkeypatch.setattr(builder, "_renameat2_no_replace", _unsupported_renameat2)
+
+    retained = builder._publish_directory_no_replace(source, destination)
+
+    assert retained
+    assert destination.is_symlink()
+    assert destination.readlink() == Path(source.name)
+    assert (destination / "manifest.json").read_text() == "source"
+
+
+def test_symlink_fallback_preserves_an_existing_dangling_destination(monkeypatch, tmp_path):
+    builder = _load_builder_module()
+    source = tmp_path / ".temporary-index"
+    destination = tmp_path / "published-index"
+    source.mkdir()
+    destination.symlink_to("missing-index", target_is_directory=True)
+    monkeypatch.setattr(builder, "_renameat2_no_replace", _unsupported_renameat2)
+
+    with pytest.raises(FileExistsError):
+        builder._publish_directory_no_replace(source, destination)
+
+    assert destination.is_symlink()
+    assert destination.readlink() == Path("missing-index")
+    assert source.exists()
+
+
 def test_builder_creates_train_only_artifact_with_converted_floorplans(monkeypatch, tmp_path):
     builder = _load_builder_module()
     dataset = [_sample([1.0, 4.0], [[10, 20, 3, 4], [30, 40, 5, 6]])]
     monkeypatch.setattr(builder, "FloorplanDatasetLite", lambda _path: dataset)
+    monkeypatch.setattr(builder, "_renameat2_no_replace", _unsupported_renameat2)
     output = tmp_path / "pilot"
 
     summary = builder.build_index(tmp_path, output, max_per_n=1, seed=17)
 
     assert summary["source_split"] == "train"
+    assert output.is_symlink()
     assert json.loads((output / "manifest.json").read_text())["source_split"] == "train"
     shard = builder.RetrievalIndex.load(output).shards[2]
     assert shard.source_ids.tolist() == [0]
@@ -151,6 +192,25 @@ def test_builder_keeps_existing_output_and_cleans_no_temporary_publish_directory
         builder.build_index(tmp_path, output, max_per_n=1, seed=17)
 
     assert (output / "sentinel").read_text() == "keep"
+    assert list(tmp_path.glob(".pilot.tmp-*")) == []
+
+
+def test_builder_cleans_temporary_directory_when_symlink_fallback_fails(monkeypatch, tmp_path):
+    builder = _load_builder_module()
+    output = tmp_path / "pilot"
+    monkeypatch.setattr(builder, "FloorplanDatasetLite", lambda _path: [_sample([1.0])])
+    monkeypatch.setattr(builder, "_renameat2_no_replace", _unsupported_renameat2)
+
+    def fail_symlink(*_args, **_kwargs):
+        raise OSError(errno.EIO, "simulated symlink failure")
+
+    monkeypatch.setattr(builder.os, "symlink", fail_symlink)
+
+    with pytest.raises(OSError, match="simulated symlink failure"):
+        builder.build_index(tmp_path, output, max_per_n=1, seed=17)
+
+    assert not output.exists()
+    assert not output.is_symlink()
     assert list(tmp_path.glob(".pilot.tmp-*")) == []
 
 
