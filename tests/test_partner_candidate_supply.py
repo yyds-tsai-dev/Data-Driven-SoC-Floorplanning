@@ -35,6 +35,17 @@ def test_rank_predictions_penalizes_overlap_after_hpwl_normalization():
     assert rank_predictions([overlapping, separated], area, b2b) == [1, 0]
 
 
+def test_direct_baseline_frozen_rank_order():
+    predictions = [
+        np.array([[0, 0, 2, 2], [1, 1, 2, 2]], dtype=np.float64),
+        np.array([[0, 0, 2, 2], [2, 0, 2, 2]], dtype=np.float64),
+        np.array([[0, 0, 2, 2], [8, 0, 2, 2]], dtype=np.float64),
+    ]
+    area = np.array([4.0, 4.0])
+    b2b = np.array([[0.0, 1.0], [1.0, 0.0]])
+    assert rank_predictions(predictions, area, b2b) == [1, 0, 2]
+
+
 def test_rank_predictions_accepts_source_neutral_constraint_penalties():
     p0 = np.array([[0, 0, 1, 1]], dtype=np.float64)
     p1 = np.array([[0, 0, 1, 1]], dtype=np.float64)

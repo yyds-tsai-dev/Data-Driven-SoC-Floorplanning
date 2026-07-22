@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import os
 
+from candidate_supply_claude import rank_predictions
 from iccad2026_evaluate import FloorplanOptimizer
 from diffusion_data import build_condition, fp_sol_to_z0, layout_scale, z_to_rectangles
 from diffusion_model import DiffusionSchedule, GraphDiffusionDenoiser, ModelConfig, ddim_refine
@@ -366,46 +367,12 @@ class MyOptimizer(FloorplanOptimizer):
         w_b2b = (b2b[:n, :n].detach().cpu().numpy()
                  if b2b is not None else None)
 
-        def _hpwl_of(P):
-            # cheap standalone HPWL proxy for ordering (weighted b2b
-            # Manhattan center distances; exact HPWL not needed to rank)
-            if w_b2b is None:
-                return 0.0
-            cx = P[:, 0] + 0.5 * P[:, 2]
-            cy = P[:, 1] + 0.5 * P[:, 3]
-            iu, ju = np.nonzero(np.triu(w_b2b, 1))
-            if not len(iu):
-                return 0.0
-            return float((w_b2b[iu, ju] * (np.abs(cx[iu] - cx[ju])
-                                           + np.abs(cy[iu] - cy[ju]))).sum())
-
-        def _ovl_frac(P):
-            x0, y0 = P[:, 0], P[:, 1]
-            x1, y1 = x0 + P[:, 2], y0 + P[:, 3]
-            ox = (np.minimum(x1[:, None], x1[None, :])
-                  - np.maximum(x0[:, None], x0[None, :])).clip(min=0.0)
-            oy = (np.minimum(y1[:, None], y1[None, :])
-                  - np.maximum(y0[:, None], y0[None, :])).clip(min=0.0)
-            ov = ox * oy
-            ov[np.diag_indices(n)] = 0.0
-            total = float((P[:, 2] * P[:, 3]).sum())
-            return float(ov.sum()) / (2.0 * max(total, 1e-9))
-
-        hps = [_hpwl_of(P) for P in preds]
-        hp_min = max(min(hps), 1e-9)
-        raw = [hps[k] / hp_min + 5.0 * _ovl_frac(preds[k])
-               for k in range(len(preds))]
-
         # Constraint-aware prescreen (PARTNER_PRESCREEN_V=1): the plain
         # HPWL+overlap ranking is blind to boundary/grouping structure, so
         # predictions that legalize into violation-free layouts can lose
         # their refine slot to prettier-but-doomed ones.  Penalize coded
         # blocks far from their required wall and dispersed cluster groups.
         if os.environ.get("PARTNER_PRESCREEN_V"):
-            try:
-                w_v = float(os.environ.get("PARTNER_PRESCREEN_VW", "0.5"))
-            except ValueError:
-                w_v = 0.5
             _f, _p, _mib, clu, bnd = _parse_constraints(cons, n)
             groups = {}
             for i in range(n):
@@ -453,10 +420,17 @@ class MyOptimizer(FloorplanOptimizer):
                                       if len(g) >= 2), 1)
                 return pen + spread
 
-            for k in range(len(preds)):
-                raw[k] += w_v * _viol_est(preds[k])
-
-        order = sorted(range(len(preds)), key=lambda k: raw[k])
+            penalties = [_viol_est(prediction) for prediction in preds]
+        else:
+            penalties = None
+        order = rank_predictions(
+            preds,
+            at[:n].detach().cpu().numpy(),
+            w_b2b if w_b2b is not None else np.zeros((n, n), dtype=np.float64),
+            constraint_penalties=penalties,
+            violation_weight=(_env_float("PARTNER_PRESCREEN_VW", 0.5)
+                              if penalties is not None else 0.0),
+        )
         return [preds[k] for k in order]
 
     def _direct_worker(self, n, at, cons, tpos, b2b, p2b, pins,
