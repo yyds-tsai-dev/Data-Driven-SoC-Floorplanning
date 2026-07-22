@@ -133,8 +133,14 @@ def _shard_path(root: Path, block_count: int) -> Path:
 
 
 def _normalized(features: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
-    z_score = (features - mean) / np.maximum(scale, 1e-6)
-    return z_score / np.maximum(np.linalg.norm(z_score, axis=-1, keepdims=True), 1e-9)
+    features64 = np.asarray(features, dtype=np.float64)
+    mean64 = np.asarray(mean, dtype=np.float64)
+    scale64 = np.asarray(scale, dtype=np.float64)
+    z_score = (features64 - mean64) / np.maximum(scale64, 1e-6)
+    normalized = z_score / np.maximum(np.linalg.norm(z_score, axis=-1, keepdims=True), 1e-9)
+    if not np.isfinite(normalized).all():
+        raise ValueError("normalized retrieval features must be finite")
+    return normalized
 
 
 def _manifest_entry(shard: RetrievalShard, root: Path) -> dict[str, object]:
@@ -289,6 +295,8 @@ class RetrievalIndex:
         query = _normalized(query_vector[None], shard.feature_mean, shard.feature_scale)[0]
         keys = _normalized(shard.global_features, shard.feature_mean, shard.feature_scale)
         distances = 1.0 - keys @ query
+        if not np.isfinite(distances).all():
+            raise ValueError("retrieval query distances must be finite")
         order = np.argsort(distances, kind="stable")
         if exclude_source_id is not None:
             order = order[shard.source_ids[order] != exclude_source_id]
