@@ -3,11 +3,13 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import scripts.probes.flow_candidate_probe as probe
 from scripts.probes.flow_candidate_probe import (
     REQUIRED_ROW_FIELDS,
     best_of_k,
@@ -17,6 +19,19 @@ from scripts.probes.flow_candidate_probe import (
     validate_flow_checkpoint,
     validate_row,
 )
+
+
+def _candidate(index: int = 0) -> dict[str, object]:
+    return {
+        "candidate_index": index,
+        "anchor_exact": True,
+        "anchor_max_error": 0.0,
+        "raw_overlap": 0,
+        "raw_hpwl_proxy": 11.0,
+        "raw_boundary_violations": 0,
+        "raw_group_violations": 0,
+        "raw_mib_violations": 0,
+    }
 
 
 def test_probe_matrix_reports_nfe_not_only_steps():
@@ -64,8 +79,8 @@ def test_schema_requires_candidate_metrics_and_deterministic_best_of_k():
         solver="euler",
         finite=True,
         repair={"available": False},
-        candidates=[{"candidate_index": 0}],
-        best_of_k={"candidate_index": 0},
+        candidates=[_candidate()],
+        best_of_k=_candidate(),
     )
     validate_row(row)
 
@@ -93,6 +108,37 @@ def test_schema_requires_candidate_metrics_and_deterministic_best_of_k():
     assert winner["candidate_index"] == 3
     with pytest.raises(ValueError, match="missing required row fields"):
         validate_row({"case_id": 21})
+    malformed = dict(row)
+    malformed["candidates"] = [{"candidate_index": 0}]
+    with pytest.raises(ValueError, match="candidate missing required fields"):
+        validate_row(malformed)
+
+
+def test_evaluator_visible_hard_anchors_mask_non_visible_label_coordinates():
+    constraints = torch.tensor(
+        [
+            [0, 1, 0, 0, 0],  # preplaced: evaluator exposes xywh
+            [1, 0, 0, 0, 0],  # fixed: evaluator exposes only wh
+            [0, 0, 0, 0, 0],  # movable: evaluator exposes nothing
+        ]
+    )
+    label_positions = torch.tensor(
+        [[10.0, 11.0, 12.0, 13.0], [20.0, 21.0, 22.0, 23.0], [30.0, 31.0, 32.0, 33.0]]
+    )
+
+    anchors = probe.evaluator_visible_target_positions(label_positions, constraints, block_count=3)
+    assert torch.equal(
+        anchors,
+        torch.tensor([[10.0, 11.0, 12.0, 13.0], [-1.0, -1.0, 22.0, 23.0], [-1.0, -1.0, -1.0, -1.0]]),
+    )
+
+    altered = label_positions.clone()
+    altered[1, :2] = torch.tensor([999.0, 998.0])
+    altered[2] = torch.tensor([997.0, 996.0, 995.0, 994.0])
+    assert torch.equal(
+        anchors,
+        probe.evaluator_visible_target_positions(altered, constraints, block_count=3),
+    )
 
 
 @pytest.mark.parametrize("checkpoint", [{"args": {}}, {"args": {"training_method": "diffusion"}}])

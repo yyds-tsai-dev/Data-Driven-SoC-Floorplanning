@@ -3,7 +3,9 @@
 
 The probe intentionally measures only conditioned candidate generation.  It
 does not run the production legalizer or use validation labels for fitting or
-selection.  Each requested ``case`` is the official
+selection.  The label payload is accessed only by a narrow adapter that
+returns evaluator-visible hard anchors (preplaced xywh, fixed wh); it is then
+discarded.  Each requested ``case`` is the official
 ``LiteTensorDataTest/config_<case>`` input, with one fixed seed protocol and
 the shared xyaspect rectangle decoder for every matrix row.
 """
@@ -53,6 +55,19 @@ REQUIRED_ROW_FIELDS = frozenset(
         "repair",
     }
 )
+REQUIRED_CANDIDATE_FIELDS = frozenset(
+    {
+        "candidate_index",
+        "anchor_exact",
+        "anchor_max_error",
+        "raw_overlap",
+        "raw_hpwl_proxy",
+        "raw_boundary_violations",
+        "raw_group_violations",
+        "raw_mib_violations",
+    }
+)
+_CANDIDATE_NUMERIC_FIELDS = REQUIRED_CANDIDATE_FIELDS - {"candidate_index", "anchor_exact"}
 
 
 def build_matrix(flow_steps: Iterable[int], solvers: Iterable[str]) -> list[tuple[str, str, int, int]]:
@@ -111,6 +126,23 @@ def timed_call(
     return result, clock() - started
 
 
+def validate_candidate(candidate: Mapping[str, Any], *, label: str = "candidate") -> None:
+    if not isinstance(candidate, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    missing = sorted(REQUIRED_CANDIDATE_FIELDS - set(candidate))
+    if missing:
+        raise ValueError(f"{label} missing required fields: {', '.join(missing)}")
+    index = candidate["candidate_index"]
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError(f"{label} candidate_index must be a non-negative integer")
+    if not isinstance(candidate["anchor_exact"], bool):
+        raise ValueError(f"{label} anchor_exact must be boolean")
+    for field in _CANDIDATE_NUMERIC_FIELDS:
+        value = candidate[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError(f"{label} {field} must be a finite number")
+
+
 def validate_row(row: Mapping[str, Any]) -> None:
     missing = sorted(REQUIRED_ROW_FIELDS - set(row))
     if missing:
@@ -119,6 +151,9 @@ def validate_row(row: Mapping[str, Any]) -> None:
         raise ValueError("row candidates must be a non-empty list")
     if not isinstance(row["best_of_k"], Mapping):
         raise ValueError("row best_of_k must be a mapping")
+    for candidate in row["candidates"]:
+        validate_candidate(candidate)
+    validate_candidate(row["best_of_k"], label="best_of_k")
 
 
 def _candidate_key(candidate: Mapping[str, Any]) -> tuple[float, int, float, int]:
@@ -181,6 +216,47 @@ def _load_model(path: Path, *, method: str | None, device: torch.device):
     return model, config, time.perf_counter() - started
 
 
+def evaluator_visible_target_positions(
+    label_positions: torch.Tensor,
+    constraints: torch.Tensor,
+    *,
+    block_count: int,
+) -> torch.Tensor:
+    """Apply the ContestEvaluator's solve-visible hard-anchor mask exactly."""
+    if block_count <= 0:
+        raise ValueError("block_count must be positive")
+    positions = torch.as_tensor(label_positions).detach().cpu().float().reshape(-1, 4)
+    constraint_tensor = torch.as_tensor(constraints).detach().cpu()
+    if positions.shape[0] < block_count or constraint_tensor.shape[0] < block_count:
+        raise ValueError("hard-anchor inputs are shorter than block_count")
+    anchors = torch.full((block_count, 4), -1.0)
+    columns = constraint_tensor.shape[1] if constraint_tensor.dim() > 1 else 0
+    for block in range(block_count):
+        is_fixed = columns > 0 and constraint_tensor[block, 0] != 0
+        is_preplaced = columns > 1 and constraint_tensor[block, 1] != 0
+        if is_preplaced:
+            anchors[block] = positions[block]
+        elif is_fixed:
+            anchors[block, 2:] = positions[block, 2:]
+    return anchors
+
+
+def _load_evaluator_exposed_hard_anchors(
+    label_path: Path,
+    constraints: torch.Tensor,
+    block_count: int,
+) -> torch.Tensor:
+    """Read a label only to derive and immediately mask evaluator-visible anchors."""
+    from floorset_arch.diffusion.diagnostics import xywh_from_fp_sol
+
+    label_payload = torch.load(label_path, map_location="cpu", weights_only=False)[0]
+    full_positions = xywh_from_fp_sol(label_payload[1], block_count)
+    anchors = evaluator_visible_target_positions(full_positions, constraints, block_count=block_count)
+    del full_positions
+    del label_payload
+    return anchors
+
+
 def _load_official_case(case_id: int, data_path: Path):
     """Read exactly config_<case>/litedata_1, never a label-selected index."""
     if not isinstance(case_id, int) or case_id < 21 or case_id > 120:
@@ -191,7 +267,6 @@ def _load_official_case(case_id: int, data_path: Path):
     if not input_path.is_file() or not label_path.is_file():
         raise FileNotFoundError(f"missing official validation input for config_{case_id}: {config_dir}")
     inputs = torch.load(input_path, map_location="cpu", weights_only=False)[0]
-    labels = torch.load(label_path, map_location="cpu", weights_only=False)[0]
     area_and_constraints, b2b, p2b, pins = inputs
     area = area_and_constraints[:, 0].float()
     constraints = area_and_constraints[:, 1:].float()
@@ -199,12 +274,11 @@ def _load_official_case(case_id: int, data_path: Path):
     if block_count <= 0:
         raise ValueError(f"config_{case_id} has no active blocks")
 
-    from scripts.diffusion_diagnostic import _target_positions_from_fp_sol
     from floorset_arch.parser import parse_instance
 
-    target_positions = _target_positions_from_fp_sol(labels[1], constraints, block_count)
-    instance = parse_instance(block_count, area, b2b, p2b, pins, constraints, target_positions)
-    return area, b2b.float(), p2b.float(), pins.float(), constraints, target_positions, instance
+    evaluator_anchors = _load_evaluator_exposed_hard_anchors(label_path, constraints, block_count)
+    instance = parse_instance(block_count, area, b2b, p2b, pins, constraints, evaluator_anchors)
+    return area, b2b.float(), p2b.float(), pins.float(), constraints, evaluator_anchors, instance
 
 
 def _expand_condition(condition: Mapping[str, torch.Tensor], samples: int) -> dict[str, torch.Tensor]:
@@ -428,6 +502,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "device": str(device),
             "seed_protocol": "fixed per row: 20260723",
             "case_resolution": "official LiteTensorDataTest/config_<case>/litedata_1.pth",
+            "anchor_inputs": (
+                "ContestEvaluator solve-visible hard anchors only: preplaced xywh, fixed wh; "
+                "labels are not retained or used for fitting, model/checkpoint selection, or quality metrics."
+            ),
             "cold_load_s": {"direct": direct_load_s, "flow": flow_load_s},
             "repair": "not run; no bounded partner-only seam",
         },
