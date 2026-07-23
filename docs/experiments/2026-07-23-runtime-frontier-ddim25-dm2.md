@@ -81,6 +81,28 @@ Checkpoint:`eval_retrieval_direct_control.pt`(direct_v2_cont step 1,139,000)。
 - 結構註記(beta 後):partner legalizer 是 fork,落後 src `column_slicing.py`
   (`_layout_fast`/vectorized components)— 合流是更大的槓桿。
 
+## 補記 2:Noise optimization(ReNO/D-Flow/DNO 族)在 direct_v2 上判死
+
+使用者指定方向(freeze weights、以 output 能量梯度更新 input noise)。機制全部落地
+(commits `62f260d`/`cf1666a`/`ec0b23b`,可微 DDIM 逐位等價、DNO 配方、χ_d 正則、
+antithetic、43 tests 綠),Phase A 機制/方向全部健康(能量降 28%、轉移性成立、
+同算力 raw overlap 贏 baseline_big),**但 full-100 大敗**:
+
+| config | no_runtime | alphaProj | sum_rt |
+|---|---|---|---|
+| baseline(兩點均值)| 1.1539 | 0.899 | 200s |
+| `PARTNER_NOISE_OPT=hybrid` | **1.2714(+0.1175)** | 1.311 | 402s |
+
+分band:n<60 −0.0039(noise 內)、60-100 +0.053、**n≥100 +0.120(20/21 案變差)**
+— 隨塊數單調惡化,λ 加權下尾段沉沒總分。機制:對 seed 做 overlap 最小化產生
+同質化的「近合法」候選,經 overlap 加權 prescreen 排前後**擠掉尾段 SA/refine
+依賴的結構多樣性**;refine 本能修掉 raw overlap,故 raw 合法性不是瓶頸。
+第三次驗證「raw 指標贏 ≠ evaluator 贏」(guidance→noise-opt 同病)。
+w_hpwl=0.1 即使 per-sample 歸一化後仍使 unroll 停滯(energy_drop 0.03 vs 0.28),維持 0。
+代碼留存 default off;flow v1 出來可低成本重 A/B(deterministic flow 的
+best-of-N 多樣性短板理論上给 noise-opt 更大空間),但敗因(refine 消化力)
+與採樣器無關,期望需打折。
+
 ## 待辦(接續)
 
 - T12 numba(跑中):目標 3s 檔位解鎖(投影 ~0.86-0.88)+ 3.5s 檔品質直升。
