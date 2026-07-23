@@ -92,3 +92,43 @@ def test_padding_blocks_contribute_nothing():
     z = _z([(0.1, 0.1), (0.1, 0.1)]).requires_grad_(True)
     e = guidance_energy(z, ctx, 1.0, 1.0, 0.0, 0.0)
     assert e.item() < 1e-8            # only one real block: no overlap, boundary un-coded
+
+
+from physics_guidance_claude import GuidanceConfig, guide_x0, make_guidance
+
+
+def test_guide_x0_reduces_overlap_energy():
+    ctx = _ctx()
+    cfg = GuidanceConfig(k_steps=8, eta=0.05, t_gate=0.5)
+    z = _z([(0.1, 0.1), (0.1, 0.1)])
+    e0 = guidance_energy(z, ctx, cfg.w_overlap, cfg.w_boundary, cfg.w_hpwl, cfg.w_group)
+    z1 = guide_x0(z, ctx, cfg, data_time=0.9)
+    e1 = guidance_energy(z1, ctx, cfg.w_overlap, cfg.w_boundary, cfg.w_hpwl, cfg.w_group)
+    assert e1.item() < e0.item()
+
+
+def test_guide_x0_identity_outside_t_gate():
+    ctx = _ctx()
+    cfg = GuidanceConfig(t_gate=0.35)
+    z = _z([(0.1, 0.1), (0.1, 0.1)])
+    out = guide_x0(z, ctx, cfg, data_time=0.2)   # 0.2 < 1-0.35
+    assert torch.equal(out, z)
+
+
+def test_guide_x0_freezes_known_and_aspect_channels():
+    ctx = _ctx()
+    ctx.known_mask[0, 0, :] = True               # block 0 fully anchored
+    cfg = GuidanceConfig(k_steps=4, guide_aspect=False, t_gate=1.0)
+    z = _z([(0.1, 0.1), (0.1, 0.1)], aspect=0.3)
+    out = guide_x0(z, ctx, cfg, data_time=1.0)
+    assert torch.equal(out[0, 0], z[0, 0])                  # anchored block untouched
+    torch.testing.assert_close(out[..., 2], z[..., 2])      # aspect frozen
+    assert not torch.equal(out[0, 1, :2], z[0, 1, :2])      # free block moved
+
+
+def test_guide_x0_respects_trust_radius():
+    ctx = _ctx()
+    cfg = GuidanceConfig(k_steps=1, eta=100.0, trust_radius=0.03, t_gate=1.0)
+    z = _z([(0.1, 0.1), (0.1, 0.1)])
+    out = guide_x0(z, ctx, cfg, data_time=1.0)
+    assert float((out - z).abs().max()) <= 0.03 + 1e-6

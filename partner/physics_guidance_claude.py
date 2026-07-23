@@ -146,9 +146,17 @@ def guide_x0(z0: torch.Tensor, ctx: GuidanceContext, cfg: GuidanceConfig,
         return z0
     strength = data_time * data_time      # endpoint estimates reliable near clean end
     z = z0.detach()
+    # Tiny deterministic per-node offset to break min/max ties in the overlap
+    # energy (exactly-coincident blocks otherwise yield an exact-zero
+    # subgradient and never separate). Does not alter the stored z, only the
+    # point at which the gradient is evaluated each inner step.
+    n_nodes = z0.shape[1]
+    tie_break = (1e-6 * torch.arange(n_nodes, device=z0.device,
+                                     dtype=z0.dtype)).view(1, n_nodes, 1)
     for _ in range(cfg.k_steps):
         z = z.detach().requires_grad_(True)
-        e = guidance_energy(z, ctx, cfg.w_overlap, cfg.w_boundary,
+        zt = z + tie_break
+        e = guidance_energy(zt, ctx, cfg.w_overlap, cfg.w_boundary,
                             cfg.w_hpwl, cfg.w_group)
         (g,) = torch.autograd.grad(e, z)
         g = g.masked_fill(ctx.known_mask, 0.0)
