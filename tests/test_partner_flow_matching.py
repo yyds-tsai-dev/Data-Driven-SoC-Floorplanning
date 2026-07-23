@@ -150,3 +150,29 @@ def test_known_channels_follow_one_noise_path_through_heun_stages():
         scalar_time = time[0] / (model.config.timesteps - 1)
         expected = (1.0 - scalar_time) * known_noise + scalar_time * known
         torch.testing.assert_close(state[known_mask], expected[known_mask])
+
+
+def test_self_condition_aspect_channel_is_clamped():
+    """Sampler must clamp the aspect channel of self-conditioning to match
+    the training-side clamp (flow_train_claude.py), else train/sample skew."""
+    captured = []
+
+    class RecordingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(z_dim=4, timesteps=1000)
+
+        def forward(self, z, t, node_feat, adj, mask, rel_feat=None, self_cond=None):
+            if self_cond is not None:
+                captured.append(self_cond.detach().clone())
+            # huge velocity so the endpoint estimate's aspect channel exceeds 3
+            v = torch.zeros_like(z)
+            v[..., 2] = 100.0
+            return v * mask.unsqueeze(-1)
+
+    model = RecordingModel()
+    sample_flow(model, _condition(), steps=3, solver="euler",
+                generator=torch.Generator().manual_seed(0))
+    assert captured, "self_cond was never passed back to the model"
+    for sc in captured:
+        assert sc[..., 2].abs().max() <= 3.0 + 1e-6

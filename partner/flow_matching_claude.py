@@ -113,6 +113,7 @@ def sample_flow(
             v0,
             torch.full((batch,), t0, device=device, dtype=dtype),
         ).detach()
+        self_condition[..., 2] = self_condition[..., 2].clamp(-3.0, 3.0)
         if has_known:
             self_condition = torch.where(known_mask, z_known, self_condition)
 
