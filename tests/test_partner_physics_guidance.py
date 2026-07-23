@@ -198,3 +198,22 @@ def test_sample_direct_guidance_changes_output_and_keeps_anchors():
     assert calls and all(0.0 <= dt <= 1.0 for dt in calls)
     assert not torch.equal(out, base)
     torch.testing.assert_close(out[0, 0, :3], z_known[0, 0, :3])  # anchors exact
+
+
+def test_build_context_parses_constraint_columns():
+    from physics_guidance_claude import build_context
+    n = 3
+    at = torch.tensor([[100.0, 25.0, -1.0]])          # third = padding
+    cons = torch.zeros(1, 3, 5)
+    cons[0, 0, 4] = 1.0                                # boundary: left wall
+    cons[0, 1, 3] = 2.0                                # cluster id 2
+    b2b = torch.zeros(3, 3)
+    b2b[0, 1] = 3.0
+    scale = torch.sqrt(at.clamp_min(0).sum(1)).clamp_min(1.0)
+    known = torch.zeros(1, 3, 4, dtype=torch.bool)
+    ctx = build_context(at, cons, b2b, scale, known)
+    assert bool(ctx.mask[0, 2]) is False
+    assert int(ctx.boundary_code[0, 0]) == 1
+    assert int(ctx.group_id[0, 1]) == 2
+    assert ctx.pair_i.tolist() == [0] and ctx.pair_j.tolist() == [1]
+    assert abs(float(ctx.pair_w[0]) - 3.0) < 1e-6

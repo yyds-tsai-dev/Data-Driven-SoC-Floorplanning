@@ -414,11 +414,21 @@ class MyOptimizer(FloorplanOptimizer):
             cond_k = {k: (v.expand(K_s, *v.shape[1:]).contiguous()
                           if torch.is_tensor(v) else v)
                       for k, v in cond.items()}
+            guide = None
+            if os.environ.get("PARTNER_PHYSICS_GUIDE") == "1":
+                from physics_guidance_claude import (GuidanceConfig,
+                                                     build_context,
+                                                     make_guidance)
+                ctx = build_context(at_d, cons_d, b2b.to(dev), scale,
+                                    known).expand(K_s)
+                guide = make_guidance(ctx, GuidanceConfig.from_env())
             z = sample_direct(self.direct_model, cond_k,
-                              self.direct_schedule, steps=50,
+                              self.direct_schedule,
+                              steps=_env_int("PARTNER_DDIM_STEPS", 50),
                               generator=gen,
                               z_known=z_known.expand(K_s, -1, -1),
-                              known_mask=known.expand(K_s, -1, -1))
+                              known_mask=known.expand(K_s, -1, -1),
+                              guidance=guide)
             rects = z_to_rectangles(
                 z, at_d.expand(K_s, -1),
                 target_positions=tpos_d.expand(K_s, -1, -1),
