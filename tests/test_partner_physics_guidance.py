@@ -132,3 +132,69 @@ def test_guide_x0_respects_trust_radius():
     z = _z([(0.1, 0.1), (0.1, 0.1)])
     out = guide_x0(z, ctx, cfg, data_time=1.0)
     assert float((out - z).abs().max()) <= 0.03 + 1e-6
+
+
+from direct_model_claude import sample_direct
+
+
+class _TinyDenoiser(torch.nn.Module):
+    """Deterministic fake model: v = 0.1*z (no learned weights)."""
+    def __init__(self):
+        super().__init__()
+        from types import SimpleNamespace
+        self.config = SimpleNamespace(z_dim=4)
+
+    def forward(self, z, t, node_feat, adj, mask, rel_feat=None, self_cond=None):
+        return 0.1 * z * mask.unsqueeze(-1)
+
+
+class _FakeSchedule:
+    timesteps = 1000
+
+    @staticmethod
+    def alpha_sigma(t):
+        tt = t.float() / 999.0
+        alpha = torch.cos(tt * math.pi / 2).clamp(1e-4, 1.0).view(-1, 1, 1)
+        sigma = torch.sin(tt * math.pi / 2).clamp(1e-4, 1.0).view(-1, 1, 1)
+        return alpha, sigma
+
+
+def _cond(n=3):
+    return {
+        "node_feat": torch.zeros(1, n, 2),
+        "adj": None,
+        "mask": torch.ones(1, n, dtype=torch.bool),
+        "rel_feat": None,
+    }
+
+
+def test_sample_direct_none_guidance_matches_baseline():
+    m, s = _TinyDenoiser(), _FakeSchedule()
+    a = sample_direct(m, _cond(), s, steps=8,
+                      generator=torch.Generator().manual_seed(3))
+    b = sample_direct(m, _cond(), s, steps=8,
+                      generator=torch.Generator().manual_seed(3), guidance=None)
+    torch.testing.assert_close(a, b)
+
+
+def test_sample_direct_guidance_changes_output_and_keeps_anchors():
+    m, s = _TinyDenoiser(), _FakeSchedule()
+    z_known = torch.zeros(1, 3, 4)
+    z_known[0, 0] = torch.tensor([0.7, 0.7, 0.0, 0.0])
+    known = torch.zeros(1, 3, 4, dtype=torch.bool)
+    known[0, 0, :3] = True
+    calls = []
+
+    def shove(z0, data_time):
+        calls.append(data_time)
+        return z0 + 0.01
+
+    base = sample_direct(m, _cond(), s, steps=8,
+                         generator=torch.Generator().manual_seed(3),
+                         z_known=z_known, known_mask=known)
+    out = sample_direct(m, _cond(), s, steps=8,
+                        generator=torch.Generator().manual_seed(3),
+                        z_known=z_known, known_mask=known, guidance=shove)
+    assert calls and all(0.0 <= dt <= 1.0 for dt in calls)
+    assert not torch.equal(out, base)
+    torch.testing.assert_close(out[0, 0, :3], z_known[0, 0, :3])  # anchors exact

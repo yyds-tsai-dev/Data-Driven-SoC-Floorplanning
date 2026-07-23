@@ -219,6 +219,7 @@ def sample_direct(
     generator: Optional[torch.Generator] = None,
     z_known: Optional[torch.Tensor] = None,
     known_mask: Optional[torch.Tensor] = None,
+    guidance=None,
 ) -> torch.Tensor:
     """DDIM sampling with self-conditioning and hard-anchor clamping."""
     node_feat = cond["node_feat"]
@@ -244,8 +245,18 @@ def sample_direct(
         z0[..., 2] = z0[..., 2].clamp(-3.0, 3.0)
         if z_known is not None and known_mask is not None:
             z0 = torch.where(known_mask, z_known, z0)
-        sc = z0
-        eps = sigma * z + alpha * v
+        if guidance is not None:
+            data_time = 1.0 - float(t_val.item()) / max(schedule.timesteps - 1, 1)
+            with torch.enable_grad():
+                z0 = guidance(z0, data_time)
+            z0[..., 2] = z0[..., 2].clamp(-3.0, 3.0)
+            if z_known is not None and known_mask is not None:
+                z0 = torch.where(known_mask, z_known, z0)
+            sc = z0
+            eps = (z - alpha * z0) / sigma.clamp_min(1e-6)
+        else:
+            sc = z0
+            eps = sigma * z + alpha * v
         if idx == len(times) - 1:
             z = z0
             break
