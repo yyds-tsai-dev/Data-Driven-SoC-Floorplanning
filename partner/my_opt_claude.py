@@ -441,6 +441,17 @@ class MyOptimizer(FloorplanOptimizer):
         # near ~2x the validated 48-sample batch)
         ks_cap = _env_int("PARTNER_KS_CAP", 56)
         K_s = max(K, min(os_f * K, ks_cap)) if oversample else K
+        if (os.environ.get("PARTNER_NOISE_OPT") == "hybrid"
+                and self.direct_model is not None):
+            try:
+                preds = self._noise_opt_hybrid_preds(
+                    n, cond, z_known, known, scale, at_d, cons_d, tpos_d,
+                    b2b.to(dev), K_s)
+                if preds:
+                    return preds
+            except Exception as exc:  # never harm the default channel
+                if self.verbose:
+                    print(f"noise-opt hybrid failed: {exc}", file=sys.stderr)
         with torch.no_grad():
             cond_k = {k: (v.expand(K_s, *v.shape[1:]).contiguous()
                           if torch.is_tensor(v) else v)
@@ -526,6 +537,92 @@ class MyOptimizer(FloorplanOptimizer):
                 constraints=cons_d.expand(K, -1, -1),
                 z_repr=self.flow_cfg.z_repr)
         return [rects[k, :n].cpu().numpy().astype(np.float64) for k in range(K)]
+
+    def _noise_opt_hybrid_preds(self, n, cond, z_known, known, scale,
+                                at_d, cons_d, tpos_d, b2b, K_s) -> List[np.ndarray]:
+        """Opt-in (PARTNER_NOISE_OPT=hybrid) initial-noise optimization.
+
+        Sample K_s candidates at the production step count, rank by the
+        per-sample layout energy, gradient-optimize the initial noise of the
+        best M via a cheap differentiable unroll, re-render those M at the
+        production step count, and REPLACE the worst M of the pool with them
+        (candidate count unchanged -- replace-not-add). Any failure raises and
+        the caller falls back to the untouched default sampler."""
+        import time as _time
+        from physics_guidance_claude import build_context, guidance_energy_per_sample
+        from noise_opt_claude import (NoiseOptConfig, optimize_noise,
+                                      sample_direct_diff, make_direct_sampler)
+        dev = self.device
+        model, sched = self.direct_model, self.direct_schedule
+        zdim, z_repr = self.direct_cfg.z_dim, self.direct_cfg.z_repr
+        N = cond["mask"].shape[1]
+        valid = cond["mask"].unsqueeze(-1)
+        has_known = bool(known.any())
+        render_steps = _env_int("PARTNER_DDIM_STEPS", 50)
+        unroll = _env_int("PARTNER_NOPT_UNROLL", 10)
+        iters = _env_int("PARTNER_NOPT_ITERS", 10)
+        M = min(_env_int("PARTNER_NOPT_TOPM", 4), K_s)
+        gc = os.environ.get("PARTNER_NOPT_GRAD_CKPT", "1") != "0"
+
+        def ex(t, k):
+            return t.expand(k, *t.shape[1:]).contiguous()
+
+        def ex_cond(k):
+            return {kk: (ex(v, k) if torch.is_tensor(v) else v)
+                    for kk, v in cond.items()}
+
+        def render(z_init, k, seed):
+            with torch.no_grad():
+                kn = (torch.randn(render_steps, k, N, zdim, device=dev,
+                                  generator=torch.Generator(device=dev).manual_seed(seed))
+                      if has_known else None)
+                return sample_direct_diff(
+                    model, ex_cond(k), sched, render_steps, z_init * ex(valid, k),
+                    known_noise=kn, z_known=ex(z_known, k), known_mask=ex(known, k))
+
+        t0 = _time.time()
+        ctx = build_context(at_d, cons_d, b2b, scale, known)
+        cfg = NoiseOptConfig.from_env()
+        cfg.rounds, cfg.steps = iters, unroll
+
+        # 1. sample the K_s-candidate pool (production step count), keep seeds
+        gen = torch.Generator(device=dev).manual_seed(_env_int("PARTNER_NOPT_SEED", 20))
+        z_seed = torch.randn((K_s, N, zdim), device=dev, generator=gen) * ex(valid, K_s)
+        z_pool = render(z_seed, K_s, _env_int("PARTNER_NOPT_SEED", 20) + 1)
+        e_pool = guidance_energy_per_sample(
+            z_pool, ctx.expand(K_s), cfg.w_overlap, cfg.w_boundary,
+            cfg.w_hpwl, cfg.w_group)
+        best = torch.topk(e_pool, M, largest=False).indices
+        worst = torch.topk(e_pool, M, largest=True).indices
+
+        # 2. optimize the best-M seeds with a cheap unroll
+        kn_opt = (torch.randn(unroll, M, N, zdim, device=dev,
+                              generator=torch.Generator(device=dev).manual_seed(41))
+                  if has_known else None)
+        sampler = make_direct_sampler(
+            model, ex_cond(M), sched, unroll, ex(z_known, M), ex(known, M),
+            kn_opt, grad_checkpoint=gc)
+        z_opt = optimize_noise(
+            None, ex_cond(M), ctx.expand(M), z_seed[best].contiguous(),
+            ex(z_known, M), ex(known, M), cfg, sample_fn=sampler)
+
+        # 3. re-render the optimized seeds at production step count, replace worst
+        z_ref = render(z_opt, M, 71)
+        rects_pool = z_to_rectangles(
+            z_pool, at_d.expand(K_s, -1), target_positions=tpos_d.expand(K_s, -1, -1),
+            constraints=cons_d.expand(K_s, -1, -1), z_repr=z_repr)
+        rects_ref = z_to_rectangles(
+            z_ref, at_d.expand(M, -1), target_positions=tpos_d.expand(M, -1, -1),
+            constraints=cons_d.expand(M, -1, -1), z_repr=z_repr)
+        preds = [rects_pool[k, :n].cpu().numpy().astype(np.float64) for k in range(K_s)]
+        for j, w in enumerate(worst.tolist()):
+            preds[w] = rects_ref[j, :n].cpu().numpy().astype(np.float64)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"[noise-opt] n={n} K_s={K_s} M={M} iters={iters} unroll={unroll} "
+              f"render={render_steps} gpu_s={_time.time() - t0:.2f}", file=sys.stderr)
+        return preds
 
     def _constraint_penalties(self, preds, n, at, cons):
         if not os.environ.get("PARTNER_PRESCREEN_V"):
