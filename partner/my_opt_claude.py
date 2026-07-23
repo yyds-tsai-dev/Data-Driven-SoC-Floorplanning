@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import os
 
-from candidate_supply_claude import CandidateBatch, rank_predictions
+from candidate_supply_claude import CandidateBatch, allocate_quotas, rank_predictions
 from iccad2026_evaluate import FloorplanOptimizer
 from diffusion_data import build_condition, fp_sol_to_z0, layout_scale, z_to_rectangles
 from diffusion_model import DiffusionSchedule, GraphDiffusionDenoiser, ModelConfig, ddim_refine
@@ -146,6 +146,8 @@ class MyOptimizer(FloorplanOptimizer):
         self._load_model()
         self.direct_model = None
         self._load_direct_model()
+        self.flow_model = None
+        self._load_flow_model()
         self.retrieval_index = None
         self.retrieval_slots = 0
         configured_max_cost = _env_float("PARTNER_RETRIEVAL_MAX_COST", 2.0)
@@ -205,6 +207,35 @@ class MyOptimizer(FloorplanOptimizer):
             self.direct_model = None
             if self.verbose:
                 print(f"direct model unavailable: {exc}")
+
+    def _load_flow_model(self) -> None:
+        """Load the opt-in flow-matching candidate source (off by default:
+        requires both FLOW_CKPT and PARTNER_FLOW_SLOTS>0).  Any failure
+        (missing file, wrong checkpoint tag, load error) silently disables
+        the flow channel — it never harms the Direct/column pipeline."""
+        self.flow_model = None
+        path = os.environ.get("FLOW_CKPT", "").strip()
+        slots = _env_int("PARTNER_FLOW_SLOTS", 0)
+        if not path or slots <= 0 or not Path(path).exists():
+            return
+        try:
+            from flow_train_claude import checkpoint_method
+            ckpt = torch.load(path, map_location=self.device, weights_only=False)
+            checkpoint_method(ckpt)
+            from direct_model_claude import DirectDenoiser, DirectModelConfig
+            cfg = DirectModelConfig(**{k: v for k, v in ckpt["model_config"].items()
+                                       if k in DirectModelConfig.__dataclass_fields__})
+            model = DirectDenoiser(cfg).to(self.device)
+            model.load_state_dict(ckpt.get("ema") or ckpt["model"])
+            model.eval()
+            self.flow_model = model
+            self.flow_cfg = cfg
+            if self.verbose:
+                print(f"loaded flow model step {ckpt.get('step')} from {path}")
+        except Exception as exc:
+            self.flow_model = None
+            if self.verbose:
+                print(f"flow model unavailable: {exc}")
 
     def _load_model(self) -> None:
         if not self.checkpoint_path.exists():
@@ -436,7 +467,65 @@ class MyOptimizer(FloorplanOptimizer):
                 z_repr=self.direct_cfg.z_repr)
         preds = [rects[k, :n].cpu().numpy().astype(np.float64)
                  for k in range(K_s)]
+
+        # Opt-in flow-matching candidate source (default off): replaces a
+        # fixed slice of the Direct batch with flow samples so the total
+        # candidate count handed to the refine ladder is UNCHANGED
+        # (replace-not-add) -- see candidate_supply_claude.allocate_quotas.
+        if self.flow_model is not None:
+            flow_slots = _env_int("PARTNER_FLOW_SLOTS", 0)
+            if flow_slots > 0 and preds:
+                quotas = allocate_quotas(
+                    len(preds),
+                    {"direct": max(0, len(preds) - flow_slots), "flow": flow_slots},
+                    ("direct", "flow"),
+                )
+                flow_n = quotas.get("flow", 0)
+                if flow_n > 0:
+                    try:
+                        flow_preds = self._sample_flow_preds(
+                            n, at, cons, tpos, b2b, p2b, pins, flow_n)
+                        direct_n = quotas.get("direct", len(preds) - flow_n)
+                        preds = preds[:direct_n] + flow_preds
+                    except Exception:
+                        pass  # flow failure never harms the Direct channel
         return preds
+
+    def _sample_flow_preds(self, n, at, cons, tpos, b2b, p2b, pins,
+                           K) -> List[np.ndarray]:
+        """Sample K layouts from the opt-in flow-matching model."""
+        from direct_train_claude import fast_condition
+        from direct_model_claude import known_z_channels
+        from flow_matching_claude import sample_flow
+        dev = self.device
+        at_d = at.unsqueeze(0).to(dev)
+        cons_d = cons.unsqueeze(0).to(dev)
+        tpos_d = tpos.unsqueeze(0).to(dev)
+        cond = fast_condition(
+            at_d, b2b.unsqueeze(0).to(dev), p2b.unsqueeze(0).to(dev),
+            pins.unsqueeze(0).to(dev), cons_d, tpos_d,
+            relation_feat_dim=self.flow_cfg.relation_feat_dim,
+            node_feat_dim=self.flow_cfg.node_feat_dim)
+        scale = layout_scale(at_d)
+        z_known, known = known_z_channels(at_d, cons_d, tpos_d, scale)
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(23)
+        cond_k = {k: (v.expand(K, *v.shape[1:]).contiguous()
+                      if torch.is_tensor(v) else v) for k, v in cond.items()}
+        with torch.no_grad():
+            sample = sample_flow(
+                self.flow_model, cond_k,
+                steps=_env_int("PARTNER_FLOW_STEPS", 8),
+                solver=os.environ.get("PARTNER_FLOW_SOLVER", "euler"),
+                generator=gen,
+                z_known=z_known.expand(K, -1, -1),
+                known_mask=known.expand(K, -1, -1))
+            rects = z_to_rectangles(
+                sample.z, at_d.expand(K, -1),
+                target_positions=tpos_d.expand(K, -1, -1),
+                constraints=cons_d.expand(K, -1, -1),
+                z_repr=self.flow_cfg.z_repr)
+        return [rects[k, :n].cpu().numpy().astype(np.float64) for k in range(K)]
 
     def _constraint_penalties(self, preds, n, at, cons):
         if not os.environ.get("PARTNER_PRESCREEN_V"):
