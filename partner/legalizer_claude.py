@@ -202,6 +202,24 @@ class _ColumnOptimizer:
         self._choose_frame(pins)
         self._build_units()
 
+        # -- column-cache delta-evaluation state (PARTNER_COL_CACHE=1) --------
+        # Skips re-running _stack_column for the left prefix of columns that are
+        # bit-identical to the previous _layout call. See _layout_delta for the
+        # correctness argument. Default OFF: bare defaults are unchanged.
+        self._dc_enabled = _os.environ.get("PARTNER_COL_CACHE", "0") in (
+            "1", "true", "True", "on", "ON")
+        self._dc_prev_cols: Optional[List[List[int]]] = None
+        self._dc_prev_sig: Optional[List[tuple]] = None
+        self._dc_cache: List[Optional[tuple]] = []
+        # units whose internal order a _random_move can permute (subgroup
+        # reorder). Only these need a per-column signature check; everything
+        # else is captured by column membership.
+        self._dc_mutable = frozenset(
+            k for k, u in enumerate(self.units)
+            if len(u.subgroups) >= 2 or any(len(sg) >= 2 for sg in u.subgroups))
+        self._dc_hits = 0
+        self._dc_recompute = 0
+
     # ------------------------------------------------------------------
     def _resolve_shapes(self):
         n = self.n
@@ -1110,6 +1128,11 @@ class _ColumnOptimizer:
 
     # ------------------------------------------------------------------
     def _layout(self, cols: List[List[int]]) -> Tuple[np.ndarray, float, float]:
+        if self._dc_enabled:
+            return self._layout_delta(cols)
+        return self._layout_full(cols)
+
+    def _layout_full(self, cols: List[List[int]]) -> Tuple[np.ndarray, float, float]:
         n = self.n
         pos = np.zeros((n, 4))
         for i in range(n):
@@ -1244,6 +1267,245 @@ class _ColumnOptimizer:
                             continue
                         # collision check against every other block (chunked
                         # units may have siblings to the right)
+                        nx0, ny0 = nx, pos[i, 1]
+                        nx1, ny1 = x_right, pos[i, 1] + pos[i, 3]
+                        px0 = pos[:, 0]
+                        py0 = pos[:, 1]
+                        clash = ((px0 < nx1 - 1e-7)
+                                 & (px0 + pos[:, 2] > nx0 + 1e-7)
+                                 & (py0 < ny1 - 1e-7)
+                                 & (py0 + pos[:, 3] > ny0 + 1e-7))
+                        clash[i] = False
+                        if not clash.any():
+                            pos[i, 0] = nx
+
+        return pos, x_right, y_top
+
+    # ------------------------------------------------------------------
+    # Column-cache delta-evaluation (PARTNER_COL_CACHE=1)
+    # ------------------------------------------------------------------
+    # Equivalence design (bit-exact; must match _layout_full byte-for-byte):
+    #
+    # A column ci is placed at x-offset = sum of widths of columns 0..ci-1.
+    # _stack_column(ulist, x, w, pos) is a *deterministic* function of
+    # (ulist, x, w, self.units' internal state, self.locked_rects). Between two
+    # consecutive _layout calls the SA loop mutates only `cols` (and, for the
+    # subgroup-reorder move, one unit's .subgroups via _refresh_unit); the
+    # locked obstacles never move. Therefore a column reproduces bit-identical
+    # output iff ALL of its inputs are bit-identical:
+    #   (1) same membership+order  -> ulist == prev ulist
+    #   (2) same unit internals    -> subgroup signature of its mutable units
+    #                                 unchanged (single-block / fixed-order
+    #                                 units cannot be reordered, so only
+    #                                 self._dc_mutable members need checking)
+    #   (3) same x-offset          -> x is bit-identical to the cached x
+    #   (4) same width             -> follows from (1)+(3): w is a deterministic
+    #                                 fn of ulist and (for obstacle columns) x.
+    # Obstacles are handled implicitly: _stack_column's segment logic depends on
+    # x only, so (3) already guarantees an obstacle-touching column reproduces
+    # exactly. No separate obstacle test is needed.
+    #
+    # x propagates left-to-right, so once any column diverges (fails (1)/(2), or
+    # is empty-after-nonempty, or is itself past the first change) every later
+    # column's x shifts by a non-representable delta and can never re-align
+    # bit-exactly -> the whole suffix is recomputed. Reuse is thus a *prefix*:
+    # columns 0..(first change - 1). We never translate stored coordinates
+    # (x_new + rel is NOT bit-equal to a fresh accumulation from x_new because
+    # float addition is non-associative); we only reuse when x is unchanged, so
+    # the cached rows are re-emitted verbatim.
+    #
+    # u.hcache (per-unit band-solve memo) is safe to leave stale across reused
+    # columns: it is keyed on (u.bands, w) and _refresh_unit nulls it on
+    # mutation, so any later read returns the same value a fresh solve would.
+    #
+    # The two global post-passes (top-tag lift, right-tag align) read global
+    # state (y_top / x_right / all-block collision), so they are NEVER cached:
+    # the cache stores the *pre-post-pass* rows, and the post-passes are re-run
+    # every call on the fully assembled pos -- identical to _layout_full.
+    def _layout_delta(self, cols: List[List[int]]) -> Tuple[np.ndarray, float, float]:
+        n = self.n
+        pos = np.zeros((n, 4))
+        for i in range(n):
+            if self.kind[i] == 2:
+                pos[i] = (self.lx[i], self.ly[i], self.rw[i], self.rh[i])
+
+        H = self.H
+        x = 0.0
+        col_records = []
+        units = self.units
+        has_locked = bool(self.locked_rects)
+        unit_col = self._unit_col
+        col_spans = []
+
+        prev_cols = self._dc_prev_cols
+        prev_sig = self._dc_prev_sig
+        cache = self._dc_cache
+        if len(cache) != len(cols):
+            cache = [None] * len(cols)
+        mutable = self._dc_mutable
+        cur_sig: List[tuple] = []
+        # can only reuse against a previous call with the same column count
+        diverged = prev_cols is None or len(prev_cols) != len(cols)
+
+        for ci, ulist in enumerate(cols):
+            if mutable:
+                sig = tuple((k, tuple(tuple(sg) for sg in units[k].subgroups))
+                            for k in ulist if k in mutable)
+            else:
+                sig = ()
+            cur_sig.append(sig)
+
+            if not ulist:
+                col_records.append(None)
+                col_spans.append(None)
+                cache[ci] = None
+                # empty column contributes zero width; x is unchanged, but an
+                # emptied (was non-empty) column dropped its width -> the
+                # downstream x shifts, so the suffix must be recomputed.
+                if not diverged and prev_cols[ci] != []:
+                    diverged = True
+                continue
+
+            reuse = (not diverged
+                     and ulist == prev_cols[ci]
+                     and sig == prev_sig[ci]
+                     and cache[ci] is not None
+                     and cache[ci][0] == x)
+            if reuse:
+                cx, cw, pos_block, record, span = cache[ci]
+                for (i, px, py, pw, ph) in pos_block:
+                    pos[i, 0] = px
+                    pos[i, 1] = py
+                    pos[i, 2] = pw
+                    pos[i, 3] = ph
+                for k in ulist:
+                    unit_col[k] = ci
+                col_records.append(record)
+                col_spans.append(span)
+                x = cx + cw
+                self._dc_hits += 1
+                continue
+
+            # -- recompute this column: verbatim _layout_full per-column body --
+            diverged = True
+            self._dc_recompute += 1
+            for k in ulist:
+                unit_col[k] = ci
+            soft_a = 0.0
+            rigid_h = 0.0
+            max_w = 0.0
+            for k in ulist:
+                u = units[k]
+                soft_a += u.eff_soft
+                rigid_h += u.eff_rigid_h
+                if u.max_rigid_w > max_w:
+                    max_w = u.max_rigid_w
+            avail = H - rigid_h
+            if avail < 0.05 * H:
+                avail = 0.05 * H
+            w = soft_a / avail
+            if w < max_w:
+                w = max_w
+            if w < 0.5:
+                w = 0.5
+            if has_locked:
+                for _ in range(3):
+                    obs = self._obstacles_in(x, x + w)
+                    obs_h = 0.0
+                    for s, e in obs:
+                        if e > 0.0 and s < H:
+                            span2 = (e if e < H else H) - (s if s > 0.0 else 0.0)
+                            strip = self._band_strip(x, w, s, e, ())
+                            if strip is not None:
+                                span2 *= 1.0 - strip[1] / w
+                            obs_h += span2
+                    avail = H - rigid_h - obs_h
+                    if avail < 0.05 * H:
+                        avail = 0.05 * H
+                    w2 = soft_a / avail
+                    if w2 < max_w:
+                        w2 = max_w
+                    if w2 < 0.5:
+                        w2 = 0.5
+                    if abs(w2 - w) < 5e-3:
+                        w = w2
+                        break
+                    w = w2
+
+            placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
+            if soft_a > 0:
+                tries = 0
+                while col_top > H * 1.0005 and tries < 3:
+                    overhead = col_top - soft_a / w
+                    if overhead < H * 0.98:
+                        w2 = soft_a / (H - overhead)
+                    else:
+                        w2 = w * 1.25
+                    w = min(max(w2, w * 1.01), w * 2.0)
+                    placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
+                    tries += 1
+
+            record = (x, w, placed, occupied)
+            span = (x, x + w)
+            col_records.append(record)
+            col_spans.append(span)
+            # cache the pre-post-pass rows for every block this column placed
+            pos_block = [(i, pos[i, 0], pos[i, 1], pos[i, 2], pos[i, 3])
+                         for k in ulist for i in units[k].blocks]
+            cache[ci] = (x, w, pos_block, record, span)
+            x += w
+
+        self._col_spans = col_spans
+        self._dc_cache = cache
+        self._dc_prev_cols = [list(c) for c in cols]
+        self._dc_prev_sig = cur_sig
+
+        # -- global post-passes: verbatim _layout_full tail (never cached) --
+        x_right = x
+        y_top = 0.0
+        for rec in col_records:
+            if rec is None:
+                continue
+            for (_k, _yb, yt) in rec[2]:
+                y_top = max(y_top, yt)
+        for (ox, oy, ow, oh) in self.locked_rects:
+            x_right = max(x_right, ox + ow)
+            y_top = max(y_top, oy + oh)
+
+        for rec in col_records:
+            if rec is None or not rec[2]:
+                continue
+            cx0, cw, placed, occupied = rec
+            k, yb, yt = max(placed, key=lambda t: t[2])
+            u = self.units[k]
+            top_block = u.blocks[-1]
+            if not (self.boundary[top_block] & 4):
+                continue
+            dy = y_top - yt
+            if dy <= 1e-9:
+                continue
+            occ_wo = [iv for iv in occupied if not (abs(iv[0] - yb) < 1e-6 and abs(iv[1] - yt) < 1e-6)]
+            blockers = self._obstacles_in(cx0, cx0 + cw)
+            for (k2, yb2, yt2) in placed:
+                if k2 != k:
+                    blockers.append([yb2, yt2])
+            if self._interval_free(blockers, yb + dy, yt + dy):
+                for i in u.blocks:
+                    pos[i, 1] += dy
+
+        last = None
+        for rec in reversed(col_records):
+            if rec is not None and rec[2]:
+                last = rec
+                break
+        if last is not None:
+            for (k, _yb, _yt) in last[2]:
+                u = self.units[k]
+                for i in u.blocks:
+                    if self.boundary[i] & 2:
+                        nx = x_right - pos[i, 2]
+                        if nx <= pos[i, 0] + 1e-9:
+                            continue
                         nx0, ny0 = nx, pos[i, 1]
                         nx1, ny1 = x_right, pos[i, 1] + pos[i, 3]
                         px0 = pos[:, 0]
