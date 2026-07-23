@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Mapping, Optional
 
 import torch
+import torch.utils.checkpoint
 
 from flow_matching_claude import endpoint_from_velocity
 from physics_guidance_claude import GuidanceContext, guidance_energy_per_sample
@@ -142,6 +143,90 @@ def sample_flow_diff(
         z = z_next * valid
 
     return z
+
+
+# --------------------------------------------------------------------------- #
+# Differentiable DDIM sampler (numerically identical to sample_direct)
+# --------------------------------------------------------------------------- #
+def sample_direct_diff(
+    model,
+    cond: Mapping[str, torch.Tensor],
+    schedule,
+    steps: int,
+    z_init: torch.Tensor,
+    known_noise: torch.Tensor | None = None,
+    z_known: torch.Tensor | None = None,
+    known_mask: torch.Tensor | None = None,
+    grad_checkpoint: bool = False,
+) -> torch.Tensor:
+    """Autograd-enabled twin of ``direct_model_claude.sample_direct`` (no guidance).
+
+    Same v-prediction DDIM update, self-conditioning, per-step hard-anchor
+    imposition, and aspect clamp -- but ``z_init`` and the per-step
+    ``known_noise`` (``[steps, B, N, z_dim]``) are supplied by the caller instead
+    of drawn, and the ``@torch.no_grad`` guard is removed so gradients flow back
+    to ``z_init``. The in-place aspect clamp of ``sample_direct`` is expressed
+    with ``torch.cat`` here (identical values, autograd-safe). Self-conditioning
+    is detached (matches sample_direct's no_grad state, halves the unroll graph).
+    Returns the clean endpoint z0 (``[B, N, z_dim]``).
+    """
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+    node_feat = cond["node_feat"]
+    mask = cond["mask"]
+    rel_feat = cond.get("rel_feat")
+    adj = cond.get("adj")
+    device = node_feat.device
+    B, N, _ = node_feat.shape
+    valid = mask.unsqueeze(-1)
+    has_known = z_known is not None and known_mask is not None
+    if has_known and known_noise is None:
+        raise ValueError("known_noise ([steps,B,N,z]) required when anchoring")
+
+    def clamp_aspect(z0: torch.Tensor) -> torch.Tensor:
+        return torch.cat([z0[..., :2], z0[..., 2:3].clamp(-3.0, 3.0), z0[..., 3:]], dim=-1)
+
+    z = z_init * valid
+    times = torch.linspace(schedule.timesteps - 1, 0, steps, device=device).long()
+    sc = None
+    for idx in range(len(times)):
+        t = torch.full((B,), int(times[idx].item()), device=device, dtype=torch.long)
+        alpha, sigma = schedule.alpha_sigma(t)
+        if has_known:
+            z_imposed = alpha * z_known + sigma * known_noise[idx]
+            z = torch.where(known_mask, z_imposed, z)
+
+        def vel(z_in, _sc=sc, _t=t):
+            return model(z_in, _t, node_feat, adj, mask, rel_feat=rel_feat, self_cond=_sc)
+
+        if grad_checkpoint:
+            v = torch.utils.checkpoint.checkpoint(vel, z, use_reentrant=False)
+        else:
+            v = vel(z)
+
+        z0 = alpha * z - sigma * v
+        z0 = clamp_aspect(z0)
+        if has_known:
+            z0 = torch.where(known_mask, z_known, z0)
+        sc = z0.detach()
+        eps = sigma * z + alpha * v
+        if idx == len(times) - 1:
+            z = z0
+            break
+        t_next = torch.full((B,), int(times[idx + 1].item()), device=device, dtype=torch.long)
+        alpha_n, sigma_n = schedule.alpha_sigma(t_next)
+        z = (alpha_n * z0 + sigma_n * eps) * valid
+    return z * valid
+
+
+def make_direct_sampler(model, cond, schedule, steps, z_known, known_mask,
+                        known_noise, grad_checkpoint=False):
+    """Bind a ``seed -> z0`` DDIM sampler for ``optimize_noise(sample_fn=...)``."""
+    def _fn(seed: torch.Tensor) -> torch.Tensor:
+        return sample_direct_diff(
+            model, cond, schedule, steps, seed, known_noise=known_noise,
+            z_known=z_known, known_mask=known_mask, grad_checkpoint=grad_checkpoint)
+    return _fn
 
 
 # --------------------------------------------------------------------------- #
@@ -249,13 +334,16 @@ def optimize_noise(
     known_mask: torch.Tensor | None,
     cfg: NoiseOptConfig,
     energy_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    sample_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     return_result: bool = False,
 ):
-    """Projected-gradient descent on the flow seed against a layout energy.
+    """Projected-gradient descent on the initial noise against a layout energy.
 
-    Returns the best-along-trajectory seed ``z_T_opt`` (and optionally a
-    :class:`NoiseOptResult` with the endpoint, per-sample energy trace, argmin
-    iter, and per-iter scalar logs).
+    ``sample_fn(seed) -> z0`` maps a seed to a clean endpoint; when omitted a
+    flow sampler is built from ``flow_model``/``cond``. Pass
+    :func:`make_direct_sampler` for the DDIM path. Returns the best-along-
+    trajectory seed ``z_T_opt`` (and optionally a :class:`NoiseOptResult` with
+    the endpoint, per-sample energy trace, argmin iter, and per-iter logs).
     """
     mask = cond["mask"]
     z_dim = z_T0.shape[-1]
@@ -298,10 +386,13 @@ def optimize_noise(
 
     optim = torch.optim.Adam([z_T], lr=cfg.lr)
 
-    def sample(seed: torch.Tensor) -> torch.Tensor:
-        return sample_flow_diff(
-            flow_model, cond, cfg.steps, cfg.solver, seed,
-            z_known=z_known, known_mask=known_mask, known_noise=known_noise)
+    if sample_fn is None:
+        def sample(seed: torch.Tensor) -> torch.Tensor:
+            return sample_flow_diff(
+                flow_model, cond, cfg.steps, cfg.solver, seed,
+                z_known=z_known, known_mask=known_mask, known_noise=known_noise)
+    else:
+        sample = sample_fn
 
     def lr_at(it: int) -> float:
         if it < cfg.warmup:

@@ -12,7 +12,9 @@ import torch
 from flow_matching_claude import sample_flow
 from noise_opt_claude import (
     NoiseOptConfig,
+    make_direct_sampler,
     optimize_noise,
+    sample_direct_diff,
     sample_flow_diff,
 )
 
@@ -100,6 +102,96 @@ def test_sample_flow_diff_carries_gradient_to_seed():
     assert z_init.grad is not None
     assert torch.isfinite(z_init.grad).all()
     assert z_init.grad.abs().sum() > 0
+
+
+# --------------------------------------------------------------------------- #
+# 1b. differentiable DDIM twin == frozen sample_direct
+# --------------------------------------------------------------------------- #
+def _direct_draws(shape, steps, has_known, seed):
+    """Reproduce sample_direct's draw order: z first, then one per step."""
+    gen = torch.Generator().manual_seed(seed)
+    z = torch.randn(shape, generator=gen)
+    kn = None
+    if has_known:
+        kn = torch.stack([torch.randn(shape, generator=gen) for _ in range(steps)])
+    return z, kn
+
+
+def test_sample_direct_diff_matches_sample_direct_no_known():
+    from direct_model_claude import sample_direct
+    from diffusion_model import DiffusionSchedule
+    model = ZScaledVelocity()
+    cond = _condition()
+    sched = DiffusionSchedule(1000)
+    steps = 6
+    z, _ = _direct_draws((1, 4, 4), steps, has_known=False, seed=41)
+    ref = sample_direct(model, cond, sched, steps=steps,
+                        generator=torch.Generator().manual_seed(41))
+    got = sample_direct_diff(model, cond, sched, steps=steps, z_init=z)
+    torch.testing.assert_close(got, ref)
+
+
+def test_sample_direct_diff_matches_sample_direct_with_known():
+    from direct_model_claude import sample_direct
+    from diffusion_model import DiffusionSchedule
+    model = ZScaledVelocity()
+    cond = _condition()
+    sched = DiffusionSchedule(1000)
+    steps = 5
+    z_known = torch.zeros(1, 4, 4)
+    z_known[:, 0, :3] = torch.tensor([0.7, 0.5, 1.0])
+    known_mask = torch.zeros(1, 4, 4, dtype=torch.bool)
+    known_mask[:, 0, :3] = True
+    z, kn = _direct_draws((1, 4, 4), steps, has_known=True, seed=53)
+    ref = sample_direct(model, cond, sched, steps=steps,
+                        generator=torch.Generator().manual_seed(53),
+                        z_known=z_known, known_mask=known_mask)
+    got = sample_direct_diff(model, cond, sched, steps=steps, z_init=z,
+                             known_noise=kn, z_known=z_known, known_mask=known_mask)
+    torch.testing.assert_close(got, ref)
+
+
+def test_sample_direct_diff_gradient_and_checkpoint_agree():
+    from diffusion_model import DiffusionSchedule
+    model = ZScaledVelocity()
+    cond = _condition()
+    sched = DiffusionSchedule(1000)
+    z, _ = _direct_draws((1, 4, 4), 4, has_known=False, seed=7)
+    z1 = z.clone().requires_grad_(True)
+    z2 = z.clone().requires_grad_(True)
+    out1 = sample_direct_diff(model, cond, sched, 4, z1, grad_checkpoint=False)
+    out2 = sample_direct_diff(model, cond, sched, 4, z2, grad_checkpoint=True)
+    torch.testing.assert_close(out1, out2)
+    out1.pow(2).sum().backward()
+    out2.pow(2).sum().backward()
+    assert z1.grad is not None and torch.isfinite(z1.grad).all()
+    torch.testing.assert_close(z1.grad, z2.grad)
+
+
+def test_optimize_noise_direct_sampler_runs_and_anchors():
+    from diffusion_model import DiffusionSchedule
+    model = ZeroVelocity()
+    cond = _condition(blocks=4)
+    sched = DiffusionSchedule(1000)
+    steps = 6
+    z_T0 = torch.randn(1, 4, 4)
+    z_known = torch.zeros(1, 4, 4)
+    z_known[:, 0, :3] = torch.tensor([0.3, 0.2, 0.4])
+    known_mask = torch.zeros(1, 4, 4, dtype=torch.bool)
+    known_mask[:, 0, :3] = True
+    kn = torch.randn(steps, 1, 4, 4)
+    sampler = make_direct_sampler(model, cond, sched, steps, z_known, known_mask, kn)
+
+    def energy_fn(z0):
+        return (z0 ** 2).reshape(z0.shape[0], -1).sum(dim=1)
+
+    cfg = NoiseOptConfig(rounds=6, lr=0.1, steps=steps)
+    _z, res = optimize_noise(None, cond, ctx=None, z_T0=z_T0, z_known=z_known,
+                             known_mask=known_mask, cfg=cfg, energy_fn=energy_fn,
+                             sample_fn=sampler, return_result=True)
+    # per-step anchoring makes the endpoint known channels exactly z_known
+    torch.testing.assert_close(res.z0[known_mask], z_known[known_mask])
+    assert torch.isfinite(res.energy).all()
 
 
 # --------------------------------------------------------------------------- #
