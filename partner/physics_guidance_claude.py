@@ -22,7 +22,15 @@ class GuidanceConfig:
     t_gate: float = 0.35            # active when data_time >= 1 - t_gate
     w_overlap: float = 1.0
     w_boundary: float = 0.5
-    w_hpwl: float = 0.1
+    # w_hpwl defaults OFF: the wirelength-attraction gradient (normalized only
+    # by sum(pair_w)) overpowers the overlap-separation gradient (weight 1.0
+    # but normalized by B*diag^2, ~1/B-diluted), pulling net-connected blocks
+    # onto each other. Measured: enabling it inflates raw pairwise overlap
+    # 2-10x on tail cases; disabling it drops overlap 40-90% vs the un-guided
+    # baseline. Re-enable per-run via PGUIDE_W_HPWL only after re-normalizing
+    # the overlap term so separation can dominate. See probe evidence
+    # artifacts/pguide/{attrib,term}_probe.json.
+    w_hpwl: float = 0.0
     w_group: float = 0.0
     guide_aspect: bool = False
     trust_radius: float = 0.05      # max |Δz| per inner step (normalized units)
@@ -40,7 +48,7 @@ class GuidanceConfig:
             t_gate=f("PGUIDE_TGATE", 0.35),
             w_overlap=f("PGUIDE_W_OVERLAP", 1.0),
             w_boundary=f("PGUIDE_W_BOUNDARY", 0.5),
-            w_hpwl=f("PGUIDE_W_HPWL", 0.1),
+            w_hpwl=f("PGUIDE_W_HPWL", 0.0),   # OFF by default; see w_hpwl note
             w_group=f("PGUIDE_W_GROUP", 0.0),
             guide_aspect=os.environ.get("PGUIDE_ASPECT") == "1",
             trust_radius=f("PGUIDE_TRUST", 0.05),
