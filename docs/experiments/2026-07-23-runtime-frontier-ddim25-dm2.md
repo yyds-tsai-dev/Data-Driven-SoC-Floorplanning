@@ -64,6 +64,23 @@ Checkpoint:`eval_retrieval_direct_control.pt`(direct_v2_cont step 1,139,000)。
 相關 commits:`3857982`(掃描)、`8c37eb9`(MAX6 判讀)、`961957a`..`85d0203`(guidance 鏈)、
 `0db74e4`(HPWL 根因修復)、`8a821a3`(probe)。
 
+## 補記:SA 加速軌(numba 判死 → delta-evaluation colcache)
+
+- **Numba 判死**(誠實停手):熱點 `_stack_column`(63.6% wall)是 Python 物件圖裝箱器,
+  njit 不可達;唯一可 njit 的 `_cost` 佔 10.6% → Amdahl 上限 1.07×。Profiler probe
+  commit `5868037`。
+- **Bit-exact column-cache delta-evaluation 落地**(commit `c69b468`,`PARTNER_COL_CACHE=1`
+  opt-in,等價測試 5 綠:同 seed 逐位相同):case99 SA 吞吐 1.22×(prefix 復用天花板
+  28%,x 平移與重新累加浮點不等價 → 逐位紅線下 2× 結構性不可達)。
+- **A/B ×2 判定:不顯著**(baseline 1.1561/1.1518 vs colcache 1.1474/1.1538;
+  Δ −0.0034 ≈ run 方差 ±0.003)→ 不進 submission 定案,default off 保留。
+- **3s cliff 未解**(colcache 3 檔 1.3294 ≈ 基線):cliff 部分是 wall-bounded refine
+  (`refiner_claude._build_edges`/`_axis_pass` 佔 23.6% wall),不吃 SA 吞吐。
+  紅線放寬(≤1e-9 drift,src `column_slicing.py::_layout_fast` 標準)可到 ~70% 復用,
+  但尾段案 87% 障礙接觸仍 ~1.2×,beta 前不做。
+- 結構註記(beta 後):partner legalizer 是 fork,落後 src `column_slicing.py`
+  (`_layout_fast`/vectorized components)— 合流是更大的槓桿。
+
 ## 待辦(接續)
 
 - T12 numba(跑中):目標 3s 檔位解鎖(投影 ~0.86-0.88)+ 3.5s 檔品質直升。
