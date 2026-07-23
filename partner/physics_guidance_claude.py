@@ -186,9 +186,14 @@ def build_context(area_target: torch.Tensor, constraints: torch.Tensor,
     ncol = c.shape[-1]
     boundary = c[..., 4].round().long() if ncol > 4 else torch.zeros_like(mask, dtype=torch.long)
     group = c[..., 3].round().long() if ncol > 3 else torch.zeros_like(mask, dtype=torch.long)
-    n = area_target.shape[1]
-    w = b2b[:n, :n]
-    iu = torch.triu_indices(n, n, offset=1)
+    # b2b's own square extent is the authoritative pair-index range: it is
+    # sized to the real block_count, while area_target/constraints may be
+    # padded wider (N_pad >= block_count) -- slicing b2b to area_target's
+    # width would silently under-cover and triu_indices would then index
+    # past b2b's actual bounds (device-side assert on CUDA).
+    n_pairs = min(b2b.shape[-2], b2b.shape[-1])
+    w = b2b[:n_pairs, :n_pairs]
+    iu = torch.triu_indices(n_pairs, n_pairs, offset=1, device=w.device)
     vals = w[iu[0], iu[1]] + w[iu[1], iu[0]]
     nz = vals > 0
     return GuidanceContext(
