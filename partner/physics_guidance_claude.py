@@ -148,6 +148,75 @@ def guidance_energy(z: torch.Tensor, ctx: GuidanceContext,
     return e
 
 
+def guidance_energy_per_sample(z: torch.Tensor, ctx: GuidanceContext,
+                               w_overlap: float, w_boundary: float,
+                               w_hpwl: float, w_group: float) -> torch.Tensor:
+    """Per-sample analytic layout energy -> ``[B]``.
+
+    Same terms as ``guidance_energy`` but every term is normalized by *its own
+    sample's* scale and kept on the batch dimension instead of being summed into
+    a single scalar. The batch-total overlap normalization in ``guidance_energy``
+    (dividing by ``sum_b diag_b^2``) makes each sample's overlap ~1/B-diluted and
+    lets the hpwl term dominate on tail cases; here overlap for sample ``b`` is
+    divided by ``diag_b^2`` alone, so overlap-separation and wirelength stay on
+    the same per-sample scale (which is what makes ``w_hpwl>0`` safe here).
+    Samples are independent, so ``loss = energy.sum()`` gives each sample its own
+    correctly-scaled gradient.
+    """
+    x, y, w, h = rects_from_z(z, ctx)
+    B = z.shape[0]
+    m = ctx.mask.to(z.dtype)                       # [B,N]
+    x1, y1 = x + w, y + h
+    diag = ctx.scale.view(-1, 1).clamp_min(1.0)    # [B,1]
+    e = z.new_zeros(B)
+
+    if w_overlap:
+        ox = (torch.minimum(x1.unsqueeze(2), x1.unsqueeze(1))
+              - torch.maximum(x.unsqueeze(2), x.unsqueeze(1))).clamp_min(0.0)
+        oy = (torch.minimum(y1.unsqueeze(2), y1.unsqueeze(1))
+              - torch.maximum(y.unsqueeze(2), y.unsqueeze(1))).clamp_min(0.0)
+        pm = m.unsqueeze(2) * m.unsqueeze(1)
+        ov = ox * oy * pm
+        ov = ov - torch.diag_embed(torch.diagonal(ov, dim1=1, dim2=2))
+        e = e + w_overlap * 0.5 * ov.reshape(B, -1).sum(dim=1) / (diag.squeeze(1) ** 2)
+
+    if w_boundary and int(ctx.boundary_code.max()) > 0:
+        big = 10.0 * float(diag.max())
+        X0 = torch.where(ctx.mask, x, torch.full_like(x, big)).min(dim=1, keepdim=True).values.detach()
+        X1 = torch.where(ctx.mask, x1, torch.full_like(x1, -big)).max(dim=1, keepdim=True).values.detach()
+        Y0 = torch.where(ctx.mask, y, torch.full_like(y, big)).min(dim=1, keepdim=True).values.detach()
+        Y1 = torch.where(ctx.mask, y1, torch.full_like(y1, -big)).max(dim=1, keepdim=True).values.detach()
+        code = ctx.boundary_code
+        gb = z.new_zeros(x.shape)
+        gb = gb + torch.where(code & 1 > 0, (x - X0).clamp_min(0.0), torch.zeros_like(x))
+        gb = gb + torch.where(code & 2 > 0, (X1 - x1).clamp_min(0.0), torch.zeros_like(x))
+        gb = gb + torch.where(code & 4 > 0, (Y1 - y1).clamp_min(0.0), torch.zeros_like(x))
+        gb = gb + torch.where(code & 8 > 0, (y - Y0).clamp_min(0.0), torch.zeros_like(x))
+        e = e + w_boundary * (gb * m / diag).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+
+    if w_hpwl and ctx.pair_i.numel():
+        cx, cy = x + 0.5 * w, y + 0.5 * h
+        dx = (cx[:, ctx.pair_i] - cx[:, ctx.pair_j]).abs()
+        dy = (cy[:, ctx.pair_i] - cy[:, ctx.pair_j]).abs()
+        e = e + w_hpwl * (ctx.pair_w * (dx + dy) / diag).sum(dim=1) \
+            / ctx.pair_w.sum().clamp_min(1e-6)
+
+    if w_group and int(ctx.group_id.max()) > 0:
+        cx, cy = x + 0.5 * w, y + 0.5 * h
+        for gid in torch.unique(ctx.group_id):
+            if int(gid) <= 0:
+                continue
+            gm = (ctx.group_id == gid) & ctx.mask
+            if int(gm.sum()) < 2:
+                continue
+            gden = gm.sum(dim=1, keepdim=True).clamp_min(1)
+            gx = (cx * gm).sum(dim=1, keepdim=True) / gden
+            gy = (cy * gm).sum(dim=1, keepdim=True) / gden
+            e = e + w_group * (((cx - gx) ** 2 + (cy - gy) ** 2) * gm
+                               / diag ** 2).sum(dim=1) / gm.sum(dim=1).clamp_min(1)
+    return e
+
+
 def guide_x0(z0: torch.Tensor, ctx: GuidanceContext, cfg: GuidanceConfig,
              data_time: float) -> torch.Tensor:
     if data_time < 1.0 - cfg.t_gate or cfg.k_steps <= 0:
