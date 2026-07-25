@@ -39,6 +39,49 @@ def endpoint_from_velocity(
     return z_t + (1.0 - tau) * velocity
 
 
+def endpoint_snr_weight(t: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Straight-path SNR analogue for weighting the endpoint (x0) loss.
+
+    On the linear path ``z_t = (1-t)*noise + t*z0`` the implied endpoint error
+    equals ``(1-t) * (velocity error)``, so an unweighted endpoint MSE
+    implicitly scales as ``(1-t)**2`` and is dominated by the high-noise
+    (low-t) regime where the endpoint is least reliable.  Multiplying by
+    ``t**2 / (1-t)**2`` -- the data/noise coefficient-variance ratio, the flow
+    analogue of the diffusion SNR ``alpha**2 / sigma**2`` -- cancels that
+    ``(1-t)**2`` amplification and leaves a net ``t**2`` emphasis on the
+    underlying velocity error, matching the geometry losses.  The clamp mirrors
+    ``direct_train_v2``'s min-SNR-gamma and keeps the weight finite as t -> 1.
+    """
+    flat = t.reshape(-1).to(torch.float32)
+    ratio = (flat * flat) / ((1.0 - flat) * (1.0 - flat)).clamp_min(1e-8)
+    return ratio.clamp(max=gamma)
+
+
+def sample_flow_t(
+    n: int,
+    device,
+    generator=None,
+    term_prob: float = 0.10,
+    term_band: float = 0.02,
+) -> torch.Tensor:
+    """Sample flow times in ``[0, 1)`` with a small mass near the data endpoint.
+
+    Uniform ``t`` never reaches the terminal time the Heun corrector (and
+    Euler's final substep) evaluate at, and starves the near-data regime where
+    final coordinate precision is set.  With probability ``term_prob`` a sample
+    is instead drawn from ``[1 - term_band, 1)``, covering the terminal
+    neighbourhood with reducible-target training; a hard ``t = 1.0`` spike is
+    avoided because its velocity target ``z0 - noise`` is unpredictable from the
+    clean state and carries an irreducible loss floor.
+    """
+    t = torch.rand((n,), device=device, generator=generator)
+    if term_prob > 0.0 and term_band > 0.0:
+        term = torch.rand((n,), device=device, generator=generator) < term_prob
+        t_term = 1.0 - torch.rand((n,), device=device, generator=generator) * term_band
+        t = torch.where(term, t_term, t)
+    return t
+
+
 @torch.no_grad()
 def sample_flow(
     model,

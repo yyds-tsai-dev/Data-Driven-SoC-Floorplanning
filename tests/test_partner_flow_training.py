@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from flow_matching_claude import flow_path
+from flow_matching_claude import endpoint_snr_weight, flow_path, sample_flow_t
 import flow_train_claude as flow_train
 from flow_train_claude import checkpoint_method, masked_flow_loss
 
@@ -54,6 +54,44 @@ def test_flow_primary_loss_backpropagates_and_checkpoint_is_tagged():
     assert checkpoint_method({"args": {"training_method": "flow_matching_v1"}}) == (
         "flow_matching_v1"
     )
+
+
+def test_checkpoint_method_accepts_flow_v2_and_keeps_v1():
+    # v2 is the current recipe; v1 stays loadable for the candidate probe.
+    assert checkpoint_method({"args": {"training_method": "flow_matching_v2"}}) == (
+        "flow_matching_v2"
+    )
+    assert checkpoint_method({"args": {"training_method": "flow_matching_v1"}}) == (
+        "flow_matching_v1"
+    )
+
+
+def test_endpoint_snr_weight_downweights_low_t_and_clamps():
+    # Low-t (high-noise) endpoints get a small weight; the weight rises with t
+    # and saturates at gamma once t**2/(1-t)**2 exceeds it.
+    gamma = 5.0
+    t = torch.tensor([0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 0.999])
+    w = endpoint_snr_weight(t, gamma)
+
+    assert w.shape == t.shape
+    assert float(w[0]) == 0.0
+    assert (w[1:] >= w[:-1]).all()          # monotone non-decreasing in t
+    assert float(w[3]) == pytest.approx(1.0, abs=1e-5)  # t=0.5 -> SNR 1
+    assert w.max() <= gamma + 1e-6
+    assert float(w[-1]) == pytest.approx(gamma, abs=1e-5)  # clamped near t=1
+
+
+def test_sample_flow_t_covers_terminal_band_and_stays_in_unit_interval():
+    gen = torch.Generator().manual_seed(0)
+    t = sample_flow_t(20000, torch.device("cpu"), gen, term_prob=0.10, term_band=0.02)
+
+    assert t.shape == (20000,)
+    assert float(t.min()) >= 0.0 and float(t.max()) < 1.0
+    frac_terminal = float((t >= 0.98).float().mean())
+    assert 0.07 <= frac_terminal <= 0.13   # ~10% land in [1-band, 1)
+
+    uniform = sample_flow_t(5000, torch.device("cpu"), gen, term_prob=0.0, term_band=0.02)
+    assert float((uniform >= 0.98).float().mean()) < 0.05  # no terminal spike
 
 
 def test_module_import_does_not_mutate_sys_path():
