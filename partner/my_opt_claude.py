@@ -504,7 +504,12 @@ class MyOptimizer(FloorplanOptimizer):
 
     def _sample_flow_preds(self, n, at, cons, tpos, b2b, p2b, pins,
                            K) -> List[np.ndarray]:
-        """Sample K layouts from the opt-in flow-matching model."""
+        """Sample K layouts from the opt-in flow-matching model.
+
+        Default path is unchanged. Opt-in flow-seed variants (all default off):
+        PARTNER_FLOW_ANTITHETIC=1 (V-A, +/-z paired seeds), PARTNER_FLOW_ZORDER=1
+        (V-B, zero-order neighborhood resample), PARTNER_FLOW_NOPT=hybrid
+        (V-C/D, gradient noise-opt on the flow channel)."""
         from direct_train_claude import fast_condition
         from direct_model_claude import known_z_channels
         from flow_matching_claude import sample_flow
@@ -519,23 +524,220 @@ class MyOptimizer(FloorplanOptimizer):
             node_feat_dim=self.flow_cfg.node_feat_dim)
         scale = layout_scale(at_d)
         z_known, known = known_z_channels(at_d, cons_d, tpos_d, scale)
-        gen = torch.Generator(device=dev)
-        gen.manual_seed(23)
+        b2b_d = b2b.to(dev)
+        if os.environ.get("PARTNER_FLOW_NOPT") == "hybrid":
+            return self._flow_noise_opt_preds(
+                n, cond, z_known, known, scale, at_d, cons_d, tpos_d, b2b_d, K)
+        if os.environ.get("PARTNER_FLOW_ZORDER"):
+            return self._flow_zorder_preds(
+                n, cond, z_known, known, scale, at_d, cons_d, tpos_d, b2b_d, K)
+
+        steps = _env_int("PARTNER_FLOW_STEPS", 8)
+        solver = os.environ.get("PARTNER_FLOW_SOLVER", "euler")
         cond_k = {k: (v.expand(K, *v.shape[1:]).contiguous()
                       if torch.is_tensor(v) else v) for k, v in cond.items()}
-        with torch.no_grad():
-            sample = sample_flow(
-                self.flow_model, cond_k,
-                steps=_env_int("PARTNER_FLOW_STEPS", 8),
-                solver=os.environ.get("PARTNER_FLOW_SOLVER", "euler"),
-                generator=gen,
-                z_known=z_known.expand(K, -1, -1),
-                known_mask=known.expand(K, -1, -1))
-            rects = z_to_rectangles(
-                sample.z, at_d.expand(K, -1),
-                target_positions=tpos_d.expand(K, -1, -1),
-                constraints=cons_d.expand(K, -1, -1),
-                z_repr=self.flow_cfg.z_repr)
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(23)
+        if os.environ.get("PARTNER_FLOW_ANTITHETIC"):
+            # V-A: antithetic +/-z coverage (arXiv 2506.06185). known_noise is
+            # shared within each pair so only the free seed is mirrored.
+            from noise_opt_claude import sample_flow_diff
+            N = cond["mask"].shape[1]
+            zdim = self.flow_cfg.z_dim
+            valid = cond_k["mask"].unsqueeze(-1)
+            has_known = bool(known.any())
+            half = (K + 1) // 2
+            zf = torch.randn((half, N, zdim), device=dev, generator=gen)
+            z_init = torch.cat([zf, -zf], dim=0)[:K] * valid
+            kn = None
+            if has_known:
+                knh = torch.randn((half, N, zdim), device=dev, generator=gen)
+                kn = torch.cat([knh, knh], dim=0)[:K] * known.expand(K, -1, -1)
+            with torch.no_grad():
+                z = sample_flow_diff(
+                    self.flow_model, cond_k, steps, solver, z_init,
+                    z_known=z_known.expand(K, -1, -1),
+                    known_mask=known.expand(K, -1, -1), known_noise=kn)
+        else:
+            with torch.no_grad():
+                z = sample_flow(
+                    self.flow_model, cond_k, steps=steps, solver=solver,
+                    generator=gen, z_known=z_known.expand(K, -1, -1),
+                    known_mask=known.expand(K, -1, -1)).z
+        rects = z_to_rectangles(
+            z, at_d.expand(K, -1), target_positions=tpos_d.expand(K, -1, -1),
+            constraints=cons_d.expand(K, -1, -1), z_repr=self.flow_cfg.z_repr)
+        return [rects[k, :n].cpu().numpy().astype(np.float64) for k in range(K)]
+
+    def _flow_setup(self, cond, K):
+        """Local (ex, ex_cond, N, zdim, valid, has_known, steps, solver)."""
+        def ex(t, k):
+            return t.expand(k, *t.shape[1:]).contiguous()
+
+        def ex_cond(k):
+            return {kk: (ex(v, k) if torch.is_tensor(v) else v)
+                    for kk, v in cond.items()}
+        return (ex, ex_cond, cond["mask"].shape[1], self.flow_cfg.z_dim,
+                cond["mask"].unsqueeze(-1), bool(cond["mask"].numel()),
+                _env_int("PARTNER_FLOW_STEPS", 8),
+                os.environ.get("PARTNER_FLOW_SOLVER", "euler"))
+
+    def _flow_zorder_preds(self, n, cond, z_known, known, scale,
+                           at_d, cons_d, tpos_d, b2b, K) -> List[np.ndarray]:
+        """V-B: zero-order neighborhood resample (Ma et al. 2501.09732).
+
+        Sample a pool, pick the top-M by layout energy, draw sigma-Gaussian
+        neighbors of each, re-render everything, and keep the best K by energy.
+        Pure forward, stochastic (no gradient collapse -> dodges failure mode A;
+        selection stays overlap-driven)."""
+        import time as _time
+        from physics_guidance_claude import build_context, guidance_energy_per_sample
+        from noise_opt_claude import sample_flow_diff
+        dev = self.device
+        z_repr = self.flow_cfg.z_repr
+        ex, ex_cond, N, zdim, _v, _hk, steps, solver = self._flow_setup(cond, K)
+        has_known = bool(known.any())
+        M = _env_int("PARTNER_FLOW_ZORDER_M", 4)
+        nb = _env_int("PARTNER_FLOW_ZORDER_NB", 3)
+        sig = _env_float("PARTNER_FLOW_ZORDER_SIGMA", 0.1)
+        Ksample = max(K, _env_int("PARTNER_FLOW_ZORDER_K", 16))
+        w_ov = _env_float("PARTNER_FLOW_ZORDER_W_OVERLAP", 1.0)
+        w_bd = _env_float("PARTNER_FLOW_ZORDER_W_BOUNDARY", 0.5)
+        ctx = build_context(at_d, cons_d, b2b, scale, known)
+
+        def render(z_init):
+            k = z_init.shape[0]
+            valid_k = cond["mask"].unsqueeze(-1).expand(k, -1, -1)
+            kn = (z_init * ex(known, k)) if has_known else None
+            with torch.no_grad():
+                return sample_flow_diff(
+                    self.flow_model, ex_cond(k), steps, solver, z_init * valid_k,
+                    z_known=ex(z_known, k), known_mask=ex(known, k), known_noise=kn)
+
+        def energy(z0):
+            k = z0.shape[0]
+            return guidance_energy_per_sample(z0, ctx.expand(k), w_ov, w_bd, 0.0, 0.0)
+
+        t0 = _time.time()
+        gen = torch.Generator(device=dev).manual_seed(23)
+        valid_s = cond["mask"].unsqueeze(-1).expand(Ksample, -1, -1)
+        z_seed = torch.randn((Ksample, N, zdim), device=dev, generator=gen) * valid_s
+        z0 = render(z_seed)
+        e = energy(z0)
+        top = torch.topk(e, min(M, Ksample), largest=False).indices
+        neigh = []
+        for idx in top.tolist():
+            base = z_seed[idx:idx + 1]
+            for _ in range(nb):
+                neigh.append(base + sig * torch.randn_like(base))
+        if neigh:
+            z_nb = torch.cat(neigh, dim=0)
+            z0_nb = render(z_nb)
+            z_all = torch.cat([z0, z0_nb], dim=0)
+        else:
+            z_all = z0
+        e_all = energy(z_all)
+        keep = torch.topk(e_all, min(K, z_all.shape[0]), largest=False).indices
+        z_keep = z_all[keep].contiguous()
+        Kk = z_keep.shape[0]
+        rects = z_to_rectangles(
+            z_keep, at_d.expand(Kk, -1), target_positions=tpos_d.expand(Kk, -1, -1),
+            constraints=cons_d.expand(Kk, -1, -1), z_repr=z_repr)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"[flow-zorder] n={n} Ksample={Ksample} nb={len(neigh)} "
+              f"K={Kk} gpu_s={_time.time() - t0:.2f}", file=sys.stderr)
+        return [rects[k, :n].cpu().numpy().astype(np.float64) for k in range(Kk)]
+
+    def _flow_noise_opt_preds(self, n, cond, z_known, known, scale,
+                              at_d, cons_d, tpos_d, b2b, K) -> List[np.ndarray]:
+        """V-C/D: gradient noise-opt on the flow channel with an INVERTED energy
+        (hpwl-heavy). Tests whether targeting the refine-immovable wirelength
+        dimension (not the refine-fixable overlap) revives gradient noise-opt,
+        and whether the flow 8-step unroll avoids the DDIM-25 hpwl stall.
+        Optional batch-repulsion (V-D) via PGUIDE_W_REP."""
+        import time as _time
+        from physics_guidance_claude import build_context, guidance_energy_per_sample
+        from noise_opt_claude import NoiseOptConfig, optimize_noise, sample_flow_diff
+        dev = self.device
+        z_repr = self.flow_cfg.z_repr
+        ex, ex_cond, N, zdim, _v, _hk, steps, solver = self._flow_setup(cond, K)
+        has_known = bool(known.any())
+        M = min(_env_int("PARTNER_FLOW_NOPT_TOPM", 4), K)
+        w_rep = _env_float("PGUIDE_W_REP", 0.0)
+        sig_rep = _env_float("PGUIDE_SIGMA_REP", 0.1)
+        ctx = build_context(at_d, cons_d, b2b, scale, known)
+        cfg = NoiseOptConfig.from_env()
+        cfg.rounds = _env_int("PARTNER_FLOW_NOPT_ITERS", 10)
+        cfg.steps, cfg.solver = steps, solver
+        cfg.w_hpwl = _env_float("PARTNER_FLOW_NOPT_W_HPWL", 1.0)
+        cfg.w_overlap = _env_float("PARTNER_FLOW_NOPT_W_OVERLAP", 0.2)
+        cfg.w_boundary = _env_float("PARTNER_FLOW_NOPT_W_BOUNDARY", 0.2)
+        cfg.w_group = 0.0
+
+        def render(z_init):
+            k = z_init.shape[0]
+            valid_k = cond["mask"].unsqueeze(-1).expand(k, -1, -1)
+            kn = (z_init * ex(known, k)) if has_known else None
+            with torch.no_grad():
+                return sample_flow_diff(
+                    self.flow_model, ex_cond(k), steps, solver, z_init * valid_k,
+                    z_known=ex(z_known, k), known_mask=ex(known, k), known_noise=kn)
+
+        def base_energy(z0):
+            k = z0.shape[0]
+            return guidance_energy_per_sample(
+                z0, ctx.expand(k), cfg.w_overlap, cfg.w_boundary, cfg.w_hpwl, 0.0)
+
+        t0 = _time.time()
+        gen = torch.Generator(device=dev).manual_seed(23)
+        valid_K = cond["mask"].unsqueeze(-1).expand(K, -1, -1)
+        z_seed = torch.randn((K, N, zdim), device=dev, generator=gen) * valid_K
+        z0 = render(z_seed)
+        e = base_energy(z0)
+        best = torch.topk(e, M, largest=False).indices
+        worst = torch.topk(e, M, largest=True).indices
+
+        def flow_sampler(seed):
+            kn = (seed * ex(known, M)) if has_known else None
+            return sample_flow_diff(
+                self.flow_model, ex_cond(M), steps, solver, seed,
+                z_known=ex(z_known, M), known_mask=ex(known, M), known_noise=kn)
+
+        energy_fn = None
+        if w_rep > 0.0:
+            ctx_M = ctx.expand(M)
+
+            def energy_fn(z0m):  # V-D: SVGD-style batch repulsion
+                base = guidance_energy_per_sample(
+                    z0m, ctx_M, cfg.w_overlap, cfg.w_boundary, cfg.w_hpwl, 0.0)
+                x = z0m[..., 0] * ctx_M.scale.view(-1, 1)
+                y = z0m[..., 1] * ctx_M.scale.view(-1, 1)
+                m = ctx_M.mask.to(z0m.dtype)
+                cx = (x * m).sum(1) / m.sum(1).clamp_min(1.0)
+                cy = (y * m).sum(1) / m.sum(1).clamp_min(1.0)
+                diag = ctx_M.scale.clamp_min(1.0)
+                d2 = ((cx[:, None] - cx[None]) ** 2 + (cy[:, None] - cy[None]) ** 2)
+                rep = torch.exp(-d2 / (sig_rep * diag.mean()) ** 2)
+                rep = rep - torch.diag(torch.diagonal(rep))
+                return base + w_rep * rep.sum(dim=1)
+
+        z_opt = optimize_noise(
+            None, ex_cond(M), ctx.expand(M), z_seed[best].contiguous(),
+            ex(z_known, M), ex(known, M), cfg, energy_fn=energy_fn,
+            sample_fn=flow_sampler)
+        z_ref = render(z_opt)
+
+        z_out = z0.clone()
+        for j, w in enumerate(worst.tolist()):
+            z_out[w] = z_ref[j]
+        rects = z_to_rectangles(
+            z_out, at_d.expand(K, -1), target_positions=tpos_d.expand(K, -1, -1),
+            constraints=cons_d.expand(K, -1, -1), z_repr=z_repr)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"[flow-nopt] n={n} K={K} M={M} iters={cfg.rounds} steps={steps} "
+              f"w_rep={w_rep} gpu_s={_time.time() - t0:.2f}", file=sys.stderr)
         return [rects[k, :n].cpu().numpy().astype(np.float64) for k in range(K)]
 
     def _noise_opt_hybrid_preds(self, n, cond, z_known, known, scale,
