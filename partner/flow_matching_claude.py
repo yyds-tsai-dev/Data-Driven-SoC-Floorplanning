@@ -51,28 +51,56 @@ def endpoint_snr_weight(t: torch.Tensor, gamma: float) -> torch.Tensor:
     ``(1-t)**2`` amplification and leaves a net ``t**2`` emphasis on the
     underlying velocity error, matching the geometry losses.  The clamp mirrors
     ``direct_train_v2``'s min-SNR-gamma and keeps the weight finite as t -> 1.
+
+    MEASURED NET-NEGATIVE (v2, 2026-07-27).  The diffusion analogy is a category
+    error: in diffusion ``x0_hat = (z_t - sigma*eps_hat)/alpha`` *amplifies* the
+    residual by ``1/alpha`` as the noise level rises, which is the pathology
+    min-SNR repairs.  On the straight path ``x0_hat = z_t + (1-t)*v_hat`` has
+    residual ``(1-t)*(v_hat - v)`` -- attenuated, never amplified -- so there is
+    no pathology to fix.  Applying this weight moved 84% of the endpoint
+    gradient mass out of ``t < 0.5`` and cost ~5% coordinate accuracy and ~21%
+    overlap quality.  Kept for ablation only; not a default.
     """
     flat = t.reshape(-1).to(torch.float32)
     ratio = (flat * flat) / ((1.0 - flat) * (1.0 - flat)).clamp_min(1e-8)
     return ratio.clamp(max=gamma)
 
 
+def endpoint_time_weight(t: torch.Tensor, mode: str, gamma: float) -> torch.Tensor:
+    """Return the per-sample time weight for the endpoint (x0) loss.
+
+    ``none`` (v1 and the v2.1 default) leaves the endpoint loss unweighted, so
+    it acts as a dense ``(1-t)``-profiled coordinate-space auxiliary spanning
+    the whole path.  ``snr`` selects the disproved min-SNR analogue above.
+    """
+    if mode == "none":
+        return torch.ones_like(t.reshape(-1), dtype=torch.float32)
+    if mode == "snr":
+        return endpoint_snr_weight(t, gamma)
+    raise ValueError("x0 time weighting must be 'none' or 'snr'")
+
+
 def sample_flow_t(
     n: int,
     device,
     generator=None,
-    term_prob: float = 0.10,
+    term_prob: float = 0.0,
     term_band: float = 0.02,
 ) -> torch.Tensor:
-    """Sample flow times in ``[0, 1)`` with a small mass near the data endpoint.
+    """Sample flow times in ``[0, 1)``, optionally with mass near the endpoint.
 
-    Uniform ``t`` never reaches the terminal time the Heun corrector (and
-    Euler's final substep) evaluate at, and starves the near-data regime where
-    final coordinate precision is set.  With probability ``term_prob`` a sample
-    is instead drawn from ``[1 - term_band, 1)``, covering the terminal
-    neighbourhood with reducible-target training; a hard ``t = 1.0`` spike is
-    avoided because its velocity target ``z0 - noise`` is unpredictable from the
-    clean state and carries an irreducible loss floor.
+    With probability ``term_prob`` a sample is drawn from ``[1 - term_band, 1)``
+    instead of uniformly, covering the terminal neighbourhood that the Heun
+    corrector (and Euler's final substep) evaluate at but uniform ``t`` never
+    reaches.  ``term_prob = 0`` (the v2.1 default) is exactly uniform ``t``.
+
+    Measured in v2: the band does improve every metric at ``t >= 0.97``, but it
+    spends 10% of the sample budget where the endpoint is already ~10x more
+    accurate than at low t, and removes 10% of the training mass from the
+    ``t**2``-gated geometry losses whose useful range is ``t < 0.95``.  It also
+    inflates the logged ``v`` and ``mib`` averages, because terminal samples sit
+    at the velocity ceiling and at ``mib``'s non-zero ground-truth floor.  Off
+    by default until an ablation shows it pays for itself.
     """
     t = torch.rand((n,), device=device, generator=generator)
     if term_prob > 0.0 and term_band > 0.0:

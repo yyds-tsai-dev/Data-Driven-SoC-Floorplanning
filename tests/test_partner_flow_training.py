@@ -5,9 +5,14 @@ from pathlib import Path
 import pytest
 import torch
 
-from flow_matching_claude import endpoint_snr_weight, flow_path, sample_flow_t
+from flow_matching_claude import (
+    endpoint_snr_weight,
+    endpoint_time_weight,
+    flow_path,
+    sample_flow_t,
+)
 import flow_train_claude as flow_train
-from flow_train_claude import checkpoint_method, masked_flow_loss
+from flow_train_claude import checkpoint_method, masked_flow_loss, parse_flow_extras
 
 
 def test_zero_error_flow_velocity_has_zero_primary_loss():
@@ -56,14 +61,54 @@ def test_flow_primary_loss_backpropagates_and_checkpoint_is_tagged():
     )
 
 
-def test_checkpoint_method_accepts_flow_v2_and_keeps_v1():
-    # v2 is the current recipe; v1 stays loadable for the candidate probe.
-    assert checkpoint_method({"args": {"training_method": "flow_matching_v2"}}) == (
-        "flow_matching_v2"
+@pytest.mark.parametrize(
+    "method", ["flow_matching_v1", "flow_matching_v2", "flow_matching_v2_1"]
+)
+def test_checkpoint_method_accepts_every_flow_generation(method):
+    # v2.1 is current; v1/v2 stay loadable for the candidate probe.
+    assert checkpoint_method({"args": {"training_method": method}}) == method
+
+
+def test_v2_1_defaults_reproduce_the_validated_v1_objective():
+    """v2's two loss-recipe changes are OFF by default after the 0727 diagnosis.
+
+    SNR endpoint weighting was measured net-negative and terminal-t coverage
+    unproven, so the default objective is exactly v1's; both stay reachable by
+    flag for the ablation arms.
+    """
+    known, rest = parse_flow_extras([])
+    assert known.x0_time_weighting == "none"
+    assert known.term_t_prob == 0.0
+    assert rest == []
+
+    arm, _ = parse_flow_extras(["--x0-time-weighting", "snr", "--term-t-prob", "0.1"])
+    assert arm.x0_time_weighting == "snr" and arm.term_t_prob == 0.1
+
+
+def test_parse_flow_extras_passes_through_trainer_flags():
+    known, rest = parse_flow_extras(["--term-band", "0.05", "--batch-size", "12"])
+    assert known.term_band == 0.05
+    assert rest == ["--batch-size", "12"]
+
+
+def test_endpoint_time_weight_none_is_identity_and_snr_matches_helper():
+    t = torch.tensor([0.0, 0.25, 0.5, 0.75, 0.95])
+
+    none = endpoint_time_weight(t, "none", 5.0)
+    assert torch.equal(none, torch.ones(5))
+
+    torch.testing.assert_close(
+        endpoint_time_weight(t, "snr", 5.0), endpoint_snr_weight(t, 5.0)
     )
-    assert checkpoint_method({"args": {"training_method": "flow_matching_v1"}}) == (
-        "flow_matching_v1"
-    )
+    with pytest.raises(ValueError, match="none.*snr"):
+        endpoint_time_weight(t, "cosine", 5.0)
+
+
+def test_sample_flow_t_defaults_to_uniform_time():
+    # The v2.1 default must not put a spike at the data endpoint.
+    gen = torch.Generator().manual_seed(3)
+    t = sample_flow_t(20000, torch.device("cpu"), gen)
+    assert float((t >= 0.98).float().mean()) < 0.035
 
 
 def test_endpoint_snr_weight_downweights_low_t_and_clamps():

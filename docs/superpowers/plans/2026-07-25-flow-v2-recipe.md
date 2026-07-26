@@ -4,6 +4,13 @@ Date: 2026-07-25
 Branch: `codex/5.6-sol-flow-matching-f1-f3`
 Author: deep-reasoner (Opus), for the Fable-5 scheduler
 
+> **SUPERSEDED 2026-07-27 — v2 LOST on full-100 (1.1655 vs v1 1.1387).**
+> Fix 1 (the SNR endpoint weighting) is convicted and removed; Fix 3
+> (terminal-t) is defaulted off pending ablation; Fix 2's premise is refuted by
+> v1's own 650k-vs-1M evidence. Kept as the historical record of what was run
+> and why. **The current recipe, the diagnosis, and the ablation plan are in
+> [2026-07-27-flow-v2-postmortem-and-v2_1.md](2026-07-27-flow-v2-postmortem-and-v2_1.md).**
+
 ## Summary
 
 v1 flow matching (`checkpoints/flow_matching_v1/final.pt`, 1M steps) already

@@ -17,24 +17,24 @@ import torch.nn.functional as F
 
 from flow_matching_claude import (
     endpoint_from_velocity,
-    endpoint_snr_weight,
+    endpoint_time_weight,
     flow_path,
     sample_flow_t,
 )
 
-# Accepted flow training-method tags.  v2 is the current recipe (SNR-weighted
-# endpoint loss + terminal-t coverage + full-cosine anneal); v1 is retained so
-# the candidate probe can still load the earlier ``flow_matching_v1`` weights.
-FLOW_METHODS = ("flow_matching_v1", "flow_matching_v2")
+# Accepted flow training-method tags.  v2.1 is the current recipe; v1 and v2
+# stay loadable so the candidate probe can still read the earlier weights.
+FLOW_METHODS = ("flow_matching_v1", "flow_matching_v2", "flow_matching_v2_1")
+TRAINING_METHOD = "flow_matching_v2_1"
 
 
 def checkpoint_method(checkpoint):
-    """Validate that a checkpoint was produced by a flow trainer (v1 or v2)."""
+    """Validate that a checkpoint was produced by a flow trainer."""
     method = checkpoint.get("args", {}).get("training_method")
     if method not in FLOW_METHODS:
         raise ValueError(
             "checkpoint must declare training_method in "
-            "{flow_matching_v1, flow_matching_v2}"
+            "{flow_matching_v1, flow_matching_v2, flow_matching_v2_1}"
         )
     return method
 
@@ -126,14 +126,15 @@ def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, am
         torch.ones_like(area),
     )
     channel_weight = torch.tensor([1.0, 1.0, 1.0, 0.0], device=device).view(1, 1, 4)
-    # S-2: weight the endpoint imitation by the straight-path SNR analogue so
-    # the loss is not dominated by high-noise (low-t) steps whose endpoint is
-    # unreliable.  The normalizer intentionally excludes w_snr (matching
-    # direct_train_v2), so this rebalances the effective x0 magnitude upward.
-    w_snr = endpoint_snr_weight(t, args.min_snr_gamma).view(batch_size, 1, 1)
+    # Endpoint time weighting.  Default 'none' (= v1): on the straight path the
+    # endpoint residual is (1-t)*(velocity residual), already attenuated at high
+    # noise, so the unweighted loss is a well-conditioned coordinate-space
+    # auxiliary over the whole path.  'snr' reproduces the disproved v2 arm.
+    w_time = endpoint_time_weight(t, args.x0_time_weighting, args.min_snr_gamma)
+    w_time = w_time.view(batch_size, 1, 1).to(z0_hat.dtype)
     endpoint_error = F.smooth_l1_loss(z0_hat, z0, reduction="none", beta=0.02)
     endpoint_error = (
-        endpoint_error * channel_weight * node_weight.unsqueeze(-1) * mask_weight * w_snr
+        endpoint_error * channel_weight * node_weight.unsqueeze(-1) * mask_weight * w_time
     )
     x0_loss = endpoint_error.sum() / (
         node_weight.unsqueeze(-1) * mask_weight * channel_weight
@@ -183,6 +184,26 @@ def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, am
     }
 
 
+def parse_flow_extras(argv):
+    """Split the flow-only knobs off an argv list.
+
+    v2.1 defaults deliberately reproduce the validated v1 objective:
+    ``x0_time_weighting='none'`` and ``term_t_prob=0`` (uniform t).  Both v2
+    arms remain reachable by flag so an ablation needs no code edit.
+    """
+    import argparse
+
+    extra = argparse.ArgumentParser(add_help=False)
+    extra.add_argument("--hpwl-loss-weight", type=float, default=0.30)
+    extra.add_argument("--x0-time-weighting", choices=("none", "snr"), default="none")
+    extra.add_argument("--term-t-prob", type=float, default=0.0)
+    extra.add_argument("--term-band", type=float, default=0.02)
+    return extra.parse_known_args(argv)
+
+
+FLOW_EXTRA_FIELDS = ("hpwl_loss_weight", "x0_time_weighting", "term_t_prob", "term_band")
+
+
 def main():
     """Configure Direct-v2 defaults, then reuse the V1 training lifecycle."""
     import inspect
@@ -203,36 +224,24 @@ def main():
         "--ema-decay": "0.9998",
         "--node-feat-dim": "32",
         "--max-steps": "800000",
-        "--checkpoint-dir": "checkpoints/flow_matching_v2",
+        "--checkpoint-dir": "checkpoints/flow_matching_v2_1",
     }
     for flag, value in defaults.items():
         if not has(flag):
             argv += [flag, value]
     sys.argv = [sys.argv[0]] + argv
 
-    import argparse
-
-    extra = argparse.ArgumentParser(add_help=False)
-    extra.add_argument("--hpwl-loss-weight", type=float, default=0.30)
-    # Terminal-t coverage (Fix 3): fraction of samples drawn from the data
-    # endpoint band [1 - term_band, 1), fixing the Heun/Euler terminal and
-    # adding near-data precision.  Set --term-t-prob 0 to recover uniform t.
-    extra.add_argument("--term-t-prob", type=float, default=0.10)
-    extra.add_argument("--term-band", type=float, default=0.02)
-    known, rest = extra.parse_known_args(sys.argv[1:])
+    known, rest = parse_flow_extras(sys.argv[1:])
     sys.argv = [sys.argv[0]] + rest
 
     original_parse = V1.parse_args
 
     def parse_flow_args():
         args = original_parse()
-        args.training_method = "flow_matching_v2"
-        if not hasattr(args, "hpwl_loss_weight"):
-            args.hpwl_loss_weight = known.hpwl_loss_weight
-        if not hasattr(args, "term_t_prob"):
-            args.term_t_prob = known.term_t_prob
-        if not hasattr(args, "term_band"):
-            args.term_band = known.term_band
+        args.training_method = TRAINING_METHOD
+        for field in FLOW_EXTRA_FIELDS:
+            if not hasattr(args, field):
+                setattr(args, field, getattr(known, field))
         return args
 
     V1.parse_args = parse_flow_args
