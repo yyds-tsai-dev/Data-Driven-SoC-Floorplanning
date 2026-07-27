@@ -22,10 +22,17 @@ from flow_matching_claude import (
     sample_flow_t,
 )
 
-# Accepted flow training-method tags.  v2.1 is the current recipe; v1 and v2
-# stay loadable so the candidate probe can still read the earlier weights.
-FLOW_METHODS = ("flow_matching_v1", "flow_matching_v2", "flow_matching_v2_1")
-TRAINING_METHOD = "flow_matching_v2_1"
+# Accepted flow training-method tags.  The tag names the trainer generation,
+# not the recipe -- the recipe is fully described by the recorded args
+# (mib_hinge / x0_time_weighting / term_t_prob).  Older tags stay loadable so
+# the candidate probe can still read v1 and v2 weights.
+FLOW_METHODS = (
+    "flow_matching_v1",
+    "flow_matching_v2",
+    "flow_matching_v2_1",
+    "flow_matching_v3",
+)
+TRAINING_METHOD = "flow_matching_v3"
 
 
 def checkpoint_method(checkpoint):
@@ -33,10 +40,32 @@ def checkpoint_method(checkpoint):
     method = checkpoint.get("args", {}).get("training_method")
     if method not in FLOW_METHODS:
         raise ValueError(
-            "checkpoint must declare training_method in "
-            "{flow_matching_v1, flow_matching_v2, flow_matching_v2_1}"
+            "checkpoint must declare training_method in {"
+            + ", ".join(FLOW_METHODS)
+            + "}"
         )
     return method
+
+
+def mib_objective(mib_pred, mib_gt, hinge):
+    """Per-sample MIB aspect objective, optionally hinged at the golden layout.
+
+    ``mib_aspect`` measures mean pairwise ``|log(w/h)_i - log(w/h)_j|`` inside a
+    MIB group -- an *absolute* symmetry penalty with no reference point.  The
+    golden layouts score ~0.59-0.67 on it, while trained models score ~0.42-0.51,
+    so the unhinged term spends gradient pushing the model to be *more* aspect
+    consistent than the ground truth it is imitating, and that symmetry is paid
+    for in coordinate accuracy.
+
+    Hinging at the golden value penalizes only the part that is worse than
+    golden.  The hinge is absolute, not relative (unlike ``hp_loss``'s
+    ``/hp_gt``): ``mib_gt`` is legitimately zero whenever a sample has no MIB
+    group or a perfectly consistent one, and the existing ``--mib-loss-weight``
+    is calibrated against this absolute scale.
+    """
+    if not hinge:
+        return mib_pred
+    return torch.relu(mib_pred - mib_gt)
 
 
 def validate_resume_checkpoint(args):
@@ -149,7 +178,17 @@ def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, am
     ov = (V1.overlap_fraction(rects, mask, scale) * endpoint_weight).mean()
     bd = (V1.boundary_touch(rects, cons, mask, scale) * endpoint_weight).mean()
     cg = (V1.cluster_gap(rects, gt_rects, cons, mask, scale) * endpoint_weight).mean()
-    mb = (V1.mib_aspect(rects, cons, mask) * endpoint_weight).mean()
+    # v3: optionally reference the MIB aspect penalty to the golden layout.
+    # mib_aspect is D4-invariant (transpose negates every block's log-aspect,
+    # leaving pairwise differences unchanged; mirrors do not touch w/h), so
+    # taking mib_gt from the augmented gt_rects is consistent with the sample.
+    mib_pred = V1.mib_aspect(rects, cons, mask)
+    if args.mib_hinge:
+        with torch.no_grad():
+            mib_gt = V1.mib_aspect(gt_rects, cons, mask)
+    else:
+        mib_gt = None
+    mb = (mib_objective(mib_pred, mib_gt, args.mib_hinge) * endpoint_weight).mean()
 
     hp_pred = V2.hpwl_pair(rects, b2b, p2b, pins)
     with torch.no_grad():
@@ -198,10 +237,18 @@ def parse_flow_extras(argv):
     extra.add_argument("--x0-time-weighting", choices=("none", "snr"), default="none")
     extra.add_argument("--term-t-prob", type=float, default=0.0)
     extra.add_argument("--term-band", type=float, default=0.02)
+    # v3 arm.  Off keeps the objective bit-exact with v1.
+    extra.add_argument("--mib-hinge", action="store_true")
     return extra.parse_known_args(argv)
 
 
-FLOW_EXTRA_FIELDS = ("hpwl_loss_weight", "x0_time_weighting", "term_t_prob", "term_band")
+FLOW_EXTRA_FIELDS = (
+    "hpwl_loss_weight",
+    "x0_time_weighting",
+    "term_t_prob",
+    "term_band",
+    "mib_hinge",
+)
 
 
 def main():
@@ -223,8 +270,8 @@ def main():
         "--warmup": "4000",
         "--ema-decay": "0.9998",
         "--node-feat-dim": "32",
-        "--max-steps": "800000",
-        "--checkpoint-dir": "checkpoints/flow_matching_v2_1",
+        "--max-steps": "1000000",
+        "--checkpoint-dir": "checkpoints/flow_matching_v3",
     }
     for flag, value in defaults.items():
         if not has(flag):

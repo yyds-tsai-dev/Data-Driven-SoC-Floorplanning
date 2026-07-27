@@ -9,6 +9,10 @@ Supersedes: [2026-07-25-flow-v2-recipe.md](2026-07-25-flow-v2-recipe.md)
 > v2.1 reverts the objective to v1's and keeps only the LR-horizon change.
 > Expected score gain of a v2.1 retrain over v1 is ~0 — read
 > "Should we retrain at all?" before spending GPU.**
+>
+> **UPDATE 2026-07-28 — the A/B ablation closed and v3 is approved.** Part III's
+> arms have run; results and their consequences are in **Part IV**, which also
+> specifies the **v3 mib-hinge** recipe now cleared for a 1M-step run.
 
 ---
 
@@ -300,3 +304,163 @@ Caveat: the probe scores on the first N training samples, which both models saw,
 so it measures fit rather than generalization. It is a fair *relative* comparison
 (identical batches, noise, and metric definitions) and that is what the ablation
 needs — but do not read its absolutes as validation metrics.
+
+---
+
+# Part IV — ablation outcome and the v3 mib hinge
+
+Date: 2026-07-28
+
+## IV.1 What the A/B arms settled
+
+| question | outcome |
+|---|---|
+| terminal-t (arm B vs arm A) | **Not convicted, not adopted.** Arm B's `ov` +9.4% does not clear the seed floor; the t≥0.97 improvement is real but too narrow to pay for itself. **v3 does not carry terminal-t.** |
+| seed variance (arm A vs v1) | **Large: `ov` ±6-19%, `v` ±2-9% at 200k.** |
+| SNR weighting | **Conviction stands.** |
+
+The seed floor is the important result, and it revises Part I. **Finding 2's
+"`ov` +21% real damage" was mostly seed noise** — a 21% `ov` gap sits inside a
+±6-19% floor. What survives is Finding 3, because it rests on the *shape* of the
+x0-vs-t curve (monotone in t, crossing 1.0 at t≈0.75, matching `clamp(t²/(1−t)²,5)`)
+rather than on any single metric's magnitude. **Shape evidence is immune to the
+seed-variance floor; magnitude evidence is not.** That is the transferable
+lesson: on this channel, prefer a mechanism fingerprint over an effect size.
+
+It also retroactively justifies the caution in Finding 5 — between per-case
+evaluation noise (one case can swing the total by 0.006) and per-run training
+noise (`ov` ±19%), single-run magnitude comparisons on this channel are close to
+uninformative.
+
+## IV.2 The v3 hypothesis
+
+The probe re-confirms the opening: every model sits at `mib ≈ 0.42-0.51` against
+a **golden layout that itself scores ≈ 0.59-0.67**. `mib_aspect` is an *absolute*
+symmetry penalty with no reference point, so the term spends gradient making the
+model **more aspect-consistent than the ground truth it is imitating** — and that
+excess symmetry is paid for in coordinate accuracy. v3 hinges it at golden, the
+way `hp_loss` is already hinged at `hp_gt`.
+
+## IV.3 Implementation
+
+`mib_objective(mib_pred, mib_gt, hinge)` in `partner/flow_train_claude.py`:
+
+- **Granularity: per-sample**, matching `mib_aspect`'s `(B,)` output and
+  `hp_loss`'s existing per-sample hinge, then `* endpoint_weight` then `.mean()`.
+- **Absolute hinge `relu(mib_pred − mib_gt)`, NOT relative.** `hp_loss` divides
+  by `hp_gt.clamp_min(1.0)`; `mib_gt` cannot be normalized that way because it is
+  legitimately **zero** whenever a sample has no MIB group or a perfectly
+  consistent one, and `--mib-loss-weight 0.1` is already calibrated against the
+  absolute scale.
+- **`mib_gt` is computed under `no_grad` from the augmented `gt_rects`** already
+  present in the step (the same tensor `cluster_gap` consumes).
+
+### D4 invariance — verified, not assumed
+
+Required, because `mib_gt` is read off the *augmented* golden rects. Transpose
+maps `log(w/h) → −log(w/h)` for **every** block uniformly, so the pairwise
+`|la_i − la_j|` is unchanged; mirror-x/y move positions only and never touch
+`w`/`h`. **Verified numerically**: `mib_gt` over 6 random D4 augmentations of
+real batches has max spread `6e-8` (float noise). Locked by
+`test_mib_aspect_is_d4_invariant_so_golden_reference_survives_augmentation`.
+
+### How much does the hinge actually change? (measured, v1@1M)
+
+| t | v1 mib term | hinged | mib_gt |
+|---|---|---|---|
+| 0.30 | 0.5076 | **0.0093** | 0.6688 |
+| 0.60 | 0.5153 | **0.0113** | 0.6688 |
+| 0.90 | 0.6597 | **0.0045** | 0.6688 |
+
+The hinge fires on only **17%** of MIB-bearing samples and shrinks the term
+**~50-100x**. **Say this plainly: v3 is very close to "run v1 with the mib term
+switched off."** The difference from `--mib-loss-weight 0` is that the hinge
+keeps a one-sided safety net if the model ever drifts worse than golden — which
+does still happen 17% of the time. If v3 wins, the honest attribution is
+"removing spurious symmetry pressure", and `--mib-loss-weight 0` should be
+expected to capture most of the same gain more cheaply.
+
+### Single-variable discipline
+
+v3 = **v1 exactly** (`--x0-time-weighting none`, `--term-t-prob 0`, `--seed 1234`,
+`--max-steps 1000000`) **plus the hinge, and nothing else**. Two things make this
+a genuinely clean control rather than a nominal one:
+
+1. Same seed ⇒ identical init and identical file-shuffle data order.
+2. **Identical RNG stream.** With `term_prob=0`, `sample_flow_t` issues exactly
+   one `torch.rand` of the same shape from the same generator that v1's bare
+   `torch.rand` did, so every downstream noise draw matches. Locked by
+   `test_uniform_t_consumes_the_generator_exactly_like_v1` — without it a silent
+   extra RNG draw would desynchronize the runs for a reason unrelated to the
+   hinge and quietly destroy the comparison.
+3. The hinge itself consumes no randomness, and `--mib-hinge` off is bit-exact
+   with v1 (verified: identical logged `v`/`x0`/`ov`/`bd`/`cg`/`pos_l1` across a
+   3-step CPU run, only total `loss` differs when the flag is on).
+
+## IV.4 200k smoke criteria — **read the direction carefully**
+
+**The trap: raw `mib` will RISE, and that is the intended direction.** Freed from
+sub-golden symmetry pressure, the model should drift *up* from ~0.42 toward
+golden's ~0.59. Anyone reading "mib went up, v3 is worse" has inverted the test.
+
+The probe therefore now emits two new columns:
+
+- **`mib_gap` = mean `|mib_pred − mib_gt|`** — distance to golden. **Should shrink.**
+- **`mib_exc` = mean `relu(mib_pred − mib_gt)`** — the hinged excess. Should stay small.
+
+**Primary criterion.** Against the **two floors** (`v1@200k` and `armA@200k`):
+
+1. `pos_l1` / `x0` / `v` **not worse** — this is where the released coordinate
+   freedom must show up. This is the criterion that matters.
+2. `mib_gap` **shrinks** in the mid-t band, where there is room to move.
+
+Recorded `v1@200k` baseline (`--batches 4 --batch-size 8 --num-samples 256`):
+
+| t | v | x0 | ov | mib | **mib_gap** | mib_exc | pos_l1 |
+|---|---|---|---|---|---|---|---|
+| 0.30 | 0.05940 | 0.06470 | 0.03732 | 0.40729 | **0.19490** | 0.00592 | 0.04114 |
+| 0.45 | 0.08288 | 0.06144 | 0.03224 | 0.39368 | **0.20297** | 0.00315 | 0.04164 |
+| 0.60 | 0.11011 | 0.05411 | 0.02711 | 0.41412 | **0.17955** | 0.00166 | 0.03940 |
+| 0.90 | 0.19027 | 0.01890 | 0.01751 | 0.56301 | **0.04224** | 0.00744 | 0.02398 |
+
+Read `mib_gap` at **t = 0.30-0.60**; at t≥0.9 the endpoint is already near golden
+so the gap is small and uninformative.
+
+**Given the seed floor (IV.1), apply these as a direction check, not a
+significance test.** A `pos_l1`/`x0` improvement inside ±5% is not evidence.
+Only a clear `mib_gap` reduction *together with* non-degraded coordinates should
+be read as the hinge working.
+
+**Secondary criterion.** One D+F full-100 on the 200k snapshot. Noisy (Finding 5);
+direction only. Recommend early stop only on **clear** degradation, not on a
+delta of the +0.0268 order — which we now know a single case can manufacture.
+
+**Honest expectation.** v1@650k already matched v1@1M, so this model is not
+step-limited; v3 is a *loss-shape* change, and its plausible upside is the
+coordinate accuracy currently being traded away for excess symmetry. Given the
+17% firing rate, expect a small effect. The 1M horizon is the user's call for a
+maximally clean v1 comparison, not evidence that 1M is needed.
+
+## IV.5 Launch command
+
+```bash
+uv run python3 partner/flow_train_claude.py \
+    --data-path FloorSet/ \
+    --checkpoint-dir checkpoints/flow_matching_v3 \
+    --max-steps 1000000 --seed 1234 \
+    --batch-size 12 --d-model 640 --layers 14 --heads 10 --node-feat-dim 32 \
+    --lr 8e-5 --warmup 4000 --ema-decay 0.9998 --amp \
+    --vram-fraction 0.85 --gpu-util-cap 0.95 \
+    --x0-time-weighting none --term-t-prob 0.0 --mib-hinge
+```
+
+At the ~8.2 sps observed on an exclusive card, 1M steps ≈ **34 h**. Snapshots
+every 25k; smoke-check at `step_00200000.pt` (~7 h in) with:
+
+```bash
+uv run python scripts/probes/flow_t_resolved_probe.py --repo $PWD \
+    --ckpt v1=checkpoints/flow_matching_v1/step_00200000.pt \
+           v3=checkpoints/flow_matching_v3/step_00200000.pt \
+    --batches 4 --batch-size 8 --num-samples 256 --threads 32 \
+    --output artifacts/flow_v3_smoke_tprobe.json
+```

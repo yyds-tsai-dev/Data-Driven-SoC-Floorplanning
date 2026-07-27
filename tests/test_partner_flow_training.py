@@ -12,7 +12,12 @@ from flow_matching_claude import (
     sample_flow_t,
 )
 import flow_train_claude as flow_train
-from flow_train_claude import checkpoint_method, masked_flow_loss, parse_flow_extras
+from flow_train_claude import (
+    checkpoint_method,
+    masked_flow_loss,
+    mib_objective,
+    parse_flow_extras,
+)
 
 
 def test_zero_error_flow_velocity_has_zero_primary_loss():
@@ -62,11 +67,100 @@ def test_flow_primary_loss_backpropagates_and_checkpoint_is_tagged():
 
 
 @pytest.mark.parametrize(
-    "method", ["flow_matching_v1", "flow_matching_v2", "flow_matching_v2_1"]
+    "method",
+    [
+        "flow_matching_v1",
+        "flow_matching_v2",
+        "flow_matching_v2_1",
+        "flow_matching_v3",
+    ],
 )
 def test_checkpoint_method_accepts_every_flow_generation(method):
-    # v2.1 is current; v1/v2 stay loadable for the candidate probe.
+    # v3 is current; older tags stay loadable for the candidate probe.
     assert checkpoint_method({"args": {"training_method": method}}) == method
+
+
+# --- v3: golden-referenced MIB aspect hinge ---------------------------------
+
+
+def test_mib_hinge_is_zero_when_prediction_is_more_symmetric_than_golden():
+    # Trained models sit at ~0.42-0.51 against a golden ~0.59-0.67, so this is
+    # the common case: the unhinged term was charging for symmetry the ground
+    # truth does not have.
+    mib_pred = torch.tensor([0.42, 0.10, 0.00])
+    mib_gt = torch.tensor([0.59, 0.67, 0.00])
+
+    hinged = mib_objective(mib_pred, mib_gt, hinge=True)
+
+    assert torch.equal(hinged, torch.zeros(3))
+
+
+def test_mib_hinge_charges_only_the_excess_over_golden():
+    mib_pred = torch.tensor([0.80, 0.60])
+    mib_gt = torch.tensor([0.50, 0.65])
+
+    hinged = mib_objective(mib_pred, mib_gt, hinge=True)
+
+    torch.testing.assert_close(hinged, torch.tensor([0.30, 0.00]))
+    assert float(hinged[0]) > 0.0
+
+
+def test_mib_hinge_scores_the_golden_layout_itself_at_zero():
+    mib_gt = torch.tensor([0.589, 0.0, 1.25])
+
+    assert torch.equal(mib_objective(mib_gt, mib_gt, hinge=True), torch.zeros(3))
+
+
+def test_mib_hinge_off_is_bit_exact_with_the_v1_objective():
+    mib_pred = torch.tensor([0.42, 0.80, 0.00])
+    mib_gt = torch.tensor([0.59, 0.50, 0.00])
+
+    # off must return the prediction untouched, ignoring golden entirely
+    assert mib_objective(mib_pred, mib_gt, hinge=False) is mib_pred
+    assert mib_objective(mib_pred, None, hinge=False) is mib_pred
+
+
+def test_mib_hinge_defaults_off_so_the_objective_stays_v1():
+    known, _rest = parse_flow_extras([])
+    assert known.mib_hinge is False
+    assert parse_flow_extras(["--mib-hinge"])[0].mib_hinge is True
+
+
+def test_mib_hinge_gradient_flows_only_through_the_excess():
+    mib_pred = torch.tensor([0.80, 0.42], requires_grad=True)
+    mib_gt = torch.tensor([0.50, 0.59])
+
+    mib_objective(mib_pred, mib_gt, hinge=True).sum().backward()
+
+    # worse-than-golden sample carries gradient, better-than-golden does not
+    torch.testing.assert_close(mib_pred.grad, torch.tensor([1.0, 0.0]))
+
+
+def test_mib_aspect_is_d4_invariant_so_golden_reference_survives_augmentation():
+    """The hinge reads mib_gt off the *augmented* golden rects, so the metric
+    must be D4-invariant or the reference would move with the augmentation."""
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root / "FloorSet" / "iccad2026contest"))
+    sys.path.insert(0, str(root / "FloorSet"))
+    import direct_train_claude as trainer
+
+    # two blocks in MIB group 1, one in group 2, one ungrouped
+    w = torch.tensor([[4.0, 2.0, 3.0, 5.0]])
+    h = torch.tensor([[1.0, 3.0, 6.0, 5.0]])
+    rects = torch.stack([torch.zeros_like(w), torch.zeros_like(w), w, h], dim=-1)
+    cons = torch.zeros(1, 4, 5)
+    cons[..., 2] = torch.tensor([[1.0, 1.0, 2.0, 0.0]])
+    mask = torch.ones(1, 4, dtype=torch.bool)
+
+    base = trainer.mib_aspect(rects, cons, mask)
+    # transpose: w <-> h  (negates every log-aspect)
+    transposed = torch.stack([torch.zeros_like(w), torch.zeros_like(w), h, w], dim=-1)
+    # mirror: w/h untouched, only positions move
+    mirrored = torch.stack([w, h, w, h], dim=-1)
+
+    torch.testing.assert_close(trainer.mib_aspect(transposed, cons, mask), base)
+    torch.testing.assert_close(trainer.mib_aspect(mirrored, cons, mask), base)
+    assert float(base) > 0.0
 
 
 def test_v2_1_defaults_reproduce_the_validated_v1_objective():
@@ -109,6 +203,22 @@ def test_sample_flow_t_defaults_to_uniform_time():
     gen = torch.Generator().manual_seed(3)
     t = sample_flow_t(20000, torch.device("cpu"), gen)
     assert float((t >= 0.98).float().mean()) < 0.035
+
+
+def test_uniform_t_consumes_the_generator_exactly_like_v1():
+    """v3 is only a clean single-variable control against v1 if the default
+    t-sampling draws the identical RNG stream v1's bare torch.rand did --
+    otherwise every downstream noise draw shifts and the runs diverge for a
+    reason that has nothing to do with the mib hinge."""
+    a = torch.Generator().manual_seed(7)
+    b = torch.Generator().manual_seed(7)
+
+    ours = sample_flow_t(12, torch.device("cpu"), a)
+    v1_style = torch.rand((12,), device=torch.device("cpu"), generator=b)
+
+    assert torch.equal(ours, v1_style)
+    # and the generators must be left in the same state for the noise draw
+    assert torch.equal(torch.randn(5, generator=a), torch.randn(5, generator=b))
 
 
 def test_endpoint_snr_weight_downweights_low_t_and_clamps():

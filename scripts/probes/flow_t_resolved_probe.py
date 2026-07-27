@@ -84,7 +84,8 @@ def main():
         print(f"[{name}] step={step} method={method}", flush=True)
         rows = []
         for tv in t_grid:
-            acc = {k: 0.0 for k in ("v", "x0", "ov", "bd", "cg", "mib", "hp", "pos_l1")}
+            acc = {k: 0.0 for k in ("v", "x0", "ov", "bd", "cg", "mib",
+                                    "mib_gap", "mib_exc", "hp", "pos_l1")}
             n = 0
             for bi, batch in enumerate(batches):
                 area, b2b, p2b, pins, cons, _tree, fp, _m = batch
@@ -124,21 +125,31 @@ def main():
                 ov = V1.overlap_fraction(rects, mask, scale).mean()
                 bd = V1.boundary_touch(rects, cons, mask, scale).mean()
                 cg = V1.cluster_gap(rects, gt, cons, mask, scale).mean()
-                mb = V1.mib_aspect(rects, cons, mask).mean()
+                mib_p = V1.mib_aspect(rects, cons, mask)
+                # v3 note: raw `mib` RISES when the model stops being pushed
+                # more symmetric than golden, so "lower mib is better" is the
+                # wrong read for a hinged run.  `mib_gap` (distance to golden)
+                # and `mib_exc` (the hinged excess) are the directional ones.
+                mib_g = V1.mib_aspect(gt, cons, mask)
+                mib_gap = (mib_p - mib_g).abs().mean()
+                mib_exc = F.relu(mib_p - mib_g).mean()
+                mb = mib_p.mean()
                 hpp = V2.hpwl_pair(rects, b2b, p2b, pins)
                 hpg = V2.hpwl_pair(gt, b2b, p2b, pins).clamp_min(1.0)
                 hp = (F.relu(hpp - hpg) / hpg).mean()
                 pl = ((z0_hat[..., :2] - z0[..., :2]).abs().sum(-1) * mask).sum() / \
                     mask.sum().clamp_min(1)
                 for k, val in (("v", v_loss), ("x0", x0), ("ov", ov), ("bd", bd),
-                               ("cg", cg), ("mib", mb), ("hp", hp), ("pos_l1", pl)):
+                               ("cg", cg), ("mib", mb), ("mib_gap", mib_gap),
+                               ("mib_exc", mib_exc), ("hp", hp), ("pos_l1", pl)):
                     acc[k] += float(val)
                 n += 1
             row = {k: acc[k] / n for k in acc}
             row["t"] = tv
             rows.append(row)
             print(f"  t={tv:.2f} " + " ".join(f"{k}={row[k]:.5f}" for k in
-                  ("v", "x0", "ov", "bd", "cg", "mib", "pos_l1")), flush=True)
+                  ("v", "x0", "ov", "mib", "mib_gap", "mib_exc", "pos_l1")),
+                  flush=True)
         results[name] = {"step": step, "method": method, "rows": rows}
         del model
 
