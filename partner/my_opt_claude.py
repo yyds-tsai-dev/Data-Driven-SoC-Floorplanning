@@ -408,7 +408,8 @@ class MyOptimizer(FloorplanOptimizer):
                                  K, oversample: bool = True) -> List[np.ndarray]:
         """Generate the baseline bounded Direct batch before prescreening."""
         from direct_train_claude import fast_condition
-        from direct_model_claude import known_z_channels, sample_direct
+        from direct_model_claude import (known_z_channels, sample_direct,
+                                         sample_direct_dpmpp)
         dev = self.device
         at_d = at.unsqueeze(0).to(dev)
         cons_d = cons.unsqueeze(0).to(dev)
@@ -464,13 +465,22 @@ class MyOptimizer(FloorplanOptimizer):
                 ctx = build_context(at_d, cons_d, b2b.to(dev), scale,
                                     known).expand(K_s)
                 guide = make_guidance(ctx, GuidanceConfig.from_env())
-            z = sample_direct(self.direct_model, cond_k,
-                              self.direct_schedule,
-                              steps=_env_int("PARTNER_DDIM_STEPS", 50),
-                              generator=gen,
-                              z_known=z_known.expand(K_s, -1, -1),
-                              known_mask=known.expand(K_s, -1, -1),
-                              guidance=guide)
+            solver = os.environ.get("PARTNER_DIRECT_SOLVER", "ddim")
+            if solver == "dpmpp" and guide is None:
+                z = sample_direct_dpmpp(
+                    self.direct_model, cond_k, self.direct_schedule,
+                    steps=_env_int("PARTNER_DDIM_STEPS", 50),
+                    generator=gen,
+                    z_known=z_known.expand(K_s, -1, -1),
+                    known_mask=known.expand(K_s, -1, -1))
+            else:
+                z = sample_direct(self.direct_model, cond_k,
+                                  self.direct_schedule,
+                                  steps=_env_int("PARTNER_DDIM_STEPS", 50),
+                                  generator=gen,
+                                  z_known=z_known.expand(K_s, -1, -1),
+                                  known_mask=known.expand(K_s, -1, -1),
+                                  guidance=guide)
             rects = z_to_rectangles(
                 z, at_d.expand(K_s, -1),
                 target_positions=tpos_d.expand(K_s, -1, -1),

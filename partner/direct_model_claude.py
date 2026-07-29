@@ -265,3 +265,73 @@ def sample_direct(
         alpha_n, sigma_n = schedule.alpha_sigma(t_next)
         z = (alpha_n * z0 + sigma_n * eps) * mask.unsqueeze(-1)
     return z * mask.unsqueeze(-1)
+
+
+@torch.no_grad()
+def sample_direct_dpmpp(
+    model: DirectDenoiser,
+    cond: Dict[str, torch.Tensor],
+    schedule: DiffusionSchedule,
+    steps: int = 10,
+    generator: Optional[torch.Generator] = None,
+    z_known: Optional[torch.Tensor] = None,
+    known_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """DPM-Solver++(2M) sampling: data-prediction multistep, order 2.
+
+    Targets the same probability-flow ODE as ``sample_direct`` with a
+    second-order multistep update, so ~8-10 steps track the DDIM-25 solution.
+    Keeps sample_direct's per-step contract: hard-anchor imposition before the
+    model call, aspect clamp + anchor overwrite on the x0 estimate, and x0
+    self-conditioning. A first-order step is algebraically a DDIM step, and
+    the first step (no history) and the final integration step run first
+    order, so steps=1 matches ``sample_direct`` exactly. No guidance hook —
+    callers with a guidance callable must use ``sample_direct``.
+    """
+    node_feat = cond["node_feat"]
+    mask = cond["mask"]
+    rel_feat = cond.get("rel_feat")
+    device = node_feat.device
+    B, N, _ = node_feat.shape
+    zdim = model.config.z_dim
+    z = torch.randn((B, N, zdim), device=device, generator=generator)
+    z = z * mask.unsqueeze(-1)
+    times = torch.linspace(schedule.timesteps - 1, 0, steps, device=device).long()
+    sc = None
+    prev_z0 = None
+    prev_lam = None
+    for idx, t_val in enumerate(times):
+        t = torch.full((B,), int(t_val.item()), device=device, dtype=torch.long)
+        alpha, sigma = schedule.alpha_sigma(t)
+        if z_known is not None and known_mask is not None:
+            noise = torch.randn(z.shape, device=device, generator=generator)
+            z_imposed = alpha * z_known + sigma * noise
+            z = torch.where(known_mask, z_imposed, z)
+        v = model(z, t, node_feat, cond.get("adj"), mask,
+                  rel_feat=rel_feat, self_cond=sc)
+        z0 = alpha * z - sigma * v
+        z0[..., 2] = z0[..., 2].clamp(-3.0, 3.0)
+        if z_known is not None and known_mask is not None:
+            z0 = torch.where(known_mask, z_known, z0)
+        sc = z0
+        if idx == len(times) - 1:
+            z = z0
+            break
+        lam = torch.log(alpha.clamp_min(1e-12)) - torch.log(sigma.clamp_min(1e-12))
+        t_next = torch.full((B,), int(times[idx + 1].item()),
+                            device=device, dtype=torch.long)
+        alpha_n, sigma_n = schedule.alpha_sigma(t_next)
+        lam_n = torch.log(alpha_n.clamp_min(1e-12)) - torch.log(sigma_n.clamp_min(1e-12))
+        h = lam_n - lam
+        d = z0
+        if prev_z0 is not None and idx + 1 < len(times) - 1:
+            # midpoint 2M correction; the final integration step stays first
+            # order (lower_order_final) — with few steps the terminal h is
+            # large and the extrapolation would overshoot
+            r = (lam - prev_lam) / h.clamp_min(1e-12)
+            d = z0 + (z0 - prev_z0) / (2.0 * r.clamp_min(1e-12))
+        z = (sigma_n / sigma.clamp_min(1e-12)) * z - alpha_n * torch.expm1(-h) * d
+        z = z * mask.unsqueeze(-1)
+        prev_z0 = z0
+        prev_lam = lam
+    return z * mask.unsqueeze(-1)
