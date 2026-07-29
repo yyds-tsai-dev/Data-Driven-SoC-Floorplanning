@@ -109,8 +109,11 @@ def test_retrieval_matches_soft_d4_metadata_and_hard_anchors(monkeypatch):
         fp_xywh=np.array([[[0.0, 0.0, 3.0, 3.0], [4.0, 0.0, 2.0, 2.0]]]),
     ))
     seen = []
-    original = my_opt_claude.remap_boundary_node_features
-    monkeypatch.setattr(my_opt_claude, "remap_boundary_node_features", lambda nodes, transform: (seen.append(transform), original(nodes, transform))[1])
+    # _sample_retrieval_preds imports the retrieval helpers lazily (the channel
+    # is opt-in), so the spy has to live on the source module.
+    import retrieval_transfer_claude
+    original = retrieval_transfer_claude.remap_boundary_node_features
+    monkeypatch.setattr(retrieval_transfer_claude, "remap_boundary_node_features", lambda nodes, transform: (seen.append(transform), original(nodes, transform))[1])
     batch = _optimizer(index)._sample_retrieval_preds(2, area, constraints, targets, b2b, p2b, pins, 2)
     assert seen == ["identity", "mirror_x", "mirror_y", "transpose"]
     assert batch.source == "retrieval"

@@ -38,9 +38,11 @@ from legalizer_claude import (_ColumnOptimizer, _ensure_no_overlap,
                               _parse_constraints, _target, init_worker_pool,
                               legalize_rectangles, rectangles_from_z)
 from refiner_claude import full_violations, refine_prediction
-from retrieval_features_claude import extract_retrieval_features
-from retrieval_matching_claude import match_blocks
-from retrieval_transfer_claude import remap_boundary_node_features, transfer_layout
+
+# The retrieval channel (retrieval_*_claude) is opt-in: it only runs when both
+# PARTNER_RETRIEVAL_INDEX and PARTNER_RETRIEVAL_SLOTS are set.  Its modules are
+# imported lazily inside _sample_retrieval_preds so a deployment that ships
+# only the active channels (Direct + flow + column) needs no retrieval sources.
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -921,6 +923,10 @@ class MyOptimizer(FloorplanOptimizer):
             return self._empty_retrieval_batch(started)
 
         try:
+            from retrieval_features_claude import extract_retrieval_features
+            from retrieval_matching_claude import match_blocks
+            from retrieval_transfer_claude import (remap_boundary_node_features,
+                                                   transfer_layout)
             area = at[:n].detach().cpu().numpy()
             constraints = cons[:n].detach().cpu().numpy()
             target_positions = tpos[:n].detach().cpu().numpy()

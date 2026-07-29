@@ -67,7 +67,9 @@ from diffusion_data import (batch_to_device, build_relation_features,
                             fp_sol_to_z0, layout_scale, normalized_adjacency,
                             valid_block_mask, z_to_rectangles)
 from diffusion_model import DiffusionSchedule
-from diffusion_train import known_target_positions_from_fp
+# diffusion_train is a training-only dependency (known_target_positions_from_fp
+# is used by train_step alone), imported lazily so inference-side consumers of
+# fast_condition do not pull in the v1 diffusion trainer.
 from direct_model_claude import (DirectDenoiser, DirectModelConfig, EMA,
                                  known_z_channels)
 
@@ -429,6 +431,7 @@ def train_step(model, ema, schedule, batch, args, rng, amp_dtype, amp_on):
     the main forward each get their own autocast region — sharing one region
     would poison torch's autocast weight cache with grad-less casts (the
     second forward would silently lose its autograd graph)."""
+    from diffusion_train import known_target_positions_from_fp
     area, b2b, p2b, pins, cons, _tree, fp, _metrics = batch
     if args.augment:
         pins, cons, fp = augment_batch(area, pins, cons, fp, rng)
