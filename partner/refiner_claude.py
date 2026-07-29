@@ -88,6 +88,42 @@ class _Refiner:
 
         self.hp0 = max(opt._hpwl(P), 1e-9)
 
+        # -- refine stall early stop (PARTNER_REFINE_STALL_STOP=1, off) ----
+        # Companion to `PARTNER_SA_STALL_STOP` in legalizer_claude.py: `run`
+        # breaks out of a search phase once `_key()` (the same proxy the
+        # phase already computes each pass) has not improved by >= stall_eps
+        # (relative) within one stall window.  The window is a fraction of
+        # the CURRENT phase's own remaining span -- self-scaling, like the SA
+        # port, because a refiner span ranges from ~0.5s (a rung tighten) to
+        # ~20s (a tail-case worker).
+        #
+        # This is the terminal time sink of BOTH pool worker classes:
+        # `_worker_refine` ends in `run` (refine_prediction step 5) and
+        # `_worker_solve` ends in `run` too (finish() -> refine_positions,
+        # the stage-2 slice that is what actually pins an SA worker to
+        # worker_deadline).  So the stop can convert convergence into a
+        # shorter per-case wall clock, which the SA-side stop alone could
+        # not do (it only re-spent the time inside the same worker).
+        # Default off => decision logic unchanged, rng stream untouched
+        # (the added predicates consume no randomness).
+        self.stall_eps = 0.002
+        self._stall_frac = 0.0
+        self._run_stalled = False
+        if os.environ.get("PARTNER_REFINE_STALL_STOP", "0") in (
+                "1", "true", "True", "on", "ON"):
+            try:
+                self._stall_frac = float(os.environ.get(
+                    "PARTNER_REFINE_STALL_WINDOW", "0.25"))
+            except ValueError:
+                self._stall_frac = 0.25
+            if not (0.0 < self._stall_frac < 1.0):
+                self._stall_frac = 0.25
+            try:
+                self.stall_eps = float(os.environ.get(
+                    "PARTNER_REFINE_STALL_EPS", "0.002"))
+            except ValueError:
+                self.stall_eps = 0.002
+
     # ------------------------------------------------------------------
     def _contacts(self, idxs):
         """Exact touch contacts among idxs on the current layout."""
@@ -3523,7 +3559,25 @@ class _Refiner:
         stall = 0
         kicks = 0
         rounds = 0
+        # stall early stop (see __init__): disabled -> stall_win is None and
+        # every predicate below is a dead branch.
+        self._run_stalled = False
+        stall_eps = self.stall_eps
+        stall_win = (self._stall_frac * max(deadline - time.time(), 1e-6)
+                     if self._stall_frac > 0.0 else None)
+        ref_key = best_key
+        ref_time = time.time()
         while time.time() < deadline and rounds < 400:
+            if stall_win is not None:
+                # sign-safe relative test: improvement is measured from the
+                # last window reset, not from the previous pass, so a run of
+                # micro-accepts cannot keep a converged phase alive forever.
+                now = time.time()
+                if ref_key - best_key >= stall_eps * abs(ref_key):
+                    ref_key, ref_time = best_key, now
+                elif now - ref_time >= stall_win:
+                    self._run_stalled = True
+                    break
             self._axis_pass(0)
             self._axis_pass(1)
             if rounds >= 1 and rounds % 2 == 1:
@@ -3573,7 +3627,22 @@ class _Refiner:
             best = self.P.copy()
         batches = swaps = 0
         stall2 = 0
+        # phase boundary: the discrete phase is a DIFFERENT move class (the
+        # only one that can reorder a saturated packing), so it gets a fresh
+        # anchor and a window scaled to what is left of the budget -- a
+        # converged continuous phase must not veto it, and the time
+        # squeeze/deflate spent must not be charged to it.
+        if stall_win is not None:
+            stall_win = self._stall_frac * max(deadline - time.time(), 1e-6)
+            ref_key, ref_time = best_key, time.time()
         while time.time() < deadline and stall2 < 4:
+            if stall_win is not None:
+                now = time.time()
+                if ref_key - best_key >= stall_eps * abs(ref_key):
+                    ref_key, ref_time = best_key, now
+                elif now - ref_time >= stall_win:
+                    self._run_stalled = True
+                    break
             self._build_swappable()
             acc, cur_key = self._discrete_batch(cur_key, deadline)
             if acc == 0 and os.environ.get("PARTNER_MATCH"):
