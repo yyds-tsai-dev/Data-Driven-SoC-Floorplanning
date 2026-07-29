@@ -77,6 +77,38 @@ def _target(target_positions: Optional[torch.Tensor], i: int) -> Tuple[float, fl
     return tx, ty, tw, th
 
 
+def _fastsa_temp(frac: float, t0: float, t1: float,
+                 k: float, c: float, steps: float) -> float:
+    """Fast-SA three-stage temperature law (Chen-Chang ISPD'05), mapped onto
+    our wall-clock fraction axis and ANCHORED to the caller's geometric
+    endpoints t0 (hot) / t1 (cold) so the acceptance regime stays in the range
+    our Metropolis criterion + cost scale are already tuned for. Shape (not
+    absolute scale) is what the port reproduces.
+
+    Ported verbatim from src/floorset_arch/legalizer/column_slicing.py
+    (`_fastsa_temp`). The paper indexes temperature steps by an integer n:
+        T_1 = Davg / ln P                       (stage 1, hot random walk)
+        T_n = T_1*|Dcost| / (n*c),  2 <= n <= k (stage 2, fast quench ~greedy)
+        T_n = T_1*|Dcost| / n,      n > k       (stage 3, reheat + 1/n cooling)
+    We (a) map frac in [0,1] linearly to a continuous index n in [1, steps],
+    (b) replace the online Davg/|Dcost| scale by an anchor A = t1*steps so the
+    stage-3 kernel A/n lands exactly on t1 at frac=1, and (c) hold stage 1 at
+    the hot anchor t0. This preserves the three invariants that DEFINE the
+    schedule -- the xc deep quench of stage 2, the ~c-fold reheat jump at n=k,
+    and the 1/n stage-3 tail -- while leaving t0/t1 (hence the accept curve)
+    untouched. With steps=41, k=7 the reheat lands at frac~0.15, so ~15% of
+    the run is hot exploration + quench and ~85% is the low-T 1/n hill-climb,
+    the paper's iteration split. Pure function; called once per outer loop,
+    exactly like the geometric law it replaces."""
+    n = 1.0 + (steps - 1.0) * frac
+    A = t1 * steps
+    if n < 2.0:
+        return t0                    # stage 1: high-T random exploration
+    if n <= k:
+        return A / (n * c)           # stage 2: fast quench to pseudo-greedy
+    return A / n                     # stage 3: reheat, then 1/n cooling to t1
+
+
 # =============================================================================
 # Rectangle reconstruction from diffusion z output (kept for my_opt_claude.py)
 # =============================================================================
@@ -219,6 +251,77 @@ class _ColumnOptimizer:
             if len(u.subgroups) >= 2 or any(len(sg) >= 2 for sg in u.subgroups))
         self._dc_hits = 0
         self._dc_recompute = 0
+
+        # -- Fast-SA cooling schedule (PARTNER_FASTSA_TEMP=1, default off) ---
+        # Cherry-pick #1 from src/floorset_arch/legalizer/column_slicing.py.
+        # "geometric" (default) keeps the historical wall-clock geometric law
+        # in `_anneal` bit-identical -- the schedule branch is a single string
+        # compare per outer loop and never touches the rng stream. "fastsa"
+        # swaps ONLY the T(frac) curve for the Chen-Chang three-stage law
+        # (`_fastsa_temp`); move set, Metropolis accept, recalibration, the
+        # partner-only late-phase violation-weight annealing and finish/polish
+        # are all untouched. k / c / steps mirror the paper's (k=7, c=100)
+        # plus the frac->index span; malformed values fall back silently.
+        self._sa_schedule = "fastsa" if _os.environ.get(
+            "PARTNER_FASTSA_TEMP", "0") in ("1", "true", "True", "on", "ON") \
+            else "geometric"
+        try:
+            self._fastsa_k = float(_os.environ.get("PARTNER_FASTSA_K", "7"))
+        except ValueError:
+            self._fastsa_k = 7.0
+        try:
+            self._fastsa_c = float(_os.environ.get("PARTNER_FASTSA_C", "100"))
+        except ValueError:
+            self._fastsa_c = 100.0
+        try:
+            self._fastsa_steps = float(
+                _os.environ.get("PARTNER_FASTSA_STEPS", "41"))
+        except ValueError:
+            self._fastsa_steps = 41.0
+        # guard degenerate params so the law stays well-formed (steps > k >= 2)
+        if self._fastsa_k < 2.0:
+            self._fastsa_k = 2.0
+        if self._fastsa_steps <= self._fastsa_k:
+            self._fastsa_steps = self._fastsa_k + 1.0
+        if self._fastsa_c <= 0.0:
+            self._fastsa_c = 100.0
+
+        # -- SA stall early stop (PARTNER_SA_STALL_STOP=1, default off) ------
+        # Cherry-pick #2 from column_slicing.py ("E2-adaptive early stop").
+        # An `_anneal` chain breaks once best_cost has not improved by >=
+        # `stall_eps` (relative) within one stall window.
+        #
+        # DEVIATION FROM SRC (deliberate): src derives the window as a
+        # fraction of the case BASE budget and threads it from the main
+        # process into the forked workers, because its adaptive mode inflates
+        # the deadline to base*CAP and the early stop is what reins the
+        # runtime back under the ceiling. This fork is deadline-bounded (the
+        # official runtime IS the budget), there is no inflated ceiling, and
+        # chain spans vary by an order of magnitude between `probe` and
+        # `finish`. So the window here is a fraction of the CURRENT chain's
+        # own span -- self-scaling, no payload plumbing, and at the default
+        # 0.25 it lands in the same band as src's effective window/span ratio
+        # (~0.12-0.23). Consequently src's `finish` wrap-up cap (which exists
+        # only to stop the polish from eating the ceiling) is NOT ported:
+        # here the reclaimed time flows naturally to the next restart, the
+        # greedy polish and the refine stage.
+        self.stall_eps = 0.003
+        self._stall_frac = 0.0
+        self._anneal_stalled = False
+        if _os.environ.get("PARTNER_SA_STALL_STOP", "0") in (
+                "1", "true", "True", "on", "ON"):
+            try:
+                self._stall_frac = float(_os.environ.get(
+                    "PARTNER_SA_STALL_WINDOW", "0.25"))
+            except ValueError:
+                self._stall_frac = 0.25
+            if not (0.0 < self._stall_frac < 1.0):
+                self._stall_frac = 0.25
+            try:
+                self.stall_eps = float(_os.environ.get(
+                    "PARTNER_SA_STALL_EPS", "0.003"))
+            except ValueError:
+                self.stall_eps = 0.003
 
     # ------------------------------------------------------------------
     def _resolve_shapes(self):
@@ -1763,6 +1866,16 @@ class _ColumnOptimizer:
         except ValueError:
             vw_end, vw_frac = 0.0, 0.7
         vw_at = (start + vw_frac * span) if vw_end > vw0 else None
+        # Stall early stop (PARTNER_SA_STALL_STOP): break out of this chain
+        # once best_cost has not improved by >= stall_eps (relative) within
+        # the last stall_win seconds. The check hangs on the existing
+        # per-outer-loop time read, so it adds no per-move cost and consumes
+        # no rng. Disabled (bit-identical) when _stall_frac == 0.
+        self._anneal_stalled = False
+        stall_win = self._stall_frac * span if self._stall_frac > 0.0 else None
+        stall_eps = self.stall_eps
+        stall_ref_cost = best_cost   # best_cost at the last window reset
+        stall_ref_time = start
         while True:
             now = time.time()
             if now >= deadline:
@@ -1779,6 +1892,12 @@ class _ColumnOptimizer:
                     if best_cost < cur_cost:
                         cols = bcols
                         cur_cost = best_cost
+                    # repricing violations rescales the cost (best_cost jumps
+                    # UP); re-anchor the stall window so the jump is not read
+                    # as a stall and does not kill the very phase this feature
+                    # exists to run.
+                    stall_ref_cost = best_cost
+                    stall_ref_time = now
             if recal_at and now >= recal_at[0]:
                 recal_at.pop(0)
                 # tighten the HPWL normalizer toward the (unknown) baseline so
@@ -1793,8 +1912,26 @@ class _ColumnOptimizer:
                 if best_cost < cur_cost:
                     cols = bcols
                     cur_cost = best_cost
+                # a recalibration rescales the cost; re-anchor the stall
+                # window so the shift is not misread as an improvement or a
+                # stall.
+                stall_ref_cost = best_cost
+                stall_ref_time = now
+            if stall_win is not None:
+                # improvement is measured from the last reset; a sign-safe
+                # absolute test avoids the relative form breaking near zero.
+                if stall_ref_cost - best_cost >= stall_eps * abs(stall_ref_cost):
+                    stall_ref_cost = best_cost
+                    stall_ref_time = now
+                elif now - stall_ref_time >= stall_win:
+                    self._anneal_stalled = True
+                    break
             frac = min((now - start) / span, 1.0)
-            T = t0 * (t1 / t0) ** frac
+            if self._sa_schedule == "fastsa":
+                T = _fastsa_temp(frac, t0, t1, self._fastsa_k,
+                                 self._fastsa_c, self._fastsa_steps)
+            else:
+                T = t0 * (t1 / t0) ** frac
             for _ in range(24):
                 undo = self._random_move(cols)
                 if undo is None:
