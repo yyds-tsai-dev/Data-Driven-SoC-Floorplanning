@@ -28,7 +28,7 @@ DISQUALIFICATION）。本次重打取代 0728 舊包，理由有二：**舊包�
 | §2 requirements 完整性 | 非空則須含傳遞依賴 | 空檔（Case A），不觸發 fresh venv 安裝 | PASS |
 | §5 評測指令 | `python iccad2026_evaluate.py --evaluate op_wrapper.py`（cwd=cadc1013/） | 已在解壓後的乾淨目錄實跑（見 §4） | PASS |
 | §5 optimizer 須為 FloorplanOptimizer 子類 | — | `my_opt_claude.MyOptimizer(FloorplanOptimizer)`，由 op_wrapper 以 `MyOptimizer`/`ContestOptimizer` 曝露 | PASS |
-| §6 100 案不 crash | — | 本次只跑 3 案抽驗（見殘留風險 R1）；同版程式碼在 repo 內 full-100 已 100/100 feasible × 9 runs | PARTIAL |
+| §6 100 案不 crash | — | **R1 已補**：從最終 tar 全新解壓跑 full-100（官方 evaluator + repo evaluator 兩 pass）：noRT 1.1283 / proj 0.8736 / **100/100 feasible** / tailQ 1.1163，與 refstall_on 家族（1.1253-1.1265）差 0.002-0.003 在判準內；direct step 1200000 + flow step 1000000 均載入無靜默失敗（artifacts/partner_eval/repack_full100_verify.json，0729 13:0x，GPU 有 v3 訓練爭用） | PASS |
 
 ## 2. .py 閉包：留 13 / 刪 6
 
