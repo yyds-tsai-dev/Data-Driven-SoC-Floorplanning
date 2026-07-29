@@ -78,3 +78,11 @@ PARTNER_DIRECT_SOLVER=dpmpp PARTNER_DDIM_STEPS=10
 PARTNER_DIRECT_SOLVER=dpmpp PARTNER_DDIM_STEPS=10 PARTNER_REFINE_STALL_STOP=1
 # 基座不變:PARTNER_BUDGET_MAX=3.5 PARTNER_DIRECT_MIN=2.0 + flow st8 + antithetic
 ```
+
+## 補記 3（0729 傍晚）：flow v3 mib-hinge gate 判負，提交包定版
+
+**v3 判負**：v3（mib-hinge，1M steps 訓完 16:04）成對同腳本背靠背 gate（乾淨環境，GPU 無訓練爭用）：v1 = 1.1356 vs v3 = **1.1577（Δ +0.0221）**，gate 門檻 ≤−0.003 完全不過（`artifacts/partner_eval/v3gate_v1_paired.json` / `v3gate_v3.json`，兩輪 100/100 feasible）。650k 中期 gate 的持平（0.8932）是下坡前兆；mib-hinge 配方蓋棺。**提交包 `submission/cadc1013.tar.gz`（FLOW_CKPT=v1）即最終定版**——不換檔、不重打。
+
+**方差觀察**：今天 control 家族全日 range 1.1237-1.1356（≈0.012），遠大於先前標的 ±0.003 —— 3.5s 檔位的跨期方差含機器負載動態成分。紀律再確認：**促轉判定只採信同期成對 Δ**；跨期絕對值僅供趨勢參考。
+
+（fast-worker 所跑 `v3gate_v1_control.json`（1.1381）因 env 組態不明棄用，以同腳本 `v3gate_v1_paired.json` 為準。）
