@@ -86,3 +86,35 @@ PARTNER_DIRECT_SOLVER=dpmpp PARTNER_DDIM_STEPS=10 PARTNER_REFINE_STALL_STOP=1
 **方差觀察**：今天 control 家族全日 range 1.1237-1.1356（≈0.012），遠大於先前標的 ±0.003 —— 3.5s 檔位的跨期方差含機器負載動態成分。紀律再確認：**促轉判定只採信同期成對 Δ**；跨期絕對值僅供趨勢參考。
 
 （fast-worker 所跑 `v3gate_v1_control.json`（1.1381）因 env 組態不明棄用，以同腳本 `v3gate_v1_paired.json` 為準。）
+
+## 補記 4（0730）：CSA-in-refiner（任務 #7）判負 — 座標殘差已近枯竭
+
+CSF「換引擎」判死後的唯一倖存後代（`docs/design/2026-07-29-csf-analytical-prototype.md` §7）：**CSA 只做座標精修**，在 backbone 已合法化的拓撲上，繼承 V_rel/area_gap 不動，只攻 HPWL gap。天花板 tail `hpwl_gap→0` = −0.0219，過 −0.01 gate 需 **~46% 捕獲率**。
+
+**三輪同期成對 full-100 A/B 判負**（疊 0729 定案 env：dpmpp10 + DDIM10 + `PARTNER_REFINE_STALL_STOP=1`；9 runs 全 **100/100 feasible**，`artifacts/partner_eval/csaref_*.json`，腳本 `scratchpad/csaref_ab_chain.sh` / 分析 `scratchpad/analyze_csaref.py`）：
+
+| round | arm | dNoRT | dProj | dTailQ | dSumRt | d_tail_hpwl | d_tail_area | d_tail_Vrel | win/loss |
+|---|---|---|---|---|---|---|---|---|---|
+| rep1 | stall | +0.0054 | +0.0054 | +0.0060 | +0.8s | −0.0046 | −0.0008 | +0.0013 | 34/44 |
+| rep2 | stall | +0.0007 | −0.0025 | −0.0010 | −0.7s | +0.0027 | +0.0003 | −0.0007 | 45/33 |
+| rep3 | stall | −0.0004 | −0.0021 | −0.0005 | −0.6s | −0.0034 | −0.0048 | +0.0016 | 40/45 |
+| rep1 | end | +0.0043 | +0.0032 | +0.0045 | +0.7s | +0.0098 | −0.0008 | −0.0016 | 43/36 |
+| rep2 | end | −0.0009 | −0.0014 | −0.0015 | +0.6s | +0.0016 | +0.0018 | −0.0007 | 51/39 |
+| rep3 | end | +0.0057 | +0.0038 | +0.0054 | +0.4s | −0.0061 | −0.0020 | +0.0022 | 40/43 |
+
+均值 **stall +0.0019 / end +0.0030**（control 家族 1.1298-1.1316），gate `≤−0.003` 不過；tailQ 兩臂符號皆不一致（stall +0.0060/−0.0010/−0.0005）。牆鐘中性（±0.8s / 199s），符合減時鐵律但也代表沒有 runtime 側收益可換。
+
+**死因（結構性，比「wash」更強的結論）**：
+1. **捕獲率實測 ~3%，遠低於所需 46%**。tail `hpwl_gap` 成對 Δ = −0.0046 / +0.0027 / −0.0034（base 0.0558），均值 −0.0018，**符號不一致且與 control 自身跨輪散佈（0.0510-0.0613）同量級** —— 捕獲量測不出來，不是「小而真」而是「淹沒在諧波裡」。按天花板換算，3% 捕獲 ≈ −0.0007，比 gate 低一個量級。
+2. **機制本身是真的，但在真實 layout 上餘量很小**。CSA 攻的是 `_axis_pass` 的座標下降盲點：它按拓撲序讓每組取自己的 1-D 加權中位最優，**從不為被拖動的下游鏈付 HPWL**，因此可以收斂到比起點更差的點且回不來。合成案（`tests/test_partner_csa_refine.py::test_csa_pass_escapes_the_coordinate_descent_fixed_point`）證實：median sweep 卡在 hp 49.0，CSA 把整條密排列走回 39.0。但 `_axis_pass` 的 backward `dmax` 最長路徑 pass **已經**讓零間隙鏈整體平移，真正只有聯合求解才拿得到的殘差（拖動定價的不對稱）在 column backbone 的飽和packing 上佔比極小。
+3. 呼應 0707 定論：**tail 剩下的 hpwl_gap 0.056 是拓撲缺口（哪個塊放哪裡），不是座標缺口**；headroom 需 (order, shape) 聯合，單通道精修不可分解。CSA 是一個更好的座標 solver，但座標通道已近枯竭。
+4. 兩種落點都測了，排除「時機」解釋：`stall`（迴圈內、median sweep 不動點處，與 squeeze 搶同一份 slack）與 `end`（終端、從 caller span 內 carve 出，squeeze 已先把 bbox 面積入袋）。end 臂 rep1 的 `d_tail_hpwl +0.0098` 顯示 carve 掉的 8% 搜索時間比 CSA 撿回的多。
+
+**代碼留存 default off**（`PARTNER_CSA_REFINE=1` 啟用，`_WHERE` = stall|end|both，`_SHARE`/`_ITERS`/`_STEP`/`_DECAY`/`_MS`）：
+- `partner/csa_coordinate_solver.py`（新，216 行）：`AxisHpwlObjective`（值 + 解析次梯度，向量化）、`ShiftPolytope`（refiner 自己的可行集 + retraction）、`csa_shifts`（Polak-Ribière、scale-free `c/‖p‖` 步長、幾何衰減取代論文 Q-table）。
+- `partner/layout_refiner.py`：`_axis_constraints` 從 `_axis_pass` **逐字抽出**（兩邊共用同一多面體，任何分歧都是合法性漏洞）；`_csa_problem` / `_csa_pass`。
+- **retraction 是唯一新的數學**，也是第一版失敗處：單用拓撲 clip 會把「鏈頭往右、鏈尾往左」的步整個壓成 0（實測直接把 CSA 釘死在座標下降不動點）；縮短步長也無效（飽和 packing 上接觸約束是緊的 ⇒ λ=0）。定案：Cimmino 平滑 → **兩側單向鏈修復**（down/up）→ 拓撲 clip 作合法性保證，由目標函數挑。
+- 合法性：只動 xy 不動 wh（area 繼承）、移動限於 refiner 多面體（零重疊 by construction、已滿足 boundary tag 釘死、preplaced 凍結、cluster 剛性）、整個 pass 除非 `_key()` 嚴格改善且無重疊否則整體回滾、例外封裝。off 時 `csa_share == 0.0` 使所有謂詞成死枝，且 pass 不抽 `self.rng` ⇒ 決策邏輯與 rng 流 bit 級不變。
+- 測試 `tests/test_partner_csa_refine.py` 19 綠（env 佈線、off 惰性、形狀/凍結塊/零重疊不變量、proxy 單調、目標 vs `opt._hpwl`、次梯度 vs 有限差分、投影可行性與冪等、逃逸不動點、終端落點不超時）；partner 全家 **243 綠**，全套 623 passed / 1 skipped。
+
+**結案**：CSF 這條線（含本後代）全部關閉。剩餘 headroom 不在座標精修層。
