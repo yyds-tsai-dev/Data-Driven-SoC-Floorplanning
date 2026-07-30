@@ -36,12 +36,42 @@ from typing import List, Optional
 
 import numpy as np
 
+import csa_coordinate_solver as _csa
+
 _DEBUG = bool(os.environ.get("REFINER_DEBUG"))
 
 EDGE_EPS = 1e-6     # evaluator boundary-touch / overlap tolerance
 SEP_TOL = 5e-7      # projection overlap beyond this forces a separation constraint
 CONTACT_TOL = 1e-9  # tolerance when recording exact cluster contacts
 TOUCH_TOL = 1e-7    # touching test for grouping checks (matches legalizer)
+
+
+def _env_pos(name: str, default: float, hi: float) -> float:
+    """Positive float env override; malformed or out of (0, hi] -> default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return v if 0.0 < v <= hi else default
+
+
+class _AxisCons:
+    """Separation polytope for one axis: per-group rigid-shift box
+    [lo, dmax] plus the difference constraints d[j] - d[i] >= c."""
+    __slots__ = ("G", "lo", "dmax", "edges_in", "edges_out", "order",
+                 "pinned")
+
+    def __init__(self, G, lo, dmax, edges_in, edges_out, order, pinned):
+        self.G = G
+        self.lo = lo
+        self.dmax = dmax
+        self.edges_in = edges_in
+        self.edges_out = edges_out
+        self.order = order
+        self.pinned = pinned
 
 
 class _Group:
@@ -123,6 +153,41 @@ class _Refiner:
                     "PARTNER_REFINE_STALL_EPS", "0.002"))
             except ValueError:
                 self.stall_eps = 0.002
+
+        # -- CSA coordinate polish (PARTNER_CSA_REFINE=1, off) -------------
+        # Surviving descendant of the CSF gate (docs/design/
+        # 2026-07-29-csf-analytical-prototype.md sec. 7): a joint projected
+        # conjugate-subgradient sweep over the per-group shift vector, run at
+        # the median sweep's fixed point.  `_axis_pass` is a coordinate
+        # descent -- each group takes its OWN 1-D weighted-median optimum and
+        # never pays for the downstream chain it drags -- so it can stall at
+        # a point where only a joint move improves.  CSA prices the drag.
+        #
+        # Shapes are untouched (area_gap inherited), the feasible set is
+        # `_axis_constraints` (overlap-free by construction, satisfied
+        # boundary tags pinned, clusters rigid -> V_rel inherited), and
+        # `_csa_pass` reverts unless the full `_key()` proxy improves.  The
+        # pass consumes no `self.rng` draws, so with the flag off the
+        # decision logic AND the rng stream are bit-identical to the
+        # pre-port fork (csa_share == 0.0 makes every predicate dead).
+        self.csa_iters = 60
+        self.csa_step = 0.05      # first step, as a fraction of the axis span
+        self.csa_decay = 0.95     # geometric schedule replacing the paper's Q-table
+        self.csa_ms = 15.0        # per-pass wall-clock cap
+        self.csa_share = 0.0      # >0 enables; share of the run span CSA may use
+        self.csa_where = "stall"  # "stall" | "end" | "both" (see `run`)
+        self._csa_spent = 0.0
+        self._csa_calls = 0
+        self._csa_applied = 0
+        if os.environ.get("PARTNER_CSA_REFINE", "0") in (
+                "1", "true", "True", "on", "ON"):
+            self.csa_share = _env_pos("PARTNER_CSA_SHARE", 0.08, 1.0)
+            self.csa_iters = int(_env_pos("PARTNER_CSA_ITERS", 60.0, 100000.0))
+            self.csa_step = _env_pos("PARTNER_CSA_STEP", 0.05, 1.0)
+            self.csa_decay = _env_pos("PARTNER_CSA_DECAY", 0.95, 1.0)
+            self.csa_ms = _env_pos("PARTNER_CSA_MS", 15.0, 1e6)
+            w = os.environ.get("PARTNER_CSA_WHERE", "stall")
+            self.csa_where = w if w in ("stall", "end", "both") else "stall"
 
     # ------------------------------------------------------------------
     def _contacts(self, idxs):
@@ -373,19 +438,10 @@ class _Refiner:
             wts = g.eW
         return self._wmedian(des, wts)
 
-    def _axis_pass(self, axis: int, max_step: Optional[float] = None,
-                   hold: bool = False, invert: bool = False):
-        """Compaction-style global sweep: separation constraints between
-        groups become difference constraints on rigid shifts d_g.  A
-        backward longest-path pass yields each group's maximum feasible
-        shift given that everything downstream may also move; the forward
-        pass then assigns d_g = clip(median target, assigned-predecessor
-        bound, dmax_g).  Whole zero-gap chains can therefore translate
-        together — the freedom a purely local sweep never sees.
-
-        hold=True turns the sweep into a minimum-displacement legalizer:
-        every target is "stay put" and overlapping pairs are separated
-        along their axis of smaller penetration."""
+    def _axis_constraints(self, axis: int, invert: bool = False):
+        """Build the separation polytope for one axis (extracted verbatim from
+        `_axis_pass` so the CSA pass optimizes over the SAME feasible set --
+        any divergence here would be a legality hole)."""
         P = self.P
         n = self.n
         o = 1 - axis
@@ -478,6 +534,30 @@ class _Refiner:
                 v = dmax[gj_] - c
                 if v < dmax[gi_]:
                     dmax[gi_] = v
+        return _AxisCons(len(self.groups), lo_fixed, dmax, edges_in,
+                         edges_out, order, pinned)
+
+    def _axis_pass(self, axis: int, max_step: Optional[float] = None,
+                   hold: bool = False, invert: bool = False):
+        """Compaction-style global sweep: separation constraints between
+        groups become difference constraints on rigid shifts d_g.  A
+        backward longest-path pass yields each group's maximum feasible
+        shift given that everything downstream may also move; the forward
+        pass then assigns d_g = clip(median target, assigned-predecessor
+        bound, dmax_g).  Whole zero-gap chains can therefore translate
+        together — the freedom a purely local sweep never sees.
+
+        hold=True turns the sweep into a minimum-displacement legalizer:
+        every target is "stay put" and overlapping pairs are separated
+        along their axis of smaller penetration."""
+        cons = self._axis_constraints(axis, invert)
+        G = cons.G
+        lo_fixed = cons.lo
+        dmax = cons.dmax
+        edges_in = cons.edges_in
+        edges_out = cons.edges_out
+        order = cons.order
+        pinned = cons.pinned
 
         # forward: assign shifts toward each group's weighted-median target
         d = np.zeros(G)
@@ -511,6 +591,89 @@ class _Refiner:
             assigned[gi_] = True
             if abs(d[gi_]) > 1e-12:
                 self._move(g, d[gi_], axis)
+
+    def _csa_problem(self, axis: int, cons: "_AxisCons"):
+        """Axis HPWL as a function of the group shift vector + its polytope.
+
+        Same-group edges are dropped (a rigid shift leaves them invariant),
+        preplaced blocks map to a sentinel slot that is pinned at 0, so the
+        objective is exactly `opt._hpwl`'s `axis` half up to a constant."""
+        opt = self.opt
+        P = self.P
+        G = len(self.groups)
+        gof = self.group_of
+        cen = P[:, axis] + 0.5 * P[:, axis + 2]
+        ei = np.asarray(opt.eI, dtype=np.int64)
+        ej = np.asarray(opt.eJ, dtype=np.int64)
+        if len(ei):
+            gu = gof[ei]
+            gv = gof[ej]
+            keep = gu != gv
+            eu = np.where(gu >= 0, gu, G)[keep]
+            ev = np.where(gv >= 0, gv, G)[keep]
+            eb = (cen[ei] - cen[ej])[keep]
+            ew = np.asarray(opt.eW, dtype=np.float64)[keep]
+        else:
+            eu = ev = np.zeros(0, dtype=np.int64)
+            eb = ew = np.zeros(0)
+        pb_i = np.asarray(opt.pB, dtype=np.int64)
+        if len(pb_i):
+            gp = gof[pb_i]
+            pu = np.where(gp >= 0, gp, G)
+            tgt = np.asarray(opt.pX if axis == 0 else opt.pY, dtype=np.float64)
+            pb = cen[pb_i] - tgt
+            pw = np.asarray(opt.pW, dtype=np.float64)
+        else:
+            pu = np.zeros(0, dtype=np.int64)
+            pb = pw = np.zeros(0)
+        obj = _csa.AxisHpwlObjective(G, eu, ev, eb, ew, pu, pb, pw)
+        poly = _csa.ShiftPolytope(G, cons.lo, cons.dmax, cons.edges_in,
+                                  cons.edges_out, cons.order, cons.pinned)
+        return obj, poly
+
+    def _csa_pass(self, axis: int, key0: Optional[float] = None) -> bool:
+        """Joint conjugate-subgradient polish of the group shifts on `axis`.
+
+        Monotone by construction: the shift vector is a point of the same
+        polytope the median sweep walks, and the whole pass is reverted
+        unless the layout is still overlap-free AND the full proxy strictly
+        improves.  Returns True iff the move was kept."""
+        t_start = time.time()
+        self._csa_calls += 1
+        try:
+            cons = self._axis_constraints(axis)
+            obj, poly = self._csa_problem(axis, cons)
+            if obj.terms == 0 or cons.G == 0 or bool(cons.pinned.all()):
+                return False
+            span = ((self.xmax - self.xmin) if axis == 0
+                    else (self.ymax - self.ymin))
+            step = self.csa_step * span
+            if not (step > 0.0):
+                return False
+            d, f, f0, _it = _csa.csa_shifts(
+                obj, poly, step, self.csa_iters, self.csa_decay,
+                t_start + self.csa_ms * 1e-3)
+            if f >= f0 - 1e-12:
+                return False
+            if key0 is None:
+                key0 = self._key()
+            snap = self.P.copy()
+            for gi_ in cons.order:
+                dv = float(d[gi_])
+                if abs(dv) > 1e-12:
+                    self._move(self.groups[gi_], dv, axis)
+            if self._has_overlap() or self._key() >= key0 - 1e-12:
+                self.P[...] = snap
+                return False
+            self._csa_applied += 1
+            return True
+        except Exception:
+            if _DEBUG:
+                import traceback
+                traceback.print_exc()
+            return False
+        finally:
+            self._csa_spent += time.time() - t_start
 
     def _overlap_count(self) -> int:
         P = self.P
@@ -3554,6 +3717,15 @@ class _Refiner:
         return cur_key
 
     def run(self, deadline: float) -> np.ndarray:
+        # "end"/"both" placement CARVES its slice out of the caller's span
+        # rather than adding to it: the fork is deadline-bounded, so an
+        # overrun would show up as raw runtime, not as free search.
+        hard_deadline = deadline
+        csa_end = (self.csa_share > 0.0
+                   and self.csa_where in ("end", "both"))
+        if csa_end:
+            deadline = deadline - self.csa_share * max(
+                deadline - time.time(), 0.0)
         best_key = self._key()
         best = self.P.copy()
         stall = 0
@@ -3567,7 +3739,20 @@ class _Refiner:
                      if self._stall_frac > 0.0 else None)
         ref_key = best_key
         ref_time = time.time()
+        # CSA carve-out: a bounded slice of THIS phase's span, spent only at
+        # the median sweep's fixed point (stall >= 1, i.e. the previous round
+        # bought nothing).  csa_share == 0.0 (default) -> dead branch.
+        csa_cap = (self.csa_share * max(deadline - time.time(), 0.0)
+                   if self.csa_share > 0.0 else 0.0)
         while time.time() < deadline and rounds < 400:
+            if (csa_cap > 0.0 and self.csa_where in ("stall", "both")
+                    and stall >= 1 and self._csa_spent < csa_cap):
+                # gate on the CURRENT point's proxy (not best_key): the round
+                # that stalled left `self.P` at its own, possibly worse,
+                # result, and the job here is to escape THAT fixed point.
+                # Global acceptance is still the round's `best` snapshot.
+                self._csa_pass(0)
+                self._csa_pass(1)
             if stall_win is not None:
                 # sign-safe relative test: improvement is measured from the
                 # last window reset, not from the previous pass, so a run of
@@ -3685,9 +3870,27 @@ class _Refiner:
             if cur_key < best_key - 1e-12:
                 best_key = cur_key
                 best = self.P.copy()
+        # terminal CSA polish: everything else has run, so the squeeze phase
+        # has already banked whatever bbox area it could and the slack CSA
+        # spends on HPWL is slack nothing else was going to use.  (The
+        # in-loop "stall" placement competes with the squeeze for that same
+        # slack -- which is exactly what the A/B is there to separate.)
+        if csa_end:
+            self.P[...] = best
+            while time.time() < hard_deadline:
+                if not (self._csa_pass(0) | self._csa_pass(1)):
+                    break
+            k = self._key()
+            if k < best_key - 1e-12:
+                best_key = k
+                best = self.P.copy()
+
         if _DEBUG:
             print(f"[refiner] rounds={rounds} kicks={kicks} "
-                  f"discrete: {batches} batches, {swaps} moves accepted",
+                  f"discrete: {batches} batches, {swaps} moves accepted"
+                  + (f" | csa {self._csa_applied}/{self._csa_calls} kept "
+                     f"in {self._csa_spent:.3f}s" if self.csa_share > 0.0
+                     else ""),
                   flush=True)
         self.P[...] = best
         return best
