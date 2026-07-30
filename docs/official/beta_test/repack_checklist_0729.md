@@ -4,7 +4,9 @@
 DISQUALIFICATION）。本次重打取代 0728 舊包，理由有二：**舊包混入未使用的 .py（清潔度違規）**、
 且 **舊包裝錯 direct checkpoint（step 1139000，非 0729 定案證據所用的 step 1200000）**。
 
-- 包：`submission/cadc1013.tar.gz`（799,222,482 bytes，md5 `2bf39655bd42e458170078539c0712c8`；
+> **注意：現役包是 §7 的 0730 新檔名版（md5 `a80b90d3…`）。以下 §1-§5 描述 0729 舊檔名版，判準與結論仍適用。**
+
+- 包（0729 版，已被 §7 取代）：`submission/cadc1013_0729_oldnames.tar.gz.bak`（799,222,482 bytes，md5 `2bf39655bd42e458170078539c0712c8`；
   檔案模式統一 644 / 目錄 755，`--owner=0 --group=0 --numeric-owner`）
 - 內容 root：`cadc1013/`（扁平），13 個 .py + `requirements.txt`(0 bytes) + `checkpoints/` 2 個 .pt
 - 來源：repo branch `5.6-sol-reduce-time`，partner 模組取自本次 commit 的工作樹（含 0729 promote 的
@@ -143,3 +145,70 @@ no-runtime 欄位；基準 = `artifacts/partner_eval/refstall_on_rep3.json` 同�
   載入時印一行 `checkpoint not found ... using heuristic init only`——這與所有證據 run 的行為一致
   （repo 內同樣沒有該檔），非退化。
 - **R5（低）**：archive 799 MB，全部是兩個 430 MB 權重；若主辦對單隊大小有未公布的上限會有風險。
+
+## 7. 0730 新檔名重打（現役包；覆蓋 §1-§5 的檔名與 md5）
+
+`partner/` 模組在 `d9aa665` 改為語義檔名、`a11273f`/`c84e26d` 收割 flow branch 之後，
+提交包依同一份 §1-§4 判準重打。**閉包成員、定案 env、兩顆 checkpoint 全部不變，只換檔名。**
+
+- 包：`submission/cadc1013.tar.gz`（**799,227,068 bytes**，md5 **`a80b90d3714b2e026b4bcc84a41b5237`**；
+  模式 644/755、uid/gid 0/0）
+- 舊包備份：`submission/cadc1013_0729_oldnames.tar.gz.bak`（md5 `2bf39655…`）＋
+  `submission/cadc1013_0729_oldnames/`（皆 gitignored）
+- checkpoint 直接沿用已驗證的兩顆（未重新產生）：
+  `checkpoints/direct_v2_final.pt` md5 `15133794ee2afc9f1289eb168241f824`（step 1200000）、
+  `checkpoints/flow_matching_v1_final.pt` md5 `7d207b32a1d764c2d8dff0e116389860`（step 1000000）
+
+### 模組名對照（13 檔閉包）
+
+| 舊名（0729 包） | 新名（0730 包） |
+| --- | --- |
+| `op_wrapper.py` | `op_wrapper.py`（唯一改動：`from contest_optimizer import MyOptimizer`） |
+| `my_opt_claude.py` | `contest_optimizer.py` |
+| `legalizer_claude.py` | `column_sa_legalizer.py` |
+| `refiner_claude.py` | `layout_refiner.py` |
+| `direct_model_claude.py` | `direct_diffusion_model.py` |
+| `direct_train_claude.py` | `direct_diffusion_train.py` |
+| `flow_matching_claude.py` | `flow_matching_model.py` |
+| `flow_train_claude.py` | `flow_matching_train.py` |
+| `noise_opt_claude.py` | `noise_optimization.py` |
+| `physics_guidance_claude.py` | `physics_guidance.py` |
+| `candidate_supply_claude.py` | `candidate_supply.py` |
+| `diffusion_data.py` / `diffusion_model.py` | 不變 |
+
+不打包（新名）：`violation_killer`、`retrieval_{index,features,matching,transfer}`、`diffusion_train`、
+`frame_repack`、`analytic_polish`、`direct_diffusion_train_v2`、`flow_matching_distill`
+（後四者本來就不在 0729 包內）。全部十個都以實測確認：在定案 env 下既不被 import，也不可 import。
+
+### 稽核
+
+- 絕對路徑掃描 0 命中；13 個 .py，無多餘/重複 optimizer .py、無 `__pycache__`/log/JSON；
+  `tar tzf` 全部條目在 `cadc1013/` 之下；`requirements.txt` 0 bytes。
+- 12 個 helper 與 `partner/` 對應檔**逐 byte 相同**（`op_wrapper.py` 為包專屬）。
+- flow 收割未動 runtime：`flow_matching_model.py` 相對 `dee4156` 是**純新增**（0 行刪除），
+  `sample_flow` / `endpoint_from_velocity` / `flow_path` 三個 runtime 函式 AST 逐節點相同；
+  `direct_diffusion_model.py` 與 `direct_model_claude.py` 逐 byte 相同；
+  `flow_matching_train.FLOW_METHODS` 含 `flow_matching_v1`，現役 checkpoint 照常通過 tag 驗證。
+
+### 從新 tar 全新解壓 → full-100（GPU 無其他佔用，v3 訓練已結束）
+
+| pass | 指令 | total | noRT | feasible | errors | avg / max runtime |
+| --- | --- | --- | --- | --- | --- | --- |
+| 官方 evaluator | `python iccad2026_evaluate.py --evaluate op_wrapper.py` | 1.1391 (RF=1.0) | — | **100/100** | 0 | 1.99 s / 3.55 s |
+| repo evaluator | 同上，取 no-runtime 欄位 | 1.3030 | **1.1354** | **100/100** | 0 | 1.99 s / 3.52 s |
+
+`artifacts/partner_eval/repack_full100_newnames_{official,repo}.json`。overlap 違規總數 0，
+tailQ（n>100 平均 noRT）1.1286。載入訊息確認：
+`loaded direct model step 1200000` + `loaded flow model step 1000000`（新模組名下），
+兩通道 `direct_model`/`flow_model` 皆非 None、device `cuda`，無靜默失敗。
+
+noRT 1.1354 對 0729 R1 的 1.1283 為 **+0.0071**（判準 ≤0.01 內），但確實落在
+refstall_on 家族觀測帶（1.1253-1.1265）之上——依上述 byte/AST 同一性證據，這是抽樣變異
+而非改名或收割造成的退化；若要收窄不確定性，唯一乾淨做法是同期成對再跑一輪。
+
+### 本次一併修好的 repo 問題
+
+`d9aa665` 是純 `git mv`（0 行變更），因此被改名模組**內部的 import 敘述仍指向舊 `*_claude` 名**
+（`contest_optimizer.py` 一檔 29 處），`c84e26d` 這個 HEAD 事實上 import 不起來；
+`606 passed` 反映的是工作樹而非 HEAD。本次把該跟進修正（8 檔）一併提交，
+提交包即建構於此修正之上。
