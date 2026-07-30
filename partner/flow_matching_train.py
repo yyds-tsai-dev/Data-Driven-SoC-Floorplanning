@@ -2,7 +2,7 @@
 """Direct-v2-compatible conditional flow-matching trainer.
 
 The optimizer, data loader, checkpoint lifecycle, EMA, and shared-GPU
-throttling are deliberately delegated to ``direct_train_claude``.  This
+throttling are deliberately delegated to ``direct_diffusion_train``.  This
 module changes the direct trainer's stochastic path from diffusion
 v-prediction to straight-path velocity matching while retaining v2's
 conditioning, augmentation, geometry, HPWL, and large-case objectives.
@@ -15,15 +15,61 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from flow_matching_claude import endpoint_from_velocity, flow_path
+from flow_matching_model import (
+    endpoint_from_velocity,
+    endpoint_time_weight,
+    flow_path,
+    sample_flow_t,
+)
+
+# Accepted flow training-method tags.  The tag names the trainer generation,
+# not the recipe -- the recipe is fully described by the recorded args
+# (mib_hinge / x0_time_weighting / term_t_prob).  Older tags stay loadable so
+# the candidate probe can still read v1 and v2 weights.
+FLOW_METHODS = (
+    "flow_matching_v1",
+    "flow_matching_v2",
+    "flow_matching_v2_1",
+    "flow_matching_v3",
+    # Post-hoc SCFM few-step distillation of any of the above (flow_matching_distill).
+    # The student keeps the teacher's architecture, z_repr and sampler contract,
+    # so it is loadable everywhere a flow checkpoint is.
+    "flow_distill_v1",
+)
+TRAINING_METHOD = "flow_matching_v3"
 
 
 def checkpoint_method(checkpoint):
-    """Validate that a checkpoint was produced by this flow trainer."""
+    """Validate that a checkpoint was produced by a flow trainer."""
     method = checkpoint.get("args", {}).get("training_method")
-    if method != "flow_matching_v1":
-        raise ValueError("checkpoint must declare training_method=flow_matching_v1")
+    if method not in FLOW_METHODS:
+        raise ValueError(
+            "checkpoint must declare training_method in {"
+            + ", ".join(FLOW_METHODS)
+            + "}"
+        )
     return method
+
+
+def mib_objective(mib_pred, mib_gt, hinge):
+    """Per-sample MIB aspect objective, optionally hinged at the golden layout.
+
+    ``mib_aspect`` measures mean pairwise ``|log(w/h)_i - log(w/h)_j|`` inside a
+    MIB group -- an *absolute* symmetry penalty with no reference point.  The
+    golden layouts score ~0.59-0.67 on it, while trained models score ~0.42-0.51,
+    so the unhinged term spends gradient pushing the model to be *more* aspect
+    consistent than the ground truth it is imitating, and that symmetry is paid
+    for in coordinate accuracy.
+
+    Hinging at the golden value penalizes only the part that is worse than
+    golden.  The hinge is absolute, not relative (unlike ``hp_loss``'s
+    ``/hp_gt``): ``mib_gt`` is legitimately zero whenever a sample has no MIB
+    group or a perfectly consistent one, and the existing ``--mib-loss-weight``
+    is calibrated against this absolute scale.
+    """
+    if not hinge:
+        return mib_pred
+    return torch.relu(mib_pred - mib_gt)
 
 
 def validate_resume_checkpoint(args):
@@ -52,10 +98,10 @@ def masked_flow_loss(predicted, target, z_t, z0, t, mask):
 
 def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, amp_on):
     """Train one DirectDenoiser step against a linear noise-to-data path."""
-    import direct_train_claude as V1
-    import direct_train_v2_claude as V2
+    import direct_diffusion_train as V1
+    import direct_diffusion_train_v2 as V2
     from diffusion_data import fp_sol_to_z0, z_to_rectangles
-    from direct_model_claude import known_z_channels
+    from direct_diffusion_model import known_z_channels
     from diffusion_train import known_target_positions_from_fp
 
     area, b2b, p2b, pins, cons, _tree, fp, _metrics = batch
@@ -71,7 +117,10 @@ def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, am
     )
     batch_size = area.shape[0]
     device = area.device
-    t = torch.rand((batch_size,), device=device, generator=rng)
+    t = sample_flow_t(
+        batch_size, device, rng,
+        term_prob=args.term_t_prob, term_band=args.term_band,
+    )
     noise = torch.randn(z0.shape, device=device, generator=rng)
     z_t, velocity_target = flow_path(z0, noise, t)
     z_t = z_t * mask.unsqueeze(-1)
@@ -110,8 +159,16 @@ def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, am
         torch.ones_like(area),
     )
     channel_weight = torch.tensor([1.0, 1.0, 1.0, 0.0], device=device).view(1, 1, 4)
+    # Endpoint time weighting.  Default 'none' (= v1): on the straight path the
+    # endpoint residual is (1-t)*(velocity residual), already attenuated at high
+    # noise, so the unweighted loss is a well-conditioned coordinate-space
+    # auxiliary over the whole path.  'snr' reproduces the disproved v2 arm.
+    w_time = endpoint_time_weight(t, args.x0_time_weighting, args.min_snr_gamma)
+    w_time = w_time.view(batch_size, 1, 1).to(z0_hat.dtype)
     endpoint_error = F.smooth_l1_loss(z0_hat, z0, reduction="none", beta=0.02)
-    endpoint_error = endpoint_error * channel_weight * node_weight.unsqueeze(-1) * mask_weight
+    endpoint_error = (
+        endpoint_error * channel_weight * node_weight.unsqueeze(-1) * mask_weight * w_time
+    )
     x0_loss = endpoint_error.sum() / (
         node_weight.unsqueeze(-1) * mask_weight * channel_weight
     ).sum().clamp_min(1)
@@ -125,7 +182,17 @@ def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, am
     ov = (V1.overlap_fraction(rects, mask, scale) * endpoint_weight).mean()
     bd = (V1.boundary_touch(rects, cons, mask, scale) * endpoint_weight).mean()
     cg = (V1.cluster_gap(rects, gt_rects, cons, mask, scale) * endpoint_weight).mean()
-    mb = (V1.mib_aspect(rects, cons, mask) * endpoint_weight).mean()
+    # v3: optionally reference the MIB aspect penalty to the golden layout.
+    # mib_aspect is D4-invariant (transpose negates every block's log-aspect,
+    # leaving pairwise differences unchanged; mirrors do not touch w/h), so
+    # taking mib_gt from the augmented gt_rects is consistent with the sample.
+    mib_pred = V1.mib_aspect(rects, cons, mask)
+    if args.mib_hinge:
+        with torch.no_grad():
+            mib_gt = V1.mib_aspect(gt_rects, cons, mask)
+    else:
+        mib_gt = None
+    mb = (mib_objective(mib_pred, mib_gt, args.mib_hinge) * endpoint_weight).mean()
 
     hp_pred = V2.hpwl_pair(rects, b2b, p2b, pins)
     with torch.no_grad():
@@ -160,11 +227,39 @@ def flow_train_step(model, ema, unused_schedule, batch, args, rng, amp_dtype, am
     }
 
 
+def parse_flow_extras(argv):
+    """Split the flow-only knobs off an argv list.
+
+    v2.1 defaults deliberately reproduce the validated v1 objective:
+    ``x0_time_weighting='none'`` and ``term_t_prob=0`` (uniform t).  Both v2
+    arms remain reachable by flag so an ablation needs no code edit.
+    """
+    import argparse
+
+    extra = argparse.ArgumentParser(add_help=False)
+    extra.add_argument("--hpwl-loss-weight", type=float, default=0.30)
+    extra.add_argument("--x0-time-weighting", choices=("none", "snr"), default="none")
+    extra.add_argument("--term-t-prob", type=float, default=0.0)
+    extra.add_argument("--term-band", type=float, default=0.02)
+    # v3 arm.  Off keeps the objective bit-exact with v1.
+    extra.add_argument("--mib-hinge", action="store_true")
+    return extra.parse_known_args(argv)
+
+
+FLOW_EXTRA_FIELDS = (
+    "hpwl_loss_weight",
+    "x0_time_weighting",
+    "term_t_prob",
+    "term_band",
+    "mib_hinge",
+)
+
+
 def main():
     """Configure Direct-v2 defaults, then reuse the V1 training lifecycle."""
     import inspect
 
-    import direct_train_claude as V1
+    import direct_diffusion_train as V1
 
     argv = sys.argv[1:]
 
@@ -179,28 +274,25 @@ def main():
         "--warmup": "4000",
         "--ema-decay": "0.9998",
         "--node-feat-dim": "32",
-        "--max-steps": "800000",
-        "--checkpoint-dir": "checkpoints/flow_matching_v1",
+        "--max-steps": "1000000",
+        "--checkpoint-dir": "checkpoints/flow_matching_v3",
     }
     for flag, value in defaults.items():
         if not has(flag):
             argv += [flag, value]
     sys.argv = [sys.argv[0]] + argv
 
-    import argparse
-
-    extra = argparse.ArgumentParser(add_help=False)
-    extra.add_argument("--hpwl-loss-weight", type=float, default=0.30)
-    known, rest = extra.parse_known_args(sys.argv[1:])
+    known, rest = parse_flow_extras(sys.argv[1:])
     sys.argv = [sys.argv[0]] + rest
 
     original_parse = V1.parse_args
 
     def parse_flow_args():
         args = original_parse()
-        args.training_method = "flow_matching_v1"
-        if not hasattr(args, "hpwl_loss_weight"):
-            args.hpwl_loss_weight = known.hpwl_loss_weight
+        args.training_method = TRAINING_METHOD
+        for field in FLOW_EXTRA_FIELDS:
+            if not hasattr(args, field):
+                setattr(args, field, getattr(known, field))
         return args
 
     V1.parse_args = parse_flow_args
