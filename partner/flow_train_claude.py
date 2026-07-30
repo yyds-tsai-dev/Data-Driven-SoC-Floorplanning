@@ -31,6 +31,10 @@ FLOW_METHODS = (
     "flow_matching_v2",
     "flow_matching_v2_1",
     "flow_matching_v3",
+    # Post-hoc SCFM few-step distillation of any of the above (flow_distill_claude).
+    # The student keeps the teacher's architecture, z_repr and sampler contract,
+    # so it is loadable everywhere a flow checkpoint is.
+    "flow_distill_v1",
 )
 TRAINING_METHOD = "flow_matching_v3"
 
