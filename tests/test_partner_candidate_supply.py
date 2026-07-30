@@ -1,6 +1,6 @@
 import numpy as np
 
-from candidate_supply_claude import CandidateBatch, allocate_quotas, rank_predictions
+from candidate_supply import CandidateBatch, allocate_quotas, rank_predictions
 
 
 def test_candidate_batch_rejects_non_rectangles():

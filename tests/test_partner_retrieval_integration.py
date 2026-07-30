@@ -11,11 +11,11 @@ CONTEST = Path(__file__).parents[1] / "FloorSet" / "iccad2026contest"
 if str(CONTEST) not in sys.path:
     sys.path.insert(0, str(CONTEST))
 
-import my_opt_claude
-from candidate_supply_claude import CandidateBatch
-from my_opt_claude import FIRST_R4_RETRIEVAL_SLOTS, MyOptimizer, _select_ranked_source_quota
-from retrieval_features_claude import extract_retrieval_features
-from retrieval_index_claude import RetrievalResult
+import contest_optimizer
+from candidate_supply import CandidateBatch
+from contest_optimizer import FIRST_R4_RETRIEVAL_SLOTS, MyOptimizer, _select_ranked_source_quota
+from retrieval_features import extract_retrieval_features
+from retrieval_index import RetrievalResult
 
 
 def _inputs():
@@ -63,8 +63,8 @@ def test_missing_or_zero_retrieval_env_never_loads_index(monkeypatch):
 
     monkeypatch.setattr(MyOptimizer, "_load_model", lambda self: None)
     monkeypatch.setattr(MyOptimizer, "_load_direct_model", lambda self: None)
-    monkeypatch.setattr(my_opt_claude, "init_worker_pool", lambda _workers: None)
-    monkeypatch.setattr("retrieval_index_claude.RetrievalIndex.load", lambda path: calls.append(path))
+    monkeypatch.setattr(contest_optimizer, "init_worker_pool", lambda _workers: None)
+    monkeypatch.setattr("retrieval_index.RetrievalIndex.load", lambda path: calls.append(path))
     monkeypatch.delenv("PARTNER_RETRIEVAL_INDEX", raising=False)
     monkeypatch.setenv("PARTNER_RETRIEVAL_SLOTS", "2")
     MyOptimizer(device="cpu")
@@ -77,8 +77,8 @@ def test_missing_or_zero_retrieval_env_never_loads_index(monkeypatch):
 def test_corrupt_index_fails_closed(monkeypatch):
     monkeypatch.setattr(MyOptimizer, "_load_model", lambda self: None)
     monkeypatch.setattr(MyOptimizer, "_load_direct_model", lambda self: None)
-    monkeypatch.setattr(my_opt_claude, "init_worker_pool", lambda _workers: None)
-    monkeypatch.setattr("retrieval_index_claude.RetrievalIndex.load", lambda _path: (_ for _ in ()).throw(ValueError("bad")))
+    monkeypatch.setattr(contest_optimizer, "init_worker_pool", lambda _workers: None)
+    monkeypatch.setattr("retrieval_index.RetrievalIndex.load", lambda _path: (_ for _ in ()).throw(ValueError("bad")))
     monkeypatch.setenv("PARTNER_RETRIEVAL_INDEX", "corrupt")
     monkeypatch.setenv("PARTNER_RETRIEVAL_SLOTS", "2")
     optimizer = MyOptimizer(device="cpu")
@@ -89,8 +89,8 @@ def test_corrupt_index_fails_closed(monkeypatch):
 def test_retrieval_env_slots_are_hard_capped_to_first_r4_capacity(monkeypatch):
     monkeypatch.setattr(MyOptimizer, "_load_model", lambda self: None)
     monkeypatch.setattr(MyOptimizer, "_load_direct_model", lambda self: None)
-    monkeypatch.setattr(my_opt_claude, "init_worker_pool", lambda _workers: None)
-    monkeypatch.setattr("retrieval_index_claude.RetrievalIndex.load", lambda _path: object())
+    monkeypatch.setattr(contest_optimizer, "init_worker_pool", lambda _workers: None)
+    monkeypatch.setattr("retrieval_index.RetrievalIndex.load", lambda _path: object())
     monkeypatch.setenv("PARTNER_RETRIEVAL_INDEX", "pilot64")
     monkeypatch.setenv("PARTNER_RETRIEVAL_SLOTS", "5")
     optimizer = MyOptimizer(device="cpu")
@@ -111,9 +111,9 @@ def test_retrieval_matches_soft_d4_metadata_and_hard_anchors(monkeypatch):
     seen = []
     # _sample_retrieval_preds imports the retrieval helpers lazily (the channel
     # is opt-in), so the spy has to live on the source module.
-    import retrieval_transfer_claude
-    original = retrieval_transfer_claude.remap_boundary_node_features
-    monkeypatch.setattr(retrieval_transfer_claude, "remap_boundary_node_features", lambda nodes, transform: (seen.append(transform), original(nodes, transform))[1])
+    import retrieval_transfer
+    original = retrieval_transfer.remap_boundary_node_features
+    monkeypatch.setattr(retrieval_transfer, "remap_boundary_node_features", lambda nodes, transform: (seen.append(transform), original(nodes, transform))[1])
     batch = _optimizer(index)._sample_retrieval_preds(2, area, constraints, targets, b2b, p2b, pins, 2)
     assert seen == ["identity", "mirror_x", "mirror_y", "transpose"]
     assert batch.source == "retrieval"
@@ -174,7 +174,7 @@ def test_portfolio_defensively_caps_env_slots_to_two_and_keeps_three_direct(monk
 
 
 def test_gate_runner_uses_pilot64_two_slots_and_identical_direct_minimum():
-    text = (my_opt_claude.Path(__file__).parents[1] / "scripts/probes/run_retrieval_gate.sh").read_text()
+    text = (contest_optimizer.Path(__file__).parents[1] / "scripts/probes/run_retrieval_gate.sh").read_text()
     assert "artifacts/retrieval/pilot64" in text
     assert 'INDEX="$ROOT/artifacts/retrieval/pilot64"' in text
     assert 'PARTNER_RETRIEVAL_INDEX="$INDEX"' in text

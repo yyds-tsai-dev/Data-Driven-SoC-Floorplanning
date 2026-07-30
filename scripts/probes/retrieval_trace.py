@@ -32,11 +32,11 @@ for import_path in (
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
-from candidate_supply_claude import CandidateBatch
-import legalizer_claude
-from legalizer_claude import _worker_refine
+from candidate_supply import CandidateBatch
+import column_sa_legalizer
+from column_sa_legalizer import _worker_refine
 from lite_dataset_test import FloorplanDatasetLiteTest
-from my_opt_claude import FIRST_R4_RETRIEVAL_SLOTS, MyOptimizer, _select_ranked_source_quota
+from contest_optimizer import FIRST_R4_RETRIEVAL_SLOTS, MyOptimizer, _select_ranked_source_quota
 
 
 def parse_case_ids(value: str) -> list[int]:
@@ -130,7 +130,7 @@ def resolve_selection_k(block_count: int, selection_k: str | int) -> int:
     if selection_k != "auto":
         return int(selection_k)
     try:
-        pool_size = max(0, int(legalizer_claude._POOL_SIZE))
+        pool_size = max(0, int(column_sa_legalizer._POOL_SIZE))
     except (TypeError, ValueError):
         pool_size = 0
     if pool_size == 0:

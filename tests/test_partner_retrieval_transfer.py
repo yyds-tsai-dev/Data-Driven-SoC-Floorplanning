@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from retrieval_matching_claude import hungarian_min_cost, match_blocks
-from retrieval_transfer_claude import (
+from retrieval_matching import hungarian_min_cost, match_blocks
+from retrieval_transfer import (
     apply_d4_rectangles,
     remap_boundary_node_features,
     transfer_layout,

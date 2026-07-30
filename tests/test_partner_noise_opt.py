@@ -1,4 +1,4 @@
-"""Mechanism tests for initial-noise optimization (partner/noise_opt_claude.py).
+"""Mechanism tests for initial-noise optimization (partner/noise_optimization.py).
 
 Covers: (1) sample_flow_diff is numerically identical to the frozen no_grad
 sample_flow on the same draws, (2) optimize_noise drives a toy energy down while
@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import torch
 
-from flow_matching_claude import sample_flow
-from noise_opt_claude import (
+from flow_matching_model import sample_flow
+from noise_optimization import (
     NoiseOptConfig,
     make_direct_sampler,
     optimize_noise,
@@ -118,7 +118,7 @@ def _direct_draws(shape, steps, has_known, seed):
 
 
 def test_sample_direct_diff_matches_sample_direct_no_known():
-    from direct_model_claude import sample_direct
+    from direct_diffusion_model import sample_direct
     from diffusion_model import DiffusionSchedule
     model = ZScaledVelocity()
     cond = _condition()
@@ -132,7 +132,7 @@ def test_sample_direct_diff_matches_sample_direct_no_known():
 
 
 def test_sample_direct_diff_matches_sample_direct_with_known():
-    from direct_model_claude import sample_direct
+    from direct_diffusion_model import sample_direct
     from diffusion_model import DiffusionSchedule
     model = ZScaledVelocity()
     cond = _condition()

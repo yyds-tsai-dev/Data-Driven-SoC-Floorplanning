@@ -1,5 +1,5 @@
 """Contract tests for the DPM-Solver++(2M) direct sampler
-(partner/direct_model_claude.py::sample_direct_dpmpp).
+(partner/direct_diffusion_model.py::sample_direct_dpmpp).
 
 Covers: (1) steps=1 is bitwise-identical to DDIM (both collapse to a single
 x0 readout), (2) both samplers track the same probability-flow ODE — the
@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import torch
 
 from diffusion_model import DiffusionSchedule
-from direct_model_claude import sample_direct, sample_direct_dpmpp
+from direct_diffusion_model import sample_direct, sample_direct_dpmpp
 
 
 class ZScaledV(torch.nn.Module):

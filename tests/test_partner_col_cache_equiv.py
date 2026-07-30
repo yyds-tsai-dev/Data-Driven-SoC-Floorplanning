@@ -32,7 +32,7 @@ for _p in (ROOT / "partner", ROOT / "FloorSet"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-import legalizer_claude as lg  # noqa: E402
+import column_sa_legalizer as lg  # noqa: E402
 
 try:
     from lite_dataset_test import FloorplanDatasetLiteTest

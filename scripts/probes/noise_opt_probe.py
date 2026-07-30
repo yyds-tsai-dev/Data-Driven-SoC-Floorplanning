@@ -121,12 +121,12 @@ def main():
         os.environ.setdefault("PARTNER_FLOW_SLOTS", "1")
     os.environ.setdefault("PARTNER_PRESCREEN_V", "1")
 
-    from my_opt_claude import MyOptimizer
-    from direct_train_claude import fast_condition
-    from direct_model_claude import known_z_channels
+    from contest_optimizer import MyOptimizer
+    from direct_diffusion_train import fast_condition
+    from direct_diffusion_model import known_z_channels
     from diffusion_data import layout_scale, z_to_rectangles
-    from physics_guidance_claude import build_context
-    from noise_opt_claude import (NoiseOptConfig, optimize_noise,
+    from physics_guidance import build_context
+    from noise_optimization import (NoiseOptConfig, optimize_noise,
                                   sample_flow_diff, sample_direct_diff,
                                   make_direct_sampler)
 

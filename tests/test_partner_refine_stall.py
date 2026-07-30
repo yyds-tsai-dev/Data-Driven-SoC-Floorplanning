@@ -30,8 +30,8 @@ for _p in (ROOT / "partner", ROOT / "FloorSet"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-import legalizer_claude as lg      # noqa: E402
-import refiner_claude as rf        # noqa: E402
+import column_sa_legalizer as lg      # noqa: E402
+import layout_refiner as rf        # noqa: E402
 
 _ENV = ("PARTNER_REFINE_STALL_STOP", "PARTNER_REFINE_STALL_WINDOW",
         "PARTNER_REFINE_STALL_EPS")

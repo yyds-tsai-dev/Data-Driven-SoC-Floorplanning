@@ -6,7 +6,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "partner"))
 
-from physics_guidance_claude import (GuidanceContext, guidance_energy,
+from physics_guidance import (GuidanceContext, guidance_energy,
                                      rects_from_z)
 
 
@@ -94,7 +94,7 @@ def test_padding_blocks_contribute_nothing():
     assert e.item() < 1e-8            # only one real block: no overlap, boundary un-coded
 
 
-from physics_guidance_claude import GuidanceConfig, guide_x0, make_guidance
+from physics_guidance import GuidanceConfig, guide_x0, make_guidance
 
 
 def test_guide_x0_reduces_overlap_energy():
@@ -134,7 +134,7 @@ def test_guide_x0_respects_trust_radius():
     assert float((out - z).abs().max()) <= 0.03 + 1e-6
 
 
-from direct_model_claude import sample_direct
+from direct_diffusion_model import sample_direct
 
 
 class _TinyDenoiser(torch.nn.Module):
@@ -201,7 +201,7 @@ def test_sample_direct_guidance_changes_output_and_keeps_anchors():
 
 
 def test_build_context_parses_constraint_columns():
-    from physics_guidance_claude import build_context
+    from physics_guidance import build_context
     n = 3
     at = torch.tensor([[100.0, 25.0, -1.0]])          # third = padding
     cons = torch.zeros(1, 3, 5)

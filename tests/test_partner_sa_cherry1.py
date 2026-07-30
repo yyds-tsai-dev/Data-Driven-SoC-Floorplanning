@@ -1,5 +1,5 @@
 """Cherry-pick batch 1: the two src-only SA components ported into the
-partner legalizer fork (`partner/legalizer_claude.py`).
+partner legalizer fork (`partner/column_sa_legalizer.py`).
 
 1. `PARTNER_FASTSA_TEMP=1` -> Chen-Chang ISPD'05 three-stage cooling law
    (`_fastsa_temp`, a verbatim copy of the src helper) replaces the geometric
@@ -28,7 +28,7 @@ for _p in (ROOT / "partner", ROOT / "FloorSet"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-import legalizer_claude as lg  # noqa: E402
+import column_sa_legalizer as lg  # noqa: E402
 
 T0, T1 = 0.02, 0.0008           # the probe()/finish() anchors the port keeps
 K, C, STEPS = 7.0, 100.0, 41.0  # paper (k=7, c=100) + our frac->index span

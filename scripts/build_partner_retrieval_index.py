@@ -23,8 +23,8 @@ for import_path in (REPO_ROOT / "FloorSet", REPO_ROOT / "partner"):
         sys.path.insert(0, str(import_path))
 
 from lite_dataset import FloorplanDatasetLite
-from retrieval_features_claude import extract_retrieval_features
-from retrieval_index_claude import RetrievalIndex, RetrievalShard, save_index
+from retrieval_features import extract_retrieval_features
+from retrieval_index import RetrievalIndex, RetrievalShard, save_index
 
 
 FEATURE_VERSION = 1

@@ -63,7 +63,7 @@ def main():
     import numpy as np
     import torch
     from litetestLoader import FloorplanDatasetLiteTest
-    from my_opt_claude import MyOptimizer
+    from contest_optimizer import MyOptimizer
 
     dataset = FloorplanDatasetLiteTest("../")
     out = []

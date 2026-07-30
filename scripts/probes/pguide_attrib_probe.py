@@ -36,7 +36,7 @@ def main():
     import torch
     from pguide_quick_probe import load_case, _overlap_area
     from litetestLoader import FloorplanDatasetLiteTest
-    from my_opt_claude import MyOptimizer
+    from contest_optimizer import MyOptimizer
 
     dataset = FloorplanDatasetLiteTest("../")
     opt = MyOptimizer()

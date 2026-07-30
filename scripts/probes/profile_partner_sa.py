@@ -59,7 +59,7 @@ def load_case(case: int):
 
 
 def build_opt(n, area_target, b2b, p2b, pins, constraints, target, budget, seed):
-    import legalizer_claude as lg
+    import column_sa_legalizer as lg
     seeds = []
     for i in range(n):
         a = max(float(area_target[i]), 1e-9)

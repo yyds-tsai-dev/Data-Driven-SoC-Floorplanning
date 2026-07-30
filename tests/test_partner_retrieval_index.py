@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from retrieval_index_claude import RetrievalIndex, RetrievalShard, save_index
+from retrieval_index import RetrievalIndex, RetrievalShard, save_index
 
 
 def _shard() -> RetrievalShard:

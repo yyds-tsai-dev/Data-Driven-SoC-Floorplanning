@@ -29,7 +29,7 @@ OUT="$ROOT/artifacts/partner_eval/flow_${VARIANT}.json"
 cd "$ROOT/FloorSet/iccad2026contest"
 echo "VARIANT=$VARIANT -> $OUT"
 uv run python "$ROOT/scripts/iccad2026_evaluate.py" \
-  --data-path ../ --evaluate "$ROOT/partner/my_opt_claude.py" \
+  --data-path ../ --evaluate "$ROOT/partner/contest_optimizer.py" \
   --output "$OUT" 2>&1 | tail -5
 
 uv run python - "$OUT" "$VARIANT" "$ROOT" << 'EOF'

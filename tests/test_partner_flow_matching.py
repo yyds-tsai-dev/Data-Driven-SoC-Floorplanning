@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flow_matching_claude import endpoint_from_velocity, flow_path, sample_flow
+from flow_matching_model import endpoint_from_velocity, flow_path, sample_flow
 
 
 class ConstantVelocity(torch.nn.Module):
@@ -154,7 +154,7 @@ def test_known_channels_follow_one_noise_path_through_heun_stages():
 
 def test_self_condition_aspect_channel_is_clamped():
     """Sampler must clamp the aspect channel of self-conditioning to match
-    the training-side clamp (flow_train_claude.py), else train/sample skew."""
+    the training-side clamp (flow_matching_train.py), else train/sample skew."""
     captured = []
 
     class RecordingModel(torch.nn.Module):

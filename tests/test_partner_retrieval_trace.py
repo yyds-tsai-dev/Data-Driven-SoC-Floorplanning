@@ -137,7 +137,7 @@ def test_case_trace_builds_evaluator_faithful_anchors_from_golden_layout(monkeyp
 
 def test_auto_selection_k_reads_live_legalizer_pool_capacity(monkeypatch):
     trace = _load_trace_module()
-    monkeypatch.setattr(trace.legalizer_claude, "_POOL_SIZE", 24)
+    monkeypatch.setattr(trace.column_sa_legalizer, "_POOL_SIZE", 24)
     monkeypatch.setenv("PARTNER_NREF", "15")
     monkeypatch.setenv("PARTNER_NREF_MIN_N", "95")
 
@@ -147,7 +147,7 @@ def test_auto_selection_k_reads_live_legalizer_pool_capacity(monkeypatch):
 
 def test_auto_selection_k_matches_production_minimum_for_small_live_pool(monkeypatch):
     trace = _load_trace_module()
-    monkeypatch.setattr(trace.legalizer_claude, "_POOL_SIZE", 2)
+    monkeypatch.setattr(trace.column_sa_legalizer, "_POOL_SIZE", 2)
     monkeypatch.setenv("PARTNER_NREF", "15")
     monkeypatch.setenv("PARTNER_NREF_MIN_N", "95")
 
@@ -258,4 +258,4 @@ def test_trace_module_does_not_contain_index_build_or_production_writes():
 
     assert "save_index(" not in text
     assert "build_partner_retrieval_index" not in text
-    assert "partner/my_opt_claude.py" not in text
+    assert "partner/contest_optimizer.py" not in text

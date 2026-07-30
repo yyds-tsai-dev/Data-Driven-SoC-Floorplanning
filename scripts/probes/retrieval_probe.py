@@ -18,10 +18,10 @@ for import_path in (REPO_ROOT / "FloorSet", REPO_ROOT / "partner"):
         sys.path.insert(0, str(import_path))
 
 from lite_dataset_test import FloorplanDatasetLiteTest
-from retrieval_features_claude import extract_retrieval_features
-from retrieval_index_claude import RetrievalIndex
-from retrieval_matching_claude import MatchResult, match_blocks
-from retrieval_transfer_claude import remap_boundary_node_features, transfer_layout
+from retrieval_features import extract_retrieval_features
+from retrieval_index import RetrievalIndex
+from retrieval_matching import MatchResult, match_blocks
+from retrieval_transfer import remap_boundary_node_features, transfer_layout
 
 
 MATCH_MAX_COST = 2.0

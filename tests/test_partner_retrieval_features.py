@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from retrieval_features_claude import RetrievalFeatures, extract_retrieval_features
+from retrieval_features import RetrievalFeatures, extract_retrieval_features
 
 
 def _instance():
