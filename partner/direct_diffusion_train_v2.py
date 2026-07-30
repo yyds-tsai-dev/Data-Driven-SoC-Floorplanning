@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """v2 trainer for the direct-prediction model — run on a second machine.
 
-Deltas vs direct_train_claude.py (v1), each targeting a measured v1 gap:
+Deltas vs direct_diffusion_train.py (v1), each targeting a measured v1 gap:
 
   1. Block-count loss weighting  exp((n-60)/60), clipped [0.5, 3].
      v1's error is tail-heavy (p90 = 2.7x median) exactly on the large
@@ -22,13 +22,13 @@ Deltas vs direct_train_claude.py (v1), each targeting a measured v1 gap:
 
 Feature set / z-repr / sampler are IDENTICAL to v1 on purpose: a v2
 checkpoint drops into the same inference path (direct_eval_claude,
-my_opt_claude via DIRECT_CKPT env) with zero code changes and zero
+contest_optimizer via DIRECT_CKPT env) with zero code changes and zero
 train/test-skew risk.
 
 Second-machine setup:
   git clone <repo> && cd FloorSet/iccad2026contest
   # dataset (~24 GB) auto-downloads on first run via lite_dataset
-  python3 direct_train_v2_claude.py --checkpoint-dir checkpoints/direct_v2 \
+  python3 direct_diffusion_train_v2.py --checkpoint-dir checkpoints/direct_v2 \
       --amp --batch-size 12 --max-steps 800000 --num-workers 4
   # resume: append  --resume latest
   # bigger GPU (>=24GB, A100/4090): --batch-size 24 --lr 1.1e-4
@@ -50,9 +50,9 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import direct_train_claude as V1
+import direct_diffusion_train as V1
 from diffusion_data import fp_sol_to_z0, z_to_rectangles
-from direct_model_claude import known_z_channels
+from direct_diffusion_model import known_z_channels
 from diffusion_train import known_target_positions_from_fp
 
 

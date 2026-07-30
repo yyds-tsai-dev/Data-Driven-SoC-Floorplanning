@@ -5,7 +5,7 @@ Pipeline per test case:
   1. Deterministic heuristic seed layout (pin/graph-weighted centroids).
   2. Optional graph-conditioned diffusion refinement of the seed (the seed
      only provides relative-position hints; a few DDIM steps suffice).
-  3. legalizer_claude.legalize_rectangles: column-slicing layout with
+  3. column_sa_legalizer.legalize_rectangles: column-slicing layout with
      hard-constraint guarantees plus a time-budgeted simulated-annealing
      search that minimizes HPWL / bbox area / soft violations.
 
@@ -30,16 +30,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import os
 
-from candidate_supply_claude import CandidateBatch, allocate_quotas, rank_predictions
+from candidate_supply import CandidateBatch, allocate_quotas, rank_predictions
 from iccad2026_evaluate import FloorplanOptimizer
 from diffusion_data import build_condition, fp_sol_to_z0, layout_scale, z_to_rectangles
 from diffusion_model import DiffusionSchedule, GraphDiffusionDenoiser, ModelConfig, ddim_refine
-from legalizer_claude import (_ColumnOptimizer, _ensure_no_overlap,
+from column_sa_legalizer import (_ColumnOptimizer, _ensure_no_overlap,
                               _parse_constraints, _target, init_worker_pool,
                               legalize_rectangles, rectangles_from_z)
-from refiner_claude import full_violations, refine_prediction
+from layout_refiner import full_violations, refine_prediction
 
-# The retrieval channel (retrieval_*_claude) is opt-in: it only runs when both
+# The retrieval channel (retrieval_*) is opt-in: it only runs when both
 # PARTNER_RETRIEVAL_INDEX and PARTNER_RETRIEVAL_SLOTS are set.  Its modules are
 # imported lazily inside _sample_retrieval_preds so a deployment that ships
 # only the active channels (Direct + flow + column) needs no retrieval sources.
@@ -158,7 +158,7 @@ class MyOptimizer(FloorplanOptimizer):
         requested_slots = _env_int("PARTNER_RETRIEVAL_SLOTS", 0)
         if retrieval_path and requested_slots > 0:
             try:
-                from retrieval_index_claude import RetrievalIndex
+                from retrieval_index import RetrievalIndex
                 self.retrieval_index = RetrievalIndex.load(Path(retrieval_path))
                 self.retrieval_slots = min(requested_slots, FIRST_R4_RETRIEVAL_SLOTS)
             except Exception as exc:
@@ -177,7 +177,7 @@ class MyOptimizer(FloorplanOptimizer):
         if os.environ.get("DIRECT_OFF"):
             return
         try:
-            from direct_model_claude import DirectDenoiser, DirectModelConfig
+            from direct_diffusion_model import DirectDenoiser, DirectModelConfig
             env_path = os.environ.get("DIRECT_CKPT")
             if env_path:
                 path = Path(env_path)
@@ -221,10 +221,10 @@ class MyOptimizer(FloorplanOptimizer):
         if not path or slots <= 0 or not Path(path).exists():
             return
         try:
-            from flow_train_claude import checkpoint_method
+            from flow_matching_train import checkpoint_method
             ckpt = torch.load(path, map_location=self.device, weights_only=False)
             checkpoint_method(ckpt)
-            from direct_model_claude import DirectDenoiser, DirectModelConfig
+            from direct_diffusion_model import DirectDenoiser, DirectModelConfig
             cfg = DirectModelConfig(**{k: v for k, v in ckpt["model_config"].items()
                                        if k in DirectModelConfig.__dataclass_fields__})
             model = DirectDenoiser(cfg).to(self.device)
@@ -331,7 +331,7 @@ class MyOptimizer(FloorplanOptimizer):
             # above AND after the column restarts are dispatched (GPU
             # contention here once starved mid-size cases' SA budget and
             # regressed the full validation to 1.262).
-            import legalizer_claude as _lg
+            import column_sa_legalizer as _lg
             direct_box: List = []
             th = None
             sample_fn = None
@@ -390,7 +390,7 @@ class MyOptimizer(FloorplanOptimizer):
         """Post-pass: targeted elimination of residual soft violations
         (boundary / grouping / MIB) via exact candidate enumeration with an
         evaluator-faithful acceptance test.  Contained: any failure —
-        including an absent vkill_claude module — returns `out` unchanged.
+        including an absent violation_killer module — returns `out` unchanged.
         Runs until the absolute deadline `t_kill` (carved out of the case
         budget by solve, so per-case wall-clock is unchanged).  Opt-in via
         VKILL=1 (bare defaults keep the original pipeline byte-identical);
@@ -398,7 +398,7 @@ class MyOptimizer(FloorplanOptimizer):
         if not os.environ.get("VKILL") or os.environ.get("VKILL_OFF"):
             return out
         try:
-            from vkill_claude import kill_violations
+            from violation_killer import kill_violations
             return kill_violations(
                 out, at, cons, tpos, b2b, p2b, pins,
                 budget=max(0.2, t_kill - time.time()),
@@ -409,8 +409,8 @@ class MyOptimizer(FloorplanOptimizer):
     def _sample_direct_raw_preds(self, n, at, cons, tpos, b2b, p2b, pins,
                                  K, oversample: bool = True) -> List[np.ndarray]:
         """Generate the baseline bounded Direct batch before prescreening."""
-        from direct_train_claude import fast_condition
-        from direct_model_claude import (known_z_channels, sample_direct,
+        from direct_diffusion_train import fast_condition
+        from direct_diffusion_model import (known_z_channels, sample_direct,
                                          sample_direct_dpmpp)
         dev = self.device
         at_d = at.unsqueeze(0).to(dev)
@@ -461,7 +461,7 @@ class MyOptimizer(FloorplanOptimizer):
                       for k, v in cond.items()}
             guide = None
             if os.environ.get("PARTNER_PHYSICS_GUIDE") == "1":
-                from physics_guidance_claude import (GuidanceConfig,
+                from physics_guidance import (GuidanceConfig,
                                                      build_context,
                                                      make_guidance)
                 ctx = build_context(at_d, cons_d, b2b.to(dev), scale,
@@ -494,7 +494,7 @@ class MyOptimizer(FloorplanOptimizer):
         # Opt-in flow-matching candidate source (default off): replaces a
         # fixed slice of the Direct batch with flow samples so the total
         # candidate count handed to the refine ladder is UNCHANGED
-        # (replace-not-add) -- see candidate_supply_claude.allocate_quotas.
+        # (replace-not-add) -- see candidate_supply.allocate_quotas.
         if self.flow_model is not None:
             flow_slots = _env_int("PARTNER_FLOW_SLOTS", 0)
             if flow_slots > 0 and preds:
@@ -522,9 +522,9 @@ class MyOptimizer(FloorplanOptimizer):
         PARTNER_FLOW_ANTITHETIC=1 (V-A, +/-z paired seeds), PARTNER_FLOW_ZORDER=1
         (V-B, zero-order neighborhood resample), PARTNER_FLOW_NOPT=hybrid
         (V-C/D, gradient noise-opt on the flow channel)."""
-        from direct_train_claude import fast_condition
-        from direct_model_claude import known_z_channels
-        from flow_matching_claude import sample_flow
+        from direct_diffusion_train import fast_condition
+        from direct_diffusion_model import known_z_channels
+        from flow_matching_model import sample_flow
         dev = self.device
         at_d = at.unsqueeze(0).to(dev)
         cons_d = cons.unsqueeze(0).to(dev)
@@ -553,7 +553,7 @@ class MyOptimizer(FloorplanOptimizer):
         if os.environ.get("PARTNER_FLOW_ANTITHETIC"):
             # V-A: antithetic +/-z coverage (arXiv 2506.06185). known_noise is
             # shared within each pair so only the free seed is mirrored.
-            from noise_opt_claude import sample_flow_diff
+            from noise_optimization import sample_flow_diff
             N = cond["mask"].shape[1]
             zdim = self.flow_cfg.z_dim
             valid = cond_k["mask"].unsqueeze(-1)
@@ -603,8 +603,8 @@ class MyOptimizer(FloorplanOptimizer):
         Pure forward, stochastic (no gradient collapse -> dodges failure mode A;
         selection stays overlap-driven)."""
         import time as _time
-        from physics_guidance_claude import build_context, guidance_energy_per_sample
-        from noise_opt_claude import sample_flow_diff
+        from physics_guidance import build_context, guidance_energy_per_sample
+        from noise_optimization import sample_flow_diff
         dev = self.device
         z_repr = self.flow_cfg.z_repr
         ex, ex_cond, N, zdim, _v, _hk, steps, solver = self._flow_setup(cond, K)
@@ -669,8 +669,8 @@ class MyOptimizer(FloorplanOptimizer):
         and whether the flow 8-step unroll avoids the DDIM-25 hpwl stall.
         Optional batch-repulsion (V-D) via PGUIDE_W_REP."""
         import time as _time
-        from physics_guidance_claude import build_context, guidance_energy_per_sample
-        from noise_opt_claude import NoiseOptConfig, optimize_noise, sample_flow_diff
+        from physics_guidance import build_context, guidance_energy_per_sample
+        from noise_optimization import NoiseOptConfig, optimize_noise, sample_flow_diff
         dev = self.device
         z_repr = self.flow_cfg.z_repr
         ex, ex_cond, N, zdim, _v, _hk, steps, solver = self._flow_setup(cond, K)
@@ -763,8 +763,8 @@ class MyOptimizer(FloorplanOptimizer):
         (candidate count unchanged -- replace-not-add). Any failure raises and
         the caller falls back to the untouched default sampler."""
         import time as _time
-        from physics_guidance_claude import build_context, guidance_energy_per_sample
-        from noise_opt_claude import (NoiseOptConfig, optimize_noise,
+        from physics_guidance import build_context, guidance_energy_per_sample
+        from noise_optimization import (NoiseOptConfig, optimize_noise,
                                       sample_direct_diff, make_direct_sampler)
         dev = self.device
         model, sched = self.direct_model, self.direct_schedule
@@ -923,9 +923,9 @@ class MyOptimizer(FloorplanOptimizer):
             return self._empty_retrieval_batch(started)
 
         try:
-            from retrieval_features_claude import extract_retrieval_features
-            from retrieval_matching_claude import match_blocks
-            from retrieval_transfer_claude import (remap_boundary_node_features,
+            from retrieval_features import extract_retrieval_features
+            from retrieval_matching import match_blocks
+            from retrieval_transfer import (remap_boundary_node_features,
                                                    transfer_layout)
             area = at[:n].detach().cpu().numpy()
             constraints = cons[:n].detach().cpu().numpy()

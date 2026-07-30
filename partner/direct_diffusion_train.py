@@ -37,7 +37,7 @@ Usage (1+ week run on the shared L4 — survives kills, auto-resumes):
       > direct_v1.log 2>&1 &
 
 One-off / manual:
-  python3 direct_train_claude.py --checkpoint-dir checkpoints/direct_v1 \
+  python3 direct_diffusion_train.py --checkpoint-dir checkpoints/direct_v1 \
       --amp --batch-size 16 --max-steps 600000 --num-workers 4
 """
 
@@ -70,7 +70,7 @@ from diffusion_model import DiffusionSchedule
 # diffusion_train is a training-only dependency (known_target_positions_from_fp
 # is used by train_step alone), imported lazily so inference-side consumers of
 # fast_condition do not pull in the v1 diffusion trainer.
-from direct_model_claude import (DirectDenoiser, DirectModelConfig, EMA,
+from direct_diffusion_model import (DirectDenoiser, DirectModelConfig, EMA,
                                  known_z_channels)
 
 

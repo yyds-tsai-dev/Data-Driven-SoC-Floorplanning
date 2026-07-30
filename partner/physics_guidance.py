@@ -3,7 +3,7 @@ layouts (z-space), used by the Direct DDIM and Flow samplers.
 
 Standalone by design: mirrors the xyaspect decode of
 ``diffusion_data.z_to_rectangles`` and the boundary-code semantics of
-``my_opt_claude._viol_est`` (self-referential arrangement bbox), but does
+``contest_optimizer._viol_est`` (self-referential arrangement bbox), but does
 not import either (z_to_rectangles is non-differentiable w.r.t. our use:
 it hard-overwrites anchor channels).
 """

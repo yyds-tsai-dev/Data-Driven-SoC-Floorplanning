@@ -10,7 +10,7 @@ Design notes
 ------------
 * Convention. This straight-path flow integrates t=0 (noise) -> t=1 (data).
   The task's "z_T" is therefore the ``z`` at the *start* of the Euler loop.
-* Differentiability. ``flow_matching_claude.sample_flow`` is ``@torch.no_grad``
+* Differentiability. ``flow_matching_model.sample_flow`` is ``@torch.no_grad``
   and draws its own noise, so it cannot carry a gradient back to the seed. This
   module adds ``sample_flow_diff``: the identical numerics with autograd left on
   and the initial noise + known-channel noise passed in as fixed inputs. The
@@ -50,8 +50,8 @@ from typing import Callable, List, Mapping, Optional
 import torch
 import torch.utils.checkpoint
 
-from flow_matching_claude import endpoint_from_velocity
-from physics_guidance_claude import GuidanceContext, guidance_energy_per_sample
+from flow_matching_model import endpoint_from_velocity
+from physics_guidance import GuidanceContext, guidance_energy_per_sample
 
 
 # --------------------------------------------------------------------------- #
@@ -67,7 +67,7 @@ def sample_flow_diff(
     known_mask: torch.Tensor | None = None,
     known_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Autograd-enabled twin of ``flow_matching_claude.sample_flow``.
+    """Autograd-enabled twin of ``flow_matching_model.sample_flow``.
 
     Same Euler/Heun update, self-conditioning, and known-channel imposition as
     ``sample_flow`` -- but the initial noise ``z_init`` and (when anchoring) the
@@ -159,7 +159,7 @@ def sample_direct_diff(
     known_mask: torch.Tensor | None = None,
     grad_checkpoint: bool = False,
 ) -> torch.Tensor:
-    """Autograd-enabled twin of ``direct_model_claude.sample_direct`` (no guidance).
+    """Autograd-enabled twin of ``direct_diffusion_model.sample_direct`` (no guidance).
 
     Same v-prediction DDIM update, self-conditioning, per-step hard-anchor
     imposition, and aspect clamp -- but ``z_init`` and the per-step

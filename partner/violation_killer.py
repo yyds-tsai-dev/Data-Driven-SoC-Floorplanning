@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from legalizer_claude import _ColumnOptimizer, MIB_AREA_GUARD
+from column_sa_legalizer import _ColumnOptimizer, MIB_AREA_GUARD
 
 Rect = Tuple[float, float, float, float]
 
@@ -55,7 +55,7 @@ SWAP_CAP = 12         # wall-swap partners per boundary fix
 def kill_violations(out, area_targets, constraints, target_positions,
                     b2b, p2b, pins, budget: float = 6.0,
                     verbose: bool = False):
-    """Entry point used by my_opt_claude.MyOptimizer._violation_kill."""
+    """Entry point used by contest_optimizer.MyOptimizer._violation_kill."""
     try:
         res = _kill(list(out), area_targets, constraints, target_positions,
                     b2b, p2b, pins, float(budget), bool(verbose))
@@ -1037,7 +1037,7 @@ def _lns_pass(ctx: _Ctx, P: np.ndarray, cur_score: float, cur_V: int,
     pipeline lacks entirely: the SA moves one unit, the refiner applies
     local ops — neither can re-arrange ten blocks jointly.  Exact-cost
     accept, deterministic seeds (round r rips the r-th worst region)."""
-    from frame_repack_claude import _split_free, _prune
+    from frame_repack import _split_free, _prune
     opt = ctx.opt
     n = len(P)
     coded = set(int(i) for i in opt._bnd_idx)
@@ -1222,7 +1222,7 @@ def _kill(out: List[Rect], area_targets, constraints, target_positions,
             and not os.environ.get("VKILL_STAGE2_OFF")):
         t_end2 = t_end + _envf("VKILL_STAGE2_BUDGET", 0.0)
         try:
-            from refiner_claude import refine_prediction
+            from layout_refiner import refine_prediction
             for vw, seed in ((3.0, 7), (2.0, 11), (4.0, 13),
                              (3.0, 17), (2.0, 19)):
                 left = t_end2 - time.time()

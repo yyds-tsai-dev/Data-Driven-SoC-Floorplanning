@@ -53,7 +53,7 @@ MIB_AREA_GUARD = 0.0095    # stay under the 1% hard area tolerance
 
 
 # =============================================================================
-# Constraint parsing helpers (API kept for my_opt_claude.py)
+# Constraint parsing helpers (API kept for contest_optimizer.py)
 # =============================================================================
 def _col(constraints: Optional[torch.Tensor], n: int, idx: int) -> List[float]:
     if constraints is None or constraints.dim() < 2 or constraints.shape[1] <= idx:
@@ -110,7 +110,7 @@ def _fastsa_temp(frac: float, t0: float, t1: float,
 
 
 # =============================================================================
-# Rectangle reconstruction from diffusion z output (kept for my_opt_claude.py)
+# Rectangle reconstruction from diffusion z output (kept for contest_optimizer.py)
 # =============================================================================
 def rectangles_from_z(
     z: torch.Tensor,
@@ -2024,7 +2024,7 @@ class _ColumnOptimizer:
         # accepted only if the shared proxy cost does not regress
         if refine_t > 0.05 and time.time() < deadline - 0.1:
             try:
-                from refiner_claude import refine_positions
+                from layout_refiner import refine_positions
                 pos2 = refine_positions(self, pos, deadline - 0.05,
                                         seed=self.rng.randrange(1 << 30))
                 if pos2 is not None:
@@ -2872,7 +2872,7 @@ def _worker_refine(args):
     try:
         (pred, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
          deadline, seed, v_weight, tag_anchor) = args
-        from refiner_claude import refine_prediction, full_violations
+        from layout_refiner import refine_prediction, full_violations
         at = torch.from_numpy(areas_np)
         cons = torch.from_numpy(cons_np) if cons_np is not None else None
         tpos = torch.from_numpy(tpos_np) if tpos_np is not None else None
@@ -3138,7 +3138,7 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                         continue
                     Qr = np.asarray([list(r) for r in rep],
                                     dtype=np.float64)
-                    from refiner_claude import full_violations as _fv
+                    from layout_refiner import full_violations as _fv
                     hp2 = opt1._hpwl(Qr)
                     a2 = float(((Qr[:, 0] + Qr[:, 2]).max()
                                 - Qr[:, 0].min())

@@ -89,7 +89,7 @@ class _Refiner:
         self.hp0 = max(opt._hpwl(P), 1e-9)
 
         # -- refine stall early stop (PARTNER_REFINE_STALL_STOP=1, off) ----
-        # Companion to `PARTNER_SA_STALL_STOP` in legalizer_claude.py: `run`
+        # Companion to `PARTNER_SA_STALL_STOP` in column_sa_legalizer.py: `run`
         # breaks out of a search phase once `_key()` (the same proxy the
         # phase already computes each pass) has not improved by >= stall_eps
         # (relative) within one stall window.  The window is a fraction of
@@ -4616,7 +4616,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                     # re-place them into the frame's free space (MaxRects,
                     # reshape allowed, landing near the model's intent).
                     try:
-                        from frame_repack_claude import _split_free, _prune
+                        from frame_repack import _split_free, _prune
                         P = r.P
                         nn = len(P)
                         x0 = P[:, 0]
