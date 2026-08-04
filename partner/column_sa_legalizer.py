@@ -51,6 +51,56 @@ UTIL_TARGET_FRAME = 0.96   # utilization used to size the frame height
 UTIL_TARGET_REF = 0.97     # utilization used for the area cost reference
 MIB_AREA_GUARD = 0.0095    # stay under the 1% hard area tolerance
 
+_TRUE = ("1", "true", "True", "on", "ON")
+
+
+def _flag_on(name: str) -> bool:
+    """Shared `PARTNER_*` boolean env reader (same spelling set as the
+    existing inline checks)."""
+    return _os.environ.get(name, "0") in _TRUE
+
+
+def early_exit_on() -> bool:
+    """PARTNER_EARLY_EXIT=1 (default off): the fork is deadline-bounded, so
+    a converged stage must RETURN its unspent share to the case instead of
+    handing it to the next opportunistic consumer.  See
+    docs/design/2026-08-04-early-exit-true-time-reduction.md."""
+    return _flag_on("PARTNER_EARLY_EXIT")
+
+
+def early_exit_window(specific: str, default: float = 0.25) -> float:
+    """Stall-window fraction with the documented precedence:
+
+      1. the phase's own `PARTNER_*_STALL_WINDOW` when explicitly set,
+      2. `PARTNER_EARLY_EXIT_WINDOW` when PARTNER_EARLY_EXIT is on,
+      3. `default` (the historical stall-stop value).
+
+    The window is always a FRACTION of the phase's own span, so it scales
+    itself down with `PARTNER_BUDGET_MAX` (a 0.2 s/case regime gets a 0.2 s
+    -scaled window without any new tuning)."""
+    raw = _os.environ.get(specific)
+    if raw is None and early_exit_on():
+        raw = _os.environ.get("PARTNER_EARLY_EXIT_WINDOW")
+        default = 0.15
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val if 0.0 < val < 1.0 else default
+
+
+def early_exit_min_window() -> float:
+    """Absolute floor (seconds) under the fractional stall window.  At very
+    small budgets a fraction of a ~0.1 s span would stop a phase before its
+    first productive round; the floor costs nothing at the 3.5 s tier."""
+    try:
+        val = float(_os.environ.get("PARTNER_EARLY_EXIT_MIN_WINDOW", "0.05"))
+    except ValueError:
+        return 0.05
+    return val if val >= 0.0 else 0.05
+
 
 # =============================================================================
 # Constraint parsing helpers (API kept for contest_optimizer.py)
@@ -305,18 +355,28 @@ class _ColumnOptimizer:
         # only to stop the polish from eating the ceiling) is NOT ported:
         # here the reclaimed time flows naturally to the next restart, the
         # greedy polish and the refine stage.
+        #
+        # -- true time reduction (PARTNER_EARLY_EXIT=1, default off) ---------
+        # `PARTNER_SA_STALL_STOP` was measured quality-negative because the
+        # time it reclaimed had nowhere to go (finish() simply handed it to
+        # the greedy polish and the stage-2 refiner, and the case still ran
+        # to `worker_deadline`).  EARLY_EXIT keeps the same detector but
+        # changes the SEMANTICS: `finish` claws the unspent share back out of
+        # its own deadline, so a converged worker RETURNS early and the case
+        # wall clock drops below the budget.  EARLY_EXIT therefore implies
+        # the SA stall stop; an explicit PARTNER_SA_STALL_STOP=0 cannot turn
+        # it back off (the stop is what makes the exit possible), but the
+        # window/eps overrides still apply.
         self.stall_eps = 0.003
         self._stall_frac = 0.0
         self._anneal_stalled = False
-        if _os.environ.get("PARTNER_SA_STALL_STOP", "0") in (
-                "1", "true", "True", "on", "ON"):
-            try:
-                self._stall_frac = float(_os.environ.get(
-                    "PARTNER_SA_STALL_WINDOW", "0.25"))
-            except ValueError:
-                self._stall_frac = 0.25
-            if not (0.0 < self._stall_frac < 1.0):
-                self._stall_frac = 0.25
+        self._early_exit = early_exit_on()
+        # unspent tail of the probe chains, reclaimed by `run` /
+        # `legalize_rectangles` so it cannot inflate `finish` (EARLY_EXIT only)
+        self._probe_unspent = 0.0
+        if self._early_exit or _flag_on("PARTNER_SA_STALL_STOP"):
+            self._stall_frac = early_exit_window("PARTNER_SA_STALL_WINDOW",
+                                                 0.25)
             try:
                 self.stall_eps = float(_os.environ.get(
                     "PARTNER_SA_STALL_EPS", "0.003"))
@@ -1873,6 +1933,10 @@ class _ColumnOptimizer:
         # no rng. Disabled (bit-identical) when _stall_frac == 0.
         self._anneal_stalled = False
         stall_win = self._stall_frac * span if self._stall_frac > 0.0 else None
+        if stall_win is not None and self._early_exit:
+            # keep one productive outer iteration inside the window even when
+            # the case budget is tiny (0.2 s/case endgame)
+            stall_win = max(stall_win, early_exit_min_window())
         stall_eps = self.stall_eps
         stall_ref_cost = best_cost   # best_cost at the last window reset
         stall_ref_time = start
@@ -1974,11 +2038,15 @@ class _ColumnOptimizer:
     def probe(self, t_each: float) -> float:
         cands = sorted({max(2, self.C0 - 1), self.C0, min(18, self.C0 + 1)})
         results = []
+        self._probe_unspent = 0.0
         for C in cands:
             pc = self._init_columns(C)
             pcost, _ = self._evaluate(pc)
-            snap, bcost = self._anneal(pc, time.time() + t_each, pcost,
+            chain_end = time.time() + t_each
+            snap, bcost = self._anneal(pc, chain_end, pcost,
                                        t0=0.06, t1=0.01)
+            if self._early_exit:
+                self._probe_unspent += max(0.0, chain_end - time.time())
             results.append((bcost, snap))
         results.sort(key=lambda t: t[0])
         self._best_probe = results[0]
@@ -2001,12 +2069,21 @@ class _ColumnOptimizer:
         total = max(t_end - now, 0.1)
         runs = 2 if (total > 6.0 and max_runs >= 2) else 1
         snaps = []
+        # EARLY_EXIT clawback: every stage keeps its PLANNED share and returns
+        # the rest to the caller.  `saved` accumulates the unspent tail of the
+        # anneal chains; with the flag off it stays 0.0 and every expression
+        # below is bit-identical to the pre-port fork.
+        saved = 0.0
         for r in range(runs):
             cols_r = self._restore(start_snap)
             c_r, _ = self._evaluate(cols_r)
-            snap, _bc = self._anneal(cols_r, now + total * (r + 1) / runs, c_r,
-                                     recalibrate=True)
+            sub_end = now + total * (r + 1) / runs - saved
+            snap, _bc = self._anneal(cols_r, sub_end, c_r, recalibrate=True)
+            if self._early_exit:
+                saved += max(0.0, sub_end - time.time())
             snaps.append(snap)
+        if self._early_exit and saved > 0.0:
+            deadline = max(time.time(), deadline - saved)
         # pick the better run under one common (final) normalizer
         best_cols = None
         best_c = None
@@ -2018,7 +2095,14 @@ class _ColumnOptimizer:
                 best_cols = [list(c) for c in cols_c]
                 best_snap = snap
         cols = self._restore(best_snap)
-        cols = self._greedy_polish(cols, best_c, deadline - refine_t)
+        polish_end = deadline - refine_t
+        cols = self._greedy_polish(cols, best_c, polish_end)
+        # `_greedy_polish` is already convergence-bounded (`while improved`),
+        # so with EARLY_EXIT off its unspent tail silently inflates the
+        # stage-2 refiner slice; claw it back instead.
+        if self._early_exit:
+            deadline = max(time.time(),
+                           deadline - max(0.0, polish_end - time.time()))
         pos, x_right, y_top = self._layout(cols)
         # stage-2 continuous refinement (constraint-graph / weighted-median);
         # accepted only if the shared proxy cost does not regress
@@ -2049,9 +2133,12 @@ class _ColumnOptimizer:
             return self.locked_positions()
         self.prepare()
         budget = self.deadline - time.time()
+        deadline = self.deadline
         if budget > 2.5:
             self.probe(min(0.12 * budget, 2.0) / 3)
-        return self.finish(self.deadline)
+            if self._early_exit and self._probe_unspent > 0.0:
+                deadline = max(time.time(), deadline - self._probe_unspent)
+        return self.finish(deadline)
 
     def _spread_tagged(self, cols, cur_cost, deadline):
         """Move surplus bottom/top-tagged units (only the first / last unit
@@ -3288,6 +3375,9 @@ def legalize_rectangles(
     t_probe = min(0.20 * budget, 4.2) / 6.0
     p1 = opt1.probe(t_probe)
     p2 = opt2.probe(t_probe)
+    if opt1._early_exit:
+        deadline = max(time.time(),
+                       deadline - opt1._probe_unspent - opt2._probe_unspent)
     # probes are noisy; the normal orientation handles the common
     # many-left-tags pattern structurally better, so require a clear win
     if p2 < p1 * 0.96:

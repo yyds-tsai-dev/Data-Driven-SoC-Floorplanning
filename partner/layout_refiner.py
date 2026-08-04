@@ -46,6 +46,46 @@ CONTACT_TOL = 1e-9  # tolerance when recording exact cluster contacts
 TOUCH_TOL = 1e-7    # touching test for grouping checks (matches legalizer)
 
 
+_TRUE = ("1", "true", "True", "on", "ON")
+
+
+def _flag_on(name: str) -> bool:
+    return os.environ.get(name, "0") in _TRUE
+
+
+def early_exit_on() -> bool:
+    """PARTNER_EARLY_EXIT=1 (default off).  Mirror of the canonical helper in
+    column_sa_legalizer.py -- duplicated (12 lines) so this module keeps its
+    stand-alone import graph; see
+    docs/design/2026-08-04-early-exit-true-time-reduction.md."""
+    return _flag_on("PARTNER_EARLY_EXIT")
+
+
+def early_exit_window(specific: str, default: float = 0.25) -> float:
+    """Stall-window fraction: explicit phase env > PARTNER_EARLY_EXIT_WINDOW
+    (when EARLY_EXIT is on) > historical default."""
+    raw = os.environ.get(specific)
+    if raw is None and early_exit_on():
+        raw = os.environ.get("PARTNER_EARLY_EXIT_WINDOW")
+        default = 0.15
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val if 0.0 < val < 1.0 else default
+
+
+def early_exit_min_window() -> float:
+    """Absolute floor (seconds) under the fractional stall window."""
+    try:
+        val = float(os.environ.get("PARTNER_EARLY_EXIT_MIN_WINDOW", "0.05"))
+    except ValueError:
+        return 0.05
+    return val if val >= 0.0 else 0.05
+
+
 def _env_pos(name: str, default: float, hi: float) -> float:
     """Positive float env override; malformed or out of (0, hi] -> default."""
     raw = os.environ.get(name)
@@ -136,18 +176,19 @@ class _Refiner:
         # not do (it only re-spent the time inside the same worker).
         # Default off => decision logic unchanged, rng stream untouched
         # (the added predicates consume no randomness).
+        #
+        # PARTNER_EARLY_EXIT=1 additionally changes what happens to the
+        # reclaimed time: `run`'s discrete phase stops re-scaling its window
+        # to the (now large) leftover span, and `refine_prediction` claws the
+        # unspent tail back out of its own hard deadline instead of feeding
+        # it to the recompression retry.  EARLY_EXIT implies this stop.
         self.stall_eps = 0.002
         self._stall_frac = 0.0
         self._run_stalled = False
-        if os.environ.get("PARTNER_REFINE_STALL_STOP", "0") in (
-                "1", "true", "True", "on", "ON"):
-            try:
-                self._stall_frac = float(os.environ.get(
-                    "PARTNER_REFINE_STALL_WINDOW", "0.25"))
-            except ValueError:
-                self._stall_frac = 0.25
-            if not (0.0 < self._stall_frac < 1.0):
-                self._stall_frac = 0.25
+        self._early_exit = early_exit_on()
+        if self._early_exit or _flag_on("PARTNER_REFINE_STALL_STOP"):
+            self._stall_frac = early_exit_window(
+                "PARTNER_REFINE_STALL_WINDOW", 0.25)
             try:
                 self.stall_eps = float(os.environ.get(
                     "PARTNER_REFINE_STALL_EPS", "0.002"))
@@ -3737,6 +3778,9 @@ class _Refiner:
         stall_eps = self.stall_eps
         stall_win = (self._stall_frac * max(deadline - time.time(), 1e-6)
                      if self._stall_frac > 0.0 else None)
+        if stall_win is not None and self._early_exit:
+            stall_win = max(stall_win, early_exit_min_window())
+        t_run0 = time.time()
         ref_key = best_key
         ref_time = time.time()
         # CSA carve-out: a bounded slice of THIS phase's span, spent only at
@@ -3797,6 +3841,8 @@ class _Refiner:
                 stall = 0
             rounds += 1
 
+        phase1_span = max(time.time() - t_run0, 1e-6)
+
         # phase 2: discrete slot exchanges (global swap / re-insert), the
         # only move class that can change topology on a saturated packing;
         # each accepted move already improved the proxy, and a continuous
@@ -3818,8 +3864,22 @@ class _Refiner:
         # converged continuous phase must not veto it, and the time
         # squeeze/deflate spent must not be charged to it.
         if stall_win is not None:
-            stall_win = self._stall_frac * max(deadline - time.time(), 1e-6)
-            ref_key, ref_time = best_key, time.time()
+            now = time.time()
+            remaining = max(deadline - now, 1e-6)
+            if self._early_exit:
+                # The historical rescale ties the discrete window to the
+                # LEFTOVER span -- so a continuous phase that converged after
+                # 0.2 s of a 3 s slice hands the discrete phase a nearly
+                # full-size window, i.e. it re-spends exactly the wall clock
+                # this flag exists to give back.  Under EARLY_EXIT the window
+                # is tied to how long real progress actually took
+                # (`phase1_span`), never longer than the historical value.
+                stall_win = max(
+                    self._stall_frac * min(phase1_span, remaining),
+                    early_exit_min_window())
+            else:
+                stall_win = self._stall_frac * remaining
+            ref_key, ref_time = best_key, now
         while time.time() < deadline and stall2 < 4:
             if stall_win is not None:
                 now = time.time()
@@ -5000,7 +5060,19 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         r2._pred_c = pred_c
         r2.enable_deflate = True
         r2._anchor_frame_to_tags()
-        out = r2.run(deadline - 0.02)
+        run_end = deadline - 0.02
+        out = r2.run(run_end)
+        # EARLY_EXIT clawback: `run` is the search stage of this pipeline;
+        # steps 6/6.5/7 below are its repair + retry tail, sized off
+        # `t_hard`.  Without the clawback a converged `run` silently donates
+        # its unspent share to the step-7 recompression rerun (which reruns
+        # the WHOLE pipeline) -- that is the promoted stall-stop's quality
+        # mechanism, and the exact opposite of returning wall clock.  Shrink
+        # `t_hard` by the unspent share so the tail keeps its own reserve and
+        # nothing else, and the step-7 `t_hard - 2.5` gate self-disables when
+        # the retry no longer fits inside the planned span.
+        if r2._early_exit:
+            t_hard = max(time.time(), t_hard - max(0.0, run_end - time.time()))
 
         # -- 6. post-refine violation repair ---------------------------
         # Refinement can drift tagged blocks off the frame edges, break
