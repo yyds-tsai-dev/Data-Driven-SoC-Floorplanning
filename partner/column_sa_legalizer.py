@@ -2980,7 +2980,10 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         and _POOL_READY
     deadline_A = (t_pb + (deadline - t_pb) * (1.0 - _pb_frac)) \
         if phase_b else deadline
-    worker_deadline = deadline_A - 0.30
+    # Historical margin was a flat 0.30 s; below ~2 s of remaining budget that
+    # would eat the whole worker window, so scale it down proportionally
+    # (bit-identical for remaining >= 2.0 s, i.e. every pre-POOL_GATE case).
+    worker_deadline = deadline_A - min(0.30, 0.15 * max(0.0, deadline_A - t_pb))
     payloads = [(list(rects), np_of(area_targets), np_of(constraints),
                  np_of(target_positions), np_of(b2b), np_of(p2b), np_of(pins),
                  orient, cf, sd, worker_deadline, vw, hs)
@@ -3253,7 +3256,17 @@ def legalize_rectangles(
         return opt1.locked_positions()
     budget = deadline - time.time()
 
-    if _POOL is not None and _POOL_READY and budget > 3.0:
+    # PARTNER_POOL_GATE (default 3.0 = historical behavior): minimum remaining
+    # budget for the parallel restart portfolio.  The hard 3.0 gate was
+    # measured (2026-08-04 low-budget frontier) to be the entire +0.19 quality
+    # cliff between BUDGET_MAX=3.5 and 3.0 — below it every case ran the
+    # single-threaded chain and the direct/flow channels were never consumed.
+    # Set to 0 to let the pool engage at any budget (worker margin scales).
+    try:
+        _pool_gate = float(_os.environ.get("PARTNER_POOL_GATE", "3.0"))
+    except ValueError:
+        _pool_gate = 3.0
+    if _POOL is not None and _POOL_READY and budget > _pool_gate:
         try:
             return _parallel_solve(opt1, rects, area_targets, constraints,
                                    target_positions, b2b_connectivity,
