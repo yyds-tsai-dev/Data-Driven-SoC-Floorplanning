@@ -383,6 +383,19 @@ class _ColumnOptimizer:
             except ValueError:
                 self.stall_eps = 0.003
 
+        # -- flat-array numba layout kernel (PARTNER_SA_KERNEL=numba) --------
+        # Bit-exact transcription of `_layout_full` over structure-of-arrays
+        # buffers; see partner/sa_numeric_kernel.py. Default off.
+        self._sa_kernel = None
+        if _os.environ.get("PARTNER_SA_KERNEL", "") == "numba":
+            try:
+                from sa_numeric_kernel import try_attach
+                self._sa_kernel = try_attach(self)
+            except Exception:
+                self._sa_kernel = None
+            if self._sa_kernel is not None:
+                self._dc_enabled = False   # the kernel supersedes the colcache
+
     # ------------------------------------------------------------------
     def _resolve_shapes(self):
         n = self.n
@@ -811,6 +824,9 @@ class _ColumnOptimizer:
                  for b in bands]
         u.banded = any(len(b) > 1 for b in bands) or any(u.dyn)
         u.hcache = None
+        _k = getattr(self, "_sa_kernel", None)
+        if _k is not None:
+            _k.mark_dirty()
 
     def _solve_band(self, band, w: float):
         """Find the band height h so the chunk widths sum to w. Mixed chunks
@@ -1291,6 +1307,10 @@ class _ColumnOptimizer:
 
     # ------------------------------------------------------------------
     def _layout(self, cols: List[List[int]]) -> Tuple[np.ndarray, float, float]:
+        if self._sa_kernel is not None:
+            out = self._sa_kernel.layout(cols)
+            if out is not None:
+                return out
         if self._dc_enabled:
             return self._layout_delta(cols)
         return self._layout_full(cols)
@@ -1697,6 +1717,8 @@ class _ColumnOptimizer:
         return total
 
     def _violations(self, pos: np.ndarray) -> int:
+        if self._sa_kernel is not None:
+            return self._sa_kernel.violations(pos)
         V = 0
         px0 = pos[:, 0]
         py0 = pos[:, 1]

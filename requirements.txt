@@ -1,4 +1,7 @@
 matplotlib==3.9.0
+# optional: enables the PARTNER_SA_KERNEL=numba layout kernel
+# (partner/sa_numeric_kernel.py). The solver runs unchanged without it.
+numba>=0.59
 numpy>=1.24.0,<2.0
 Requests==2.32.4
 Shapely==2.0.5
