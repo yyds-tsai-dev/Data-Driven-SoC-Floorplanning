@@ -3069,6 +3069,19 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         if _nref_env > 0 and opt1.n >= _nref_min_n:
             n_ref = max(3, min(_nref_env, _POOL_SIZE - 6))
     configs = (configs + extra)[:max(2, _POOL_SIZE - n_ref)]
+    # The hand-written list holds 24 entries, so pools larger than 24+n_ref
+    # historically idled the surplus workers.  Extend procedurally with seed
+    # variants (same orient/column/weight grid, fresh rng streams) so restart
+    # breadth scales with PARTNER_POOL.  Bit-exact for POOL<=24: the slice
+    # above already truncated to want<=24 and the loop body never runs.
+    _want = max(2, _POOL_SIZE - n_ref)
+    if len(configs) < _want:
+        _base = list(configs)
+        _k = 0
+        while len(configs) < _want:
+            _orient, _cf, _sd, _vw, _hs = _base[_k % len(_base)]
+            _k += 1
+            configs.append((_orient, _cf, _sd + 275 + 11 * _k, _vw, _hs))
 
     def np_of(t):
         return None if t is None else t.detach().cpu().numpy()

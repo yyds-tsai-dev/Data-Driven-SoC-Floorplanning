@@ -82,3 +82,65 @@ Patch(`partner/column_sa_legalizer.py` 兩處,default bit-exact):
 ~0.126(現行主標的)** + 真 SA 彈性 ~0.03(kernel 吞吐可攻)。攻擊面:把
 `_worker_refine` 的 direct-prediction 精修做成 anytime(價值/秒排序,任何截止點都交得出
 競爭解)± rung 加速(numba kernel)。若拿回 −0.12,前緣預估:2.0s→~1.16、0.25s→~1.28。
+
+## 實驗 5:PARTNER_EARLY_EXIT 探針(chain `ee_probe_chain.sh`;EE 實作 = cherry-pick
+`af930b3`,設計 `docs/design/2026-08-04-early-exit-true-time-reduction.md`)
+
+| arm | noRT | avg_rt | 判讀 |
+|---|---|---|---|
+| ee_ctrl35 | 1.1324 | 1.99s | control(家族帶內)|
+| ee_on35 | 1.1368 | **1.79s** | **EE 純減時:−10% 牆鐘只付 +0.0044** |
+| ee_on50 | **1.1204** | 2.32s | EE+MAX↑ 再消費:tail 時間饑渴再證(E2 重現);與目標反向,收案 |
+| ee_on35_pg0 | 1.1417 | 1.90s | **tail +0.018 退化 → straggler 滲漏假說**:gate=0 讓中小案派 pool 工作,逾期散兵滲入下一案吃 CPU(pg_max35_full tail +0.0075 同號)。gate=0 僅用於低預算檔;3.5 default 維持 gate=3.0 |
+
+EE 判定:同 MAX 下作純減時器可用(−10%/+0.004);「返還再消費」在 tail 是正品質但負
+runtime,與本目標(1.000/0.2s)反向。EE 的主戰場改為低預算操作點(見實驗 6)。
+
+## 實驗 6:0.25s 目標檔位精修(chain `op025_chain.sh`)
+
+| arm | noRT | avg_rt | 判讀 |
+|---|---|---|---|
+| pg025_rep2 | 1.3941 | 0.23s | rep1 1.4056;本檔位 σ≈0.006 |
+| pg025_ee | 1.3922 | 0.23s | **EE 低檔位無感**(worker 鏈 ~0.1s,stall 窗觸發不了)|
+| pg025_noflow | 1.4047 | 0.23s | **no-flow 判負 +0.011**:flow 種子在 0.25s 仍值回時間成本,留用 |
+| pg05_ee | 1.3534 | 0.41s | 0.5 檔 EE 同樣 wash |
+
+## 實驗 7:SA kernel 分數轉換(chain `kernel_score_chain.sh`)
+
+| 檔位 | off | on | Δ |
+|---|---|---|---|
+| 3.5s | 1.1289 | 1.1311 | +0.002 wash(SA 已收斂,吞吐不缺)|
+| 1.0s(gate0)| 1.3044 | **1.2768** | **−0.028** |
+| 0.25s(gate0)| 1.3990 | **1.3513** | **−0.048** |
+
+`PARTNER_SA_KERNEL=numba`(commit 3b7ccec):CSR 扁平化 + njit,bit-exact(36 tests 全
+`==`),moves/s ~2.7×。冷 JIT ~10s(cache 後 182ms)→ 促轉前需 warm-in-parent 設計。
+
+## 實驗 8:預算曲線形狀重塑(chain `shape_scan_chain.sh`;λ∝e^(n/12) 尾主宰)
+
+| arm | 曲線 | noRT | avg | tailQ | rt_tail |
+|---|---|---|---|---|---|
+| sh_flat025 | 平 [0.15,0.25] | 1.3508 | 0.247 | 1.3575 | 0.23 |
+| sh_tau8 | 9.3e-7·e^(n/8) [0.05,0.8] | 1.3043 | 0.240 | 1.2905 | 0.56 |
+| sh_tau10 | (SCALE 誤配,全體餓死)| 1.4393 | 0.162 | 1.4447 | 0.18 |
+| **sh_tau12** | 6e-5·e^(n/12) [0.05,1.0] | **1.3002** | 0.237 | **1.2852** | 0.54 |
+
+**小案讓路、tail 加菜:−0.051**。tau10 誤配臂反證 tailQ 對 tail 預算的劇烈敏感。
+新地板浮現:小案牆鐘 ~0.15-0.17s(初判串行頭,後由 `[ee]` 解剖推翻:pre=0.003,
+**地板在 solve 內部** = pool 編排 / 串行建構的固定成本)。
+
+## 實驗 9:pool-floor 路由(chain `poolfloor_scan.sh`)判死
+
+小案改走串行路(GATE=0.1/0.2)只省 0.03s/案(串行地板也 ~0.12s),tail 微增益被小案
+品質損失吃掉:pf_g01 1.3104 / pf_g02 1.3047 vs pf_ctrl 1.2941(tau12 rep,tier σ≈0.006)。
+**GATE=0 維持目標檔正解**;~0.12s 兩路共同固定地板留作後續(期望 ~−0.02)。
+
+## 現況總結(0804 晚)
+
+- **目標檔(avg≤0.24s)最佳組合 = kernel + gate0 + tau12 曲線:noRT 1.294-1.300**
+  (開場 flat-0.25 無 kernel 1.489 → −0.19)。精確壓 avg 0.2(tail 0.55→0.50)估 ~1.30。
+- 全前緣:0.24s→1.294 / 0.78s→1.277(kernel)/ 現役 3.5s 1.129-1.133 @ 2.0s。
+- 目標 (noRT 1.000, avg 0.2s) 殘距 ~0.30。剩餘攻擊面:ladder anytime(agent 進行中;
+  tail 0.55-0.8s 預算下實際可收復量待 A/B)、restart 廣度(configs 只有 24 條,
+  POOL=46 需程序化擴列)、~0.12s 固定地板(期望 −0.02)、GPU 空轉臂、
+  最後是 prior/拓撲品質牆(0707 定律域)。
