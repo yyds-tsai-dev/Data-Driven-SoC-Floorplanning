@@ -98,6 +98,29 @@ def _env_pos(name: str, default: float, hi: float) -> float:
     return v if 0.0 < v <= hi else default
 
 
+def anytime_ladder_on() -> bool:
+    """PARTNER_ANYTIME_LADDER=1 (default off).
+
+    Makes `refine_prediction`'s legalization ladder anytime: the tight rungs
+    get a bounded share of the span, a guaranteed-legal rung is always
+    reachable, and the quality tail (frame anneal + refiner + repair) is
+    funded by fractions of the span instead of absolute second offsets.  See
+    docs/design/2026-08-04-anytime-ladder.md."""
+    return _flag_on("PARTNER_ANYTIME_LADDER")
+
+
+def anytime_frac(name: str, default: float) -> float:
+    """Fractional anytime tunable in (0, 1); malformed -> default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return v if 0.0 < v < 1.0 else default
+
+
 class _AxisCons:
     """Separation polytope for one axis: per-group rigid-shift box
     [lo, dmax] plus the difference constraints d[j] - d[i] >= c."""
@@ -4727,6 +4750,33 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             # but only when the slice can afford three stages at all
             res += 0.35 * slice_
         deadline = deadline - res
+
+        # -- anytime budget plan (PARTNER_ANYTIME_LADDER=1, default off) ---
+        # Shipped ladder semantics are "try tight frames in order until one
+        # legalizes"; below ~3 s of worker deadline the tight rungs consume
+        # the whole span, so the pipeline returns None (the pool slot is
+        # wasted) or a loose-frame layout whose quality tail never runs.
+        # ANYTIME bounds the tight rungs, keeps a guaranteed-legal rung
+        # reachable, and pays the tail out of fractions of the carved
+        # reserve instead of absolute second offsets.
+        _any = anytime_ladder_on()
+        t_lad0 = time.time()
+        span_lad = max(0.0, deadline - t_lad0)
+        # end of the TIGHT (fixed-frame + small-expand) rungs.  Its real
+        # value is set once the first `_Refiner` build has been timed; until
+        # then it is non-binding, exactly as on the shipped path.
+        t_tight = deadline
+        t_build = 0.0
+
+        # captured, not read from `res`: step 6 below rebinds the name `res`
+        # to a repair attempt's result
+        _reserve = res
+
+        def _tg(off_val: float, frac: float) -> float:
+            """Tail budget term: the shipped absolute constant, capped by a
+            share of the carved reserve when ANYTIME is on (off -> the
+            shipped constant, unchanged)."""
+            return off_val if not _any else min(off_val, frac * _reserve)
         P0 = np.array(pred, dtype=np.float64, copy=True)
         # the raw prediction's centers anchor relocation landings all
         # through legalization: the HPWL median points at the congested
@@ -4772,11 +4822,43 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         # wedge tools existed (unpin retry, free-rect relocation, global
         # evict) — a bare clamp used to kill every legalization.
         if time.time() < deadline:
+            _t_b0 = time.time()
             try:
                 opt.cluster_groups = {}
                 r = _Refiner(opt, P0, seed + 9)
             finally:
                 opt.cluster_groups = saved_cg
+            if _any:
+                # The `_Refiner` build is O(n^2) and machine-relative, so it
+                # is the instance's own cost unit: every cap below is sized
+                # in build-times, never in absolute seconds.  A rung costs
+                # roughly 4-7 builds, so keeping `BUILD_MULT` builds back
+                # guarantees the secure rung is still affordable when the
+                # tight rungs fail.
+                t_build = max(time.time() - _t_b0, 1e-6)
+                keep = max(anytime_frac("PARTNER_ANYTIME_SECURE_MIN", 0.25)
+                           * span_lad,
+                           _env_pos("PARTNER_ANYTIME_BUILD_MULT", 6.0, 100.0)
+                           * t_build)
+                # ... but never more than SECURE_MAX of the span: with the
+                # 0.65 default the tight window keeps >= 0.35 of the span,
+                # which is exactly the fixed-frame rung's own shipped share,
+                # so ANYTIME never shortens that rung -- only the
+                # intermediate rungs and the unbounded calls.
+                keep = min(keep, anytime_frac("PARTNER_ANYTIME_SECURE_MAX",
+                                              0.65) * span_lad)
+                # the reserve is the ONLY thing that shortens the tight
+                # rungs: on a cheap instance `keep` is small and the fixed
+                # frame rung keeps its shipped window (its own 0.35 share
+                # below is never widened), on an expensive one the reserve
+                # binds and the secure rung stays affordable.
+                t_tight = max(deadline - keep, t_lad0 + 0.10 * span_lad)
+                if _DEBUG:
+                    print(f"[any] n={opt.n} span={span_lad:.3f} "
+                          f"build={t_build:.3f} keep={keep:.3f} "
+                          f"tight={t_tight - t_lad0:.3f} res={res:.3f}",
+                          flush=True)
+            _r0_end = min(deadline, t_tight) if _any else deadline
             r._pred_c = pred_c
             r._anchor_frame_to_tags()
             W = (r.lock_xmax - r.xmin) if r.lock_xmax is not None else None
@@ -4812,20 +4894,24 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                 r.satT[:] = False
                 r._pull_inside_frame()
                 r._seed_tags()
-                sub = min(deadline,
+                sub = min(_r0_end,
                           time.time() + 0.35 * (deadline - time.time()))
                 ok0 = r.legalize_soft(12, deadline=sub, fine=True)
                 if not ok0 and r._overlap_count() <= 6 \
-                        and time.time() < deadline:
+                        and time.time() < _r0_end:
                     # inches from closing: give the frame 2% and finish —
                     # still far tighter than the loose-ladder path, and
                     # the tag seats survive intact
                     r.xmax += 0.02 * W
                     r.ymax += 0.02 * H
-                    ok0 = r.legalize_soft(
-                        10, deadline=min(deadline, time.time() + 1.5))
+                    # the salvage is the fixed-frame rung's last chance and
+                    # the highest-value branch in the ladder: under ANYTIME
+                    # it gets the whole remaining tight window (the reserve
+                    # is the guardrail), not a share of it
+                    _sal = _r0_end if _any else (time.time() + 1.5)
+                    ok0 = r.legalize_soft(10, deadline=min(_r0_end, _sal))
                 if not ok0 and r._overlap_count() <= 2 \
-                        and time.time() < deadline:
+                        and time.time() < _r0_end:
                     # final pair(s): a wedge where every participant is
                     # tagged/fixed — sacrifice the tag seat (V+1) for the
                     # tight frame; the cross-candidate selection judges
@@ -4855,7 +4941,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                                 r.satL[m] = r.satR[m] = False
                                 r.satB[m] = r.satT[m] = False
                                 r._relocate_to_free(int(m), rects)
-                        ok0 = r.legalize(12, deadline=deadline)
+                        ok0 = r.legalize(12, deadline=_r0_end)
                     finally:
                         r._ignore_tags = False
                 if ok0 and not r._has_overlap():
@@ -4999,14 +5085,28 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
 
         rungs = ((0.02, True), (0.05, True), (0.08, True), (0.12, True),
                  (0.18, False), (0.28, False))
+        if _any:
+            # escape rung: reached only when the secure rung above failed and
+            # time is left.  A legal-but-loose candidate loses the
+            # cross-pipeline selection at worst; a missing candidate wastes
+            # the pool slot outright.
+            rungs = rungs + ((0.50, False),)
+        # index of the first SECURE rung: from here on the rung is the one
+        # that (almost) always legalizes, so it is budgeted as a share of
+        # what is left rather than out of the tight-rung window.
+        i_secure = len(rungs) - (2 if _any else 1)
         # cap the ladder at 45% of the slice: the last (loose) rung almost
         # always legalizes, and the time saved goes to squeeze/refine which
         # recovers the bbox inflation the loose rung causes
         rung_cap = time.time() + 0.45 * (deadline - time.time())
+        if _any:
+            # ... and, under ANYTIME, never past the tight-rung budget: the
+            # `continue` below then jumps straight to the secure rung.
+            rung_cap = min(rung_cap, t_tight)
         for ridx, (expand, use_pins) in enumerate(rungs):
             if legal is not None or time.time() >= deadline:
                 break
-            if time.time() > rung_cap and ridx < len(rungs) - 1:
+            if time.time() > rung_cap and ridx < i_secure:
                 continue
             try:
                 opt.cluster_groups = {}
@@ -5025,14 +5125,26 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             r._anchor_frame_to_tags()
             if use_pins:
                 r._seed_tags()
-            if r.legalize_soft():
+            # ANYTIME: the shipped call is unbounded (`deadline=None`), so a
+            # single rung can and does overrun the whole worker deadline.
+            # Tight rungs are bounded by the tight budget; the last (secure)
+            # rung keeps a share back for the frame anneal and the refiner.
+            _rdl = None
+            if _any:
+                if ridx >= i_secure:
+                    _rdl = min(deadline, time.time() + anytime_frac(
+                        "PARTNER_ANYTIME_SECURE", 0.55)
+                        * max(0.0, deadline - time.time()))
+                else:
+                    _rdl = min(deadline, t_tight)
+            if r.legalize_soft(deadline=_rdl):
                 if not use_pins:
                     # tag recovery: the pin-less rung legalized but every
                     # boundary tag is loose — try to re-seat them; revert
                     # if the layout cannot absorb it
                     snap_t = r.P.copy()
                     r._seed_tags()
-                    if not r.legalize_soft(10):
+                    if not r.legalize_soft(10, deadline=_rdl):
                         r.P[...] = snap_t
                         for g in r.groups:
                             g.pin_x = g.pin_y = False
@@ -5045,7 +5157,15 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         ((r.P[:, 1] + r.P[:, 3]).max() - r.P[:, 1].min())
                     print(f"[rp] rung expand={expand} legal bbox={bb:.0f}",
                           flush=True)
-                r._tighten(min(deadline, time.time() + 3.0))
+                # frame anneal: the shipped 3.0 s cap is an absolute-time
+                # assumption (it never binds below a ~4 s worker deadline,
+                # where the anneal is instead starved to ~0).  ANYTIME gives
+                # it a share of what is left, so it scales with the tier.
+                _tg_end = (time.time() + anytime_frac(
+                    "PARTNER_ANYTIME_TIGHTEN", 0.45)
+                    * max(0.0, deadline - time.time())) if _any \
+                    else (time.time() + 3.0)
+                r._tighten(min(deadline, _tg_end))
                 r._assemble_clusters(saved_cg)
                 if not r._has_overlap():
                     legal = r.P.copy()
@@ -5080,7 +5200,23 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         # violations enter the cost through exp(2*V/n_soft), so a repaired
         # layout wins even at a small HPWL cost — but keep it only when
         # the violation count actually drops.
-        if time.time() < t_hard - 0.4:
+        if _any:
+            # value-per-second ordering inside the reserve: the seats cost
+            # ~1 ms and reliably drop V by 1-3 (each keeps its result only
+            # when the violation count strictly drops), while one repair
+            # attempt below costs a build plus a legalization and often
+            # fails.  Banking the cheap win first means a failed repair can
+            # never cost it, and a V driven to 0 skips the repair outright.
+            out = _cluster_seat(opt, _edge_seat(opt, out),
+                                deadline=t_hard - _tg(0.05, 0.02))
+
+        # The tail gates below are absolute second offsets, i.e. they assume
+        # a reserve of several seconds.  At `res = 0.3 * slice` a 1.7 s
+        # worker deadline reserves 0.51 s, so `t_hard - 0.9` is already in
+        # the past before the reserve starts and every repair/compaction
+        # stage self-disables -- the reserve is carved and then thrown away.
+        # `_tg` caps each constant by a share of the actual reserve.
+        if time.time() < t_hard - _tg(0.4, 0.25):
             V0 = full_violations(opt, out)
             if V0 > 0:
                 Q = np.array(out, dtype=np.float64, copy=True)
@@ -5117,7 +5253,8 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         r3._pull_inside_frame()
                     r3._seed_tags()
                     if not r3.legalize_soft(
-                            10, deadline=min(t_hard, time.time() + 1.6)):
+                            10, deadline=min(t_hard, time.time()
+                                             + _tg(1.6, 0.5))):
                         return None
                     r3._assemble_clusters(saved_cg)
                     if r3._has_overlap():
@@ -5127,7 +5264,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                 best_V = V0
                 best_hp = opt._hpwl(out)
                 for clamp in (True, False):
-                    if time.time() >= t_hard - 0.3:
+                    if time.time() >= t_hard - _tg(0.3, 0.2):
                         break
                     res = _attempt(clamp)
                     if res is None:
@@ -5146,16 +5283,17 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         out = res.copy()
 
         out = _cluster_seat(opt, _edge_seat(opt, out),
-                            deadline=t_hard - 0.9)
+                            deadline=t_hard - _tg(0.9, 0.1))
 
         # -- 6.5 discrete area compaction toward the tag locks ---------
         # The residual failure shape the seats cannot fix: a whole shelf
         # sits flush past a tagged-preplaced edge while the matching free
         # area lies scattered in slivers.  Success here also deflates the
         # bbox below the recompression trigger, saving that whole rerun.
-        if time.time() < t_hard - 0.9:
+        if time.time() < t_hard - _tg(0.9, 0.35):
             out = _lock_compact(opt, out,
-                                min(t_hard - 0.5, time.time() + 2.2),
+                                min(t_hard - _tg(0.5, 0.15),
+                                    time.time() + _tg(2.2, 0.5)),
                                 seed=seed, pred=P0)
 
         # -- 7. area recompression retry --------------------------------
@@ -5168,6 +5306,11 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         pos0 = np.asarray(out, dtype=np.float64)
         bbox = float(((pos0[:, 0] + pos0[:, 2]).max() - pos0[:, 0].min())
                      * ((pos0[:, 1] + pos0[:, 3]).max() - pos0[:, 1].min()))
+        # NOTE: the 2.5 s gate is deliberately NOT relaxed under ANYTIME.
+        # Step 7 reruns the whole pipeline (3+ `_Refiner` builds), so a
+        # reserve-sized share of a 1.7 s worker deadline cannot fund it; the
+        # absolute gate self-disables at exactly the tiers where it would
+        # only steal the repair/compaction stages' reserve.
         if (_depth == 0 and time.time() < t_hard - 2.5
                 and bbox > 1.08 * opt.area_ref):
             sc = max(0.88, math.sqrt(1.02 * opt.area_ref / bbox))
@@ -5203,12 +5346,13 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         print(f"[recompress] kept sc={sc:.3f}", flush=True)
                     out = out2
 
-        if time.time() < t_hard - 0.6:
+        if time.time() < t_hard - _tg(0.6, 0.25):
             out = _lock_compact(opt, out,
-                                min(t_hard - 0.2, time.time() + 2.2),
+                                min(t_hard - _tg(0.2, 0.08),
+                                    time.time() + _tg(2.2, 0.5)),
                                 seed=seed + 7, pred=P0)
         out = _cluster_seat(opt, _edge_seat(opt, out),
-                            deadline=t_hard - 0.05)
+                            deadline=t_hard - _tg(0.05, 0.02))
         if _DEBUG:
             print(f"[refine_prediction] n={opt.n} hp={opt._hpwl(out):.1f} "
                   f"V={opt._violations(out)}", flush=True)
