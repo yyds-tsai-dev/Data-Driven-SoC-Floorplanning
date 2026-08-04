@@ -288,6 +288,7 @@ class MyOptimizer(FloorplanOptimizer):
         # wall-clock per case is unchanged).  VKILL_CARVE=0 restores the
         # legacy additive behavior; VKILL_OFF disables the pass entirely.
         vk_deadline = None
+        vk_reserve = 0.0
         if (os.environ.get("VKILL")
                 and not os.environ.get("VKILL_OFF")
                 and os.environ.get("VKILL_CARVE", "1") != "0"):
@@ -297,6 +298,7 @@ class MyOptimizer(FloorplanOptimizer):
             else:
                 reserve = min(0.1 * budget, 0.3)
             vk_deadline = deadline
+            vk_reserve = reserve
             deadline = deadline - reserve
 
         area_targets = area_targets[:block_count].detach().float().cpu()
@@ -366,20 +368,40 @@ class MyOptimizer(FloorplanOptimizer):
                         daemon=True)
                     th.start()
 
+            t_dispatch = time.time()
             column_out = legalize_rectangles(
                 raw_rects, area_targets, constraints, target_positions,
                 b2b_connectivity=b2b, p2b_connectivity=p2b, pins_pos=pins,
                 deadline=deadline, sample_fn=sample_fn,
             )
+            t_legal = time.time()
             if th is not None:
                 th.join(timeout=max(0.0, deadline - time.time()) + 0.1)
             out = (self._pick_best(column_out, direct_box)
                    if direct_box else column_out)
             t_kill = (vk_deadline if vk_deadline is not None
                       else time.time() + _env_float("VKILL_BUDGET", 6.0))
-            return self._violation_kill(
+            # PARTNER_EARLY_EXIT: the vkill reserve was carved as a FIXED
+            # share of the budget, but `t_kill` is absolute -- so a legalizer
+            # that returned early would silently hand vkill the whole
+            # reclaimed tail.  Cap it at the carved share.
+            if vk_deadline is not None and _lg.early_exit_on():
+                t_kill = min(t_kill, time.time() + vk_reserve)
+            result = self._violation_kill(
                 out, area_targets, constraints, target_positions,
                 b2b, p2b, pins, t_kill)
+            if os.environ.get("PARTNER_EARLY_EXIT_DEBUG"):
+                # per-case time anatomy: serial head (heuristic seed + GPU
+                # seed-diffusion + parse), the deadline-bounded solve, and
+                # the selection/vkill tail.  Only the middle term is what
+                # EARLY_EXIT can shorten.
+                now = time.time()
+                print(f"[ee] n={block_count} budget={budget:.2f} "
+                      f"pre={t_dispatch - start:.3f} "
+                      f"solve={t_legal - t_dispatch:.3f} "
+                      f"post={now - t_legal:.3f} total={now - start:.3f}",
+                      file=sys.stderr, flush=True)
+            return result
         except Exception as exc:
             if self.verbose:
                 print(f"column optimizer failed; using row fallback: {exc}")
