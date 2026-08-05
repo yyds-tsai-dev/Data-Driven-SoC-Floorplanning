@@ -173,6 +173,16 @@ class _Refiner:
         # pool workers must never burn their deadline on it
         self.enable_deflate = False
 
+        # -- PARTNER_REFINE_KERNEL companions, set before the builds --------
+        # `_nk` must exist before any dispatch site can run; `_fast_build`
+        # selects the O(|E| + G) bucketing in `_build_edges` (see there).
+        # `PARTNER_REFINE_FASTBUILD=0` disables the latter on its own, so the
+        # two mechanisms stay separately attributable in an A/B.
+        self._nk = None
+        self._fast_build = (
+            os.environ.get("PARTNER_REFINE_KERNEL", "") == "numba"
+            and os.environ.get("PARTNER_REFINE_FASTBUILD", "1") in _TRUE)
+
         self._build_groups()
         self._build_pins()
         self._build_edges()
@@ -252,6 +262,20 @@ class _Refiner:
             self.csa_ms = _env_pos("PARTNER_CSA_MS", 15.0, 1e6)
             w = os.environ.get("PARTNER_CSA_WHERE", "stall")
             self.csa_where = w if w in ("stall", "end", "both") else "stall"
+
+        # -- flat-array numba rung kernel attach ----------------------------
+        # Bit-exact transcription of the rung's numeric hot loops -- the
+        # `hold=True` axis pass, the `_evict` anchor scan and the overlap
+        # tests -- over structure-of-arrays buffers; see
+        # partner/refine_numeric_kernel.py.  Default off: `_nk is None` makes
+        # every dispatch site a single identity test, so the decision logic
+        # AND the rng stream are identical to the pre-port fork.
+        if os.environ.get("PARTNER_REFINE_KERNEL", "") == "numba":
+            try:
+                from refine_numeric_kernel import try_attach as _rk_attach
+                self._nk = _rk_attach(self)
+            except Exception:
+                self._nk = None
 
     # ------------------------------------------------------------------
     def _contacts(self, idxs):
@@ -371,6 +395,46 @@ class _Refiner:
         """Per-group external connectivity for the weighted-median targets."""
         opt = self.opt
         gof = self.group_of
+        if self._fast_build:
+            # PARTNER_REFINE_KERNEL: same lists, one pass.  The shipped form
+            # re-scans every edge once PER GROUP -- O(G*|E|), measured 0.137 s
+            # of a 0.140 s `_Refiner.__init__` at n=116, which is ~3x a whole
+            # kernel rung.  Bucketing by group is O(|E| + |P| + G) and appends
+            # in the same edge order, so every `g.eM/eJ/eW/pM/pX/pY/pW` array
+            # is element-for-element what the loop below produces.
+            G = len(self.groups)
+            eMs = [[] for _ in range(G)]
+            eJs = [[] for _ in range(G)]
+            eWs = [[] for _ in range(G)]
+            pMs = [[] for _ in range(G)]
+            pXs = [[] for _ in range(G)]
+            pYs = [[] for _ in range(G)]
+            pWs = [[] for _ in range(G)]
+            for a, b, w in zip(opt.eI, opt.eJ, opt.eW):
+                a, b = int(a), int(b)
+                ga, gb = gof[a], gof[b]
+                if ga == gb:
+                    continue
+                if ga >= 0:
+                    eMs[ga].append(a); eJs[ga].append(b); eWs[ga].append(w)
+                if gb >= 0:
+                    eMs[gb].append(b); eJs[gb].append(a); eWs[gb].append(w)
+            for b, w, px, py in zip(opt.pB, opt.pW, opt.pX, opt.pY):
+                b = int(b)
+                gb = gof[b]
+                if gb >= 0:
+                    pMs[gb].append(b); pXs[gb].append(px)
+                    pYs[gb].append(py); pWs[gb].append(w)
+            for gi, g in enumerate(self.groups):
+                g.eM = np.array(eMs[gi], dtype=np.int64)
+                g.eJ = np.array(eJs[gi], dtype=np.int64)
+                g.eW = np.array(eWs[gi], dtype=np.float64)
+                g.pM = np.array(pMs[gi], dtype=np.int64)
+                g.pX = np.array(pXs[gi], dtype=np.float64)
+                g.pY = np.array(pYs[gi], dtype=np.float64)
+                g.pW = np.array(pWs[gi], dtype=np.float64)
+            self._build_badj()
+            return
         for gi, g in enumerate(self.groups):
             eM, eJ, eW = [], [], []
             for a, b, w in zip(opt.eI, opt.eJ, opt.eW):
@@ -391,7 +455,12 @@ class _Refiner:
             g.pY = np.array(pY, dtype=np.float64)
             g.pW = np.array(pW, dtype=np.float64)
 
-        # per-block incident edges (for reshape deltas)
+        self._build_badj()
+
+    def _build_badj(self):
+        """Per-block incident edges / pins (for reshape deltas).  Shared
+        verbatim by both `_build_edges` variants -- already one pass."""
+        opt = self.opt
         self.badj = [[] for _ in range(self.n)]
         for a, b, w in zip(opt.eI, opt.eJ, opt.eW):
             a, b = int(a), int(b)
@@ -614,6 +683,13 @@ class _Refiner:
         hold=True turns the sweep into a minimum-displacement legalizer:
         every target is "stay put" and overlapping pairs are separated
         along their axis of smaller penetration."""
+        if hold and self._nk is not None:
+            # PARTNER_REFINE_KERNEL: constraint build + forward assignment +
+            # rigid moves fused into one njit call.  hold=False keeps the
+            # Python path (its per-group target ends in `_wmedian`'s
+            # non-stable argsort -- see refine_numeric_kernel's scope note).
+            self._nk.axis_pass_hold(axis, invert)
+            return
         cons = self._axis_constraints(axis, invert)
         G = cons.G
         lo_fixed = cons.lo
@@ -740,6 +816,8 @@ class _Refiner:
             self._csa_spent += time.time() - t_start
 
     def _overlap_count(self) -> int:
+        if self._nk is not None:
+            return self._nk.overlap_count()
         P = self.P
         x0 = P[:, 0]
         x1 = x0 + P[:, 2]
@@ -752,6 +830,8 @@ class _Refiner:
         return int(m.sum()) // 2
 
     def _has_overlap(self) -> bool:
+        if self._nk is not None:
+            return self._nk.has_overlap()
         P = self.P
         x0 = P[:, 0]
         x1 = x0 + P[:, 2]
@@ -1239,6 +1319,12 @@ class _Refiner:
                            + np.abs(cy - pc[i, 1]))
         order = np.argsort(d)
         area = float(self.opt.areas[i])
+        if self._nk is not None:
+            # PARTNER_REFINE_KERNEL: the anchor x variant scan is ~90% of
+            # `_evict`.  The prologue above stays in Python because
+            # `_optimal_point` ends in `_wmedian`'s non-stable argsort.
+            return self._nk.evict_scan(i, order, max_anchors,
+                                       bool(self.kind[i] == 0), area)
         x0a = P[:, 0]
         y0a = P[:, 1]
         x1a = x0a + P[:, 2]
