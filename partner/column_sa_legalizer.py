@@ -2485,6 +2485,16 @@ def init_worker_pool(n_workers: int = 8, warmup_timeout: float = 180.0):
         return
     try:
         import multiprocessing as mp
+        # Warm the opt-in numba refine kernel in the parent BEFORE forking:
+        # children inherit the compiled functions, so no worker pays the
+        # ~0.17s first-call cache load inside a case span (at 0.4s worker
+        # spans that would be ~40% of the slice).  No-op when the flag is off.
+        if _os.environ.get("PARTNER_REFINE_KERNEL", "") == "numba":
+            try:
+                from refine_numeric_kernel import warm_process
+                warm_process()
+            except Exception:
+                pass
         # fork: no re-import of __main__, no per-worker torch import cost.
         # Workers never touch CUDA, so forking a CUDA-initialized parent is
         # safe (same pattern as torch DataLoader workers).
