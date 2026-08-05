@@ -219,3 +219,8 @@ bit-exact(78 tests、off 路徑 byte-identical)。真熱點 = Python 層衍生�
 
 進場率備註:goal 檔 TS0 預設 0.25 時 auto=1 率 0%(TS0=0.05 才解鎖)——arm 的
 carve 守衛設計本身健康,死因是 0.44s 檔位付不起 phase-A 縮短。
+
+## 實驗 15(0805):PARTNER_PERIMETER(_COL)探針 — 兩檔位判死
+
+從未 A/B 過的既有旗標(boundary-dense 案顯式牆線打包):3.5 檔 +0.0088、
+目標檔 **+0.0484**(>>σ 0.009)。顯式牆線輸給 SA 自身的牆處理,維持 default off。
