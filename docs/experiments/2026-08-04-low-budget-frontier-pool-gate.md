@@ -135,6 +135,22 @@ runtime,與本目標(1.000/0.2s)反向。EE 的主戰場改為低預算操作點
 品質損失吃掉:pf_g01 1.3104 / pf_g02 1.3047 vs pf_ctrl 1.2941(tau12 rep,tier σ≈0.006)。
 **GATE=0 維持目標檔正解**;~0.12s 兩路共同固定地板留作後續(期望 ~−0.02)。
 
+## 實驗 10:PARTNER_ANYTIME_LADDER(commit bceac97)A/B — 全檔位 wash/敗,不促轉
+
+Agent 診斷(單執行緒 proxy 證據堅實):ladder 四缺陷疊加(全有全無交付、`_tighten`/`run`
+尾段餓死、壞順序、`legalize_soft` 無界 3× 超時),且 **promoted 3.5s 檔 n≳110 段 15 個
+refine slot 本已 100% 浪費**(rung 全失敗)。proxy n=116@1.7s 1.535→1.183。
+
+Full-100 成對判定:
+- MAX=2.0+gate0+kernel:ctrl 1.2479 / on 1.2599(**+0.012 敗**;pool 競爭下 rung 仍不完,
+  寬鬆候選擠占選擇)——順帶確立 **kernel@2.0 −0.038**(1.286→1.248)
+- MAX=3.5 三輪成對:−0.0084/+0.0047/+0.0019,**均值 −0.0006 wash**(rep1=方差)
+- 目標檔 direct 復活(AL+DM0.3+NREF6):1.3000 ≈ 家族(wash)
+
+結論:anytime 重排在單執行緒下機制為真,但競爭 regime 的 rung 完成時間才是根因。
+**次級假說:把 ladder 熱迴圈(`legalize_soft`/`_tighten`)kernel 化(SA kernel 只覆蓋
+SA 移動迴圈),rung ÷2.5 後 AL 前提才成立**。代碼留存 default off。
+
 ## 現況總結(0804 晚)
 
 - **目標檔(avg≤0.24s)最佳組合 = kernel + gate0 + tau12 曲線:noRT 1.294-1.300**
