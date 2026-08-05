@@ -224,3 +224,35 @@ carve 守衛設計本身健康,死因是 0.44s 檔位付不起 phase-A 縮短。
 
 從未 A/B 過的既有旗標(boundary-dense 案顯式牆線打包):3.5 檔 +0.0088、
 目標檔 **+0.0484**(>>σ 0.009)。顯式牆線輸給 SA 自身的牆處理,維持 default off。
+
+## 實驗 16(0805):PARTNER_FAST_SETUP(commit df004f7)——雙軸促轉,目標點定格
+
+地板真兇(agent 拆分,marshal/build 假設全證偽,setup 三項 <3ms):
+1. `finish` 寫死 `max(span, 0.1)` **最短退火跨度**——比微預算整案還長,且對已收斂
+   鏈是純浪費(proxy:多出的 70ms 買不到品質)。手術=budget-aware 夾子(計畫跨度
+   ≥0.1s 時不觸發 → 3.5 檔按構造不變)。
+2. seed 邊迴圈走**補零張量**逐列 `.item()`(n=120 要 138ms)。手術=bit-exact numpy
+   雙生(100 案全 byte-identical,2.41→0.16s)。
+
+| arm | noRT | avg | 判讀 |
+|---|---|---|---|
+| flag 單獨 ×2 | −0.0089/−0.0054 | 0.225→**0.155s** | 兩軸同贏(強制退火本在傷害)|
+| re-spend(SCALE 7.5e-5/MAX 0.9)×2 | **−0.0260/−0.0237** | 0.206s | 過 gate,促轉 |
+| **精確 0.200s(SCALE 7.0e-5)×2** | 1.1956/1.1965 | **0.200s** | vs r75 +0.002/+0.007 |
+
+**促轉(跨檔位)**:`PARTNER_FAST_SETUP=1` 入 .env 與 op_wrapper。
+
+## 戰役收官(0805)
+
+| 操作點 | 開場 | 終局 | config |
+|---|---|---|---|
+| **目標點(avg=0.200s 精確)** | 1.489 @ 0.25s | **noRT 1.196 @ 0.200s(−0.293)** | FS + RK + SA kernel + gate0 + tau12(7.0e-5,[0.05,0.9])+ dpmpp2 + flow8 + DM0.3 + NREF6 |
+| re-spend 變體 | — | 1.190 @ 0.206s | 同上,SCALE 7.5e-5 |
+| promoted 3.5s 檔 | 1.128-1.135 @ 2.0s | **1.118 @ ~1.88s** | 0729 env + RK + FS |
+
+促轉五連:POOL_GATE(低檔)、SA_KERNEL(低檔)、REFINE_KERNEL(跨檔)、
+FAST_SETUP(跨檔)、dpmpp2+tau12 曲線(目標檔)。
+判死清單:direct 低預算救援 ×2、EE 低檔、no-flow、pool-floor、POOL46 廣度 ×2、
+AL(全檔)、GPU-arm(兩檔)、perimeter(兩檔)、flow6、NREF10、st1。
+**與 (1.000, 0.2s) 的殘距 = 品質軸 −0.196**:旋鈕與工程面已窮盡;剩餘路徑=
+prior/拓撲牆(0707 定律域;cost-FT gate 已因負斜率關閉)或 solver 代際換代。
