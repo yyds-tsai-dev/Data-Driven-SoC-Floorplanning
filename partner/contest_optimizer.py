@@ -347,17 +347,27 @@ class MyOptimizer(FloorplanOptimizer):
             if self.direct_model is not None and (
                     deadline - time.time()) > _env_float(
                         "PARTNER_DIRECT_MIN", 4.5):
+                # `gen_seed` (a generator-seed OFFSET, default 0 = the
+                # reviewed baseline) lets the legalizer draw a genuinely
+                # different SECOND wave on the otherwise-idle accelerator
+                # while phase A runs -- see PARTNER_GPU_ARM in
+                # column_sa_legalizer.py.  A caller that omits it gets the
+                # historical batch bit for bit.
                 if _lg._POOL is not None and _lg._POOL_READY:
                     if self.retrieval_index is not None and self.retrieval_slots > 0:
-                        sample_fn = (lambda K: self._sample_portfolio_preds(
-                            block_count, area_targets, constraints,
-                            target_positions, b2b, p2b, pins, K,
-                            oversample=(deadline - time.time()) > 12.0))
+                        sample_fn = (lambda K, gen_seed=0:
+                                     self._sample_portfolio_preds(
+                                         block_count, area_targets, constraints,
+                                         target_positions, b2b, p2b, pins, K,
+                                         oversample=(deadline - time.time()) > 12.0,
+                                         gen_seed=gen_seed))
                     else:
-                        sample_fn = (lambda K: self._sample_direct_preds(
-                            block_count, area_targets, constraints,
-                            target_positions, b2b, p2b, pins, K,
-                            oversample=(deadline - time.time()) > 12.0))
+                        sample_fn = (lambda K, gen_seed=0:
+                                     self._sample_direct_preds(
+                                         block_count, area_targets, constraints,
+                                         target_positions, b2b, p2b, pins, K,
+                                         oversample=(deadline - time.time()) > 12.0,
+                                         gen_seed=gen_seed))
                 else:
                     # no pool: fall back to the sliced in-process thread
                     th = threading.Thread(
@@ -429,8 +439,16 @@ class MyOptimizer(FloorplanOptimizer):
             return out
 
     def _sample_direct_raw_preds(self, n, at, cons, tpos, b2b, p2b, pins,
-                                 K, oversample: bool = True) -> List[np.ndarray]:
-        """Generate the baseline bounded Direct batch before prescreening."""
+                                 K, oversample: bool = True,
+                                 gen_seed: int = 0) -> List[np.ndarray]:
+        """Generate the baseline bounded Direct batch before prescreening.
+
+        `gen_seed` is an OFFSET added to the pinned generator seeds (default 0
+        -> byte-identical to the reviewed baseline).  PARTNER_GPU_ARM uses it
+        to draw a genuinely different second wave on the idle accelerator; the
+        seeds are pinned, so calling this twice with the default offset would
+        return the same batch.
+        """
         from direct_diffusion_train import fast_condition
         from direct_diffusion_model import (known_z_channels, sample_direct,
                                          sample_direct_dpmpp)
@@ -446,7 +464,7 @@ class MyOptimizer(FloorplanOptimizer):
         scale = layout_scale(at_d)
         z_known, known = known_z_channels(at_d, cons_d, tpos_d, scale)
         gen = torch.Generator(device=dev)
-        gen.manual_seed(17)
+        gen.manual_seed(17 + int(gen_seed))
         # sampling is batched, so oversample cheaply and let the prescreen
         # keep the best K for the (expensive) refine workers — but only
         # when the budget affords the extra sampling latency (on ~6 s
@@ -529,7 +547,8 @@ class MyOptimizer(FloorplanOptimizer):
                 if flow_n > 0:
                     try:
                         flow_preds = self._sample_flow_preds(
-                            n, at, cons, tpos, b2b, p2b, pins, flow_n)
+                            n, at, cons, tpos, b2b, p2b, pins, flow_n,
+                            gen_seed=gen_seed)
                         direct_n = quotas.get("direct", len(preds) - flow_n)
                         preds = preds[:direct_n] + flow_preds
                     except Exception:
@@ -537,13 +556,18 @@ class MyOptimizer(FloorplanOptimizer):
         return preds
 
     def _sample_flow_preds(self, n, at, cons, tpos, b2b, p2b, pins,
-                           K) -> List[np.ndarray]:
+                           K, gen_seed: int = 0) -> List[np.ndarray]:
         """Sample K layouts from the opt-in flow-matching model.
 
         Default path is unchanged. Opt-in flow-seed variants (all default off):
         PARTNER_FLOW_ANTITHETIC=1 (V-A, +/-z paired seeds), PARTNER_FLOW_ZORDER=1
         (V-B, zero-order neighborhood resample), PARTNER_FLOW_NOPT=hybrid
-        (V-C/D, gradient noise-opt on the flow channel)."""
+        (V-C/D, gradient noise-opt on the flow channel).
+
+        `gen_seed` is the same generator-seed OFFSET the Direct batch takes
+        (default 0 -> unchanged).  The ZORDER / NOPT sub-samplers keep their
+        own pinned seeds, so under those opt-in flags a PARTNER_GPU_ARM second
+        wave can repeat wave-1 flow candidates; the legalizer de-duplicates."""
         from direct_diffusion_train import fast_condition
         from direct_diffusion_model import known_z_channels
         from flow_matching_model import sample_flow
@@ -571,7 +595,7 @@ class MyOptimizer(FloorplanOptimizer):
         cond_k = {k: (v.expand(K, *v.shape[1:]).contiguous()
                       if torch.is_tensor(v) else v) for k, v in cond.items()}
         gen = torch.Generator(device=dev)
-        gen.manual_seed(23)
+        gen.manual_seed(23 + int(gen_seed))
         if os.environ.get("PARTNER_FLOW_ANTITHETIC"):
             # V-A: antithetic +/-z coverage (arXiv 2506.06185). known_noise is
             # shared within each pair so only the free seed is mirrored.
@@ -920,9 +944,11 @@ class MyOptimizer(FloorplanOptimizer):
         )
 
     def _sample_direct_preds(self, n, at, cons, tpos, b2b, p2b, pins,
-                             K, oversample: bool = True) -> List[np.ndarray]:
+                             K, oversample: bool = True,
+                             gen_seed: int = 0) -> List[np.ndarray]:
         """Prescreen the Direct batch exactly as the reviewed baseline does."""
-        preds = self._sample_direct_raw_preds(n, at, cons, tpos, b2b, p2b, pins, K, oversample)
+        preds = self._sample_direct_raw_preds(n, at, cons, tpos, b2b, p2b, pins,
+                                              K, oversample, gen_seed=gen_seed)
         return [preds[index] for index in self._rank_portfolio(preds, n, at, cons, b2b)]
 
     def _empty_retrieval_batch(self, started: float, rejected: int = 0,
@@ -1034,15 +1060,18 @@ class MyOptimizer(FloorplanOptimizer):
         )
 
     def _sample_portfolio_preds(self, n, at, cons, tpos, b2b, p2b, pins,
-                                K, oversample: bool = True) -> List[np.ndarray]:
+                                K, oversample: bool = True,
+                                gen_seed: int = 0) -> List[np.ndarray]:
         """Use one source-neutral rank for the bounded Direct/retrieval portfolio."""
         retrieval_quota = min(
             max(0, int(K)), max(0, int(self.retrieval_slots)),
             FIRST_R4_RETRIEVAL_SLOTS,
         )
         if retrieval_quota <= 0 or self.retrieval_index is None:
-            return self._sample_direct_preds(n, at, cons, tpos, b2b, p2b, pins, K, oversample)
-        direct = self._sample_direct_raw_preds(n, at, cons, tpos, b2b, p2b, pins, K, oversample)
+            return self._sample_direct_preds(n, at, cons, tpos, b2b, p2b, pins,
+                                             K, oversample, gen_seed=gen_seed)
+        direct = self._sample_direct_raw_preds(n, at, cons, tpos, b2b, p2b, pins,
+                                               K, oversample, gen_seed=gen_seed)
         retrieved = self._sample_retrieval_preds(n, at, cons, tpos, b2b, p2b, pins, retrieval_quota)
         predictions = direct + retrieved.predictions
         sources = ["direct"] * len(direct) + ["retrieval"] * len(retrieved.predictions)

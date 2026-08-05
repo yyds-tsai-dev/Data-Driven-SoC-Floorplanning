@@ -103,6 +103,181 @@ def early_exit_min_window() -> float:
 
 
 # =============================================================================
+# PARTNER_GPU_ARM -- turn the idle accelerator into a second candidate wave
+# =============================================================================
+# The fork is CPU-bound after the first sampling wave: the GPU draws the
+# direct/flow batch in ~0.1-0.3 s at the head of a case and then idles for the
+# entire SA/refine span (more so on the official A100 than on the local L4).
+# PARTNER_GPU_ARM=1 (default off) spends that idle window:
+#
+#   phase A   all column restarts + the existing NREF refine slots, exactly as
+#             today.  While they run, the parent fires a SECOND sampling wave
+#             with a different generator seed -- the latency is masked by the
+#             workers, so it does not delay the start of the case (the 0723
+#             "sample at the head" variant was killed precisely because it did).
+#   phase B   the reclaimed tail of the budget: the fresh GPU candidates are
+#             refined by the (RK-accelerated) pool alongside the phase-A winner
+#             variants, and everything competes under the same true cost.
+#
+# The arm does NOT take pool slots away from phase A -- it uses a time-axis
+# carve, which is what separates it from the PARTNER_NREF increment that was
+# convicted at the goal tier for eating column-restart breadth.
+#
+# The honest risk is the carve itself (phase A loses `1 - frac` of its span,
+# the 0723 `dmoff` carve paid -0.010 for nothing).  The arm therefore refuses
+# the carve unless the MEASURED sampler latency says both waves fit and phase A
+# still retains PARTNER_GPU_ARM_MIN_A of the budget as real SA time.
+#
+# Env (all default-off / default-neutral):
+#   PARTNER_GPU_ARM         1 -> enable the arm (implies an auto phase-B carve)
+#   PARTNER_GPU_ARM_TARGET  target phase-B slice in seconds (default 0.80)
+#   PARTNER_GPU_ARM_MIN_A   min share of the budget phase A must keep (0.35)
+#   PARTNER_GPU_ARM_K       cap on second-wave candidates (default 12)
+#   PARTNER_GPU_ARM_TS0     prior sampler latency before the first measurement
+#   PARTNER_GPU_ARM_SEED    generator-seed offset for the second wave (8117)
+#   PARTNER_GPU_ARM_DEBUG   per-case stderr anatomy line
+
+# number of winner-variant payloads the phase-B round always dispatches
+_PHASE_B_VARIANTS = 8
+
+# measured wave-1 sampler latency, EMA per block-count decade.  A reusable
+# instance statistic (block count), never a case id -- see CLAUDE.md.
+_GPU_ARM_TS: Dict[int, float] = {}
+
+
+def _env_num(name: str, default: float) -> float:
+    """`PARTNER_*` float env reader that never raises."""
+    try:
+        return float(_os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def gpu_arm_on() -> bool:
+    """PARTNER_GPU_ARM=1 (default off): consume the idle accelerator with a
+    second sampling wave feeding an auto-sized phase-B round."""
+    return _flag_on("PARTNER_GPU_ARM")
+
+
+def phase_b_min_budget_default(gpu_arm: bool) -> float:
+    """Minimum remaining budget for the phase-B carve.
+
+    The historical floor is 8 s, which no promoted tier ever reaches (3.5 s
+    and 0.44 s), so `PARTNER_PHASE_B` has been unreachable in practice.  The
+    floor exists because a phase-B slice must hold at least one refine rung;
+    `PARTNER_REFINE_KERNEL=numba` cut a rung from 0.36-0.8 s to ~0.035 s
+    (12-23x), so under the kernel a 0.4 s case can afford the round.  Only the
+    arm lowers it -- with the arm off the legacy lever keeps its 8 s floor.
+    """
+    if not gpu_arm:
+        return 8.0
+    if _os.environ.get("PARTNER_REFINE_KERNEL", "") == "numba":
+        return 0.35
+    return 1.5
+
+
+def gpu_arm_sample_estimate(n: int) -> float:
+    """Expected wave-1 sampler latency (s) for an instance of `n` blocks."""
+    return float(_GPU_ARM_TS.get(int(n) // 10,
+                                 _env_num("PARTNER_GPU_ARM_TS0", 0.25)))
+
+
+def gpu_arm_record_sample(n: int, dt: float) -> None:
+    """Fold a measured wave-1 latency into the per-decade EMA."""
+    if not (dt >= 0.0):
+        return
+    key = int(n) // 10
+    prev = _GPU_ARM_TS.get(key)
+    _GPU_ARM_TS[key] = dt if prev is None else 0.5 * prev + 0.5 * dt
+
+
+def gpu_arm_slice(rem: float) -> float:
+    """Phase-B slice length (s) for a remaining budget of `rem`.
+
+        slice = clamp(0.20*rem, 0.35*rem, TARGET)
+
+    The absolute target (0.80 s) is what the promoted 3.5 s tier can spend
+    without gutting column depth (~20 RK rungs); the 35 % ceiling is what
+    keeps the goal tier's 0.44 s span usable (~0.15 s, ~4 rungs); the 20 %
+    floor stops the slice from collapsing on long budgets.
+    """
+    rem = max(0.0, float(rem))
+    return min(max(_env_num("PARTNER_GPU_ARM_TARGET", 0.80), 0.20 * rem),
+               0.35 * rem)
+
+
+def gpu_arm_wave2_k(slice_s: float, pool_size: int) -> int:
+    """How many second-wave candidates to draw.
+
+    Phase B is *under-subscribed* today (it dispatches 8 winner variants onto
+    a pool of up to 24), so the CPU cost of the extra candidates is zero --
+    the binding limits are the free pool slots, the batch latency that has to
+    hide inside phase A, and how much refine a short slice can actually do.
+    One candidate per ~60 ms of slice, plus a floor of 2.
+    """
+    cap = int(_env_num("PARTNER_GPU_ARM_K", 12))
+    return max(0, min(int(pool_size), cap,
+                      2 + int(max(0.0, slice_s) / 0.06)))
+
+
+def gpu_arm_phase_b_split(slice_s: float, pool_size: int) -> Tuple[int, int]:
+    """Split the phase-B pool between (new GPU candidates, winner variants).
+
+    On the production pool (24-46 workers) the variants keep all 8 slots and
+    the GPU wave takes idle ones -- nothing is displaced.  Only when the pool
+    cannot hold both does the split bite, and then the incumbent's basin hops
+    keep at least half of it: exploitation of a known-good layout is the
+    round's proven job, the new supply is the experiment.
+    """
+    pool_size = max(0, int(pool_size))
+    k2 = gpu_arm_wave2_k(slice_s, pool_size)
+    n_var = _PHASE_B_VARIANTS
+    if k2 + n_var > pool_size:
+        k2 = min(k2, max(0, pool_size // 2))
+        n_var = min(n_var, max(1, pool_size - k2))
+    return k2, n_var
+
+
+def gpu_arm_sampler_takes_seed(fn) -> bool:
+    """True when `fn` accepts the `gen_seed` keyword.
+
+    The legalizer must never call a legacy one-argument sampler twice: its
+    generator seed is pinned, so wave 2 would re-draw wave 1 verbatim and burn
+    the carve for nothing.
+    """
+    if fn is None:
+        return False
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "gen_seed" in params or any(
+        p.kind == p.VAR_KEYWORD for p in params.values())
+
+
+def gpu_arm_second_wave(sample_fn, k: int, gen_seed: int, t_wave1: float,
+                        deadline_a: float) -> List[np.ndarray]:
+    """Draw the masked second wave, or return `[]` for any reason at all.
+
+    Containment is the whole contract here: a GPU failure, an OOM, a legacy
+    sampler or a wave that would overrun phase A must all degrade to the plain
+    winner-variant round rather than harm the case.
+    """
+    if k <= 0 or not gpu_arm_sampler_takes_seed(sample_fn):
+        return []
+    # wave 2 costs about what wave 1 cost (the batch is capped and the step
+    # count dominates); refuse it unless it provably lands inside phase A
+    if time.time() + 1.20 * max(0.0, t_wave1) + 0.03 >= deadline_a:
+        return []
+    try:
+        out = list(sample_fn(k, gen_seed=int(gen_seed)))[:k]
+    except Exception:
+        return []
+    return [np.asarray(P, dtype=np.float64) for P in out]
+
+
+# =============================================================================
 # Constraint parsing helpers (API kept for contest_optimizer.py)
 # =============================================================================
 def _col(constraints: Optional[torch.Tensor], n: int, idx: int) -> List[float]:
@@ -3102,14 +3277,45 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
     # of this (vkill stage2) loses to SA's own tail; eight CONCURRENT
     # basin-hops around the incumbent are a different proposition.  Only
     # engages on budgets long enough for a meaningful refine round.
+    #
+    # PARTNER_GPU_ARM=1 drives the same carve from the idle-accelerator side
+    # and sizes it itself (see the module header): phase A keeps every column
+    # slot it has today and only gives up wall clock, and it only gives that
+    # up when the measured sampler latency says the masked second wave fits.
     t_pb = time.time()
+    rem_pb = max(0.0, deadline - t_pb)
+    gpu_arm = (gpu_arm_on() and sample_fn is not None and _POOL_READY
+               and _os.environ.get("PARTNER_FUSION", "0") == "0")
+    _pb_raw = _os.environ.get("PARTNER_PHASE_B")
     try:
-        _pb_frac = float(_os.environ.get("PARTNER_PHASE_B", "0") or 0)
-        _pb_min = float(_os.environ.get("PARTNER_PHASE_B_MIN_BUDGET", "8"))
+        _pb_frac = float(_pb_raw or 0)
+        _pb_min = float(_os.environ.get(
+            "PARTNER_PHASE_B_MIN_BUDGET", phase_b_min_budget_default(gpu_arm)))
     except ValueError:
         _pb_frac, _pb_min = 0.0, 8.0
+    # auto carve: only when PARTNER_PHASE_B was not pinned by hand
+    gpu_auto = False
+    _pb_est = 0.0
+    if gpu_arm and not _pb_frac:
+        _pb_est = gpu_arm_sample_estimate(opt1.n)
+        _pb_slice = gpu_arm_slice(rem_pb)
+        # phase A must still hold BOTH sampling waves and keep a real SA span
+        if (rem_pb >= _pb_min and _pb_slice > 0.0
+                and rem_pb - _pb_slice - 2.0 * _pb_est
+                >= _env_num("PARTNER_GPU_ARM_MIN_A", 0.35) * rem_pb):
+            _pb_frac = _pb_slice / rem_pb
+            gpu_auto = True
     phase_b = (0.0 < _pb_frac < 0.9) and (deadline - t_pb) >= _pb_min \
         and _POOL_READY
+    gpu_arm = gpu_arm and phase_b
+    if _os.environ.get("PARTNER_GPU_ARM_DEBUG") and gpu_arm_on():
+        # carve decision, printed for DECLINED cases too -- a goal-tier run
+        # where `auto=0` everywhere means the A/B is measuring "arm never
+        # engaged", not "arm did not help"
+        import sys as _sys
+        print(f"[gpuarm] gate n={opt1.n} rem={rem_pb:.3f} est={_pb_est:.3f} "
+              f"frac={_pb_frac:.3f} auto={int(gpu_auto)} "
+              f"phase_b={int(phase_b)}", file=_sys.stderr, flush=True)
     deadline_A = (t_pb + (deadline - t_pb) * (1.0 - _pb_frac)) \
         if phase_b else deadline
     # Historical margin was a flat 0.30 s; below ~2 s of remaining budget that
@@ -3125,11 +3331,18 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
     # column restarts are already running; sample on the GPU now and hand
     # the predictions to the reserved (idle) workers
     ref_res = None
+    preds2: List[np.ndarray] = []
+    _pb_nvar = _PHASE_B_VARIANTS
     if n_ref:
+        _t_s0 = time.time()
         try:
             preds = list(sample_fn(n_ref))
         except Exception:
             preds = []
+        _t_s1 = time.time() - _t_s0
+        if gpu_arm:
+            gpu_arm_record_sample(opt1.n, _t_s1)
+        wave1 = list(preds)
         # boundary-dense instances: overlay the exactly-packed perimeter
         # ring onto the top predictions — the model supplies the global
         # arrangement (its strength), the ring supplies wall exactness
@@ -3192,6 +3405,29 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                              anchor)
                             for k, (P, anchor) in enumerate(specs)]
             ref_res = _POOL.map_async(_worker_refine, ref_payloads)
+
+        # --- GPU idle arm: second sampling wave, masked by phase A -------
+        # The parent is about to block in `res.get`; the accelerator is idle
+        # from here until the case ends.  Draw a fresh batch (different
+        # generator seed) now -- the workers keep running through it, so the
+        # latency costs the case nothing as long as it lands before
+        # `deadline_A`, which `gpu_arm_second_wave` verifies against the
+        # latency just measured for wave 1.
+        if gpu_arm:
+            _pb_k2, _pb_nvar = gpu_arm_phase_b_split(
+                max(0.0, deadline - deadline_A), _POOL_SIZE)
+            preds2 = gpu_arm_second_wave(
+                sample_fn, _pb_k2,
+                int(_env_num("PARTNER_GPU_ARM_SEED", 8117)) + (seed % 1000),
+                _t_s1, deadline_A)
+            # opt-in flow sub-samplers (ZORDER / NOPT) keep their pinned
+            # seeds, so a wave-2 draw can repeat a wave-1 candidate; a
+            # duplicate would waste a phase-B slot, so drop it here
+            if preds2 and wave1:
+                preds2 = [Q for Q in preds2
+                          if not any(Q.shape == np.shape(P)
+                                     and np.array_equal(Q, np.asarray(P))
+                                     for P in wave1)]
     try:
         outs = res.get(timeout=max(deadline_A - time.time(), 0.1) + 2.5)
         ref_outs = []
@@ -3289,17 +3525,43 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
             if score(bestf) < score(win) - 1e-12:
                 win, win_is_ref = bestf, True
 
-    if phase_b and time.time() < deadline - 1.5 \
+    # the flat 1.5 s entry gate and 0.30 s worker margin were sized for the
+    # legacy >= 8 s carve; under the arm's auto carve both scale with the
+    # slice (a 0.15 s slice would otherwise be gated out, or handed a
+    # worker deadline in the past).  Byte-identical on the legacy path.
+    _pb_enter = 0.5 * (rem_pb * _pb_frac) if gpu_auto else 1.5
+    if phase_b and time.time() < deadline - _pb_enter \
             and _os.environ.get("PARTNER_FUSION", "0") == "0":
         Wnp = np.asarray([list(r) for r in win[0]], dtype=np.float64)
+        # `_pb_nvar` is `_PHASE_B_VARIANTS` unless the arm had to share a
+        # pool too small to hold both rounds -> no-op off the arm path
         variants = ((1.0, False), (1.0, True), (2.5, False), (3.0, False),
-                    (1.0, False), (2.5, True), (1.0, True), (1.0, False))
-        wd2 = deadline - 0.30
+                    (1.0, False), (2.5, True), (1.0, True),
+                    (1.0, False))[:_pb_nvar]
+        wd2 = deadline - (min(0.30, 0.15 * max(0.0, deadline - time.time()))
+                          if gpu_auto else 0.30)
         pb_payloads = [(Wnp.copy(), np_of(area_targets),
                         np_of(constraints), np_of(target_positions),
                         np_of(b2b), np_of(p2b), np_of(pins),
                         wd2, seed + 401 + 11 * k, vw, anc)
                        for k, (vw, anc) in enumerate(variants)]
+        # second-wave GPU candidates ride the SAME round on the pool slots
+        # phase B has always left idle (8 payloads on a pool of up to 24).
+        # They enter as raw predictions, so they get their own light
+        # v_weight / anchor mix -- selection below is still true cost.
+        pb_payloads += [(np.asarray(P, dtype=np.float64),
+                         np_of(area_targets), np_of(constraints),
+                         np_of(target_positions), np_of(b2b), np_of(p2b),
+                         np_of(pins), wd2, seed + 601 + 13 * k,
+                         (2.5 if k % 4 == 3 else 1.0), bool(k % 3 == 2))
+                        for k, P in enumerate(preds2)]
+        if _os.environ.get("PARTNER_GPU_ARM_DEBUG"):
+            import sys as _sys
+            print(f"[gpuarm] n={opt1.n} rem={rem_pb:.3f} "
+                  f"frac={_pb_frac:.3f} slice={rem_pb * _pb_frac:.3f} "
+                  f"est={_pb_est:.3f} auto={int(gpu_auto)} "
+                  f"wave2={len(preds2)} payloads={len(pb_payloads)}",
+                  file=_sys.stderr, flush=True)
         try:
             res2 = _POOL.map_async(_worker_refine, pb_payloads)
             outs2 = [o for o in res2.get(
