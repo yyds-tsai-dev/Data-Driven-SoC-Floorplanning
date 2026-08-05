@@ -189,3 +189,16 @@ bit-exact(78 tests、off 路徑 byte-identical)。真熱點 = Python 層衍生�
   clamp[0.05,0.75])+ DM0.3 + NREF6 + **dpmpp4** + flow st8 →
   **noRT 1.223-1.230 @ avg 0.211-0.217s**(g5_st4_b 1.2234 最佳單點)。
 - Session 目標點軌跡:1.489(flat 0.25s 無 kernel)→ 1.223(−0.266)。
+
+## 實驗 13(0805):st 地板與 flow 定案 — 目標檔旋鈕空間收攏
+
+- **g6:`PARTNER_DDIM_STEPS=2` 促轉**(vs st4 成對 −0.0108/−0.0170 符號一致)。
+  單調鏈 st10→8→6→4→2 全程成立:目標檔 direct = 粗略拓撲草圖產生器,品質由
+  RK 精修扛,GPU 時間釋放一路是淨贏。
+- **g7:st1 wash**(+0.0100/−0.0010 符號不一致)——地板在 st2。**flow6 判死**
+  (vs flow8 +0.0140/+0.0031 兩對皆正;G3 單 run「勝」= 漂移,方差牆紀律再驗)。
+- **目標檔最終定案 config**:dpmpp2 + flow st8 + RK + SA kernel + POOL_GATE=0 +
+  tau12(SCALE=5e-5, clamp[0.05,0.75])+ DM0.3 + NREF6 →
+  **noRT 家族 1.212–1.223 @ avg 0.206–0.217s**(最佳單點 g6_st2_b 1.2121 @ 0.211s)。
+- Session 目標點軌跡:1.489 → 1.212(**−0.277**)。旋鈕空間關閉;殘餘結構線 =
+  GPU 空轉臂(phase-B 二波,agent 進行中)→ prior/拓撲牆。
