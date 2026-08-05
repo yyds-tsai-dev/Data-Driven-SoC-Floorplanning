@@ -151,6 +151,22 @@ Full-100 成對判定:
 **次級假說:把 ladder 熱迴圈(`legalize_soft`/`_tighten`)kernel 化(SA kernel 只覆蓋
 SA 移動迴圈),rung ÷2.5 後 AL 前提才成立**。代碼留存 default off。
 
+## 實驗 11:PARTNER_REFINE_KERNEL(0805,commits ca9adea/015fe0f)——雙檔位突破
+
+Rung(`legalize_soft`)÷12-23、`_tighten` ÷12-14、`_Refiner` build 6-11×(FASTBUILD),
+bit-exact(78 tests、off 路徑 byte-identical)。真熱點 = Python 層衍生結構迭代
+(_evict 35%、edge-list 25%),非重疊偵測(8%)。warm 在 pool fork 前(children 繼承)。
+
+| arm | noRT | avg | tailQ | 判讀 |
+|---|---|---|---|---|
+| rk_ctrl35 / rk_on35 | 1.1317 / **1.1208** | 1.99 / 1.88s | 1.1192 / 1.1094 | rep1 **−0.0109** |
+| rk_ctrl35_r2 / rk_on35_r2 | 1.1275 / **1.1184** | 1.99 / 1.88s | 1.1172 / 1.1059 | rep2 **−0.0091**(符號一致,promoted 檔歷史新低;runtime 同降)|
+| rk_goal_ctrl / rk_goal_on | 1.3115 / 1.3217 | 0.214 / 0.199s | — | RK 單獨在目標檔微負(價值在 direct 消費)|
+| **rk_goal_dm03**(RK+DM0.3+NREF6)| **1.2610** | **0.218s** | **1.2340** | **direct 通道在 0.44s tail 復活:−0.050,n≥110 帶 −0.074** |
+
+戰略含義:「通道不消費先驗」的 binding constraint 翻轉——prior 品質開始承重,
+訓練 gate(docs/research/2026-08-05-cost-finetune-fewstep-survey.md)前提成立。
+
 ## 現況總結(0804 晚)
 
 - **目標檔(avg≤0.24s)最佳組合 = kernel + gate0 + tau12 曲線:noRT 1.294-1.300**
