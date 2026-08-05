@@ -176,3 +176,16 @@ bit-exact(78 tests、off 路徑 byte-identical)。真熱點 = Python 層衍生�
   tail 0.55-0.8s 預算下實際可收復量待 A/B)、restart 廣度(configs 只有 24 條,
   POOL=46 需程序化擴列)、~0.12s 固定地板(期望 −0.02)、GPU 空轉臂、
   最後是 prior/拓撲品質牆(0707 定律域)。
+
+## 實驗 12(0805):目標檔 G3-G5 旋鈕收官 — st4 促轉,組合不疊加
+
+- **方差牆確立**:combo 家族帶 1.227-1.257(σ≈0.009)。G3「全臂皆勝」是 control 漂移
+  (G4 反例:同臂 st6 兩鏈 1.2287/1.2525);此檔位單 run 不可判 <0.01 的效應,
+  促轉一律成對多輪。
+- **g4/g5 判定:`PARTNER_DDIM_STEPS=4` 促轉**(兩清潔成對 −0.0116/−0.0126,tailQ
+  同向;st10→8→6→4 單調——目標檔 binding 是 GPU 時間不是 prior 保真度)。
+  組合(st6+flow6+AL)不疊加(≈家族均值);flow6/AL 單項留 default。
+- **目標檔定案 config(0805)**:RK + SA kernel + gate0 + tau12(SCALE=5e-5,
+  clamp[0.05,0.75])+ DM0.3 + NREF6 + **dpmpp4** + flow st8 →
+  **noRT 1.223-1.230 @ avg 0.211-0.217s**(g5_st4_b 1.2234 最佳單點)。
+- Session 目標點軌跡:1.489(flat 0.25s 無 kernel)→ 1.223(−0.266)。
