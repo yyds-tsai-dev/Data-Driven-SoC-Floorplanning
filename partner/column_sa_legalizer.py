@@ -68,6 +68,23 @@ def early_exit_on() -> bool:
     return _flag_on("PARTNER_EARLY_EXIT")
 
 
+def fast_setup_on() -> bool:
+    """PARTNER_FAST_SETUP=1 (default off): make the per-case FIXED costs
+    budget-aware.
+
+    At the goal operating point (b(n) = 5e-5 * exp(n/12) clamped to
+    [0.05, 0.75]) a small case asks for 0.05 s and measures 0.12-0.17 s of
+    wall clock.  The gap is not payload marshalling and not process dispatch
+    -- both are sub-millisecond, see
+    docs/design/2026-08-05-fast-setup-floor.md -- it is the flat 0.1 s
+    minimum anneal span in `finish`, which every one of the ~24 pool workers
+    pays no matter how short its deadline is.  The flag clamps that floor to
+    the span the chain was actually given, so a case honours its own budget.
+    Off: bit-identical (the clamp is a no-op whenever the planned span
+    already exceeds 0.1 s, i.e. every pre-goal-tier budget)."""
+    return _flag_on("PARTNER_FAST_SETUP")
+
+
 def early_exit_window(specific: str, default: float = 0.25) -> float:
     """Stall-window fraction with the documented precedence:
 
@@ -280,6 +297,92 @@ def gpu_arm_second_wave(sample_fn, k: int, gen_seed: int, t_wave1: float,
 # =============================================================================
 # Constraint parsing helpers (API kept for contest_optimizer.py)
 # =============================================================================
+def _pin_centroids_np(p2b: torch.Tensor, pins: torch.Tensor,
+                      n: int, n_pins: int):
+    """Vectorised twin of the `for edge in p2b` accumulation in
+    `_heuristic_init` (PARTNER_FAST_SETUP).
+
+    Bit-exact by construction: the same float32 -> float64 widening, the same
+    `(w * px)` product order, and the same accumulation order -- `np.add.at`
+    is unbuffered, so repeated target indices are summed in index order, which
+    is the loop's edge order.  Returns None on any unexpected layout so the
+    caller keeps the reference loop."""
+    e = p2b.detach().cpu().numpy()
+    pn = pins.detach().cpu().numpy()
+    if e.ndim != 2 or e.shape[1] < 3 or pn.ndim != 2 or pn.shape[1] < 2:
+        return None
+    sx = [0.0] * n
+    sy = [0.0] * n
+    wsum = [0.0] * n
+    if e.shape[0] == 0:
+        return sx, sy, wsum
+    pi = e[:, 0].astype(np.int64)
+    bi = e[:, 1].astype(np.int64)
+    keep = (e[:, 0] != -1) & (bi >= 0) & (bi < n) & (pi >= 0) & (pi < n_pins)
+    pi = pi[keep]
+    bi = bi[keep]
+    w = e[:, 2].astype(np.float64)[keep]
+    px = pn[pi, 0].astype(np.float64)
+    py = pn[pi, 1].astype(np.float64)
+    ok = (px != -1.0) & (py != -1.0)
+    bi = bi[ok]
+    px = px[ok]
+    py = py[ok]
+    w = np.maximum(w[ok], 0.0)
+    ax = np.zeros(n, dtype=np.float64)
+    ay = np.zeros(n, dtype=np.float64)
+    aw = np.zeros(n, dtype=np.float64)
+    np.add.at(ax, bi, w * px)
+    np.add.at(ay, bi, w * py)
+    np.add.at(aw, bi, w)
+    return ax.tolist(), ay.tolist(), aw.tolist()
+
+
+def _b2b_smooth_np(b2b: torch.Tensor, cx, cy, n: int):
+    """Vectorised twin of the `for edge in b2b` smoothing pass in
+    `_heuristic_init` (PARTNER_FAST_SETUP).
+
+    The loop writes nx[i] before nx[j] for each edge, so the flattened index
+    stream is INTERLEAVED (i0, j0, i1, j1, ...) rather than concatenated --
+    that is what keeps the unbuffered `np.add.at` accumulation order equal to
+    the loop's.  Returns None on any unexpected layout."""
+    e = b2b.detach().cpu().numpy()
+    if e.ndim != 2 or e.shape[1] < 3:
+        return None
+    nx = np.array(cx, dtype=np.float64)
+    ny = np.array(cy, dtype=np.float64)
+    deg = np.zeros(n, dtype=np.float64)
+    if e.shape[0] == 0:
+        return nx.tolist(), ny.tolist(), deg.tolist()
+    ii = e[:, 0].astype(np.int64)
+    jj = e[:, 1].astype(np.int64)
+    keep = (e[:, 0] != -1) & (ii >= 0) & (ii < n) & (jj >= 0) & (jj < n)
+    ii = ii[keep]
+    jj = jj[keep]
+    hw = 0.25 * np.maximum(e[:, 2].astype(np.float64)[keep], 0.0)
+    m = ii.shape[0]
+    # `acx`/`acy` are the READ side: the loop always reads the original
+    # centroid, never the partially accumulated `nx`/`ny`.
+    acx = np.array(cx, dtype=np.float64)
+    acy = np.array(cy, dtype=np.float64)
+    idx = np.empty(2 * m, dtype=np.int64)
+    idx[0::2] = ii
+    idx[1::2] = jj
+    vx = np.empty(2 * m, dtype=np.float64)
+    vx[0::2] = hw * acx[jj]
+    vx[1::2] = hw * acx[ii]
+    vy = np.empty(2 * m, dtype=np.float64)
+    vy[0::2] = hw * acy[jj]
+    vy[1::2] = hw * acy[ii]
+    vd = np.empty(2 * m, dtype=np.float64)
+    vd[0::2] = hw
+    vd[1::2] = hw
+    np.add.at(nx, idx, vx)
+    np.add.at(ny, idx, vy)
+    np.add.at(deg, idx, vd)
+    return nx.tolist(), ny.tolist(), deg.tolist()
+
+
 def _col(constraints: Optional[torch.Tensor], n: int, idx: int) -> List[float]:
     if constraints is None or constraints.dim() < 2 or constraints.shape[1] <= idx:
         return [0.0] * n
@@ -2263,7 +2366,19 @@ class _ColumnOptimizer:
         polish_t = min(0.28 * max(rem - refine_t, 0.0), 6.5)
         t_end = deadline - polish_t - refine_t
         now = time.time()
-        total = max(t_end - now, 0.1)
+        # Minimum anneal span.  The historical floor is a flat 0.1 s, which
+        # is longer than the WHOLE case budget at the goal operating point
+        # (0.05 s): every pool worker then annealed ~100 ms regardless of
+        # the deadline it was handed, and that -- not marshalling, not
+        # dispatch -- is the measured 0.12-0.17 s per-case wall floor.
+        # PARTNER_FAST_SETUP clamps the floor to the span this chain was
+        # actually given (see `fast_setup_on`); with the flag off the clamp
+        # cannot bind, because the floor only ever mattered when the planned
+        # span was already below 0.1 s.
+        _span_floor = 0.1
+        if fast_setup_on():
+            _span_floor = min(_span_floor, max(t_end - now, 0.0))
+        total = max(t_end - now, _span_floor)
         runs = 2 if (total > 6.0 and max_runs >= 2) else 1
         snaps = []
         # EARLY_EXIT clawback: every stage keeps its PLANNED share and returns

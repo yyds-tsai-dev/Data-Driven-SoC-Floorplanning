@@ -34,9 +34,11 @@ from candidate_supply import CandidateBatch, allocate_quotas, rank_predictions
 from iccad2026_evaluate import FloorplanOptimizer
 from diffusion_data import build_condition, fp_sol_to_z0, layout_scale, z_to_rectangles
 from diffusion_model import DiffusionSchedule, GraphDiffusionDenoiser, ModelConfig, ddim_refine
-from column_sa_legalizer import (_ColumnOptimizer, _ensure_no_overlap,
-                              _parse_constraints, _target, init_worker_pool,
-                              legalize_rectangles, rectangles_from_z)
+from column_sa_legalizer import (_ColumnOptimizer, _b2b_smooth_np,
+                              _ensure_no_overlap, _parse_constraints,
+                              _pin_centroids_np, _target, fast_setup_on,
+                              init_worker_pool, legalize_rectangles,
+                              rectangles_from_z)
 from layout_refiner import full_violations, refine_prediction
 
 # The retrieval channel (retrieval_*) is opt-in: it only runs when both
@@ -1234,7 +1236,17 @@ def _heuristic_init(
     sy = [0.0] * n
     wsum = [0.0] * n
     n_pins = pins.shape[0]
-    for edge in p2b:
+    # PARTNER_FAST_SETUP: the two edge loops below are per-row `.item()`
+    # calls over the PADDED connectivity tensors, so their cost tracks the
+    # tensor height, not the instance -- 4.7 ms at n=25 up to 138 ms at
+    # n=120, all of it serial in the parent before any worker sees the case.
+    # The numpy twins are bit-exact (see `_pin_centroids_np`), and any
+    # unexpected tensor layout falls back to the loops below.
+    _fast = fast_setup_on()
+    _got = _pin_centroids_np(p2b, pins, n, n_pins) if _fast else None
+    if _got is not None:
+        sx, sy, wsum = _got
+    for edge in (() if _got is not None else p2b):
         if edge[0] == -1:
             continue
         p = int(edge[0].item())
@@ -1267,7 +1279,10 @@ def _heuristic_init(
     nx = list(cx)
     ny = list(cy)
     deg = [0.0] * n
-    for edge in b2b:
+    _got2 = _b2b_smooth_np(b2b, cx, cy, n) if _fast else None
+    if _got2 is not None:
+        nx, ny, deg = _got2
+    for edge in (() if _got2 is not None else b2b):
         if edge[0] == -1:
             continue
         i = int(edge[0].item())
