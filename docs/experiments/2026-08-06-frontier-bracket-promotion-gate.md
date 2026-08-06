@@ -69,3 +69,30 @@ Per-rep 前緣校正淨值(負 = C 在 OFF 前緣下方 = 真增益):
 
 證據:session scratch `eval_fb_{alo,ahi,c}_r{1,2,3}.json`、`frontier_bracket_run.sh`;
 前兩鏈 `eval_combo_*.json`、`eval_final_*.json`(session c70131c1 scratch)。
+
+## Final repack 驗證(同日,promotion 之後)
+
+首次「解壓後的包」full-100 驗證(舊流程只驗 repo 樹,從未驗官方實際執行的
+產物)抓到三個**從 0730 舊 tar 就存在**的出貨 bug:
+
+1. **import closure 缺 8 個模組**:`violation_killer`(`coord_polish._polish`
+   與 `_edge_seat` 官方式 V 驗收的共同依賴)、`frame_repack`
+   (layout_refiner:5148)、retrieval 四件組、train-only 兩件。三層
+   `except Exception` containment 把 ModuleNotFoundError 吞成靜默 no-op —
+   解壓包跑出 **1.1936 @ 0.235s,與 A_lo(全關)精準重合**,促轉包等於沒出貨。
+2. **numba 冷 JIT 首案懸崖**:新路徑部署使磁碟快取失效,10.46s 編譯記進
+   首案 runtime(n=21 案)。
+3. checkpoint 稽核(此項 OK):包內 slim 檔與證據檔 EMA 權重 154/154 張量
+   位元相同。
+
+修復:補齊 8 模組(closure 腳本驗證 CLOSED)、`op_wrapper._warm_jit_kernels()`
+(import-time 以 `synth_instances` 合成小實例編譯兩套 kernel,不計時窗口,
+`PARTNER_JIT_WARM=0` 可關)、tar 內烘焙 numba 磁碟快取(同架構 cache-hit)。
+
+**重打包後解壓驗證(定版 tar md5 `08c00842cdf0b082a0c5aa1bbc689adc`)**:
+noRT **1.1692**(C 臂證據帶內)、100/100 feasible、avg **0.289s**、
+首案 0.052s(懸崖已平)、max 1.78s、polish/seat/wpin 確認開火
+(`[polish] n=117` 探針)。
+
+教訓成文:**提交包驗證必須從解壓後的 tar 跑**;containment 靜默失敗需配
+debug 旗標抽查;import closure 檢查納入 repack 流程。
