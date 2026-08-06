@@ -85,6 +85,41 @@ def fast_setup_on() -> bool:
     return _flag_on("PARTNER_FAST_SETUP")
 
 
+# --- PARTNER_FRAME_WPIN -------------------------------------------------
+# `_choose_frame` pins the frame HEIGHT to a top-tagged preplaced block but
+# has no width counterpart, so on instances whose preplaced blocks carry an
+# L/R tag the frame width is whatever the aspect heuristic guessed and the
+# tag is unsatisfiable by construction.  Rather than hard-pinning W (which
+# would override the height pin and lose on instances where the guess was
+# right), the derived frame enters the restart pool as an EXTRA ARM and
+# competes under the same true cost as every other restart.
+FRAME_WPIN_UTIL = 0.96    # frame utilisation used to derive H from W*
+
+
+def frame_wpin_on() -> bool:
+    """PARTNER_FRAME_WPIN=1 (default off): add W*-derived frame arms to the
+    restart portfolio on instances with an L/R-tagged preplaced block.
+
+    Gate is a reusable instance statistic (does a preplaced block carry a
+    right-wall tag?), never a case id.  Off: the portfolio, the payload
+    arity and `_choose_frame` are all byte-identical."""
+    return _flag_on("PARTNER_FRAME_WPIN")
+
+
+def col_narrow_on() -> bool:
+    """PARTNER_COL_NARROW=1 (default off): let the column-width solve shrink,
+    not just grow.
+
+    `_layout` solves each column's width from its soft area and then retries
+    WIDER when the stack overflows the frame -- but never retries NARROWER
+    when it underflows.  An underflowing column is dead area inside the
+    frame (measured: 96.8% of dead area sits inside columns), and dead area
+    inflates the bbox, which is the area_gap term of the score.  The narrow
+    loop is the exact mirror of the widen loop, with the same overflow guard
+    as its acceptance test.  Off: the loop never runs."""
+    return _flag_on("PARTNER_COL_NARROW")
+
+
 def early_exit_window(specific: str, default: float = 0.25) -> float:
     """Stall-window fraction with the documented precedence:
 
@@ -529,7 +564,12 @@ class _ColumnOptimizer:
         v_weight: float = 1.0,
         h_scale: float = 1.0,
         pinned: Optional[Dict[int, Rect]] = None,
+        w_star: Optional[float] = None,
     ):
+        # PARTNER_FRAME_WPIN portfolio arm: the frame WIDTH implied by the
+        # L/R-tagged preplaced blocks.  None (the default, and the only
+        # value any pre-flag caller passes) leaves `_choose_frame` untouched.
+        self.w_star = w_star
         self.n = len(rects)
         self.rects = rects
         self.deadline = deadline if deadline is not None else time.time() + 3.0
@@ -579,6 +619,10 @@ class _ColumnOptimizer:
             if len(u.subgroups) >= 2 or any(len(sg) >= 2 for sg in u.subgroups))
         self._dc_hits = 0
         self._dc_recompute = 0
+
+        # PARTNER_COL_NARROW (default off): read once per optimizer, never in
+        # the `_layout` inner loop.
+        self._col_narrow = col_narrow_on()
 
         # -- Fast-SA cooling schedule (PARTNER_FASTSA_TEMP=1, default off) ---
         # Cherry-pick #1 from src/floorset_arch/legalizer/column_slicing.py.
@@ -793,6 +837,16 @@ class _ColumnOptimizer:
                 pinned_H = top if pinned_H is None else max(pinned_H, top)
         if pinned_H is not None:
             H = pinned_H
+        # PARTNER_FRAME_WPIN arm: an L/R-tagged preplaced block reveals the
+        # intended frame WIDTH the same way a top-tagged one reveals its
+        # height.  We do not pin W directly -- the column solve owns width --
+        # so we express the same frame through its height and let the
+        # existing per-column width solve converge onto W*.  This
+        # deliberately overrides `pinned_H`: an arm that pins both is
+        # over-constrained, and the height-pinned arms are still in the pool
+        # alongside this one.
+        if self.w_star is not None and self.w_star > 1.0:
+            H = self.total_area / (FRAME_WPIN_UTIL * self.w_star)
         for (x, y, w, h) in self.locked_rects:
             H = max(H, y + h)
         for i in range(self.n):
@@ -1672,6 +1726,32 @@ class _ColumnOptimizer:
                     placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
                     tries += 1
 
+            # PARTNER_COL_NARROW: the mirror of the widen loop.  A column that
+            # stacks SHORT of the frame is carrying dead area that the bbox
+            # pays for; narrowing it in proportion to the shortfall trades
+            # that dead area for frame width the neighbours can use.  The
+            # acceptance test is the widen loop's own overflow guard -- if the
+            # narrower width overflows, the previous width is restacked and
+            # kept, so this can only ever return a legal column.
+            if soft_a > 0 and self._col_narrow:
+                tries = 0
+                while col_top < H * 0.995 and tries < 2:
+                    w2 = w * max(0.85, col_top / H)
+                    if w2 < max_w:
+                        w2 = max_w
+                    if w2 < 0.5:
+                        w2 = 0.5
+                    if w2 >= w - 1e-9:
+                        break
+                    p2, o2, ct2 = self._stack_column(ulist, x, w2, pos)
+                    if ct2 > H * 1.0005:
+                        # overflowed: restore the accepted width and stop
+                        placed, occupied, col_top = self._stack_column(
+                            ulist, x, w, pos)
+                        break
+                    w, placed, occupied, col_top = w2, p2, o2, ct2
+                    tries += 1
+
             col_records.append((x, w, placed, occupied))
             col_spans.append((x, x + w))
             x += w
@@ -1904,6 +1984,28 @@ class _ColumnOptimizer:
                         w2 = w * 1.25
                     w = min(max(w2, w * 1.01), w * 2.0)
                     placed, occupied, col_top = self._stack_column(ulist, x, w, pos)
+                    tries += 1
+
+            # PARTNER_COL_NARROW: mirror of the narrow loop in `_layout_full`
+            # (kept in sync so the delta cache and the full path agree).  w
+            # stays a deterministic function of (ulist, x, H), which is what
+            # the cache's correctness argument needs.
+            if soft_a > 0 and self._col_narrow:
+                tries = 0
+                while col_top < H * 0.995 and tries < 2:
+                    w2 = w * max(0.85, col_top / H)
+                    if w2 < max_w:
+                        w2 = max_w
+                    if w2 < 0.5:
+                        w2 = 0.5
+                    if w2 >= w - 1e-9:
+                        break
+                    p2, o2, ct2 = self._stack_column(ulist, x, w2, pos)
+                    if ct2 > H * 1.0005:
+                        placed, occupied, col_top = self._stack_column(
+                            ulist, x, w, pos)
+                        break
+                    w, placed, occupied, col_top = w2, p2, o2, ct2
                     tries += 1
 
             record = (x, w, placed, occupied)
@@ -3230,11 +3332,47 @@ def _perimeter_seed_layouts(opt, seed_rects, variants=2):
     return outs
 
 
+def _w_star_from_tags(opt) -> Optional[float]:
+    """Frame width implied by the L/R-tagged PREPLACED blocks, or None.
+
+    Reusable instance statistic, never a case id: the trigger is "a preplaced
+    block carries a right-wall tag" (bit 2).  A right-tagged preplaced block
+    can only satisfy its tag if the frame's right edge is its own right edge,
+    so max(x + w) over the locked rects IS the intended frame width -- the
+    max is over ALL locked rects, not just the tagged one, because a locked
+    block sticking out further would move the bbox edge past the tag.
+    The left side is the packing origin (x = 0) unless a locked rect starts
+    left of it, which is the symmetric L case.
+
+    Returns None when the tag is absent or the derived width is degenerate."""
+    if not opt.locked_rects:
+        return None
+    has_r = any(opt.kind[i] == 2 and (int(opt.boundary[i]) & 2)
+                for i in range(opt.n))
+    if not has_r:
+        return None
+    x_hi = max(x + w for (x, _y, w, _h) in opt.locked_rects)
+    x_lo = min(0.0, min(x for (x, _y, _w, _h) in opt.locked_rects))
+    w_star = x_hi - x_lo
+    if not (w_star > 1.0) or not math.isfinite(w_star):
+        return None
+    return float(w_star)
+
+
 def _worker_solve(args):
     """One independent (orientation, column count, seed) restart."""
     try:
-        (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
-         orient, c_force, seed, deadline, v_weight, h_scale) = args
+        # PARTNER_FRAME_WPIN appends a 14th field (the arm's W*, or None).
+        # Pre-flag payloads are 13-wide and take the historical branch, so
+        # the off path is byte-identical.
+        if len(args) == 14:
+            (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
+             orient, c_force, seed, deadline, v_weight, h_scale,
+             w_star) = args
+        else:
+            (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
+             orient, c_force, seed, deadline, v_weight, h_scale) = args
+            w_star = None
         at = torch.from_numpy(areas_np)
         cons = torch.from_numpy(cons_np) if cons_np is not None else None
         tpos = torch.from_numpy(tpos_np) if tpos_np is not None else None
@@ -3245,14 +3383,15 @@ def _worker_solve(args):
         if orient == 'T':
             rs, cons, tpos, pins = _transpose_inputs(rects, cons, tpos, pins)
         opt = _ColumnOptimizer(rs, at, cons, tpos, b2b, p2b, pins, deadline,
-                               seed=seed, v_weight=v_weight, h_scale=h_scale)
+                               seed=seed, v_weight=v_weight, h_scale=h_scale,
+                               w_star=w_star)
         if orient == 'P':
             got = _perimeter_pack(opt, rs)
             if got is not None and got[0]:
                 opt = _ColumnOptimizer(rs, at, cons, tpos, b2b, p2b, pins,
                                        deadline, seed=seed,
                                        v_weight=v_weight, h_scale=h_scale,
-                                       pinned=got[0])
+                                       pinned=got[0], w_star=w_star)
         if opt.locked_only():
             out = opt.locked_positions()
             return (out, 0.0, 0.0, 0)
@@ -3383,6 +3522,28 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
             _k += 1
             configs.append((_orient, _cf, _sd + 275 + 11 * _k, _vw, _hs))
 
+    # PARTNER_FRAME_WPIN: hand the tail restart slots a frame derived from
+    # the L/R-tagged preplaced blocks instead of the pin-aspect guess.  They
+    # are ADDITIONAL arms, not replacements -- the h_scale arms all stay --
+    # and they compete under the same true cost at selection, so an instance
+    # where the aspect guess was already right loses nothing but the tail
+    # slots' marginal breadth.  Only 'N' slots qualify: W* is measured in the
+    # original frame, and a 'T' restart solves the transposed one.
+    _ws_map: Dict[int, float] = {}
+    if frame_wpin_on():
+        _ws = _w_star_from_tags(opt1)
+        if _ws is not None:
+            try:
+                _ws_arms = int(float(_os.environ.get(
+                    "PARTNER_FRAME_WPIN_ARMS", "3")))
+            except ValueError:
+                _ws_arms = 3
+            for _idx in range(len(configs) - 1, -1, -1):
+                if len(_ws_map) >= max(0, _ws_arms):
+                    break
+                if configs[_idx][0] == 'N':
+                    _ws_map[_idx] = _ws
+
     def np_of(t):
         return None if t is None else t.detach().cpu().numpy()
 
@@ -3441,6 +3602,14 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                  np_of(target_positions), np_of(b2b), np_of(p2b), np_of(pins),
                  orient, cf, sd, worker_deadline, vw, hs)
                 for (orient, cf, sd, vw, hs) in configs]
+    if _ws_map:
+        # uniform arity so the worker's length test is a single branch
+        payloads = [p + (_ws_map.get(k),) for k, p in enumerate(payloads)]
+        if _os.environ.get("PARTNER_FRAME_WPIN_DEBUG"):
+            import sys as _sys
+            print(f"[wpin] n={opt1.n} W*={next(iter(_ws_map.values())):.2f} "
+                  f"arms={sorted(_ws_map)} of {len(configs)}",
+                  file=_sys.stderr, flush=True)
     res = _POOL.map_async(_worker_solve, payloads)
 
     # column restarts are already running; sample on the GPU now and hand

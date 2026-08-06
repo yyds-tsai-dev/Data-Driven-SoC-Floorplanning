@@ -61,6 +61,33 @@ def early_exit_on() -> bool:
     return _flag_on("PARTNER_EARLY_EXIT")
 
 
+def edge_seat_v2_on() -> bool:
+    """PARTNER_EDGE_SEAT_V2=1 (default off): widen `_edge_seat`'s reach and
+    make its acceptance test evaluator-faithful.
+
+    Four coupled changes, all inside `_edge_seat` (see its docstring for the
+    per-change rationale):
+
+      (i)   GAP scales with the layout -- max(2.0, 0.08 * min(bbox_w, bbox_h))
+            instead of a flat 2.0.  A flat window is a different fraction of
+            the frame on a 21-block and a 120-block case, so on large frames
+            it declared every real hover "a real misplace" and declined.
+      (ii)  the (c) outlier-pull cap goes 3 -> 8 outliers.
+      (iii) a corner-seat pass runs BEFORE the per-edge loop: a block tagged
+            for two walls needs a corner, and seating it one axis at a time
+            makes the intermediate state worse on the other axis, so the
+            per-edge loop's strict-improvement gate rejects step one and the
+            corner is never reached.  The pass moves both axes at once.
+      (iv)  acceptance switches from the solver-internal `full_violations`
+            proxy to the evaluator's own boundary+grouping+MIB total.  The
+            proxy nets moves across categories with different semantics
+            (TOUCH_TOL vs exact touch), so a net-negative proxy delta can be
+            a net-POSITIVE official delta -- measured on the offline probe.
+
+    Off: `_edge_seat` runs the historical proxy/2.0/3 path unchanged."""
+    return _flag_on("PARTNER_EDGE_SEAT_V2")
+
+
 def early_exit_window(specific: str, default: float = 0.25) -> float:
     """Stall-window fraction: explicit phase env > PARTNER_EARLY_EXIT_WINDOW
     (when EARLY_EXIT is on) > historical default."""
@@ -4455,18 +4482,51 @@ def _edge_seat(opt, out):
     side at once.  Per edge, in order: translate the tagged block onto
     the edge; reshape it (soft, area-preserving) to extend to the edge;
     pull the few outliers that overshoot the tagged shelf back level
-    with it.  Kept only if the full violation count strictly drops."""
+    with it.  Kept only if the full violation count strictly drops.
+
+    PARTNER_EDGE_SEAT_V2=1 (see `edge_seat_v2_on`) widens the reach --
+    layout-scaled GAP, an 8-outlier pull cap, a joint two-axis corner
+    pass -- and swaps the acceptance test for the evaluator's own
+    boundary+grouping+MIB total.  Default off: byte-identical."""
     Q = np.asarray(out, dtype=np.float64).copy()
     n = opt.n
     bnd = [(i, int(opt.boundary[i])) for i in range(n)
            if opt.boundary[i] > 0]
     if not bnd:
         return out
-    V0 = full_violations(opt, Q)
+
+    v2 = edge_seat_v2_on()
+    _exact = None
+    if v2:
+        # (iv) evaluator-faithful acceptance.  Lazily imported: the module
+        # pulls in column_sa_legalizer, and the off path must not pay for
+        # it.  If it is unavailable we silently keep the proxy -- a wider
+        # search under the old test, never a crash.
+        try:
+            from violation_killer import _violations_exact as _exact_fn
+            _exact = _exact_fn
+        except Exception:
+            _exact = None
+
+    def _viol(P):
+        if _exact is not None:
+            return _exact(opt, P)
+        return full_violations(opt, P)
+
+    V0 = _viol(Q)
     if V0 <= 0:
         return out
     eps = 1e-6
     GAP = 2.0        # only chase small hovers; big gaps are real misplaces
+    OVER_CAP = 3     # (c) outlier-pull cap
+    if v2:
+        # (i) the hover window is a property of the FRAME, not an absolute
+        # length: 2.0 units is a big gap on a 21-block frame and rounding
+        # noise on a 120-block one.
+        _bw = float((Q[:, 0] + Q[:, 2]).max() - Q[:, 0].min())
+        _bh = float((Q[:, 1] + Q[:, 3]).max() - Q[:, 1].min())
+        GAP = max(2.0, 0.08 * min(_bw, _bh))
+        OVER_CAP = 8                                  # (ii)
 
     def _clash(i, rect):
         x0, y0, w, h = rect
@@ -4484,7 +4544,7 @@ def _edge_seat(opt, out):
         snap = [(i, Q[i].copy()) for i, _ in changes]
         for i, rect in changes:
             Q[i] = rect
-        V = full_violations(opt, Q)
+        V = _viol(Q)
         if V < Vcur:
             Vcur = V
             return True
@@ -4501,6 +4561,40 @@ def _edge_seat(opt, out):
 
     # (bit, axis, side): side 0 = min edge, side 1 = max edge
     edges = ((1, 0, 0), (8, 1, 0), (2, 0, 1), (4, 1, 1))
+
+    if v2:
+        # (iii) corner seat.  A two-bit tag (e.g. left AND bottom) asks for
+        # a CORNER.  The per-edge loop below can only offer one axis at a
+        # time, and the intermediate -- seated on x, still hovering on y --
+        # scores no better than the start, so `_commit`'s strict gate
+        # rejects step one and step two never happens.  Move both axes
+        # together and let the same gate arbitrate the finished move.
+        # Locked blocks are excluded (kind 2 may not translate); the
+        # clash test and the global V test do the rest, so cluster/MIB
+        # members are allowed in and simply lose when they break something.
+        for i, code in bnd:
+            if bin(code).count("1") < 2 or opt.kind[i] == 2:
+                continue
+            x_lo = float(Q[:, 0].min())
+            y_lo = float(Q[:, 1].min())
+            x_hi = float((Q[:, 0] + Q[:, 2]).max())
+            y_hi = float((Q[:, 1] + Q[:, 3]).max())
+            rect = Q[i].copy()
+            if code & 1:
+                rect[0] = x_lo
+            elif code & 2:
+                rect[0] = x_hi - rect[2]
+            if code & 8:
+                rect[1] = y_lo
+            elif code & 4:
+                rect[1] = y_hi - rect[3]
+            if abs(rect[0] - Q[i, 0]) < 1e-12 \
+                    and abs(rect[1] - Q[i, 1]) < 1e-12:
+                continue                      # already seated
+            if _clash(i, tuple(rect)):
+                continue
+            _commit([(i, rect)])
+
     for _round in range(2):
         for bit, axis, side in edges:
             lo = Q[:, axis]
@@ -4644,7 +4738,7 @@ def _edge_seat(opt, out):
             else:
                 tgt = max(hi[i] for _g, i in still)
                 over = [j for j in range(n) if hi[j] > tgt + eps]
-            if 0 < len(over) <= 3 \
+            if 0 < len(over) <= OVER_CAP \
                     and all(_can_translate(j)
                             and opt.cluster[j] <= 0 for j in over):
                 def _bbox_area(P):
@@ -4664,7 +4758,7 @@ def _edge_seat(opt, out):
                 if bad:
                     Q[...] = snap
                 else:
-                    V = full_violations(opt, Q)
+                    V = _viol(Q)
                     if V < Vcur or (V == Vcur
                                     and _bbox_area(Q) < ar0 - 1e-9):
                         Vcur = V
@@ -4737,7 +4831,7 @@ def _edge_seat(opt, out):
                 for k in group:
                     Q[k, axis + 2] = dim
             if ok:
-                V = full_violations(opt, Q)
+                V = _viol(Q)
                 if V < Vcur:
                     Vcur = V
                 else:

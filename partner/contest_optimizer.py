@@ -39,7 +39,8 @@ from column_sa_legalizer import (_ColumnOptimizer, _b2b_smooth_np,
                               _pin_centroids_np, _target, fast_setup_on,
                               init_worker_pool, legalize_rectangles,
                               rectangles_from_z)
-from layout_refiner import full_violations, refine_prediction
+from layout_refiner import (edge_seat_v2_on, full_violations,
+                            refine_prediction)
 
 # The retrieval channel (retrieval_*) is opt-in: it only runs when both
 # PARTNER_RETRIEVAL_INDEX and PARTNER_RETRIEVAL_SLOTS are set.  Its modules are
@@ -389,6 +390,9 @@ class MyOptimizer(FloorplanOptimizer):
             t_legal = time.time()
             if th is not None:
                 th.join(timeout=max(0.0, deadline - time.time()) + 0.1)
+            column_out = self._column_edge_seat(
+                column_out, area_targets, constraints, target_positions,
+                b2b, p2b, pins, direct_box)
             out = (self._pick_best(column_out, direct_box)
                    if direct_box else column_out)
             t_kill = (vk_deadline if vk_deadline is not None
@@ -402,6 +406,9 @@ class MyOptimizer(FloorplanOptimizer):
             result = self._violation_kill(
                 out, area_targets, constraints, target_positions,
                 b2b, p2b, pins, t_kill)
+            result = self._coord_polish(
+                result, area_targets, constraints, target_positions,
+                b2b, p2b, pins)
             if os.environ.get("PARTNER_EARLY_EXIT_DEBUG"):
                 # per-case time anatomy: serial head (heuristic seed + GPU
                 # seed-diffusion + parse), the deadline-bounded solve, and
@@ -437,6 +444,62 @@ class MyOptimizer(FloorplanOptimizer):
                 out, at, cons, tpos, b2b, p2b, pins,
                 budget=max(0.2, t_kill - time.time()),
                 verbose=self.verbose)
+        except Exception:
+            return out
+
+    def _column_edge_seat(self, column_out, at, cons, tpos, b2b, p2b, pins,
+                          direct_box):
+        """Path coverage for `layout_refiner._edge_seat`.
+
+        `_edge_seat` runs inside the direct-prediction refine ladder, so the
+        COLUMN arm -- which wins most cases -- never saw it: its residual
+        boundary-tag hovers survived to the evaluator untouched.  This runs
+        the same surgical pass over the column champion before `_pick_best`
+        arbitrates, so both arms are judged after their tags are seated.
+
+        Ordering: this is deliberately BEFORE `_coord_polish`.  Polish's
+        BOUNDARY=2 mode only preserves tag bits that are ALREADY satisfied,
+        so seating first hands it more walls to protect.
+
+        Opt-in via PARTNER_EDGE_SEAT_V2=1 (the same flag that widens
+        `_edge_seat` itself -- the pass is only worth its cost in the widened
+        form).  Off: returns the SAME list object, no import, no scorer
+        build.  Contained: any failure returns `column_out` unchanged."""
+        if not edge_seat_v2_on():
+            return column_out
+        try:
+            from layout_refiner import _edge_seat
+            # reuse the direct channel's scorer when there is one -- it is
+            # constraint-derived, so it scores any layout of this instance
+            # (this is exactly what `_pick_best` already does with it)
+            scorer = direct_box[0][1] if direct_box else _ColumnOptimizer(
+                [tuple(map(float, r)) for r in column_out], at, cons, tpos,
+                b2b, p2b, pins, time.time() + 1.0, seed=0)
+            seated = _edge_seat(scorer, column_out)
+            return [tuple(map(float, r)) for r in seated]
+        except Exception:
+            return column_out
+
+    def _coord_polish(self, out, at, cons, tpos, b2b, p2b, pins):
+        """Post-pass: order-preserving simultaneous-axis coordinate polish of
+        the final layout (see partner/coord_polish.py).  Every stage upstream
+        of here optimises coordinates by coordinate descent over groups, so the
+        returned layout is only locally optimal for its own topology; this pass
+        re-solves both axis coordinate problems jointly under the layout's own
+        separation DAG.
+
+        Opt-in via PARTNER_COORD_POLISH=1.  With the flag unset the module is
+        never imported and this method is a single dict lookup, so the default
+        pipeline stays byte-identical.  The pass is time-boxed
+        (PARTNER_COORD_POLISH_BUDGET_MS, default 300) and its cost is INSIDE
+        the per-case timing boundary, so it is charged honestly to runtime.
+        Contained: any failure returns `out` unchanged."""
+        if not os.environ.get("PARTNER_COORD_POLISH"):
+            return out
+        try:
+            from coord_polish import polish_layout
+            return polish_layout(out, at, cons, tpos, b2b, p2b, pins,
+                                 verbose=self.verbose)
         except Exception:
             return out
 
