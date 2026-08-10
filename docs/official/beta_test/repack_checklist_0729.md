@@ -206,6 +206,64 @@ noRT 1.1354 對 0729 R1 的 1.1283 為 **+0.0071**（判準 ≤0.01 內），但
 refstall_on 家族觀測帶（1.1253-1.1265）之上——依上述 byte/AST 同一性證據，這是抽樣變異
 而非改名或收割造成的退化；若要收窄不確定性，唯一乾淨做法是同期成對再跑一輪。
 
+## 8. 0810 Beta Resubmission 重打(現役包;回應官方 format issue 通知)
+
+官方 0810 email:Beta Submission 有 format issue(s),8/12 23:59 (GMT+8) 前重傳到
+Google Drive 的 **「Beta Resubmission」資料夾**。對照 guidelines 稽核 0806 定版包
+(md5 `08c00842…`),找到三處違規,全部修正後重打;**26 個 .py 閉包、兩顆
+checkpoint、op_wrapper 定案 env 完全不動**(僅 op_wrapper 一行註解更新)。
+
+### 0806 包的三個 format 問題
+
+| # | 問題 | 違反條款 | 修正 |
+| --- | --- | --- | --- |
+| 1 | `__pycache__/` 整目錄入包(43 檔:.pyc + numba .nbi/.nbc,0806「烘焙 JIT 快取」的刻意決定) | §1 清潔度(「Do NOT include files unrelated…may lead to disqualification」) | 整目錄移除。冷 JIT 已由 op_wrapper import-time `_warm_jit_kernels()` 覆蓋(QA A14 載入不計時),快取非必要 |
+| 2 | `requirements.txt` 非空且不完整(僅 `scipy==1.13.1`+`numba==0.66.0`) | §2/§4a:非空=Case B,評測端**只用此檔建 fresh venv** → 無 torch/numpy,整包必炸;而 §2 Case A 明文 scipy、numba 皆預裝 | 改回 **0 bytes**(Case A)。0806 依據的「官方 requirements 無 scipy/numba」是 contest repo 的 requirements.txt,對 beta 評測環境不適用 |
+| 3 | 權限/擁有者未正規化(`retrieval_*.py` mode 600 — 評測端異 uid 讀不到;owner 洩漏 `yyds-dev`;模式 644/664 混雜) | 非明文條款,但 0729/0730 版既有標準 | `find` 統一 644/755,tar `--owner=0 --group=0 --numeric-owner --sort=name` |
+
+### 第四個修正(Codex 獨立稽核 round 1 抓到):`contest_optimizer.py` → `op_src.py`
+
+Codex(gpt-5.4)對重打包的稽核在其餘條款全 PASS 之下,判 §1
+「No other optimizer .py files」嚴格解讀 FAIL:`contest_optimizer.py` 檔名帶
+optimizer 且持有唯一的 `MyOptimizer(FloorplanOptimizer)` 子類,嚴格審查者可能
+視為第二個 optimizer 檔。修法=改名為官方許可的 **`op_src.py`**(§1/§3 明文
+選用檔名,兼作 op_wrapper 失敗時的官方 fallback 入口),`op_wrapper.py` L68
+import 同步改 `from op_src import MyOptimizer`。程式引用僅此一處
+(其餘 `contest_optimizer` 字樣皆為註解/docstring,保持與 `partner/` 逐 byte
+一致故不動)。附帶收益:`--evaluate op_src.py` 獨立實測 case 0/95 皆 feasible
+(無 env defaults 時走大預算 ~0.6/19.5s,緊急備援語義,品質較差但可動)。
+
+### 定版
+
+- 包:`submission/cadc1013.tar.gz`(md5
+  **`c2dd42bbf042af4d29d24c4b014a7cb6`**);31 條目 = 26 .py(含 `op_src.py`)
+  + requirements.txt(0B)+ 2 .pt + 2 目錄,無 `__pycache__`/log/JSON/隱藏檔;
+  絕對路徑掃描 0 命中;模式 644/755、uid/gid 0/0。
+- 0806 舊包備份:`submission/cadc1013_0806.tar.gz.bak`(md5 `08c00842…`)。
+- op_wrapper.py 相對 0806 僅兩處變更:L68 import 改 `op_src`、numba 來源註解
+  改為「provided by the evaluation environment (Beta guidelines §2 Case A)」。
+- 上傳注意:**只傳 `cadc1013.tar.gz` 一個檔**到「Beta Resubmission」資料夾
+  (勿附 .md5 sidecar 或其他檔案)。
+
+### 從新 tar 全新解壓 → full-100(§6 鐵律)
+
+全新解壓到臨時目錄、複製官方 `iccad2026_evaluate.py` 進 `cadc1013/`、
+`PYTHONPATH` 只給 `FloorSet/`(loader+資料,不含 repo `partner/`)、repo venv
+模擬預裝清單(numba 0.66.0 / scipy 1.13.1 / torch 2.6.0+cu124,量測窗乾淨:
+GPU idle、無他人 evaluator),官方指令
+`python iccad2026_evaluate.py --evaluate op_wrapper.py`,兩輪:
+
+| 包 | Total(RF=1.0) | feasible | errors | avg / max rt | 首案 rt |
+| --- | --- | --- | --- | --- | --- |
+| 改名前(md5 `6182b7e6…`) | 1.1673 | 100/100 | 0 | 0.295 / 1.797 s | 0.085 s |
+| **定版(md5 `c2dd42bb…`)** | **1.1647** | **100/100** | **0** | **0.293 / 1.791 s** | **0.083 s** |
+
+- 首案無冷 JIT 懸崖——證明移除烘焙快取後 op_wrapper import-time warm 足夠;
+  `loaded direct model step 1200000` + `loaded flow model step 1000000`,
+  `[polish]` 逐案觸發可見(scipy 通道活著)。
+- 對 0806 證據帶 1.1692:Δ −0.002~−0.005,遠小於此檔位家族單跑 sd
+  (≈0.008-0.010),與「僅移除垃圾檔+改名、零行為變更」一致。
+
 ### 本次一併修好的 repo 問題
 
 `d9aa665` 是純 `git mv`（0 行變更），因此被改名模組**內部的 import 敘述仍指向舊 `*_claude` 名**

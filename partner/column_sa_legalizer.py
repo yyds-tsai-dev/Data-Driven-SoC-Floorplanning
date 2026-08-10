@@ -116,8 +116,67 @@ def col_narrow_on() -> bool:
     frame (measured: 96.8% of dead area sits inside columns), and dead area
     inflates the bbox, which is the area_gap term of the score.  The narrow
     loop is the exact mirror of the widen loop, with the same overflow guard
-    as its acceptance test.  Off: the loop never runs."""
+    as its acceptance test.  Off: the loop never runs.
+
+    CAVEAT (measured 2026-08-06): `partner/sa_numeric_kernel.py` transcribes
+    the WIDEN loop only (sa_numeric_kernel.py:921).  With
+    `PARTNER_SA_KERNEL=numba` attached, `_layout` returns the kernel result
+    and `_layout_full`'s narrow block is unreachable except on a kernel
+    fallback -- so at the shipped 0.3 s operating point this flag is inert
+    inside the SA search.  See `PARTNER_SA_STATS` for the counters."""
     return _flag_on("PARTNER_COL_NARROW")
+
+
+def sa_adaptive_on() -> bool:
+    """PARTNER_SA_ADAPTIVE=1 (default off): reweight the SA move mix online.
+
+    Port of the M1c adaptive-move bookkeeping in
+    `src/floorset_arch/legalizer/column_slicing.py:1884-1912`.  A sliding
+    window of `PARTNER_SA_ADAPTIVE_WINDOW` (200) realised proposals scores
+    each move family by `acceptance_rate x mean_accepted_improvement`, then
+    redistributes the family probabilities with a
+    `PARTNER_SA_ADAPTIVE_FLOOR` (0.05) per-family floor.
+
+    The fixed literal thresholds in `_random_move` are NOT touched: the flag
+    instead remaps the single `rng.random()` draw through a monotone
+    piecewise-linear map onto the historical (0.55, 0.80, 0.92) edges.  That
+    keeps the rng stream, the branch structure and the off path byte-for-byte
+    identical -- off costs exactly one attribute load per proposal."""
+    return _flag_on("PARTNER_SA_ADAPTIVE")
+
+
+def sa_racing_on() -> bool:
+    """PARTNER_SA_RACING=1 (default off): successive-halving inside `finish`.
+
+    Port of the round-1/round-2 racing in
+    `src/floorset_arch/legalizer/column_slicing.py:2866-2886`, with a
+    DELIBERATE structural deviation.  Src races across the worker POOL: a
+    round-1 `map_async`, a rank in the parent, then a round-2 `map_async` for
+    the survivors.  That shape is exactly what killed the 0804 Anytime-Ladder
+    -- a pool-wide synchronisation barrier idles every non-survivor worker,
+    and at the 0.3 s operating point a second `map_async` also re-pays the
+    per-worker `_ColumnOptimizer` build that `PARTNER_FAST_SETUP` exists to
+    avoid.  So the race here is INSIDE one worker: round 1 spends
+    `PARTNER_SA_RACING_R1` (0.30) of the chain on `PARTNER_SA_RACING_K` (3)
+    short chains over the column-count grid, ranks them under the true cost,
+    and hands the whole remainder to the top `PARTNER_SA_RACING_TOP` (1).
+    No barrier, no extra IPC, no second setup, and the pool's total effective
+    SA iteration count is unchanged by construction (only K-1 extra
+    `_init_columns` + `_evaluate` calls are added)."""
+    return _flag_on("PARTNER_SA_RACING")
+
+
+def sa_stats_on() -> bool:
+    """PARTNER_SA_STATS=1 (default off): per-case SA throughput / channel
+    diagnostics on stderr.  Read once per case, never in an inner loop; the
+    layout counter itself is `SAKernel.calls`, which the kernel already
+    maintains unconditionally, so the instrument costs the search nothing."""
+    return _flag_on("PARTNER_SA_STATS")
+
+
+# `_random_move`'s historical branch edges.  `_remap_move_r` maps a uniform
+# draw onto these so the literal comparison chain never changes.
+_MOVE_EDGES = (0.0, 0.55, 0.80, 0.92, 1.0)
 
 
 def early_exit_window(specific: str, default: float = 0.25) -> float:
@@ -623,6 +682,44 @@ class _ColumnOptimizer:
         # PARTNER_COL_NARROW (default off): read once per optimizer, never in
         # the `_layout` inner loop.
         self._col_narrow = col_narrow_on()
+
+        # -- adaptive move mix (PARTNER_SA_ADAPTIVE=1, default off) ----------
+        # See `sa_adaptive_on`.  `_move_cum` holds the CURRENT family
+        # probabilities as a cumulative vector; it starts at the historical
+        # mix so the very first window behaves like the fixed schedule.
+        self._adaptive_moves = sa_adaptive_on()
+        self._last_move_type = 0
+        self._move_cum = [0.55, 0.80, 0.92, 1.0]
+        self._am_window = 200
+        self._am_floor = 0.05
+        if self._adaptive_moves:
+            try:
+                self._am_window = max(20, int(float(_os.environ.get(
+                    "PARTNER_SA_ADAPTIVE_WINDOW", "200"))))
+            except ValueError:
+                self._am_window = 200
+            try:
+                self._am_floor = min(0.24, max(0.0, float(_os.environ.get(
+                    "PARTNER_SA_ADAPTIVE_FLOOR", "0.05"))))
+            except ValueError:
+                self._am_floor = 0.05
+        self._adaptive_reset()
+
+        # -- in-worker successive halving (PARTNER_SA_RACING=1, default off) -
+        self._sa_racing = sa_racing_on()
+        self._race_k = 3
+        self._race_r1 = 0.30
+        self._race_top = 1
+        if self._sa_racing:
+            try:
+                self._race_k = max(2, int(float(_os.environ.get(
+                    "PARTNER_SA_RACING_K", "3"))))
+                self._race_r1 = min(0.80, max(0.05, float(_os.environ.get(
+                    "PARTNER_SA_RACING_R1", "0.30"))))
+                self._race_top = max(1, int(float(_os.environ.get(
+                    "PARTNER_SA_RACING_TOP", "1"))))
+            except ValueError:
+                self._race_k, self._race_r1, self._race_top = 3, 0.30, 1
 
         # -- Fast-SA cooling schedule (PARTNER_FASTSA_TEMP=1, default off) ---
         # Cherry-pick #1 from src/floorset_arch/legalizer/column_slicing.py.
@@ -2163,6 +2260,65 @@ class _ColumnOptimizer:
         return c, pos
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # PARTNER_SA_ADAPTIVE bookkeeping (see `sa_adaptive_on`)
+    def _adaptive_reset(self):
+        self._am_prop = [0, 0, 0, 0]          # realised proposals this window
+        self._am_acc = [0, 0, 0, 0]           # accepted this window
+        self._am_impr = [0.0, 0.0, 0.0, 0.0]  # summed strict improvement
+        self._am_since = 0
+
+    def _adaptive_reweight(self):
+        floor = self._am_floor
+        scores = []
+        for t in range(4):
+            prop = self._am_prop[t]
+            if prop <= 0:
+                scores.append(0.0)
+                continue
+            acc_rate = self._am_acc[t] / prop
+            mean_impr = (self._am_impr[t] / self._am_acc[t]) \
+                if self._am_acc[t] else 0.0
+            scores.append(acc_rate * mean_impr)
+        s = sum(scores)
+        if s <= 0.0:
+            # no signal this window -- keep the mix, just reset the counters
+            self._adaptive_reset()
+            return
+        free = 1.0 - floor * 4.0
+        acc = 0.0
+        cum = []
+        for sc in scores:
+            acc += floor + free * (sc / s)
+            cum.append(acc)
+        cum[3] = 1.0            # kill accumulated float drift at the top edge
+        self._move_cum = cum
+        self._adaptive_reset()
+
+    def _remap_move_r(self, r: float) -> float:
+        """Map a uniform draw onto the historical `_random_move` edges.
+
+        Monotone and piecewise linear, so family k is selected with
+        probability `_move_cum[k] - _move_cum[k-1]` while `_random_move`'s
+        literal comparison chain stays exactly as written.  Also records the
+        family for the acceptance bookkeeping."""
+        cum = self._move_cum
+        k = 0
+        while k < 3 and r >= cum[k]:
+            k += 1
+        self._last_move_type = k
+        lo = cum[k - 1] if k else 0.0
+        w = cum[k] - lo
+        e0 = _MOVE_EDGES[k]
+        if w <= 1e-12:
+            return e0
+        u = (r - lo) / w
+        if u < 0.0:
+            u = 0.0
+        elif u >= 1.0:
+            u = 1.0 - 1e-12
+        return e0 + u * (_MOVE_EDGES[k + 1] - e0)
+
     def _random_move(self, cols: List[List[int]]):
         """Mutate cols in place; return an undo callable, or None."""
         rng = self.rng
@@ -2171,6 +2327,8 @@ class _ColumnOptimizer:
         if not nonempty:
             return None
         r = rng.random()
+        if self._adaptive_moves:
+            r = self._remap_move_r(r)
         if r < 0.55:
             sc = rng.choice(nonempty)
             si = rng.randrange(len(cols[sc]))
@@ -2342,6 +2500,12 @@ class _ColumnOptimizer:
         stall_eps = self.stall_eps
         stall_ref_cost = best_cost   # best_cost at the last window reset
         stall_ref_time = start
+        # PARTNER_SA_ADAPTIVE: hoisted to a local so the off path pays one
+        # attribute load per CHAIN, not one per proposal.  The learned mix
+        # carries across chains; only the window counters reset.
+        _adapt = self._adaptive_moves
+        if _adapt:
+            self._adaptive_reset()
         while True:
             now = time.time()
             if now >= deadline:
@@ -2403,13 +2567,24 @@ class _ColumnOptimizer:
                 if undo is None:
                     continue
                 new_cost, _pos = self._evaluate(cols)
+                if _adapt:
+                    mt = self._last_move_type
+                    self._am_prop[mt] += 1
                 if new_cost <= cur_cost or rng.random() < math.exp((cur_cost - new_cost) / T):
+                    if _adapt:
+                        self._am_acc[mt] += 1
+                        if new_cost < cur_cost:
+                            self._am_impr[mt] += (cur_cost - new_cost)
                     cur_cost = new_cost
                     if new_cost < best_cost:
                         best_cost = new_cost
                         best = self._snapshot(cols)
                 else:
                     undo()
+                if _adapt:
+                    self._am_since += 1
+                    if self._am_since >= self._am_window:
+                        self._adaptive_reweight()
         if self.v_weight != vw0:
             # restore the true-cost weight and re-score the returned best so
             # callers compare restarts on a consistent objective
@@ -2454,6 +2629,60 @@ class _ColumnOptimizer:
         self._best_probe = results[0]
         return results[0][0]
 
+    def _race(self, start_snap, now: float, total: float):
+        """In-worker successive halving; see `sa_racing_on`.
+
+        Returns `(start_snap, now, total)` for the caller's anneal schedule:
+        the round-1 winner, and the wall clock / span that survive the race.
+        Round 1's wall clock is carved OUT of `total`, so the flag is
+        wall-clock neutral -- the losers' share is re-spent on the leader's
+        basin, not added to the case."""
+        k = max(2, self._race_k)
+        budget1 = total * self._race_r1
+        if budget1 <= 0.0 or k < 2:
+            return start_snap, now, total
+        cands = sorted({max(2, self.C0 - 1), self.C0, min(18, self.C0 + 1)})
+        # widen the column grid symmetrically if K asks for more arms
+        while len(cands) < k:
+            grew = False
+            if cands[0] - 1 >= 2:
+                cands.insert(0, cands[0] - 1)
+                grew = True
+            if len(cands) < k and cands[-1] + 1 <= 18:
+                cands.append(cands[-1] + 1)
+                grew = True
+            if not grew:
+                break
+        cands = cands[:k]
+        t_each = budget1 / len(cands)
+        results = []
+        for C in cands:
+            pc = self._init_columns(C)
+            pcost, _ = self._evaluate(pc)
+            snap, bcost = self._anneal(pc, time.time() + t_each, pcost,
+                                       t0=0.06, t1=0.01)
+            results.append((bcost, snap))
+        if not results:
+            return start_snap, now, total
+        results.sort(key=lambda t: t[0])
+        n_top = max(1, min(self._race_top, len(results)))
+        now2 = time.time()
+        rem = max(total - (now2 - now), 0.0)
+        if n_top == 1:
+            return results[0][1], now2, rem
+        # more than one survivor: deepen each on an equal share of the
+        # remainder and keep the best under the same (true) cost
+        share = rem / n_top
+        best_snap, best_c = results[0][1], results[0][0]
+        for _bc, snap in results[:n_top]:
+            cols_s = self._restore(snap)
+            c_s, _ = self._evaluate(cols_s)
+            snap2, c2 = self._anneal(cols_s, time.time() + share, c_s,
+                                     recalibrate=True)
+            if c2 < best_c:
+                best_snap, best_c = snap2, c2
+        return best_snap, time.time(), 0.0
+
     def finish(self, deadline: float, max_runs: int = 2) -> List[Rect]:
         n = self.n
         if self._best_probe is not None:
@@ -2482,6 +2711,12 @@ class _ColumnOptimizer:
             _span_floor = min(_span_floor, max(t_end - now, 0.0))
         total = max(t_end - now, _span_floor)
         runs = 2 if (total > 6.0 and max_runs >= 2) else 1
+        # PARTNER_SA_RACING: only on the single-chain schedule (the pool path
+        # -- `_worker_solve` calls `finish(max_runs=1)` and never `probe`), and
+        # never when `run()` already probed: `probe` IS round 1.
+        if (self._sa_racing and runs == 1 and self._best_probe is None
+                and total > 0.0):
+            start_snap, now, total = self._race(start_snap, now, total)
         snaps = []
         # EARLY_EXIT clawback: every stage keeps its PLANNED share and returns
         # the rest to the caller.  `saved` accumulates the unspent tail of the
@@ -3359,6 +3594,196 @@ def _w_star_from_tags(opt) -> Optional[float]:
     return float(w_star)
 
 
+# =============================================================================
+# Offline probes (T1 psel dump / frame W* oracle).  Both are read ONCE at
+# import time into module constants: with neither environment variable set
+# every hook below collapses to a falsy constant test, so the production path
+# is bit-identical (no per-case env lookup, no counter, no import).
+# =============================================================================
+# PARTNER_PSEL_DUMP=<dir> (default empty = dead branch): dump every pool
+# candidate the selector arbitrates over -- (case, channel, config, hp, area,
+# V, internal score, positions) plus the selected flag -- so the in-pool
+# oracle gain can be recomputed OFFLINE under the OFFICIAL cost (the internal
+# score uses a different hpwl/area denominator and is NOT comparable).
+# Records are buffered in memory and written once at interpreter exit, so no
+# I/O happens inside the per-case timing boundary.
+_PSEL_DUMP_PATH = _os.environ.get("PARTNER_PSEL_DUMP", "")
+# PARTNER_WSTAR_FILE=<json> (default empty = off, probe only): {"<case>": W}.
+# Feeds the FRAME_WPIN arm an externally supplied frame width instead of the
+# L/R-tag-derived one, so the oracle probe can hand every case the golden
+# bbox width (the tag derivation only fires on R-tagged preplaced cases).
+_WSTAR_FILE = _os.environ.get("PARTNER_WSTAR_FILE", "")
+# PARTNER_ORACLE_PRED_FILE=<json> (default empty = off).  *** PROBE ONLY, NEVER
+# PROMOTABLE ***: the file holds GROUND-TRUTH-derived layouts (repaired golden),
+# so any arm that reads it is an offline diagnostic -- "how much of a PERFECT
+# prior survives the direct channel" -- and not a solver configuration.
+# Format {"<case id>": [[x, y, w, h], ...]}; the case id is the solve-call
+# counter below, which is the evaluator's test id.
+# MULTI-LAYOUT form (auto-detected by rank, no extra flag): the value may also
+# be {"<case id>": [[[x, y, w, h], ...], ...]} -- a BANK of K distinct layouts
+# for that case.  The single-layout form is broadcast (every replaced batch
+# slot gets the same layout), which is what a real K-sample engine never does;
+# that homogenisation was measured to cost ~+0.035 weighted noRT on its own, so
+# an injection meant to stand in for an engine MUST use the bank form.  A bank
+# shorter than the batch is cycled round-robin.
+# PARTNER_ORACLE_PRED_K=k replaces only the first k entries of the raw Direct
+# batch (0 = the whole batch): the whole batch answers "the model is perfect",
+# k=1 answers "one perfect sample is in the batch -- can the prescreen and the
+# selector find it".
+_ORACLE_PRED_FILE = _os.environ.get("PARTNER_ORACLE_PRED_FILE", "")
+ORACLE_PRED_ON = bool(_ORACLE_PRED_FILE)
+_PROBE_ON = bool(_PSEL_DUMP_PATH or _WSTAR_FILE or _ORACLE_PRED_FILE)
+_CASE_SEQ = -1              # solve-call counter; the evaluator walks test ids
+_PSEL_CASES: List[dict] = []
+_WSTAR_MAP: Optional[Dict[int, float]] = None
+_ORACLE_MAP: Optional[Dict[int, np.ndarray]] = None
+_PSEL_HOOKED = False
+
+
+def oracle_pred_override(preds: list, n: int) -> list:
+    """PROBE ONLY.  Substitute the current case's oracle layout into the raw
+    Direct batch (see `_ORACLE_PRED_FILE`).
+
+    Accepts one layout `(n, 4)` or a bank of K distinct layouts `(K, n, 4)`
+    for the case; the bank is cycled over the replaced slots so an injected
+    "engine" keeps the batch diversity a real K-sample engine would have.
+
+    Returns `preds` unchanged whenever the oracle is missing or its block
+    count disagrees, so a partial oracle file degrades case-by-case to the
+    control arm instead of corrupting the run."""
+    global _ORACLE_MAP
+    if _ORACLE_MAP is None:
+        _ORACLE_MAP = {}
+        try:
+            import json as _json
+            with open(_ORACLE_PRED_FILE, "r", encoding="utf-8") as fh:
+                raw = _json.load(fh)
+            for _key, _val in raw.items():
+                try:
+                    _arr = np.asarray(_val, dtype=np.float64)
+                except Exception:
+                    continue        # ragged entry -> that case degrades
+                _ORACLE_MAP[int(_key)] = _arr
+        except Exception:
+            _ORACLE_MAP = {}
+    P = _ORACLE_MAP.get(_CASE_SEQ)
+    if (P is None or P.ndim not in (2, 3) or P.shape[-2] != int(n)
+            or P.shape[-1] != 4 or P.shape[0] < 1):
+        return preds
+    bank = [P] if P.ndim == 2 else [P[i] for i in range(P.shape[0])]
+    try:
+        k = int(float(_os.environ.get("PARTNER_ORACLE_PRED_K", "0") or 0))
+    except ValueError:
+        k = 0
+    if not preds:
+        return [b.copy() for b in bank]
+    m = len(preds) if (k <= 0 or k >= len(preds)) else k
+    return ([bank[i % len(bank)].copy() for i in range(m)]
+            + list(preds[m:]))
+
+
+def _wstar_oracle() -> Optional[float]:
+    """Externally supplied W* for the current case, or None."""
+    global _WSTAR_MAP
+    if _WSTAR_MAP is None:
+        try:
+            import json as _json
+            with open(_WSTAR_FILE, "r", encoding="utf-8") as fh:
+                raw = _json.load(fh)
+            _WSTAR_MAP = {int(k): float(v) for k, v in raw.items()}
+        except Exception:
+            _WSTAR_MAP = {}
+    val = _WSTAR_MAP.get(_CASE_SEQ)
+    if val is None or not (val > 1.0) or not math.isfinite(val):
+        return None
+    return float(val)
+
+
+def _psel_flush() -> None:
+    """Write the buffered candidate dump as a single npz (no pickle)."""
+    if not _PSEL_CASES:
+        return
+    import os as _o
+    _o.makedirs(_PSEL_DUMP_PATH, exist_ok=True)
+    cols: Dict[str, list] = {k: [] for k in (
+        "cand_case", "cand_chan", "cand_cfg", "cand_hp", "cand_area",
+        "cand_V", "cand_score", "cand_sel", "cand_orient", "cand_cforce",
+        "cand_vw", "cand_hs", "cand_wstar", "cand_pos_off")}
+    case_cols: Dict[str, list] = {k: [] for k in (
+        "case_seq", "case_n", "case_hp_ref", "case_area_ref", "case_nsoft",
+        "case_total_area", "case_lock_off")}
+    pos_all: List[np.ndarray] = []
+    lock_all: List[np.ndarray] = []
+    pos_rows = 0
+    lock_rows = 0
+    for rec in _PSEL_CASES:
+        case_cols["case_seq"].append(rec["seq"])
+        case_cols["case_n"].append(rec["n"])
+        case_cols["case_hp_ref"].append(rec["hp_ref"])
+        case_cols["case_area_ref"].append(rec["area_ref"])
+        case_cols["case_nsoft"].append(rec["n_soft"])
+        case_cols["case_total_area"].append(rec["total_area"])
+        case_cols["case_lock_off"].append(lock_rows)
+        lock_all.append(np.asarray(rec["locked"], dtype=bool))
+        lock_rows += rec["n"]
+        for c in rec["cands"]:
+            cols["cand_case"].append(rec["seq"])
+            cols["cand_chan"].append(c["chan"])
+            cols["cand_cfg"].append(c["cfg"])
+            cols["cand_hp"].append(c["hp"])
+            cols["cand_area"].append(c["area"])
+            cols["cand_V"].append(c["V"])
+            cols["cand_score"].append(c["score"])
+            cols["cand_sel"].append(c["sel"])
+            cols["cand_orient"].append(c["orient"])
+            cols["cand_cforce"].append(c["cforce"])
+            cols["cand_vw"].append(c["vw"])
+            cols["cand_hs"].append(c["hs"])
+            cols["cand_wstar"].append(c["wstar"])
+            cols["cand_pos_off"].append(pos_rows)
+            P = np.asarray(c["pos"], dtype=np.float64)
+            pos_all.append(P)
+            pos_rows += P.shape[0]
+    out = {k: np.asarray(v) for k, v in cols.items()}
+    out.update({k: np.asarray(v) for k, v in case_cols.items()})
+    out["pos_all"] = (np.concatenate(pos_all, axis=0) if pos_all
+                      else np.zeros((0, 4)))
+    out["lock_all"] = (np.concatenate(lock_all, axis=0) if lock_all
+                       else np.zeros(0, dtype=bool))
+    tag = _os.environ.get("PARTNER_PSEL_TAG", "psel")
+    np.savez_compressed(_o.path.join(_PSEL_DUMP_PATH, f"{tag}.npz"), **out)
+
+
+def _psel_record(seq, opt1, hp_ref, n_soft, cands, win) -> None:
+    """Buffer one case's candidate pool (guarded by the caller)."""
+    global _PSEL_HOOKED
+    if not _PSEL_HOOKED:
+        import atexit as _atexit
+        _atexit.register(_psel_flush)
+        _PSEL_HOOKED = True
+    recs = []
+    for chan, cfg, meta, o in cands:
+        orient, cforce, vw, hs, ws, sc = meta
+        recs.append({
+            "chan": chan, "cfg": cfg,
+            "hp": float(o[1]), "area": float(o[2]), "V": float(o[3]),
+            "score": float(sc),
+            "sel": bool(o is win),
+            "orient": {"N": 0, "T": 1, "P": 2, "D": 4, "B": 5}.get(orient, 3),
+            "cforce": (-1 if cforce is None else int(cforce)),
+            "vw": float(vw), "hs": float(hs),
+            "wstar": (float("nan") if ws is None else float(ws)),
+            "pos": [list(map(float, r)) for r in o[0]],
+        })
+    _PSEL_CASES.append({
+        "seq": int(seq), "n": int(opt1.n), "hp_ref": float(hp_ref),
+        "area_ref": float(opt1.area_ref), "n_soft": float(n_soft),
+        "total_area": float(opt1.total_area),
+        "locked": [opt1.kind[i] == 2 for i in range(opt1.n)],
+        "cands": recs,
+    })
+
+
 def _worker_solve(args):
     """One independent (orientation, column count, seed) restart."""
     try:
@@ -3406,6 +3831,22 @@ def _worker_solve(args):
                 opt._cost0 = c0
         out = opt.finish(deadline, max_runs=1)
         hp, area, V = opt.final_metrics
+        if sa_stats_on():
+            # SA throughput probe.  `SAKernel.calls` is the number of
+            # `_layout` evaluations this restart actually executed, i.e. the
+            # effective SA iteration count -- the gate quantity for
+            # PARTNER_SA_RACING and the throughput-tax hypothesis for
+            # PARTNER_COL_NARROW.  `fallbacks` is how often the numba kernel
+            # bailed to the Python `_layout_full` (the ONLY path on which
+            # PARTNER_COL_NARROW can fire while the kernel is attached).
+            import sys as _sys
+            _k = getattr(opt, "_sa_kernel", None)
+            print(f"[sastats] n={opt.n} orient={orient} "
+                  f"kernel={int(_k is not None)} "
+                  f"calls={getattr(_k, 'calls', -1)} "
+                  f"fallbacks={getattr(_k, 'fallbacks', -1)} "
+                  f"V={V} hp={hp:.1f} area={area:.1f}",
+                  file=_sys.stderr, flush=True)
         if orient == 'T':
             out = [(y, x, h, w) for (x, y, w, h) in out]
         return (out, hp, area, V)
@@ -3531,13 +3972,25 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
     # original frame, and a 'T' restart solves the transposed one.
     _ws_map: Dict[int, float] = {}
     if frame_wpin_on():
-        _ws = _w_star_from_tags(opt1)
+        # PARTNER_WSTAR_FILE (probe only): an externally supplied frame width
+        # for this case takes precedence over the tag derivation, which only
+        # fires on R-tagged preplaced instances.  Off -> the constant test is
+        # False and the tag path is reached exactly as before.
+        _ws = _wstar_oracle() if _WSTAR_FILE else None
+        if _ws is None:
+            _ws = _w_star_from_tags(opt1)
         if _ws is not None:
             try:
                 _ws_arms = int(float(_os.environ.get(
                     "PARTNER_FRAME_WPIN_ARMS", "3")))
             except ValueError:
                 _ws_arms = 3
+            # P2 cap: never let the W* arms take more than a quarter of the
+            # restart portfolio.  A no-op on the production pool (24 configs
+            # -> cap 6, default arms 3); it only bites on a small pool, where
+            # 3 arms out of 4 slots would erase the h_scale/orientation
+            # breadth the selection depends on.
+            _ws_arms = min(_ws_arms, max(1, len(configs) // 4))
             for _idx in range(len(configs) - 1, -1, -1):
                 if len(_ws_map) >= max(0, _ws_arms):
                     break
@@ -3624,6 +4077,17 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         except Exception:
             preds = []
         _t_s1 = time.time() - _t_s0
+        if _flag_on("PARTNER_SEAT_DEBUG"):
+            # direct-seat calibration: what the reserved workers are actually
+            # handed once the sampler has been paid for.  `wd` is the worker
+            # window measured from the legalizer's own start, `left` the part
+            # of it that survives the sampler latency `ts`.
+            import sys as _sys
+            print(f"[seat] n={opt1.n} rem={rem_pb:.4f} "
+                  f"wd={worker_deadline - t_pb:.4f} ts={_t_s1:.4f} "
+                  f"nref={n_ref} npred={len(preds)} "
+                  f"left={worker_deadline - time.time():.4f}",
+                  file=_sys.stderr, flush=True)
         if gpu_arm:
             gpu_arm_record_sample(opt1.n, _t_s1)
         wave1 = list(preds)
@@ -3723,6 +4187,14 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         # would delay every later case, so drop it entirely
         _shutdown_pool()
         raise
+    # PARTNER_PSEL_DUMP: keep the payload index of every surviving restart so
+    # the offline oracle can attribute a candidate to its config.
+    _ps_col_idx: List[int] = []
+    _ps_dir_idx: List[int] = []
+    _ps_pb: List = []
+    if _PSEL_DUMP_PATH:
+        _ps_col_idx = [k for k, o in enumerate(outs) if o is not None]
+        _ps_dir_idx = [k for k, o in enumerate(ref_outs) if o is not None]
     outs = [o for o in outs if o is not None]
     ref_outs = [o for o in ref_outs if o is not None]
     if not outs and not ref_outs:
@@ -3731,6 +4203,26 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
     area_ref = opt1.area_ref
     n_soft = opt1.n_soft_den
     hp_ref = max(min(o[1] for o in outs + ref_outs), 1e-9)
+
+    # PARTNER_PSEL_FIX=1 (default off): the two known calibration defects of
+    # this selector, both measured on the T1 candidate dump.
+    #  (i) `hp_ref` is the POOL minimum, the evaluator's denominator is the
+    #      GOLDEN hpwl, which is smaller by a factor (1 + g) with a measured
+    #      median g ~ 0.29-0.33 at the 0.3s tier.  Dividing by (1 + g) restores
+    #      the official hpwl/violation weighting.  `g` is a calibration
+    #      CONSTANT (golden hpwl is not available at solve time), never a
+    #      per-case lookup.
+    #  (ii) the 0.985 channel-swap dead zone is worth ~1.5-2% of the score,
+    #      i.e. larger than most true A/B gaps, so it blocks swaps that the
+    #      official cost says are right (2/2 in the dump).
+    # Offline dump evidence: the whole in-pool oracle gain these two can
+    # compete for is G1 = 0.0005 weighted (see the T1 probe), i.e. an order of
+    # magnitude under the single-rep measurement floor -- the flag exists so
+    # the defect is documented and re-testable, NOT as a promotion candidate.
+    _dz = 0.985
+    if _flag_on("PARTNER_PSEL_FIX"):
+        hp_ref = hp_ref / (1.0 + _env_num("PARTNER_PSEL_FIX_G", 0.29))
+        _dz = _env_num("PARTNER_PSEL_FIX_DZ", 1.0)
 
     def score(o):
         _out, hp, area, V = o
@@ -3749,10 +4241,34 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
     # marginal swaps are proxy-noise coin flips
     if best_dir is not None and (
             best_col is None
-            or score(best_dir) < 0.985 * score(best_col)):
+            or score(best_dir) < _dz * score(best_col)):
         win, win_is_ref = best_dir, True
     else:
         win, win_is_ref = best_col, False
+
+    if sa_stats_on():
+        # P4 channel-resolved dead space.  Measured on the COLUMN champion
+        # regardless of who wins the case, so a direct win cannot dilute the
+        # column mechanism's own signal (which is what the earlier
+        # whole-layout dead-space probe did).
+        import sys as _sys
+        _ta = float(opt1.total_area)
+
+        def _dead(o):
+            if o is None:
+                return -1.0
+            P = np.asarray([list(r) for r in o[0]], dtype=np.float64)
+            bb = (float((P[:, 0] + P[:, 2]).max() - P[:, 0].min())
+                  * float((P[:, 1] + P[:, 3]).max() - P[:, 1].min()))
+            return (bb - _ta) / max(bb, 1e-9)
+
+        print(f"[chan] n={opt1.n} win={'dir' if win_is_ref else 'col'} "
+              f"col_dead={_dead(best_col):.5f} "
+              f"col_score={(score(best_col) if best_col else -1.0):.5f} "
+              f"dir_dead={_dead(best_dir):.5f} "
+              f"dir_score={(score(best_dir) if best_dir else -1.0):.5f} "
+              f"n_col={len(outs)} n_dir={len(ref_outs)}",
+              file=_sys.stderr, flush=True)
 
     # PARTNER_FUSION=1 (uses the phase-B carve): regional crossover of the
     # elite candidates.  Every case computes 20-40 diverse layouts and the
@@ -3854,6 +4370,8 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         except Exception:
             _shutdown_pool()
             raise
+        if _PSEL_DUMP_PATH:
+            _ps_pb = list(outs2)
         if outs2:
             best2 = min(outs2, key=score)
             if _RDEBUG:
@@ -3862,6 +4380,25 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                       flush=True)
             if score(best2) < score(win) - 1e-12:
                 win, win_is_ref = best2, True
+
+    if _PSEL_DUMP_PATH:
+        # (chan, config index, (orient, c_force, v_weight, h_scale, W*,
+        #  internal score), candidate).  Channel codes: 0=col, 1=dir, 2=phaseB.
+        # `dir` / `phaseB` candidates carry no column config, so their meta
+        # slots are neutral -- the offline analysis keys on the channel code.
+        _ps_cands = []
+        for _j, _o in enumerate(outs):
+            _k = _ps_col_idx[_j]
+            _cfg = configs[_k] if _k < len(configs) else ('N', None, 0, 1.0, 1.0)
+            _ps_cands.append((0, _k, (_cfg[0], _cfg[1], _cfg[3], _cfg[4],
+                                      _ws_map.get(_k), score(_o)), _o))
+        for _j, _o in enumerate(ref_outs):
+            _ps_cands.append((1, _ps_dir_idx[_j],
+                              ('D', None, 1.0, 1.0, None, score(_o)), _o))
+        for _j, _o in enumerate(_ps_pb):
+            _ps_cands.append((2, _j, ('B', None, 1.0, 1.0, None, score(_o)),
+                              _o))
+        _psel_record(_CASE_SEQ, opt1, hp_ref, n_soft, _ps_cands, win)
 
     if win_is_ref:
         locked = [opt1.kind[i] == 2 for i in range(opt1.n)]
@@ -3922,6 +4459,12 @@ def legalize_rectangles(
     sample_fn=None,
 ) -> List[Rect]:
     n = len(rects)
+    # Probe-only case counter (see `_PROBE_ON`): the evaluator calls solve()
+    # once per case in test-id order, so this monotonic count IS the case id
+    # for the offline analyses.  Dead constant test on the production path.
+    if _PROBE_ON:
+        global _CASE_SEQ
+        _CASE_SEQ += 1
     if n == 0:
         return []
     if deadline is None:

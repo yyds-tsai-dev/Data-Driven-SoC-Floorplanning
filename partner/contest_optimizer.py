@@ -34,11 +34,12 @@ from candidate_supply import CandidateBatch, allocate_quotas, rank_predictions
 from iccad2026_evaluate import FloorplanOptimizer
 from diffusion_data import build_condition, fp_sol_to_z0, layout_scale, z_to_rectangles
 from diffusion_model import DiffusionSchedule, GraphDiffusionDenoiser, ModelConfig, ddim_refine
-from column_sa_legalizer import (_ColumnOptimizer, _b2b_smooth_np,
+from column_sa_legalizer import (ORACLE_PRED_ON, _ColumnOptimizer,
+                              _b2b_smooth_np,
                               _ensure_no_overlap, _parse_constraints,
                               _pin_centroids_np, _target, fast_setup_on,
                               init_worker_pool, legalize_rectangles,
-                              rectangles_from_z)
+                              oracle_pred_override, rectangles_from_z)
 from layout_refiner import (edge_seat_v2_on, full_violations,
                             refine_prediction)
 
@@ -91,6 +92,85 @@ def _time_budget(block_count: int) -> float:
     ~24 s for n=120; averages about 5 s over the validation set."""
     b = BUDGET_SCALE * math.exp(block_count / BUDGET_TAU)
     return max(BUDGET_MIN, min(BUDGET_MAX, b))
+
+
+def _direct_rung0_projection(block_count: int, remaining: float):
+    """Project what a RESERVED refine worker will actually get, and what
+    `refine_prediction`'s rung 0 (fixed-frame legalization) costs.
+
+    Every term is either read off the code path it models or a per-machine
+    constant times a *reusable instance statistic* (block count and the
+    case's own remaining budget) -- never a case id.
+
+      1. `column_sa_legalizer._parallel_solve` hands the pool
+         `worker_deadline = deadline_A - min(0.30, 0.15 * spanA)`; phase B
+         is inactive at these budgets, so `deadline_A == deadline`.
+      2. The reserved workers sit idle until the wave-1 sampler returns:
+         a batched forward, i.e. roughly linear in `n`.  The same term
+         absorbs the legalizer's own pre-dispatch setup (the gate is read a
+         little before `t_pb`), which is why it is calibrated, not derived.
+      3. `refine_prediction` carves its violation-repair reserve
+         (`min(3.5, 0.3*slice)`, plus 0.35*slice for the recompression retry
+         when the slice exceeds 8 s) off the top before the ladder starts.
+      4. Rung 0 costs one O(n^2) `_Refiner` build plus the fixed-frame
+         legalization it feeds; the ladder's own ANYTIME notes size a rung
+         at 4-7 builds, so the whole rung is modelled as c * (n/100)^2.
+
+    Returns `(span, need)`: the projected ladder span and the rung-0 cost.
+
+    Defaults calibrated on the shipped 0.3 s operating point with
+    `PARTNER_SEAT_DEBUG=1` (`[seat]` / `[rp0]` instruments, 2026-08-10):
+    warm wave-1 sampler latency 0.145 s @ n=100 -> 0.158 s @ n=120 (hence
+    the linear TS term), `_Refiner` build 3-11 ms, and a rung-0 completion
+    boundary of 6/6 workers failing at n=100, 4/6 at n=101, 0/6 at n>=102.
+    BOTH constants are machine- and sampler-relative (they move with
+    `PARTNER_DDIM_STEPS` / `PARTNER_FLOW_*` and with the accelerator), which
+    is why they are env-overridable; the shipped gate they refine
+    (`PARTNER_DIRECT_MIN`) is an absolute-seconds constant with the same
+    exposure.
+    """
+    n = max(1, int(block_count))
+    wd = remaining - min(0.30, 0.15 * max(0.0, remaining))
+    slice_ = wd - _env_float("PARTNER_DIRECT_SEAT_TS", 0.148) * (n / 100.0)
+    if slice_ <= 0.0:
+        return 0.0, float("inf")
+    span = slice_ - min(3.5, 0.3 * slice_)
+    if slice_ > 8.0:
+        span -= 0.35 * slice_
+    need = _env_float("PARTNER_DIRECT_SEAT_R0", 0.125) * (n / 100.0) ** 2
+    return span, need
+
+
+def _direct_seat_ok(block_count: int, remaining: float) -> bool:
+    """Should this case reserve pool seats for the direct channel?
+
+    Shipped gate: `remaining > PARTNER_DIRECT_MIN`.  That tests whether
+    there is time to SAMPLE, not whether there is time to REFINE -- but the
+    seats are taken from the column-restart portfolio either way
+    (`PARTNER_NREF=6` of a 24-worker pool = 25% of restart breadth at the
+    0.3 s operating point).  In the band where the budget covers sampling
+    but not rung 0, `refine_prediction` returns None for every reserved
+    worker and the case pays a quarter of its restarts for nothing.
+
+    `PARTNER_DIRECT_SEAT_FIX=1` (default off) adds the missing condition.
+    It can only ever CLOSE the channel (`DIRECT_MIN` stays as a floor), so
+    it adds no runtime and cannot open the channel anywhere it is shut
+    today.  Off -> the shipped expression, bit for bit.
+    """
+    if not (remaining > _env_float("PARTNER_DIRECT_MIN", 4.5)):
+        return False
+    fix_on = os.environ.get("PARTNER_DIRECT_SEAT_FIX", "0") in (
+        "1", "true", "True", "on", "ON")
+    dbg = bool(os.environ.get("PARTNER_SEAT_DEBUG"))
+    if not (fix_on or dbg):
+        return True
+    span, need = _direct_rung0_projection(block_count, remaining)
+    ok = span >= need
+    if dbg:
+        print(f"[seatgate] n={block_count} rem={remaining:.4f} "
+              f"span={span:.4f} need={need:.4f} ok={int(ok)} "
+              f"fix={int(fix_on)}", file=sys.stderr, flush=True)
+    return ok if fix_on else True
 
 
 def _select_ranked_source_quota(
@@ -172,6 +252,67 @@ class MyOptimizer(FloorplanOptimizer):
         # spawn the parallel-restart pool now so worker startup cost is not
         # charged to any test case
         init_worker_pool(N_RESTART_WORKERS)
+        self._warm_direct_sampler()
+
+    def _warm_direct_sampler(self) -> None:
+        """PARTNER_DIRECT_WARM=1 (default off): pay the sampler's first-call
+        cost HERE, in the untimed constructor, instead of inside the first
+        case that opens the direct channel.
+
+        Measured at the 0.3 s operating point (`PARTNER_SEAT_DEBUG`,
+        2026-08-10): wave-1 latency is 0.520 s on the first gated case and
+        0.145-0.158 s on every one after it.  That first case is n=99, whose
+        whole budget is 0.325 s -- the cold draw alone overruns the deadline,
+        so all `PARTNER_NREF` reserved workers start past `worker_deadline`
+        and return nothing, AND the case's runtime blows out to 0.89 s
+        (2.7x budget) against a per-case official RuntimeFactor.  Same class
+        of defect as the numba cold-JIT cliff caught by the 2026-08-06
+        repack verification, and the same fix: move it into module/ctor
+        time.  Fully contained -- any failure leaves the shipped lazy path.
+
+        MEASURED VERDICT (2026-08-10, 4 paired reps on top of the seat fix):
+        HOLD, do not ship.  The warm draw does remove the cold latency
+        (0.520 s -> 0.151 s at the first gated case), but the case is
+        deadline-bounded and the sampler overlaps the already-dispatched
+        column restarts, so a cold draw mostly burns time the parent was
+        going to spend blocked anyway: warming the first gated case made it
+        SLOWER (0.758 s vs 0.701 s -- the reserved workers now have a live
+        window and use it), and the no-runtime total moved +0.0046 +-
+        0.0027 the wrong way.  `PARTNER_DIRECT_SEAT_FIX` collects the same
+        first-case runtime (0.902 s -> 0.668 s) by not opening the channel
+        at all.  Kept as a documented, default-off probe.
+        """
+        if os.environ.get("PARTNER_DIRECT_WARM", "0") not in ("1", "true",
+                                                              "True", "on",
+                                                              "ON"):
+            return
+        if self.direct_model is None:
+            return
+        try:
+            # synthetic instance shaped like the band that opens the gate
+            # (block count only -- no validation data is read here)
+            n = _env_int("PARTNER_DIRECT_WARM_N", 100)
+            g = torch.Generator().manual_seed(12345)
+            at = torch.rand(n, generator=g) * 40.0 + 10.0
+            cons = torch.zeros(n, 5)
+            tpos = torch.full((n, 4), -1.0)
+            e = torch.randint(0, n, (3 * n, 2), generator=g).float()
+            b2b = torch.cat([e, torch.ones(3 * n, 1)], dim=1)
+            npin = 16
+            pe = torch.stack([
+                torch.randint(0, npin, (n,), generator=g).float(),
+                torch.arange(n, dtype=torch.float32)], dim=1)
+            p2b = torch.cat([pe, torch.ones(n, 1)], dim=1)
+            side = float(torch.sqrt(at.sum() / 0.96))
+            pins = torch.rand(npin, 2, generator=g) * side
+            self._sample_direct_preds(
+                n, at, cons, tpos, b2b, p2b, pins,
+                _env_int("PARTNER_NREF", 6) or 6, oversample=False)
+            if self.verbose:
+                print("direct sampler warmed")
+        except Exception as exc:
+            if self.verbose:
+                print(f"direct sampler warm-up skipped: {exc}")
 
     def _load_direct_model(self) -> None:
         """Load the direct-prediction denoiser (EMA weights) if a trained
@@ -347,9 +488,11 @@ class MyOptimizer(FloorplanOptimizer):
             # mid band is column-only.  Sampling now runs concurrently
             # with the already-dispatched column restarts and small-n
             # batches are fast, so a much lower gate is viable.
-            if self.direct_model is not None and (
-                    deadline - time.time()) > _env_float(
-                        "PARTNER_DIRECT_MIN", 4.5):
+            # PARTNER_DIRECT_SEAT_FIX=1 adds the second half of the
+            # condition -- enough budget for the reserved workers to finish
+            # rung 0, not merely to sample; see `_direct_seat_ok`.
+            if self.direct_model is not None and _direct_seat_ok(
+                    block_count, deadline - time.time()):
                 # `gen_seed` (a generator-seed OFFSET, default 0 = the
                 # reviewed baseline) lets the legalizer draw a genuinely
                 # different SECOND wave on the otherwise-idle accelerator
@@ -618,6 +761,16 @@ class MyOptimizer(FloorplanOptimizer):
                         preds = preds[:direct_n] + flow_preds
                     except Exception:
                         pass  # flow failure never harms the Direct channel
+
+        # *** PROBE ONLY, NEVER PROMOTABLE *** (PARTNER_ORACLE_PRED_FILE).
+        # With the flag unset `ORACLE_PRED_ON` is a False constant bound at
+        # import, so the production path is this one dead branch test.  When
+        # set, the raw Direct batch is replaced by a ground-truth-derived
+        # layout so the channel downstream of the sampler (prescreen ->
+        # refine_prediction -> selector) can be measured against a PERFECT
+        # prior.  See column_sa_legalizer.oracle_pred_override.
+        if ORACLE_PRED_ON:
+            preds = oracle_pred_override(preds, n)
         return preds
 
     def _sample_flow_preds(self, n, at, cons, tpos, b2b, p2b, pins,
@@ -949,7 +1102,15 @@ class MyOptimizer(FloorplanOptimizer):
               f"render={render_steps} gpu_s={_time.time() - t0:.2f}", file=sys.stderr)
         return preds
 
-    def _constraint_penalties(self, preds, n, at, cons):
+    def _constraint_penalties(self, preds, n, at, cons, as_counts: bool = False):
+        """Per-prediction soft-constraint surrogate.
+
+        `as_counts=False` (historical): a NORMALISED penalty -- mean boundary
+        slack in [0,1] plus mean cluster-bbox inflation in [0,3].
+        `as_counts=True` (PARTNER_PROXY_ALIGN): the same two terms converted
+        back to ESTIMATED VIOLATION COUNTS by multiplying each by the number
+        of items it was averaged over, so the caller can price them against
+        `n_soft` the way the official cost does."""
         if not os.environ.get("PARTNER_PRESCREEN_V"):
             return None
         _f, _p, _mib, clu, bnd = _parse_constraints(cons, n)
@@ -980,7 +1141,7 @@ class MyOptimizer(FloorplanOptimizer):
                 if code & 8:
                     distance = max(distance, float(y0[i] - Y0))
                 pen += min(distance / diag, 1.0)
-            if n_b:
+            if n_b and not as_counts:
                 pen /= n_b
             spread = 0.0
             for group in groups.values():
@@ -990,15 +1151,43 @@ class MyOptimizer(FloorplanOptimizer):
                 group_height = float(y1[group].max() - y0[group].min())
                 group_area = float((P[group, 2] * P[group, 3]).sum())
                 spread += min(max(0.0, group_width * group_height / max(group_area, 1e-9) - 1.2), 3.0)
-            if groups:
+            if groups and not as_counts:
                 spread /= max(sum(len(group) >= 2 for group in groups.values()), 1)
             return pen + spread
 
         return [_viol_est(prediction) for prediction in preds]
 
+    @staticmethod
+    def _soft_norm(n, cons):
+        """`_ColumnOptimizer.n_soft_den` computed from the raw constraints:
+        boundary-tagged blocks + (size-1) per MIB group + (size-1) per
+        cluster.  Same definition as column_sa_legalizer._build_soft_norm."""
+        _f, _p, mib, clu, bnd = _parse_constraints(cons, n)
+        n_soft = sum(1 for i in range(n) if bnd[i] > 0)
+        for tag in (mib, clu):
+            groups = {}
+            for i in range(n):
+                if tag[i] > 0:
+                    groups.setdefault(tag[i], []).append(i)
+            for idxs in groups.values():
+                n_soft += max(0, len(idxs) - 1)
+        return max(n_soft, 1)
+
     def _rank_portfolio(self, preds, n, at, cons, b2b):
         w_b2b = b2b[:n, :n].detach().cpu().numpy() if b2b is not None else None
-        penalties = self._constraint_penalties(preds, n, at, cons)
+        # PARTNER_PROXY_ALIGN (default off): rank the prescreen under the
+        # official cost's functional form instead of the additive proxy, so
+        # a unit of relative violation is worth 4 gap units (exp(2.) vs
+        # alpha=0.5) and the bbox gap is priced at all.  See
+        # candidate_supply.rank_predictions.  Off -> byte-identical.
+        align = os.environ.get("PARTNER_PROXY_ALIGN", "0") in (
+            "1", "true", "True", "on", "ON")
+        penalties = self._constraint_penalties(preds, n, at, cons,
+                                               as_counts=align)
+        align_ref = None
+        if align and penalties is not None:
+            area_ref = float(at[:n].sum().item()) / 0.97   # UTIL_TARGET_REF
+            align_ref = (area_ref, float(self._soft_norm(n, cons)))
         return rank_predictions(
             preds,
             at[:n].detach().cpu().numpy(),
@@ -1006,6 +1195,7 @@ class MyOptimizer(FloorplanOptimizer):
             constraint_penalties=penalties,
             violation_weight=(_env_float("PARTNER_PRESCREEN_VW", 0.5)
                               if penalties is not None else 0.0),
+            align_ref=align_ref,
         )
 
     def _sample_direct_preds(self, n, at, cons, tpos, b2b, p2b, pins,

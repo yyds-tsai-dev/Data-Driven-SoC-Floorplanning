@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
@@ -75,13 +76,42 @@ def _overlap_fraction(prediction: np.ndarray, area_targets: np.ndarray) -> float
     return float(overlap.sum()) / (2.0 * max(float(area_targets[:n].sum()), 1e-9))
 
 
+def _bbox_area(prediction: np.ndarray) -> float:
+    x0, y0 = prediction[:, 0], prediction[:, 1]
+    x1 = x0 + prediction[:, 2]
+    y1 = y0 + prediction[:, 3]
+    return float((x1.max() - x0.min()) * (y1.max() - y0.min()))
+
+
 def rank_predictions(
     predictions: Sequence[np.ndarray],
     area_targets: np.ndarray,
     b2b: np.ndarray,
     constraint_penalties: Sequence[float] | None = None,
     violation_weight: float = 0.0,
+    align_ref: tuple[float, float] | None = None,
 ) -> list[int]:
+    """Rank raw model predictions for the prescreen.
+
+    `align_ref=(area_ref, n_soft)` selects the PARTNER_PROXY_ALIGN form: the
+    official cost's own functional shape,
+
+        (1 + 0.5 * (hpwl_gap + area_gap + 5 * overlap)) * exp(2 * V / n_soft)
+
+    instead of the historical additive `hpwl/hpwl_ref + 5*overlap + w*pen`.
+    Two things change, both of them alignment defects of the old form:
+
+      * V is repriced.  In the official cost a unit of relative violation is
+        worth FOUR gap units (`exp(2 .)` vs `alpha = 0.5`); the additive form
+        priced `violation_weight` (0.5) against a hpwl coefficient of 1.0,
+        i.e. HALF a gap unit -- 8x too cheap, and in units that were not
+        violation counts at all.  `constraint_penalties` must therefore be
+        supplied in ESTIMATED VIOLATION COUNTS when `align_ref` is set.
+      * `area_gap` enters at all.  The official cost weights the bbox gap
+        exactly like the hpwl gap and the additive form omitted it entirely.
+
+    `align_ref=None` (the default, and every pre-flag caller) is byte-for-byte
+    the historical ranking."""
     if not predictions:
         return []
     hpwl = [_hpwl_proxy(prediction, b2b) for prediction in predictions]
@@ -92,6 +122,18 @@ def rank_predictions(
         penalties = constraint_penalties
     if len(penalties) != len(predictions):
         raise ValueError("constraint penalty count must match predictions")
+    if align_ref is not None:
+        area_ref, n_soft = align_ref
+        area_ref = max(float(area_ref), 1e-9)
+        n_soft = max(float(n_soft), 1.0)
+        score = [
+            (1.0 + 0.5 * (hpwl[k] / hpwl_ref - 1.0
+                          + max(0.0, _bbox_area(predictions[k]) / area_ref - 1.0)
+                          + 5.0 * _overlap_fraction(predictions[k], area_targets)))
+            * math.exp(2.0 * max(0.0, float(penalties[k])) / n_soft)
+            for k in range(len(predictions))
+        ]
+        return sorted(range(len(predictions)), key=lambda k: (score[k], k))
     score = [
         hpwl[k] / hpwl_ref
         + 5.0 * _overlap_fraction(predictions[k], area_targets)

@@ -39,6 +39,19 @@ import numpy as np
 import csa_coordinate_solver as _csa
 
 _DEBUG = bool(os.environ.get("REFINER_DEBUG"))
+# PARTNER_SEAT_DEBUG=1 (default off, read once at import): per-call rung-0
+# anatomy of `refine_prediction` -- the slice the pool worker was handed, the
+# `_Refiner` build cost (the instance's own O(n^2) cost unit) and whether the
+# fixed-frame rung closed.  Calibration instrument for the direct-channel seat
+# gate (`PARTNER_DIRECT_SEAT_FIX` in contest_optimizer.py); costs nothing when
+# off and never touches a numeric path.
+_SEAT_DBG = bool(os.environ.get("PARTNER_SEAT_DEBUG"))
+# PARTNER_FRAME_SCALE_DEBUG=1 (default off, read once at import): per-attempt
+# trace of the rung-0 frame-scale ladder (`frame_scale_set`), plus an
+# in-process `_FS_STATS` log the offline replay harnesses read.  Off it is a
+# falsy module constant, so every capture site is one `if` on a dead branch.
+_FS_DBG = bool(os.environ.get("PARTNER_FRAME_SCALE_DEBUG"))
+_FS_STATS: List[tuple] = []
 
 EDGE_EPS = 1e-6     # evaluator boundary-touch / overlap tolerance
 SEP_TOL = 5e-7      # projection overlap beyond this forces a separation constraint
@@ -113,6 +126,126 @@ def early_exit_min_window() -> float:
     return val if val >= 0.0 else 0.05
 
 
+# ---------------------------------------------------------------------------
+# PARTNER_REFINE_PROF: wall-clock anatomy of `_Refiner.run` (default off)
+#
+# The gate question for kernelizing more of the refiner is "what fraction of a
+# run does each section actually cost", and that is not answerable from the
+# rung anatomy in refine_numeric_kernel.py: a rung is `legalize_soft`
+# (hold=True), whereas `run` is the HPWL half -- the median sweep, the reshape
+# pass, the discrete batch, the tag snap.  This measures exactly those.
+#
+# Off (the default) every site is `self._prof is not None`, so not even
+# `time.time()` is called; the conditional-expression form below matters,
+# because `run` is deadline-bounded and a timer per pass would BE a policy
+# change.  On, one JSON line per `run()` call goes to `PARTNER_REFINE_PROF_FILE`
+# (append; pass a per-process path if you fan out) or, failing that, stderr.
+# ---------------------------------------------------------------------------
+_PROF_KEYS = ("axis_soft", "reshape", "tag_snap", "discrete", "squeeze",
+              "overlap", "key", "csa", "perturb", "deflate", "build_swap")
+
+# -- PARTNER_REFINE_PROF_DISC: second-tier anatomy of the `discrete` bucket --
+#
+# `discrete` is one bucket in `_PROF_KEYS` but four different move classes
+# under the hood, and the kernelization question ("what inside it is worth
+# moving to numba") needs the split.  These keys live in a SEPARATE namespace
+# (`d_` prefix, `_DPROF_KEYS`) precisely so that `sum(_PROF_KEYS) + other ==
+# span` -- the invariant the PROF test asserts -- keeps holding: the sub-
+# buckets partition `discrete`, they do not add to it.
+#
+# Requires PARTNER_REFINE_PROF (there is nothing to attribute to otherwise).
+# Off, `self._dprof is None` and no timer is read; the flag exists for the
+# micro harness, never for a scored run -- it adds ~2 `time.time()` per peer
+# probe, which on a deadline-bounded batch IS a policy perturbation.
+_DPROF_KEYS = (
+    "enum_optpt",    # `_optimal_point` (per swappable block)
+    "enum_gain",     # the two `_block_hp` calls that score the block
+    "enum_rest",     # candidate list build + sort
+    "screen_np",     # per-candidate dist/ratio/argsort over `idxs`
+    "screen_delta",  # the 4 `_block_hp` calls of the pair delta
+    "swap_edit",     # `_try_swap` geometry (snapshot + reshape), pre-legalize
+    "insert_edit",   # `_try_insert` geometry, pre-legalize
+    "lc_axis",       # `_legal_check`: `_axis_pass(hold=True)` pairs
+    "lc_ovl",        # `_legal_check`: `_has_overlap`
+    "lc_key",        # `_legal_check`: `_key` (hpwl + violations)
+    "lc_rest",       # `_legal_check`: snapshot restore / control
+    "book",          # accept bookkeeping (centroid recompute)
+    "m_enum",        # `_matching_batch` gain enumeration
+    "m_cost",        # `_matching_batch` m*m cost matrix (`_block_hp`)
+    "m_dp",          # `_matching_batch` bitmask assignment DP
+    "m_apply",       # `_matching_batch` permutation apply + legal check
+    "m_rest",        # `_matching_batch` pool build / control
+)
+
+
+def _prof_new() -> dict:
+    d = {}
+    for k in _PROF_KEYS:
+        d["t_" + k] = 0.0
+        d["c_" + k] = 0
+    return d
+
+
+def _dprof_new() -> dict:
+    d = {}
+    for k in _DPROF_KEYS:
+        d["t_" + k] = 0.0
+        d["c_" + k] = 0
+    return d
+
+
+def _prof_emit(ref, span: float, rounds: int, batches: int,
+               swaps: int = -1) -> None:
+    import json
+    import sys
+    p = ref._prof
+    # `swaps` is the discrete phase's ACCEPT count.  It is in the record
+    # because the accept rate decides which half of `_legal_check` the wall
+    # clock is in: a rejected attempt stops at the overlap test, an accepted
+    # one goes on to `_key` (`_hpwl` + `_violations`, ~50 us at n=118).  A
+    # profile without it cannot tell those two regimes apart.
+    rec = {"pid": os.getpid(), "n": int(ref.n), "G": len(ref.groups),
+           "span": round(span, 6), "rounds": int(rounds),
+           "batches": int(batches), "swaps": int(swaps)}
+    acc = 0.0
+    for k in _PROF_KEYS:
+        t = p["t_" + k]
+        acc += t
+        rec[k] = round(t, 6)
+        rec["c_" + k] = p["c_" + k]
+    rec["other"] = round(max(span - acc, 0.0), 6)
+    for k in _PROF_KEYS + ("other",):
+        rec["f_" + k] = round(rec[k] / span, 4) if span > 0 else 0.0
+    dp = ref._dprof
+    if dp is not None:
+        # sub-buckets are a partition OF `discrete`, so they are reported as
+        # fractions of `discrete`, not of `span`, and never enter `acc`.
+        den = rec["discrete"]
+        dacc = 0.0
+        for k in _DPROF_KEYS:
+            t = dp["t_" + k]
+            dacc += t
+            rec["d_" + k] = round(t, 6)
+            rec["dc_" + k] = dp["c_" + k]
+            rec["df_" + k] = round(t / den, 4) if den > 0 else 0.0
+        rec["d_unattributed"] = round(max(den - dacc, 0.0), 6)
+        rec["df_unattributed"] = (round(rec["d_unattributed"] / den, 4)
+                                  if den > 0 else 0.0)
+    line = json.dumps(rec, sort_keys=True)
+    path = os.environ.get("PARTNER_REFINE_PROF_FILE", "")
+    if path:
+        # one file per process: `run` executes in forked pool workers, and
+        # O_APPEND interleaving is only atomic on local filesystems -- this
+        # repo lives on a network mount.  Aggregate with a glob.
+        try:
+            with open("%s.%d" % (path, os.getpid()), "a") as fh:
+                fh.write(line + "\n")
+            return
+        except OSError:
+            pass
+    print("[refine-prof] " + line, file=sys.stderr, flush=True)
+
+
 def _env_pos(name: str, default: float, hi: float) -> float:
     """Positive float env override; malformed or out of (0, hi] -> default."""
     raw = os.environ.get(name)
@@ -146,6 +279,49 @@ def anytime_frac(name: str, default: float) -> float:
     except ValueError:
         return default
     return v if 0.0 < v < 1.0 else default
+
+
+def frame_scale_set() -> tuple:
+    """PARTNER_FRAME_SCALE_LADDER=1 (default off): rung-0 frame-scale ladder.
+
+    `refine_prediction`'s rung 0 legalizes into a frame whose area is
+    `area_ref * 1.08`, and `_seed_tags` then seats every boundary-tagged
+    block flush against that frame's walls -- so a rung-0 success returns a
+    bbox of EXACTLY `1.08 * area_ref` (verified per-case on the tail).  The
+    evaluator's area baseline is the golden bbox, which sits at ~1.01 *
+    area_ref there, so every direct candidate pays a structural
+    `area_gap` of +0.05..0.08 (~+0.025..0.04 of no-runtime cost) that
+    nothing downstream recovers at the sub-second tiers: the step-7
+    recompression is gated on `bbox > 1.08 * area_ref` (strict, so a rung-0
+    bbox never trips it) behind an absolute `t_hard - 2.5` gate that never
+    opens there.
+
+    ON: try `PARTNER_FRAME_SCALE_SET` (default "1.02,1.05,1.08") in
+    ascending order and keep the first scale whose fixed-frame rung
+    legalizes.  A SINGLE-element set is a pure constant shift -- one
+    attempt, no extra time, only a different frame.  Multi-element sets buy
+    the tighter frame with rung-0 attempts (see
+    `PARTNER_FRAME_SCALE_TIGHT_FRAC` / `PARTNER_FRAME_SCALE_MIN_N`).
+
+    OFF -> `(1.08,)`: one attempt at the shipped scale, bit for bit."""
+    if not _flag_on("PARTNER_FRAME_SCALE_LADDER"):
+        return (1.08,)
+    raw = os.environ.get("PARTNER_FRAME_SCALE_SET", "1.02,1.05,1.08")
+    out: List[float] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            v = float(tok)
+        except ValueError:
+            continue
+        # a frame below the area reference cannot hold the blocks, and a
+        # scale that is not strictly tighter than its successor is a wasted
+        # attempt -- drop both rather than fail
+        if 1.0 <= v <= 2.0 and (not out or v > out[-1] + 1e-9):
+            out.append(v)
+    return tuple(out) if out else (1.08,)
 
 
 class _AxisCons:
@@ -209,6 +385,11 @@ class _Refiner:
         self._fast_build = (
             os.environ.get("PARTNER_REFINE_KERNEL", "") == "numba"
             and os.environ.get("PARTNER_REFINE_FASTBUILD", "1") in _TRUE)
+        # PARTNER_REFINE_KERNEL_DISC dispatch flags; both stay False unless
+        # `try_attach` actually produced a kernel with the DISC CSR built, so
+        # a numba-less box or a failed attach silently keeps the Python path.
+        self._disc_fuse = False
+        self._disc_hp = False
 
         self._build_groups()
         self._build_pins()
@@ -300,9 +481,28 @@ class _Refiner:
         if os.environ.get("PARTNER_REFINE_KERNEL", "") == "numba":
             try:
                 from refine_numeric_kernel import try_attach as _rk_attach
+                from refine_numeric_kernel import disc_parts as _rk_parts
                 self._nk = _rk_attach(self)
+                if self._nk is not None and self._nk.disc:
+                    _parts = _rk_parts()
+                    self._disc_fuse = "fuse" in _parts
+                    self._disc_hp = "hp" in _parts
             except Exception:
                 self._nk = None
+                self._disc_fuse = False
+                self._disc_hp = False
+
+        # -- PARTNER_REFINE_PROF: `run()` section timers (default off) ------
+        # Diagnostic only; `None` makes every site in `run` a dead branch.
+        self._prof = _prof_new() if _flag_on("PARTNER_REFINE_PROF") else None
+        # second tier: splits the `discrete` bucket (see `_DPROF_KEYS`).
+        # Gated under the parent flag -- there is no record to attach to
+        # otherwise -- and `None` makes every site in the discrete family a
+        # dead branch.
+        self._dprof = (_dprof_new()
+                       if (self._prof is not None
+                           and _flag_on("PARTNER_REFINE_PROF_DISC"))
+                       else None)
 
     # ------------------------------------------------------------------
     def _contacts(self, idxs):
@@ -710,13 +910,19 @@ class _Refiner:
         hold=True turns the sweep into a minimum-displacement legalizer:
         every target is "stay put" and overlapping pairs are separated
         along their axis of smaller penetration."""
-        if hold and self._nk is not None:
+        if self._nk is not None:
             # PARTNER_REFINE_KERNEL: constraint build + forward assignment +
-            # rigid moves fused into one njit call.  hold=False keeps the
-            # Python path (its per-group target ends in `_wmedian`'s
-            # non-stable argsort -- see refine_numeric_kernel's scope note).
-            self._nk.axis_pass_hold(axis, invert)
-            return
+            # rigid moves fused into one njit call.
+            if hold:
+                self._nk.axis_pass_hold(axis, invert)
+                return
+            if self._nk.qsweep:
+                # PARTNER_REFINE_KERNEL_QSWEEP (sub-switch, default off): the
+                # same fusion for the HPWL median sweep.  Off -> this is one
+                # extra attribute test and the sweep stays in Python, exactly
+                # as it shipped.
+                self._nk.axis_pass_soft(axis, max_step, invert)
+                return
         cons = self._axis_constraints(axis, invert)
         G = cons.G
         lo_fixed = cons.lo
@@ -873,6 +1079,10 @@ class _Refiner:
     # ------------------------------------------------------------------
     def _block_hp(self, i: int, cx: float, cy: float, exclude=()) -> float:
         """HPWL of edges incident to block i with its center at (cx, cy)."""
+        if self._disc_hp:
+            # PARTNER_REFINE_KERNEL_DISC (part `hp`): same CSR order, same
+            # accumulation order, so the float sum is bit-identical.
+            return self._nk.block_hp(i, cx, cy, exclude)
         P = self.P
         s = 0.0
         for j, w in self.badj[i]:
@@ -1075,6 +1285,12 @@ class _Refiner:
 
     def _optimal_point(self, i: int):
         """Weighted-median optimum of block i's incident edges/pins."""
+        if self._disc_hp:
+            # PARTNER_REFINE_KERNEL_DISC (part `hp`).  Inherits `_wmedian_k`'s
+            # stable-vs-introsort caveat -- the same one QSWEEP already ships
+            # under, argued in refine_numeric_kernel.py's docstring and
+            # measured in tests/test_partner_refine_disc.py.
+            return self._nk.optimal_point(i)
         P = self.P
         xs, ys, ws = [], [], []
         for j, w in self.badj[i]:
@@ -1093,21 +1309,93 @@ class _Refiner:
 
     def _legal_check(self, snap: np.ndarray, cur_key: float):
         """Legalize after a discrete edit; accept iff the proxy improves."""
-        for _ in range(3):
-            self._axis_pass(0, hold=True)
-            self._axis_pass(1, hold=True)
-            if not self._has_overlap():
-                break
-        if self._has_overlap():
+        dp = self._dprof          # PARTNER_REFINE_PROF_DISC; None -> dead
+        if self._disc_fuse:
+            # PARTNER_REFINE_KERNEL_DISC (part `fuse`): the loop below plus
+            # its trailing re-test, in one njit call.  Same functions, same
+            # order -- what it removes is 6 numba dispatches and 6 O(G) Python
+            # pin re-syncs per attempt, which the sub-profile prices at ~26%
+            # of the whole `discrete` bucket.
+            _t = time.time() if dp is not None else 0.0
+            _ov = self._nk.legal_sweeps()
+            if dp is not None:
+                dp["t_lc_axis"] += time.time() - _t
+                dp["c_lc_axis"] += 6
+            if _ov:
+                self.P[...] = snap
+                return False, cur_key
+            _t = time.time() if dp is not None else 0.0
+            k = self._key()
+            if dp is not None:
+                dp["t_lc_key"] += time.time() - _t
+                dp["c_lc_key"] += 1
+            if k < cur_key - 1e-12:
+                return True, k
             self.P[...] = snap
             return False, cur_key
+        if dp is None:
+            # Uninstrumented path, verbatim as it shipped.  This IS a second
+            # copy of the loop below, and that is deliberate: `_legal_check`
+            # runs ~7 k times in a 0.23 s `run`, so even the ~10 `dp is not
+            # None` tests the instrumented copy pays would be ~1% of the
+            # span -- and on a deadline-bounded search a 1% tax is not a
+            # measurement, it is a policy change.
+            for _ in range(3):
+                self._axis_pass(0, hold=True)
+                self._axis_pass(1, hold=True)
+                if not self._has_overlap():
+                    break
+            if self._has_overlap():
+                self.P[...] = snap
+                return False, cur_key
+            k = self._key()
+            if k < cur_key - 1e-12:
+                return True, k
+            self.P[...] = snap
+            return False, cur_key
+        for _ in range(3):
+            _t = time.time() if dp is not None else 0.0
+            self._axis_pass(0, hold=True)
+            self._axis_pass(1, hold=True)
+            if dp is not None:
+                dp["t_lc_axis"] += time.time() - _t
+                dp["c_lc_axis"] += 2
+                _t = time.time()
+            _ov = self._has_overlap()
+            if dp is not None:
+                dp["t_lc_ovl"] += time.time() - _t
+                dp["c_lc_ovl"] += 1
+            if not _ov:
+                break
+        _t = time.time() if dp is not None else 0.0
+        _ov = self._has_overlap()
+        if dp is not None:
+            dp["t_lc_ovl"] += time.time() - _t
+            dp["c_lc_ovl"] += 1
+        if _ov:
+            _t = time.time() if dp is not None else 0.0
+            self.P[...] = snap
+            if dp is not None:
+                dp["t_lc_rest"] += time.time() - _t
+                dp["c_lc_rest"] += 1
+            return False, cur_key
+        _t = time.time() if dp is not None else 0.0
         k = self._key()
+        if dp is not None:
+            dp["t_lc_key"] += time.time() - _t
+            dp["c_lc_key"] += 1
         if k < cur_key - 1e-12:
             return True, k
+        _t = time.time() if dp is not None else 0.0
         self.P[...] = snap
+        if dp is not None:
+            dp["t_lc_rest"] += time.time() - _t
+            dp["c_lc_rest"] += 1
         return False, cur_key
 
     def _try_swap(self, i: int, j: int, cur_key: float):
+        dp = self._dprof          # PARTNER_REFINE_PROF_DISC; None -> dead
+        _t = time.time() if dp is not None else 0.0
         P = self.P
         snap = P.copy()
         xi, yi, wi, hi = P[i]
@@ -1128,12 +1416,17 @@ class _Refiner:
             P[j] = (min(max(xi + 0.5 * (wi - wj), self.xmin), self.xmax - wj),
                     min(max(yi + 0.5 * (hi - hj), self.ymin), self.ymax - hj),
                     wj, hj)
+        if dp is not None:
+            dp["t_swap_edit"] += time.time() - _t
+            dp["c_swap_edit"] += 1
         return self._legal_check(snap, cur_key)
 
     def _try_insert(self, i: int, cur_key: float):
         """Re-insert block i directly above/below its strongest neighbor."""
         if not self.badj[i]:
             return False, cur_key
+        dp = self._dprof          # PARTNER_REFINE_PROF_DISC; None -> dead
+        _t = time.time() if dp is not None else 0.0
         P = self.P
         j, _w = max(self.badj[i], key=lambda t: t[1])
         xj, yj, wj, hj = P[j]
@@ -1149,9 +1442,13 @@ class _Refiner:
             ny = min(max(ny, self.ymin), self.ymax - nh)
             snap = P.copy()
             P[i] = (nx, ny, nw, nh)
+            if dp is not None:
+                dp["t_insert_edit"] += time.time() - _t
+                dp["c_insert_edit"] += 1
             ok, cur_key = self._legal_check(snap, cur_key)
             if ok:
                 return True, cur_key
+            _t = time.time() if dp is not None else 0.0
         return False, cur_key
 
     def _discrete_batch(self, cur_key: float, deadline: float,
@@ -1159,6 +1456,7 @@ class _Refiner:
         """One sweep of HPWL-driven swap/insert attempts over the most
         displaced blocks.  Returns (accepted_count, new_key)."""
         P = self.P
+        dp = self._dprof          # PARTNER_REFINE_PROF_DISC; None -> dead
         idxs = np.nonzero(self.swappable)[0]
         if len(idxs) < 2:
             return 0, cur_key
@@ -1166,33 +1464,96 @@ class _Refiner:
         cy = P[:, 1] + 0.5 * P[:, 3]
         areas = np.array(self.opt.areas)
         cands = []
+        _t = time.time() if dp is not None else 0.0
+        if self._disc_hp:
+            # PARTNER_REFINE_KERNEL_DISC (part `hp`): the whole per-block
+            # `_optimal_point` + two `_block_hp` + `gain > 1e-9` scan in one
+            # njit call.  Entry-for-entry identical to the loop below, so the
+            # `sort(reverse=True)` that follows sees the same list.
+            keep, gains, opx, opy = self._nk.discrete_gains(idxs)
+            for t in range(len(idxs)):
+                if keep[t]:
+                    cands.append((float(gains[t]), int(idxs[t]),
+                                  float(opx[t]), float(opy[t])))
+            if dp is not None:
+                _e = time.time()
+                dp["t_enum_gain"] += _e - _t
+                dp["c_enum_gain"] += 2 * len(idxs)
+                _t = _e
+            cands.sort(reverse=True)
+            if dp is not None:
+                _e = time.time()
+                dp["t_enum_rest"] += _e - _t
+                dp["c_enum_rest"] += 1
+                _t = _e
+            return self._discrete_apply(cands, idxs, cx, cy, areas,
+                                        cur_key, deadline, max_cands)
         for i in idxs:
             o = self._optimal_point(int(i))
+            if dp is not None:
+                _e = time.time()
+                dp["t_enum_optpt"] += _e - _t
+                dp["c_enum_optpt"] += 1
+                _t = _e
             if o is None:
                 continue
             gain = self._block_hp(int(i), cx[i], cy[i]) \
                 - self._block_hp(int(i), o[0], o[1])
+            if dp is not None:
+                _e = time.time()
+                dp["t_enum_gain"] += _e - _t
+                dp["c_enum_gain"] += 2
+                _t = _e
             if gain > 1e-9:
                 cands.append((gain, int(i), o[0], o[1]))
         cands.sort(reverse=True)
+        if dp is not None:
+            _e = time.time()
+            dp["t_enum_rest"] += _e - _t
+            dp["c_enum_rest"] += 1
+            _t = _e
+        return self._discrete_apply(cands, idxs, cx, cy, areas,
+                                    cur_key, deadline, max_cands)
+
+    def _discrete_apply(self, cands, idxs, cx, cy, areas,
+                        cur_key: float, deadline: float, max_cands: int):
+        """The accept half of `_discrete_batch`, extracted verbatim so the
+        Python and the DISC-kernel enumerations share ONE copy of it (a second
+        copy is exactly how a `==` contract rots)."""
+        P = self.P
+        dp = self._dprof          # PARTNER_REFINE_PROF_DISC; None -> dead
         accepted = 0
         for gain, i, ox, oy in cands[:max_cands]:
             if time.time() >= deadline:
                 break
+            _t = time.time() if dp is not None else 0.0
             dist = np.abs(cx[idxs] - ox) + np.abs(cy[idxs] - oy)
             ratio = areas[idxs] / max(areas[i], 1e-9)
             bad = (idxs == i) | (ratio < 0.45) | (ratio > 2.2)
             order = np.argsort(dist + 1e18 * bad)
+            if dp is not None:
+                dp["t_screen_np"] += time.time() - _t
+                dp["c_screen_np"] += 1
             moved = False
             for t in order[:6]:
                 if bad[t] or time.time() >= deadline:
                     break
+                _t = time.time() if dp is not None else 0.0
                 j = int(idxs[t])
-                excl = (i, j)
-                delta = (self._block_hp(i, cx[j], cy[j], excl)
-                         + self._block_hp(j, cx[i], cy[i], excl)
-                         - self._block_hp(i, cx[i], cy[i], excl)
-                         - self._block_hp(j, cx[j], cy[j], excl))
+                if self._disc_hp:
+                    # DISC part `hp`: the same four terms in the same order,
+                    # one njit call instead of four Python ones.
+                    delta = self._nk.swap_delta(i, j, cx[i], cy[i],
+                                                cx[j], cy[j])
+                else:
+                    excl = (i, j)
+                    delta = (self._block_hp(i, cx[j], cy[j], excl)
+                             + self._block_hp(j, cx[i], cy[i], excl)
+                             - self._block_hp(i, cx[i], cy[i], excl)
+                             - self._block_hp(j, cx[j], cy[j], excl))
+                if dp is not None:
+                    dp["t_screen_delta"] += time.time() - _t
+                    dp["c_screen_delta"] += 4
                 if delta > -1e-9:
                     continue
                 ok, cur_key = self._try_swap(i, j, cur_key)
@@ -1203,8 +1564,12 @@ class _Refiner:
                 moved, cur_key = self._try_insert(i, cur_key)
             if moved:
                 accepted += 1
+                _t = time.time() if dp is not None else 0.0
                 cx = P[:, 0] + 0.5 * P[:, 2]
                 cy = P[:, 1] + 0.5 * P[:, 3]
+                if dp is not None:
+                    dp["t_book"] += time.time() - _t
+                    dp["c_book"] += 1
         return accepted, cur_key
 
     def _matching_batch(self, cur_key: float, deadline: float,
@@ -1216,6 +1581,7 @@ class _Refiner:
         best permutation under the usual _legal_check.  Unlocks the 3+-
         cycles that ratio-capped pairwise swaps cannot express."""
         P = self.P
+        dpf = self._dprof         # PARTNER_REFINE_PROF_DISC; None -> dead
         idxs = np.nonzero(self.swappable)[0]
         if len(idxs) < 3:
             return 0, cur_key
@@ -1223,6 +1589,7 @@ class _Refiner:
         cy = P[:, 1] + 0.5 * P[:, 3]
         areas = np.asarray(self.opt.areas)
         gains = []
+        _t = time.time() if dpf is not None else 0.0
         for i in idxs:
             o = self._optimal_point(int(i))
             if o is None:
@@ -1233,6 +1600,11 @@ class _Refiner:
                 gains.append((g, int(i)))
         gains.sort(reverse=True)
         gmap = {i: g for g, i in gains}
+        if dpf is not None:
+            _e = time.time()
+            dpf["t_m_enum"] += _e - _t
+            dpf["c_m_enum"] += 1
+            _t = _e
         used: set = set()
         accepted = 0
         for _g0, seedb in gains[:pools * 3]:
@@ -1240,6 +1612,7 @@ class _Refiner:
                 break
             if seedb in used or accepted >= pools:
                 continue
+            _t = time.time() if dpf is not None else 0.0
             ratio = areas[idxs] / max(areas[seedb], 1e-9)
             peers = [int(j) for j, rr in zip(idxs, ratio)
                      if 0.4 <= rr <= 2.5 and int(j) not in used]
@@ -1253,6 +1626,11 @@ class _Refiner:
             slots = [(float(P[j, 0]), float(P[j, 1]),
                       float(P[j, 2]), float(P[j, 3])) for j in pool]
             excl = tuple(pool)
+            if dpf is not None:
+                _e = time.time()
+                dpf["t_m_rest"] += _e - _t
+                dpf["c_m_rest"] += 1
+                _t = _e
             C = np.zeros((m, m))
             for a, i in enumerate(pool):
                 for b in range(m):
@@ -1264,6 +1642,11 @@ class _Refiner:
                         ww, hh = float(P[i, 2]), float(P[i, 3])
                     C[a, b] = self._block_hp(i, sx + 0.5 * ww,
                                              sy + 0.5 * hh, excl)
+            if dpf is not None:
+                _e = time.time()
+                dpf["t_m_cost"] += _e - _t
+                dpf["c_m_cost"] += m * m
+                _t = _e
             INF = 1e18
             size = 1 << m
             dp = np.full(size, INF)
@@ -1287,6 +1670,11 @@ class _Refiner:
                         par[nm] = mask
                         choice[nm] = b
             ident = float(sum(C[a, a] for a in range(m)))
+            if dpf is not None:
+                _e = time.time()
+                dpf["t_m_dp"] += _e - _t
+                dpf["c_m_dp"] += 1
+                _t = _e
             if dp[size - 1] >= ident - 1e-9:
                 continue
             assign = [-1] * m
@@ -1311,12 +1699,21 @@ class _Refiner:
                                 self.xmax - ww),
                             min(max(sy + 0.5 * (sh - hh), self.ymin),
                                 self.ymax - hh), ww, hh)
+            if dpf is not None:
+                _e = time.time()
+                dpf["t_m_apply"] += _e - _t
+                dpf["c_m_apply"] += 1
+                _t = _e
             ok, cur_key = self._legal_check(snap, cur_key)
             if ok:
                 accepted += 1
                 used.update(pool)
+                _t = time.time() if dpf is not None else 0.0
                 cx = P[:, 0] + 0.5 * P[:, 2]
                 cy = P[:, 1] + 0.5 * P[:, 3]
+                if dpf is not None:
+                    dpf["t_book"] += time.time() - _t
+                    dpf["c_book"] += 1
         return accepted, cur_key
 
     def _evict(self, i: int, target=None, max_anchors: int = 40) -> bool:
@@ -3898,6 +4295,8 @@ class _Refiner:
         # rather than adding to it: the fork is deadline-bounded, so an
         # overrun would show up as raw runtime, not as free search.
         hard_deadline = deadline
+        prof = self._prof          # PARTNER_REFINE_PROF; None -> dead branches
+        t_prof0 = time.time() if prof is not None else 0.0
         csa_end = (self.csa_share > 0.0
                    and self.csa_where in ("end", "both"))
         if csa_end:
@@ -3931,8 +4330,12 @@ class _Refiner:
                 # that stalled left `self.P` at its own, possibly worse,
                 # result, and the job here is to escape THAT fixed point.
                 # Global acceptance is still the round's `best` snapshot.
+                _t = time.time() if prof is not None else 0.0
                 self._csa_pass(0)
                 self._csa_pass(1)
+                if prof is not None:
+                    prof["t_csa"] += time.time() - _t
+                    prof["c_csa"] += 2
             if stall_win is not None:
                 # sign-safe relative test: improvement is measured from the
                 # last window reset, not from the previous pass, so a run of
@@ -3943,12 +4346,29 @@ class _Refiner:
                 elif now - ref_time >= stall_win:
                     self._run_stalled = True
                     break
+            _t = time.time() if prof is not None else 0.0
             self._axis_pass(0)
             self._axis_pass(1)
+            if prof is not None:
+                prof["t_axis_soft"] += time.time() - _t
+                prof["c_axis_soft"] += 2
             if rounds >= 1 and rounds % 2 == 1:
+                _t = time.time() if prof is not None else 0.0
                 self._reshape_pass(deadline)
+                if prof is not None:
+                    prof["t_reshape"] += time.time() - _t
+                    prof["c_reshape"] += 1
+            _t = time.time() if prof is not None else 0.0
             self._tag_snap()
-            if self._has_overlap():
+            if prof is not None:
+                prof["t_tag_snap"] += time.time() - _t
+                prof["c_tag_snap"] += 1
+                _t = time.time()
+            ovl = self._has_overlap()
+            if prof is not None:
+                prof["t_overlap"] += time.time() - _t
+                prof["c_overlap"] += 1
+            if ovl:
                 # a sweep produced an illegal state (only possible via the
                 # rare unresolved-cycle fallback) — discard the whole round
                 self.P[...] = best
@@ -3957,11 +4377,19 @@ class _Refiner:
                 if stall >= 2:
                     if kicks >= 6:
                         break
+                    _t = time.time() if prof is not None else 0.0
                     self._perturb()
+                    if prof is not None:
+                        prof["t_perturb"] += time.time() - _t
+                        prof["c_perturb"] += 1
                     kicks += 1
                     stall = 0
                 continue
+            _t = time.time() if prof is not None else 0.0
             k = self._key()
+            if prof is not None:
+                prof["t_key"] += time.time() - _t
+                prof["c_key"] += 1
             if k < best_key - 1e-12:
                 best_key = k
                 best = self.P.copy()
@@ -3972,7 +4400,11 @@ class _Refiner:
                 if kicks >= 6:
                     break
                 self.P[...] = best
+                _t = time.time() if prof is not None else 0.0
                 self._perturb()
+                if prof is not None:
+                    prof["t_perturb"] += time.time() - _t
+                    prof["c_perturb"] += 1
                 kicks += 1
                 stall = 0
             rounds += 1
@@ -3986,9 +4418,17 @@ class _Refiner:
         # finds nothing, a random kick re-seeds the search.
         self.P[...] = best
         cur_key = best_key
+        _t = time.time() if prof is not None else 0.0
         cur_key = self._squeeze_phase(cur_key, deadline)
+        if prof is not None:
+            prof["t_squeeze"] += time.time() - _t
+            prof["c_squeeze"] += 1
         if self.enable_deflate:
+            _t = time.time() if prof is not None else 0.0
             cur_key = self._deflate(cur_key, deadline)
+            if prof is not None:
+                prof["t_deflate"] += time.time() - _t
+                prof["c_deflate"] += 1
         if cur_key < best_key - 1e-12:
             best_key = cur_key
             best = self.P.copy()
@@ -4024,14 +4464,25 @@ class _Refiner:
                 elif now - ref_time >= stall_win:
                     self._run_stalled = True
                     break
+            _t = time.time() if prof is not None else 0.0
             self._build_swappable()
+            if prof is not None:
+                prof["t_build_swap"] += time.time() - _t
+                prof["c_build_swap"] += 1
+                _t = time.time()
             acc, cur_key = self._discrete_batch(cur_key, deadline)
+            if prof is not None:
+                prof["t_discrete"] += time.time() - _t
+                prof["c_discrete"] += 1
             if acc == 0 and os.environ.get("PARTNER_MATCH"):
                 # escalation ladder: exact cycle matching ONLY when the
                 # pairwise batch is exhausted — free on non-stalled
                 # sweeps, and a smarter kick than the random perturb
                 # (a successful cycle also re-opens pairwise wins)
+                _t = time.time() if prof is not None else 0.0
                 acc, cur_key = self._matching_batch(cur_key, deadline)
+                if prof is not None:
+                    prof["t_discrete"] += time.time() - _t
             batches += 1
             swaps += acc
             if cur_key < best_key - 1e-12:
@@ -4039,30 +4490,76 @@ class _Refiner:
                 best = self.P.copy()
             if acc == 0:
                 stall2 += 1
+                _t = time.time() if prof is not None else 0.0
                 self._perturb()
+                if prof is not None:
+                    prof["t_perturb"] += time.time() - _t
+                    prof["c_perturb"] += 1
+                    _t = time.time()
                 self._axis_pass(0)
                 self._axis_pass(1)
+                if prof is not None:
+                    prof["t_axis_soft"] += time.time() - _t
+                    prof["c_axis_soft"] += 2
+                    _t = time.time()
                 self._tag_snap()
-                if self._has_overlap():
+                if prof is not None:
+                    prof["t_tag_snap"] += time.time() - _t
+                    prof["c_tag_snap"] += 1
+                    _t = time.time()
+                ovl = self._has_overlap()
+                if prof is not None:
+                    prof["t_overlap"] += time.time() - _t
+                    prof["c_overlap"] += 1
+                if ovl:
                     self.P[...] = best
                     cur_key = best_key
                 else:
+                    _t = time.time() if prof is not None else 0.0
                     cur_key = self._key()
+                    if prof is not None:
+                        prof["t_key"] += time.time() - _t
+                        prof["c_key"] += 1
                     if cur_key < best_key - 1e-12:
                         best_key = cur_key
                         best = self.P.copy()
                 continue
             stall2 = 0
+            _t = time.time() if prof is not None else 0.0
             self._axis_pass(0)
             self._axis_pass(1)
+            if prof is not None:
+                prof["t_axis_soft"] += time.time() - _t
+                prof["c_axis_soft"] += 2
+                _t = time.time()
             self._reshape_pass(deadline)
+            if prof is not None:
+                prof["t_reshape"] += time.time() - _t
+                prof["c_reshape"] += 1
+                _t = time.time()
             self._tag_snap()
-            if self._has_overlap():
+            if prof is not None:
+                prof["t_tag_snap"] += time.time() - _t
+                prof["c_tag_snap"] += 1
+                _t = time.time()
+            ovl = self._has_overlap()
+            if prof is not None:
+                prof["t_overlap"] += time.time() - _t
+                prof["c_overlap"] += 1
+            if ovl:
                 self.P[...] = best
                 cur_key = best_key
                 continue
+            _t = time.time() if prof is not None else 0.0
             cur_key = self._key()
+            if prof is not None:
+                prof["t_key"] += time.time() - _t
+                prof["c_key"] += 1
+                _t = time.time()
             cur_key = self._squeeze_phase(cur_key, deadline)
+            if prof is not None:
+                prof["t_squeeze"] += time.time() - _t
+                prof["c_squeeze"] += 1
             if cur_key < best_key - 1e-12:
                 best_key = cur_key
                 best = self.P.copy()
@@ -4073,13 +4570,20 @@ class _Refiner:
         # slack -- which is exactly what the A/B is there to separate.)
         if csa_end:
             self.P[...] = best
+            _t = time.time() if prof is not None else 0.0
             while time.time() < hard_deadline:
                 if not (self._csa_pass(0) | self._csa_pass(1)):
                     break
+            if prof is not None:
+                prof["t_csa"] += time.time() - _t
+                prof["c_csa"] += 1
             k = self._key()
             if k < best_key - 1e-12:
                 best_key = k
                 best = self.P.copy()
+
+        if prof is not None:
+            _prof_emit(self, time.time() - t_prof0, rounds, batches, swaps)
 
         if _DEBUG:
             print(f"[refiner] rounds={rounds} kicks={kicks} "
@@ -4900,6 +5404,232 @@ def _lock_compact(opt, out, deadline: float, seed: int = 0,
         return out
 
 
+# ---------------------------------------------------------------------------
+# PARTNER_REFINE_GUARD (default off) -- no-degradation guard on the pipeline's
+# own output.
+#
+# `refine_prediction` is a PIPELINE, not a search: every stage carries its own
+# acceptance gate, and several of those gates are blind to terms the official
+# cost charges for.  `_edge_seat` / `_cluster_seat` keep a result whenever the
+# violation count strictly drops (bbox area is not consulted); the step-6
+# repair loop arbitrates on (V, hpwl) only; and the ladder itself re-legalizes
+# into a frame sized from `area_ref * 1.08`, which `_seed_tags` then fills
+# exactly.  Nothing anywhere asks whether what comes out is better than what
+# went in, or than an earlier stage's own output.
+#
+# Measured on the G-T3-1 oracle replay (a repaired golden layout injected as
+# the prediction, so the input is feasible at cost 1.0000): tid 87 comes back
+# at 1.1328 -- bbox exactly `1.08 * area_ref` (+5.2% over the evaluator's area
+# baseline, +0.026) plus 2 soft violations the input did not have (x1.0975).
+#
+# The guard re-scores the pipeline's stage snapshots -- and the INPUT itself,
+# when the input passes a hard-legality re-check -- under the same
+# evaluator-style cost `_lock_compact.judge` already uses, and returns the
+# best.  It is a SELECTION, never a new layout: everything it can return was
+# produced (and overlap-checked) by the pipeline or handed in by the caller.
+#
+# Off (the default) `_GUARD_ON` is a falsy module constant, so `_snaps` stays
+# None, every capture site collapses to one `is not None` test, and the
+# returned layout is bit-identical to the shipped path.
+_GUARD_ON = _flag_on("PARTNER_REFINE_GUARD")
+_GUARD_DBG = _flag_on("PARTNER_REFINE_GUARD_DEBUG")
+# The guard costs ~1 hpwl + 1 `full_violations` per snapshot.  Restricting it
+# to the tail (n >= 95) is the same reusable instance statistic the direct
+# channel's own slots use (`PARTNER_NREF_MIN_N`), not a case list.
+try:
+    _GUARD_MIN_N = int(float(os.environ.get("PARTNER_REFINE_GUARD_MIN_N", "95")))
+except ValueError:
+    _GUARD_MIN_N = 95
+# accept a substitution only on a strict, non-noise improvement
+_GUARD_EPS = 1e-9
+# half the evaluator's 1% soft-area tolerance: the guard may only hand back an
+# input it is sure the evaluator will call feasible
+_GUARD_AREA_TOL = 0.005
+# dimension / preplaced-origin tolerance.  The evaluator's own hard check runs
+# at 1e-4; 1e-5 keeps a 10x margin while staying above the float drift the
+# pipeline itself leaves on a legal layout (measured ~2e-6 on a preplaced
+# origin after a full `refine_prediction`), so a legitimate layout is not
+# refused by a tolerance tighter than the rule it is protecting.
+_GUARD_DIM_TOL = 1e-5
+
+
+# --- rung-(-1): "legal is admissible" --------------------------------------
+# PARTNER_LEGAL_ADMIT=1 (default off, read once at import).
+#
+# The direct channel's coverage boundary is not the sampler, it is the LADDER:
+# below n ~ 101 the per-case budget (0.05-0.33 s) cannot pay for rung 0's
+# `_Refiner` build + fixed-frame legalization, so `refine_prediction` returns
+# None and the reserved pool worker contributes nothing -- even when the
+# prediction handed to it is *already* a legal floorplan.  Rung (-1) sits below
+# rung 0: if the ladder produced nothing, but the caller's raw input passes the
+# same evaluator-faithful hard-legality re-check the guard uses
+# (`_guard_hard_ok`: overlap 1e-7, soft area +/-0.5%, fixed/MIB dims, preplaced
+# origin), hand the input back as the candidate instead of None.
+#
+# Two properties make this cheap rather than a new search stage:
+#   * it only ever fires where the shipped path returns None, so it cannot
+#     displace a ladder result and adds no wall clock to a case that succeeds;
+#   * the check itself is one O(n^2) numpy overlap matrix (n <= 120), paid once
+#     per failed refine worker, after that worker's slice is already spent.
+# The second call site is the guard's INPUT arm at any block count: the shipped
+# guard is restricted to n >= PARTNER_REFINE_GUARD_MIN_N (95), so a small case
+# whose ladder returned a legal-but-worse layout still discards a legal input.
+#
+# Off -> `_LEGAL_ADMIT` is a falsy module constant, `_admit_legal_input`
+# returns None before touching numpy, and every call site collapses to the
+# shipped expression bit for bit.
+_LEGAL_ADMIT = _flag_on("PARTNER_LEGAL_ADMIT")
+_LEGAL_ADMIT_DBG = _flag_on("PARTNER_LEGAL_ADMIT_DEBUG")
+
+
+def _admit_legal_input(opt, pred, why: str):
+    """Rung (-1).  Return `pred` iff rung (-1) is on and `pred` is hard-legal.
+
+    Returns None in every other case -- including the flag being off, which is
+    tested first so the shipped path never builds an array or imports a thing.
+    """
+    if not _LEGAL_ADMIT:
+        return None
+    ok = False
+    P = None
+    try:
+        P = np.asarray(pred, dtype=np.float64)
+        ok = _guard_hard_ok(opt, P)
+    except Exception:
+        ok = False
+    if _LEGAL_ADMIT_DBG:
+        import sys as _sys
+        print(f"[admit] n={getattr(opt, 'n', -1)} why={why} ok={int(ok)}",
+              file=_sys.stderr, flush=True)
+    return P.copy() if ok else None
+
+
+def _guard_bbox(P: np.ndarray) -> float:
+    return float(((P[:, 0] + P[:, 2]).max() - P[:, 0].min())
+                 * ((P[:, 1] + P[:, 3]).max() - P[:, 1].min()))
+
+
+def _guard_cost(opt, P: np.ndarray, hp_ref: float, den: int) -> float:
+    """Evaluator-style no-runtime cost of one layout.
+
+    Same functional form as the official cost and as `_lock_compact.judge`:
+    `(1 + 0.5*(hpwl_gap + max(0, area_gap))) * exp(2*V/N_soft)`, with
+    `full_violations` (boundary + grouping + MIB, the official soft set) and
+    `opt.area_ref` standing in for the evaluator's area baseline.
+
+    Two known deviations from the official number, both harmless for a
+    same-case COMPARISON: the hpwl term is referenced to `hp_ref` instead of
+    the (unknowable at solve time) golden hpwl, which rescales that term by
+    `hp_ref / hpwl_baseline` (~1.01-1.08 on the tail, i.e. the guard slightly
+    under-weights hpwl); and the official `max(0, hpwl_gap)` clip is dropped,
+    which is inert here because every direct-channel candidate measured at
+    n >= 95 sits above the golden hpwl.  `area_ref = total_area / 0.97` is
+    within ~1.1% of the golden bbox on the measured tail cases (golden
+    utilization 0.959-0.970), so the area clip is meaningful and kept.
+    """
+    return (1.0 + 0.5 * ((float(opt._hpwl(P)) - hp_ref) / hp_ref
+                         + max(0.0, _guard_bbox(P) / opt.area_ref - 1.0))) \
+        * math.exp(2.0 * full_violations(opt, P) / den)
+
+
+def _guard_overlap(P: np.ndarray) -> bool:
+    """True iff some pair overlaps by more than 1e-7 on BOTH axes (10x
+    stricter than the evaluator's 1e-6, matching `violation_killer`)."""
+    x0 = P[:, 0]
+    y0 = P[:, 1]
+    x1 = x0 + P[:, 2]
+    y1 = y0 + P[:, 3]
+    ox = np.minimum(x1[:, None], x1[None, :]) - np.maximum(x0[:, None], x0[None, :])
+    oy = np.minimum(y1[:, None], y1[None, :]) - np.maximum(y0[:, None], y0[None, :])
+    bad = (ox > 1e-7) & (oy > 1e-7)
+    np.fill_diagonal(bad, False)
+    return bool(bad.any())
+
+
+def _guard_hard_ok(opt, P: np.ndarray) -> bool:
+    """Hard legality of a candidate the pipeline did NOT produce.
+
+    Only the caller's raw prediction goes through here; the stage snapshots
+    are legal by construction.  Every hard constraint the evaluator can call
+    infeasible on is re-checked: overlap, soft-block exact area, fixed-shape
+    dimensions, preplaced dimensions AND origin.
+    """
+    if P.ndim != 2 or P.shape[1] != 4 or P.shape[0] != opt.n:
+        return False
+    if not np.isfinite(P).all() or (P[:, 2] <= 0).any() or (P[:, 3] <= 0).any():
+        return False
+    kind = np.asarray(opt.kind)
+    areas = np.asarray(opt.areas, dtype=np.float64)
+    rw = np.asarray(opt.rw, dtype=np.float64)
+    rh = np.asarray(opt.rh, dtype=np.float64)
+    soft = kind == 0
+    if soft.any():
+        a = P[soft, 2] * P[soft, 3]
+        if (np.abs(a - areas[soft]) / np.maximum(areas[soft], 1e-9)
+                > _GUARD_AREA_TOL).any():
+            return False
+    hard = kind != 0
+    if hard.any():
+        if (np.abs(P[hard, 2] - rw[hard]) > _GUARD_DIM_TOL).any() \
+                or (np.abs(P[hard, 3] - rh[hard]) > _GUARD_DIM_TOL).any():
+            return False
+    lock = kind == 2
+    if lock.any():
+        lx = np.asarray(getattr(opt, "lx", None), dtype=np.float64)
+        ly = np.asarray(getattr(opt, "ly", None), dtype=np.float64)
+        if lx.shape != (opt.n,) or ly.shape != (opt.n,):
+            return False
+        if (np.abs(P[lock, 0] - lx[lock]) > _GUARD_DIM_TOL).any() \
+                or (np.abs(P[lock, 1] - ly[lock]) > _GUARD_DIM_TOL).any():
+            return False
+    return not _guard_overlap(P)
+
+
+def _guard_pick(opt, out, snaps, pred):
+    """Return whichever of `out` / the stage snapshots / the input scores
+    best under `_guard_cost`.  Returns `out` unchanged on any failure."""
+    try:
+        P = np.asarray(out, dtype=np.float64)
+        den = max(getattr(opt, "n_soft_den", 1), 1)
+        hp_ref = max(float(opt._hpwl(P)), 1e-9)
+        best = None
+        best_c = _guard_cost(opt, P, hp_ref, den)
+        base_c = best_c
+        cands = list(snaps)
+        if pred is not None:
+            cands.append(("input", np.asarray(pred, dtype=np.float64)))
+        for tag, Q in cands:
+            if Q.shape != P.shape:
+                continue
+            c = _guard_cost(opt, Q, hp_ref, den)
+            if _GUARD_DBG:
+                import sys as _sys
+                print(f"[guard] n={opt.n} {tag:<8} cost={c:.6f} "
+                      f"hp={opt._hpwl(Q):.1f} area={_guard_bbox(Q):.0f} "
+                      f"V={full_violations(opt, Q)} den={den} "
+                      f"aref={opt.area_ref:.0f}", file=_sys.stderr, flush=True)
+            if c >= best_c - _GUARD_EPS:
+                continue
+            ok = (_guard_hard_ok(opt, Q) if tag == "input"
+                  else not _guard_overlap(Q))
+            if ok:
+                best = (tag, Q)
+                best_c = c
+        if _GUARD_DBG:
+            import sys as _sys
+            print(f"[guard] n={opt.n} out cost={base_c:.6f} -> "
+                  f"{best[0] if best else 'out'} {best_c:.6f}",
+                  file=_sys.stderr, flush=True)
+        if best is None:
+            return out
+        return best[1].copy()
+    except Exception:
+        if _DEBUG or _GUARD_DBG:
+            import traceback
+            traceback.print_exc()
+        return out
+
+
 def refine_prediction(opt, pred: np.ndarray, deadline: float,
                       seed: int = 0, _depth: int = 0) -> Optional[np.ndarray]:
     """Full direct-prediction pipeline glue:
@@ -4916,7 +5646,14 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
     Returns refined positions or None if no attempt legalized."""
     try:
         if opt.n < 2 or time.time() >= deadline:
-            return None
+            # rung (-1): a worker handed no budget at all still costs a pool
+            # slot; a legal input is a free candidate.  Off -> None, as shipped.
+            return (_admit_legal_input(opt, pred, "nobudget")
+                    if _depth == 0 else None)
+        # PARTNER_REFINE_GUARD stage snapshots; None (the default) makes every
+        # capture site below one `is not None` test and changes nothing.
+        _snaps = ([] if (_GUARD_ON and _depth == 0 and opt.n >= _GUARD_MIN_N)
+                  else None)
         # reserve the violation-repair slice up front — the legalization
         # rungs and the refiner will consume every second they are given,
         # and an unrepaired candidate (drifted tags, broken clusters)
@@ -5002,266 +5739,323 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         # wedge tools existed (unpin retry, free-rect relocation, global
         # evict) — a bare clamp used to kill every legalization.
         if time.time() < deadline:
-            _t_b0 = time.time()
-            try:
-                opt.cluster_groups = {}
-                r = _Refiner(opt, P0, seed + 9)
-            finally:
-                opt.cluster_groups = saved_cg
-            if _any:
-                # The `_Refiner` build is O(n^2) and machine-relative, so it
-                # is the instance's own cost unit: every cap below is sized
-                # in build-times, never in absolute seconds.  A rung costs
-                # roughly 4-7 builds, so keeping `BUILD_MULT` builds back
-                # guarantees the secure rung is still affordable when the
-                # tight rungs fail.
-                t_build = max(time.time() - _t_b0, 1e-6)
-                keep = max(anytime_frac("PARTNER_ANYTIME_SECURE_MIN", 0.25)
-                           * span_lad,
-                           _env_pos("PARTNER_ANYTIME_BUILD_MULT", 6.0, 100.0)
-                           * t_build)
-                # ... but never more than SECURE_MAX of the span: with the
-                # 0.65 default the tight window keeps >= 0.35 of the span,
-                # which is exactly the fixed-frame rung's own shipped share,
-                # so ANYTIME never shortens that rung -- only the
-                # intermediate rungs and the unbounded calls.
-                keep = min(keep, anytime_frac("PARTNER_ANYTIME_SECURE_MAX",
-                                              0.65) * span_lad)
-                # the reserve is the ONLY thing that shortens the tight
-                # rungs: on a cheap instance `keep` is small and the fixed
-                # frame rung keeps its shipped window (its own 0.35 share
-                # below is never widened), on an expensive one the reserve
-                # binds and the secure rung stays affordable.
-                t_tight = max(deadline - keep, t_lad0 + 0.10 * span_lad)
-                if _DEBUG:
-                    print(f"[any] n={opt.n} span={span_lad:.3f} "
-                          f"build={t_build:.3f} keep={keep:.3f} "
-                          f"tight={t_tight - t_lad0:.3f} res={res:.3f}",
-                          flush=True)
-            _r0_end = min(deadline, t_tight) if _any else deadline
-            r._pred_c = pred_c
-            r._anchor_frame_to_tags()
-            W = (r.lock_xmax - r.xmin) if r.lock_xmax is not None else None
-            H = (r.lock_ymax - r.ymin) if r.lock_ymax is not None else None
-            aref = opt.area_ref * 1.08
-            if W is None and H is not None:
-                W = aref / H
-            elif H is None and W is not None:
-                H = aref / W
-            elif W is None and H is None:
-                # no tagged preplaced to leak the frame: take the area
-                # reference at the PREDICTION's aspect ratio — the model
-                # sees the pin/frame anchors and its bbox shape is close
-                bw = float((r.P[:, 0] + r.P[:, 2]).max() - r.P[:, 0].min())
-                bh = float((r.P[:, 1] + r.P[:, 3]).max() - r.P[:, 1].min())
-                if bw > 1e-6 and bh > 1e-6:
-                    H = math.sqrt(aref * bh / bw)
-                    W = aref / H
-            if W is not None:
-                k2i = np.nonzero(r.kind == 2)[0]
-                if len(k2i):
-                    W = max(W, float((r.P[k2i, 0] + r.P[k2i, 2]).max())
-                            - r.xmin)
-                    H = max(H, float((r.P[k2i, 1] + r.P[k2i, 3]).max())
-                            - r.ymin)
-                r.xmax = r.xmin + W
-                r.ymax = r.ymin + H
-                for g in r.groups:
-                    g.pin_x = g.pin_y = False
-                r.satL[:] = False
-                r.satR[:] = False
-                r.satB[:] = False
-                r.satT[:] = False
-                r._pull_inside_frame()
-                r._seed_tags()
-                sub = min(_r0_end,
-                          time.time() + 0.35 * (deadline - time.time()))
-                ok0 = r.legalize_soft(12, deadline=sub, fine=True)
-                if not ok0 and r._overlap_count() <= 6 \
-                        and time.time() < _r0_end:
-                    # inches from closing: give the frame 2% and finish —
-                    # still far tighter than the loose-ladder path, and
-                    # the tag seats survive intact
-                    r.xmax += 0.02 * W
-                    r.ymax += 0.02 * H
-                    # the salvage is the fixed-frame rung's last chance and
-                    # the highest-value branch in the ladder: under ANYTIME
-                    # it gets the whole remaining tight window (the reserve
-                    # is the guardrail), not a share of it
-                    _sal = _r0_end if _any else (time.time() + 1.5)
-                    ok0 = r.legalize_soft(10, deadline=min(_r0_end, _sal))
-                if not ok0 and r._overlap_count() <= 2 \
-                        and time.time() < _r0_end:
-                    # final pair(s): a wedge where every participant is
-                    # tagged/fixed — sacrifice the tag seat (V+1) for the
-                    # tight frame; the cross-candidate selection judges
-                    r._ignore_tags = True
-                    try:
-                        rects = r._free_rects(8)
-                        for a, b in r._overlap_pairs(4):
-                            if r.kind[a] == 2 and (r._reshape_clear(b, a)
-                                                   or r._reshape_chain(b, a)):
-                                continue
-                            if r.kind[b] == 2 and (r._reshape_clear(a, b)
-                                                   or r._reshape_chain(a, b)):
-                                continue
-                            if r._reshape_chain(b, a) \
-                                    or r._reshape_chain(a, b):
-                                continue
-                            m = b if (r._movable_free(b, allow_fixed=True)
-                                      and (not r._movable_free(
-                                          a, allow_fixed=True)
-                                          or r.P[b, 2] * r.P[b, 3]
-                                          <= r.P[a, 2] * r.P[a, 3])) else a
-                            if r._movable_free(m, allow_fixed=True):
-                                gi = int(r.group_of[m])
-                                if gi >= 0:
-                                    r.groups[gi].pin_x = False
-                                    r.groups[gi].pin_y = False
-                                r.satL[m] = r.satR[m] = False
-                                r.satB[m] = r.satT[m] = False
-                                r._relocate_to_free(int(m), rects)
-                        ok0 = r.legalize(12, deadline=_r0_end)
-                    finally:
-                        r._ignore_tags = False
-                if ok0 and not r._has_overlap():
+            # -- rung-0 frame-scale ladder (PARTNER_FRAME_SCALE_LADDER) ---
+            # Off -> `_fs_set == (1.08,)`: one attempt at the shipped scale,
+            # `_fs_last` True on it, `_a_end is _r0_end` -- bit for bit the
+            # shipped rung.  See `frame_scale_set`.
+            _fs_set = frame_scale_set()
+            _fs_min_n = int(_env_pos("PARTNER_FRAME_SCALE_MIN_N", 0.0, 1e6))
+            if len(_fs_set) > 1 and opt.n < _fs_min_n:
+                # budget band (a reusable instance statistic, never a case
+                # id): below it only the widest scale is affordable, which is
+                # the shipped attempt.
+                _fs_set = _fs_set[-1:]
+            # the shipped rung-0 window, measured once so the tight probes
+            # are sized against it and not against each other's leftovers
+            _fs_win = 0.35 * max(0.0, deadline - time.time())
+            _fs_frac = _env_pos("PARTNER_FRAME_SCALE_TIGHT_FRAC", 0.5, 1.0)
+            _fs_live = False
+            for _fs_i, _fs in enumerate(_fs_set):
+                _fs_last = (_fs_i == len(_fs_set) - 1)
+                _fs_t0 = time.time()
+                if legal is not None or _fs_t0 >= deadline:
+                    break
+                _t_b0 = time.time()
+                try:
+                    opt.cluster_groups = {}
+                    r = _Refiner(opt, P0, seed + 9)
+                finally:
+                    opt.cluster_groups = saved_cg
+                _dbg_build = (time.time() - _t_b0) if _SEAT_DBG else 0.0
+                if _any and _fs_i == 0:
+                    # The `_Refiner` build is O(n^2) and machine-relative, so it
+                    # is the instance's own cost unit: every cap below is sized
+                    # in build-times, never in absolute seconds.  A rung costs
+                    # roughly 4-7 builds, so keeping `BUILD_MULT` builds back
+                    # guarantees the secure rung is still affordable when the
+                    # tight rungs fail.
+                    t_build = max(time.time() - _t_b0, 1e-6)
+                    keep = max(anytime_frac("PARTNER_ANYTIME_SECURE_MIN", 0.25)
+                               * span_lad,
+                               _env_pos("PARTNER_ANYTIME_BUILD_MULT", 6.0, 100.0)
+                               * t_build)
+                    # ... but never more than SECURE_MAX of the span: with the
+                    # 0.65 default the tight window keeps >= 0.35 of the span,
+                    # which is exactly the fixed-frame rung's own shipped share,
+                    # so ANYTIME never shortens that rung -- only the
+                    # intermediate rungs and the unbounded calls.
+                    keep = min(keep, anytime_frac("PARTNER_ANYTIME_SECURE_MAX",
+                                                  0.65) * span_lad)
+                    # the reserve is the ONLY thing that shortens the tight
+                    # rungs: on a cheap instance `keep` is small and the fixed
+                    # frame rung keeps its shipped window (its own 0.35 share
+                    # below is never widened), on an expensive one the reserve
+                    # binds and the secure rung stays affordable.
+                    t_tight = max(deadline - keep, t_lad0 + 0.10 * span_lad)
                     if _DEBUG:
-                        bb = ((r.P[:, 0] + r.P[:, 2]).max()
-                              - r.P[:, 0].min()) * \
-                            ((r.P[:, 1] + r.P[:, 3]).max()
-                             - r.P[:, 1].min())
-                        print(f"[rp] rung FIXED legal bbox={bb:.0f} "
-                              f"aref={opt.area_ref:.0f}", flush=True)
-                    r._assemble_clusters(saved_cg)
-                    if not r._has_overlap():
-                        legal = r.P.copy()
-                elif os.environ.get("PARTNER_RUNG05"):
-                    # rung 0.5: fixed-frame salvage.  The min-displacement
-                    # toolkit preserves structure but stalls 20-35 overlaps
-                    # short at ~96% frame utilization; a from-scratch
-                    # repack fits but destroys structure.  Hybrid: keep the
-                    # legalized majority, extract only the residual
-                    # overlappers (prefer soft / untagged / ungrouped) and
-                    # re-place them into the frame's free space (MaxRects,
-                    # reshape allowed, landing near the model's intent).
-                    try:
-                        from frame_repack import _split_free, _prune
-                        P = r.P
-                        nn = len(P)
-                        x0 = P[:, 0]
-                        y0 = P[:, 1]
-                        x1 = x0 + P[:, 2]
-                        y1 = y0 + P[:, 3]
-                        oxm = (np.minimum(x1[:, None], x1[None, :])
-                               - np.maximum(x0[:, None], x0[None, :]))
-                        oym = (np.minimum(y1[:, None], y1[None, :])
-                               - np.maximum(y0[:, None], y0[None, :]))
-                        badm = (oxm > 1e-7) & (oym > 1e-7)
-                        np.fill_diagonal(badm, False)
-                        codes = np.zeros(nn, dtype=np.int64)
-                        for bi_, bc_ in zip(opt._bnd_idx, opt._bnd_codes):
-                            codes[int(bi_)] = int(bc_)
-                        offenders: list = []
-                        salv_ok = True
-                        for _ in range(40):
-                            cnt = badm.sum(1)
-                            if cnt.max() == 0:
-                                break
-                            cand = np.nonzero(cnt > 0)[0]
-                            j = min(cand, key=lambda t: (
-                                (r.kind[t] == 2) * 1000
-                                + (codes[t] != 0) * 100
-                                + int(r.in_cluster[t]) * 10
-                                + (r.kind[t] == 1) * 5
-                                - int(cnt[t])))
-                            if r.kind[j] == 2:
-                                salv_ok = False
-                                break
-                            offenders.append(int(j))
-                            badm[j, :] = False
-                            badm[:, j] = False
-                        if salv_ok and offenders and badm.sum() == 0:
-                            free = [(float(r.xmin), float(r.ymin),
-                                     float(r.xmax - r.xmin),
-                                     float(r.ymax - r.ymin))]
-                            offs = set(offenders)
-                            for j in range(nn):
-                                if j in offs:
+                        print(f"[any] n={opt.n} span={span_lad:.3f} "
+                              f"build={t_build:.3f} keep={keep:.3f} "
+                              f"tight={t_tight - t_lad0:.3f} res={res:.3f}",
+                              flush=True)
+                _r0_end = min(deadline, t_tight) if _any else deadline
+                # per-attempt hard end: the LAST scale keeps the shipped
+                # rung-0 window (`_a_end is _r0_end`, so a single-scale set is
+                # bit-exact); the tighter probes before it are capped by a
+                # share of that window.
+                _a_end = _r0_end if _fs_last else min(
+                    _r0_end, time.time() + _fs_frac * _fs_win)
+                r._pred_c = pred_c
+                r._anchor_frame_to_tags()
+                W = (r.lock_xmax - r.xmin) if r.lock_xmax is not None else None
+                H = (r.lock_ymax - r.ymin) if r.lock_ymax is not None else None
+                # rung-0 frame area.  `_fs` is the shipped 1.08 unless the
+                # frame-scale ladder is on; it is only ever consulted for a
+                # side that is NOT leaked by a tagged preplaced block, so
+                # `_fs_live` records whether this instance can feel it at all.
+                _fs_live = (W is None) or (H is None)
+                aref = opt.area_ref * _fs
+                if W is None and H is not None:
+                    W = aref / H
+                elif H is None and W is not None:
+                    H = aref / W
+                elif W is None and H is None:
+                    # no tagged preplaced to leak the frame: take the area
+                    # reference at the PREDICTION's aspect ratio — the model
+                    # sees the pin/frame anchors and its bbox shape is close
+                    bw = float((r.P[:, 0] + r.P[:, 2]).max() - r.P[:, 0].min())
+                    bh = float((r.P[:, 1] + r.P[:, 3]).max() - r.P[:, 1].min())
+                    if bw > 1e-6 and bh > 1e-6:
+                        H = math.sqrt(aref * bh / bw)
+                        W = aref / H
+                if W is not None:
+                    k2i = np.nonzero(r.kind == 2)[0]
+                    if len(k2i):
+                        W = max(W, float((r.P[k2i, 0] + r.P[k2i, 2]).max())
+                                - r.xmin)
+                        H = max(H, float((r.P[k2i, 1] + r.P[k2i, 3]).max())
+                                - r.ymin)
+                    r.xmax = r.xmin + W
+                    r.ymax = r.ymin + H
+                    for g in r.groups:
+                        g.pin_x = g.pin_y = False
+                    r.satL[:] = False
+                    r.satR[:] = False
+                    r.satB[:] = False
+                    r.satT[:] = False
+                    r._pull_inside_frame()
+                    r._seed_tags()
+                    sub = min(_a_end,
+                              time.time() + 0.35 * (deadline - time.time()))
+                    ok0 = r.legalize_soft(12, deadline=sub, fine=True)
+                    if not ok0 and r._overlap_count() <= 6 \
+                            and time.time() < _a_end:
+                        # inches from closing: give the frame 2% and finish —
+                        # still far tighter than the loose-ladder path, and
+                        # the tag seats survive intact
+                        r.xmax += 0.02 * W
+                        r.ymax += 0.02 * H
+                        # the salvage is the fixed-frame rung's last chance and
+                        # the highest-value branch in the ladder: under ANYTIME
+                        # it gets the whole remaining tight window (the reserve
+                        # is the guardrail), not a share of it
+                        _sal = _a_end if _any else (time.time() + 1.5)
+                        ok0 = r.legalize_soft(10, deadline=min(_a_end, _sal))
+                    if not ok0 and r._overlap_count() <= 2 \
+                            and time.time() < _a_end:
+                        # final pair(s): a wedge where every participant is
+                        # tagged/fixed — sacrifice the tag seat (V+1) for the
+                        # tight frame; the cross-candidate selection judges
+                        r._ignore_tags = True
+                        try:
+                            rects = r._free_rects(8)
+                            for a, b in r._overlap_pairs(4):
+                                if r.kind[a] == 2 and (r._reshape_clear(b, a)
+                                                       or r._reshape_chain(b, a)):
                                     continue
-                                used = (float(x0[j]), float(y0[j]),
-                                        float(P[j, 2]), float(P[j, 3]))
-                                nxt = []
-                                for fr in free:
-                                    nxt.extend(_split_free(fr, used))
-                                free = _prune(nxt)
-                            for j in sorted(offenders,
-                                            key=lambda t:
-                                            -float(opt.areas[t])):
-                                a_j = float(opt.areas[j])
-                                if r._pred_c is not None:
-                                    px_ = float(r._pred_c[j, 0])
-                                    py_ = float(r._pred_c[j, 1])
-                                else:
-                                    px_, py_ = float(x0[j]), float(y0[j])
-                                bestp = None
-                                for fx, fy, fw, fh in free:
-                                    cands2 = []
-                                    if r.kind[j] != 0:
-                                        cands2.append((float(P[j, 2]),
-                                                       float(P[j, 3])))
-                                    else:
-                                        for wf in (float(P[j, 2]), fw,
-                                                   (a_j / fh) if fh > 0
-                                                   else 0.0):
-                                            if wf <= 0:
-                                                continue
-                                            hf = a_j / wf
-                                            if (wf <= fw + 1e-9
-                                                    and hf <= fh + 1e-9
-                                                    and max(wf / hf,
-                                                            hf / wf)
-                                                    <= 12.0):
-                                                cands2.append((wf, hf))
-                                    for w2, h2 in cands2:
-                                        if (w2 > fw + 1e-9
-                                                or h2 > fh + 1e-9):
-                                            continue
-                                        x2 = min(max(px_ - 0.5 * w2, fx),
-                                                 fx + fw - w2)
-                                        y2 = min(max(py_ - 0.5 * h2, fy),
-                                                 fy + fh - h2)
-                                        d = (abs(x2 + 0.5 * w2 - px_)
-                                             + abs(y2 + 0.5 * h2 - py_))
-                                        if bestp is None or d < bestp[0]:
-                                            bestp = (d, x2, y2, w2, h2)
-                                if bestp is None:
+                                if r.kind[b] == 2 and (r._reshape_clear(a, b)
+                                                       or r._reshape_chain(a, b)):
+                                    continue
+                                if r._reshape_chain(b, a) \
+                                        or r._reshape_chain(a, b):
+                                    continue
+                                m = b if (r._movable_free(b, allow_fixed=True)
+                                          and (not r._movable_free(
+                                              a, allow_fixed=True)
+                                              or r.P[b, 2] * r.P[b, 3]
+                                              <= r.P[a, 2] * r.P[a, 3])) else a
+                                if r._movable_free(m, allow_fixed=True):
+                                    gi = int(r.group_of[m])
+                                    if gi >= 0:
+                                        r.groups[gi].pin_x = False
+                                        r.groups[gi].pin_y = False
+                                    r.satL[m] = r.satR[m] = False
+                                    r.satB[m] = r.satT[m] = False
+                                    r._relocate_to_free(int(m), rects)
+                            ok0 = r.legalize(12, deadline=_a_end)
+                        finally:
+                            r._ignore_tags = False
+                    if ok0 and not r._has_overlap():
+                        if _DEBUG:
+                            bb = ((r.P[:, 0] + r.P[:, 2]).max()
+                                  - r.P[:, 0].min()) * \
+                                ((r.P[:, 1] + r.P[:, 3]).max()
+                                 - r.P[:, 1].min())
+                            print(f"[rp] rung FIXED legal bbox={bb:.0f} "
+                                  f"aref={opt.area_ref:.0f}", flush=True)
+                        r._assemble_clusters(saved_cg)
+                        if not r._has_overlap():
+                            legal = r.P.copy()
+                    elif os.environ.get("PARTNER_RUNG05"):
+                        # rung 0.5: fixed-frame salvage.  The min-displacement
+                        # toolkit preserves structure but stalls 20-35 overlaps
+                        # short at ~96% frame utilization; a from-scratch
+                        # repack fits but destroys structure.  Hybrid: keep the
+                        # legalized majority, extract only the residual
+                        # overlappers (prefer soft / untagged / ungrouped) and
+                        # re-place them into the frame's free space (MaxRects,
+                        # reshape allowed, landing near the model's intent).
+                        try:
+                            from frame_repack import _split_free, _prune
+                            P = r.P
+                            nn = len(P)
+                            x0 = P[:, 0]
+                            y0 = P[:, 1]
+                            x1 = x0 + P[:, 2]
+                            y1 = y0 + P[:, 3]
+                            oxm = (np.minimum(x1[:, None], x1[None, :])
+                                   - np.maximum(x0[:, None], x0[None, :]))
+                            oym = (np.minimum(y1[:, None], y1[None, :])
+                                   - np.maximum(y0[:, None], y0[None, :]))
+                            badm = (oxm > 1e-7) & (oym > 1e-7)
+                            np.fill_diagonal(badm, False)
+                            codes = np.zeros(nn, dtype=np.int64)
+                            for bi_, bc_ in zip(opt._bnd_idx, opt._bnd_codes):
+                                codes[int(bi_)] = int(bc_)
+                            offenders: list = []
+                            salv_ok = True
+                            for _ in range(40):
+                                cnt = badm.sum(1)
+                                if cnt.max() == 0:
+                                    break
+                                cand = np.nonzero(cnt > 0)[0]
+                                j = min(cand, key=lambda t: (
+                                    (r.kind[t] == 2) * 1000
+                                    + (codes[t] != 0) * 100
+                                    + int(r.in_cluster[t]) * 10
+                                    + (r.kind[t] == 1) * 5
+                                    - int(cnt[t])))
+                                if r.kind[j] == 2:
                                     salv_ok = False
                                     break
-                                _d, x2, y2, w2, h2 = bestp
-                                P[j] = (x2, y2, w2, h2)
-                                nxt = []
-                                for fr in free:
-                                    nxt.extend(_split_free(
-                                        fr, (x2, y2, w2, h2)))
-                                free = _prune(nxt)
-                            if salv_ok and not r._has_overlap():
-                                r._assemble_clusters(saved_cg)
-                                if not r._has_overlap():
-                                    legal = r.P.copy()
-                                    if _DEBUG:
-                                        print(f"[rp] rung 0.5 salvage legal"
-                                              f" ({len(offenders)} moved)",
-                                              flush=True)
-                        if legal is None and _DEBUG:
-                            print(f"[rp] rung 0.5 salvage failed "
-                                  f"(off={len(offenders)})", flush=True)
-                    except Exception:
-                        if _DEBUG:
-                            import traceback as _tb
-                            _tb.print_exc()
-                elif _DEBUG:
-                    print(f"[rp] rung FIXED failed "
-                          f"ovl={r._overlap_count()}", flush=True)
+                                offenders.append(int(j))
+                                badm[j, :] = False
+                                badm[:, j] = False
+                            if salv_ok and offenders and badm.sum() == 0:
+                                free = [(float(r.xmin), float(r.ymin),
+                                         float(r.xmax - r.xmin),
+                                         float(r.ymax - r.ymin))]
+                                offs = set(offenders)
+                                for j in range(nn):
+                                    if j in offs:
+                                        continue
+                                    used = (float(x0[j]), float(y0[j]),
+                                            float(P[j, 2]), float(P[j, 3]))
+                                    nxt = []
+                                    for fr in free:
+                                        nxt.extend(_split_free(fr, used))
+                                    free = _prune(nxt)
+                                for j in sorted(offenders,
+                                                key=lambda t:
+                                                -float(opt.areas[t])):
+                                    a_j = float(opt.areas[j])
+                                    if r._pred_c is not None:
+                                        px_ = float(r._pred_c[j, 0])
+                                        py_ = float(r._pred_c[j, 1])
+                                    else:
+                                        px_, py_ = float(x0[j]), float(y0[j])
+                                    bestp = None
+                                    for fx, fy, fw, fh in free:
+                                        cands2 = []
+                                        if r.kind[j] != 0:
+                                            cands2.append((float(P[j, 2]),
+                                                           float(P[j, 3])))
+                                        else:
+                                            for wf in (float(P[j, 2]), fw,
+                                                       (a_j / fh) if fh > 0
+                                                       else 0.0):
+                                                if wf <= 0:
+                                                    continue
+                                                hf = a_j / wf
+                                                if (wf <= fw + 1e-9
+                                                        and hf <= fh + 1e-9
+                                                        and max(wf / hf,
+                                                                hf / wf)
+                                                        <= 12.0):
+                                                    cands2.append((wf, hf))
+                                        for w2, h2 in cands2:
+                                            if (w2 > fw + 1e-9
+                                                    or h2 > fh + 1e-9):
+                                                continue
+                                            x2 = min(max(px_ - 0.5 * w2, fx),
+                                                     fx + fw - w2)
+                                            y2 = min(max(py_ - 0.5 * h2, fy),
+                                                     fy + fh - h2)
+                                            d = (abs(x2 + 0.5 * w2 - px_)
+                                                 + abs(y2 + 0.5 * h2 - py_))
+                                            if bestp is None or d < bestp[0]:
+                                                bestp = (d, x2, y2, w2, h2)
+                                    if bestp is None:
+                                        salv_ok = False
+                                        break
+                                    _d, x2, y2, w2, h2 = bestp
+                                    P[j] = (x2, y2, w2, h2)
+                                    nxt = []
+                                    for fr in free:
+                                        nxt.extend(_split_free(
+                                            fr, (x2, y2, w2, h2)))
+                                    free = _prune(nxt)
+                                if salv_ok and not r._has_overlap():
+                                    r._assemble_clusters(saved_cg)
+                                    if not r._has_overlap():
+                                        legal = r.P.copy()
+                                        if _DEBUG:
+                                            print(f"[rp] rung 0.5 salvage legal"
+                                                  f" ({len(offenders)} moved)",
+                                                  flush=True)
+                            if legal is None and _DEBUG:
+                                print(f"[rp] rung 0.5 salvage failed "
+                                      f"(off={len(offenders)})", flush=True)
+                        except Exception:
+                            if _DEBUG:
+                                import traceback as _tb
+                                _tb.print_exc()
+                    elif _DEBUG:
+                        print(f"[rp] rung FIXED failed "
+                              f"ovl={r._overlap_count()}", flush=True)
+                if _FS_DBG:
+                    import sys as _sys
+                    _FS_STATS.append((int(opt.n), float(_fs),
+                                      int(legal is not None),
+                                      int(_fs_live),
+                                      round(time.time() - _fs_t0, 4)))
+                    print(f"[fs] n={opt.n} scale={_fs:.4f} "
+                          f"ok={int(legal is not None)} "
+                          f"live={int(_fs_live)} "
+                          f"t={time.time() - _fs_t0:.4f}",
+                          file=_sys.stderr, flush=True)
+                if not _fs_live or W is None:
+                    # `aref` never entered the geometry -- both frame sides
+                    # are leaked by tagged preplaced blocks, or the frame
+                    # could not be sized at all.  Every other scale would
+                    # replay this exact attempt; stop paying for it.
+                    break
+            if _SEAT_DBG:
+                import sys as _sys
+                print(f"[rp0] n={opt.n} slice={slice_:.4f} "
+                      f"span={span_lad:.4f} build={_dbg_build:.4f} "
+                      f"r0={int(legal is not None)} "
+                      f"t={time.time() - t_lad0:.4f}",
+                      file=_sys.stderr, flush=True)
 
         rungs = ((0.02, True), (0.05, True), (0.08, True), (0.12, True),
                  (0.18, False), (0.28, False))
@@ -5353,7 +6147,12 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                 elif _DEBUG:
                     print("[rp] assembly created overlap", flush=True)
         if legal is None:
-            return None
+            # rung (-1): the whole ladder failed to legalize.  Off -> None,
+            # the shipped return, bit for bit.
+            return (_admit_legal_input(opt, pred, "ladder")
+                    if _depth == 0 else None)
+        if _snaps is not None:
+            _snaps.append(("legal", legal.copy()))
 
         # -- 5. fresh refiner on the legal layout ----------------------
         r2 = _Refiner(opt, legal, seed + 1)
@@ -5362,6 +6161,8 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         r2._anchor_frame_to_tags()
         run_end = deadline - 0.02
         out = r2.run(run_end)
+        if _snaps is not None:
+            _snaps.append(("run", np.asarray(out, dtype=np.float64).copy()))
         # EARLY_EXIT clawback: `run` is the search stage of this pipeline;
         # steps 6/6.5/7 below are its repair + retry tail, sized off
         # `t_hard`.  Without the clawback a converged `run` silently donates
@@ -5464,6 +6265,8 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
 
         out = _cluster_seat(opt, _edge_seat(opt, out),
                             deadline=t_hard - _tg(0.9, 0.1))
+        if _snaps is not None:
+            _snaps.append(("repair", np.asarray(out, dtype=np.float64).copy()))
 
         # -- 6.5 discrete area compaction toward the tag locks ---------
         # The residual failure shape the seats cannot fix: a whole shelf
@@ -5475,6 +6278,9 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                                 min(t_hard - _tg(0.5, 0.15),
                                     time.time() + _tg(2.2, 0.5)),
                                 seed=seed, pred=P0)
+
+        if _snaps is not None:
+            _snaps.append(("compact", np.asarray(out, dtype=np.float64).copy()))
 
         # -- 7. area recompression retry --------------------------------
         # A candidate that came through a loose rung carries an inflated
@@ -5536,6 +6342,16 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         if _DEBUG:
             print(f"[refine_prediction] n={opt.n} hp={opt._hpwl(out):.1f} "
                   f"V={opt._violations(out)}", flush=True)
+        if _snaps is not None:
+            out = _guard_pick(opt, out, _snaps, pred)
+        elif _LEGAL_ADMIT and _depth == 0:
+            # rung (-1), second arm: the guard's INPUT comparison without its
+            # n >= 95 restriction and without any stage snapshots.  The
+            # legality re-check runs FIRST, so on the production path (where
+            # the raw prediction overlaps) this arm costs one O(n^2) overlap
+            # matrix and never pays for a cost evaluation at all.
+            if _admit_legal_input(opt, pred, "cmp") is not None:
+                out = _guard_pick(opt, out, (), pred)
         return out
     except Exception:
         if _DEBUG:
