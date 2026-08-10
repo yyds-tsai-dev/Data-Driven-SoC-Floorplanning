@@ -552,6 +552,9 @@ class MyOptimizer(FloorplanOptimizer):
             result = self._coord_polish(
                 result, area_targets, constraints, target_positions,
                 b2b, p2b, pins)
+            result = self._final_seat(
+                result, area_targets, constraints, target_positions,
+                b2b, p2b, pins, direct_box)
             if os.environ.get("PARTNER_EARLY_EXIT_DEBUG"):
                 # per-case time anatomy: serial head (heuristic seed + GPU
                 # seed-diffusion + parse), the deadline-bounded solve, and
@@ -622,6 +625,61 @@ class MyOptimizer(FloorplanOptimizer):
             return [tuple(map(float, r)) for r in seated]
         except Exception:
             return column_out
+
+    def _final_seat(self, out, at, cons, tpos, b2b, p2b, pins, direct_box):
+        """Run `_edge_seat` once more on the FINAL layout (PARTNER_SEAT_FINAL=1).
+
+        Every existing call site sits upstream of a stage that can still move
+        blocks: the column arm is seated in `_column_edge_seat` BEFORE
+        `_pick_best` arbitrates, the direct arm is seated inside its own refine
+        ladder, and `_coord_polish` then re-solves both axis coordinate
+        problems on whichever layout won.  So the list this method receives has
+        never been offered to `_edge_seat`, and measurably is not at its fixed
+        point: replaying the pass over the shipped n>=100 layouts of a full-100
+        run still earned two tags (a 0.6%-area edge dilate on one case, a
+        strictly V-improving translate on another) in ~1 ms per case.
+
+        The pass only commits a move when the evaluator's own
+        boundary+grouping+MIB total STRICTLY drops, so this can only lower V.
+        It is the last thing to touch the layout, so nothing downstream can
+        undo it.
+
+        Opt-in via PARTNER_SEAT_FINAL=1 and only meaningful with
+        PARTNER_EDGE_SEAT_V2=1 (the narrow historical pass has nothing to add
+        here).  Off: returns the SAME list object -- no import, no scorer
+        build, byte-identical pipeline.  Contained: any failure returns `out`.
+        """
+        if not os.environ.get("PARTNER_SEAT_FINAL") or not edge_seat_v2_on():
+            return out
+        try:
+            from layout_refiner import _edge_seat
+            scorer = direct_box[0][1] if direct_box else _ColumnOptimizer(
+                [tuple(map(float, r)) for r in out], at, cons, tpos,
+                b2b, p2b, pins, time.time() + 1.0, seed=0)
+            seated = _edge_seat(scorer, out)
+            if os.environ.get("PARTNER_SEAT_FINAL_DEBUG"):
+                # self-paired accounting: V before and after, on the SAME
+                # layout in the SAME run.  A pass that can only lower V is
+                # measurable this way without a second run, so this readout is
+                # immune to the deadline-bounded SA's run-to-run drift.
+                import numpy as _np
+                a = _np.asarray([tuple(map(float, r)) for r in out],
+                                dtype=float)
+                b = _np.asarray([tuple(map(float, r)) for r in seated],
+                                dtype=float)
+                nmoved = (int((_np.abs(a - b) > 1e-12).any(axis=1).sum())
+                          if a.shape == b.shape else -1)
+                try:
+                    from violation_killer import _violations_exact
+                    v0, v1 = (_violations_exact(scorer, a),
+                              _violations_exact(scorer, b))
+                except Exception:
+                    v0 = v1 = -1
+                print(f"[fseat] n={len(out)} moved={nmoved} "
+                      f"V={v0}->{v1}", file=sys.stderr, flush=True)
+            return [tuple(map(float, r)) for r in seated]
+        except Exception:
+            return out
 
     def _coord_polish(self, out, at, cons, tpos, b2b, p2b, pins):
         """Post-pass: order-preserving simultaneous-axis coordinate polish of

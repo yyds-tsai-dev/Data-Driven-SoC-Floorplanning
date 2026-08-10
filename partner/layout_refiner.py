@@ -52,6 +52,32 @@ _SEAT_DBG = bool(os.environ.get("PARTNER_SEAT_DEBUG"))
 # falsy module constant, so every capture site is one `if` on a dead branch.
 _FS_DBG = bool(os.environ.get("PARTNER_FRAME_SCALE_DEBUG"))
 _FS_STATS: List[tuple] = []
+# PARTNER_RUNG0_TIGHTEN_DEBUG=1 (default off, read once at import): per-success
+# trace of the rung-0 frame anneal (`rung0_tighten_frac`) -- the bbox/area_ref
+# before and after the anneal, its wall cost, and whether it had to be
+# reverted.  Same shape as `_FS_STATS`: a dead branch when off.
+_R0TG_DBG = bool(os.environ.get("PARTNER_RUNG0_TIGHTEN_DEBUG"))
+_R0TG_STATS: List[tuple] = []
+# PARTNER_TIGHTEN_DEBUG=1 (default off, read once at import): stop-cause
+# instrument for `_tighten`, the ladder's frame anneal.  Emits, per direct
+# candidate (`cid` = pid:call, so the pool's interleaved stderr can be joined
+# back into one candidate):
+#   [cl]  which rung closed the candidate (r0 / r0-salvage / expand-e<f>)
+#   [tg]  one line per `_tighten` call: bbox/area_ref before and after, how
+#         many rounds shrank, and WHY it stopped -- `fail` (a legalize_soft
+#         that had budget left and still could not close the smaller frame),
+#         `failtime` (the same call ran out of deadline), `time` (round-top
+#         deadline), `clamp` (the schedule cannot take a step) or `rounds`.
+#   [fin] the candidate's final bbox, so the evaluator's per-case bbox_area
+#         identifies which candidate actually won.
+# Off, every site is one `if` on a falsy module constant.
+_TG_DBG = bool(os.environ.get("PARTNER_TIGHTEN_DEBUG"))
+_TG_CID = [0]
+_TG_CUR = ["-"]
+# call-site tag for the current `_tighten`.  Carried in a global rather than
+# a parameter on purpose: `_tighten`'s signature is monkeypatched by the
+# rung-0 tests, so adding a keyword to it would break every existing spy.
+_TG_SITE = ["?"]
 
 EDGE_EPS = 1e-6     # evaluator boundary-touch / overlap tolerance
 SEP_TOL = 5e-7      # projection overlap beyond this forces a separation constraint
@@ -322,6 +348,126 @@ def frame_scale_set() -> tuple:
         if 1.0 <= v <= 2.0 and (not out or v > out[-1] + 1e-9):
             out.append(v)
     return tuple(out) if out else (1.08,)
+
+
+def _bbox_area_of(P: np.ndarray) -> float:
+    """Bounding-box area of a placement array (instrument-only helper)."""
+    return float(((P[:, 0] + P[:, 2]).max() - P[:, 0].min())
+                 * ((P[:, 1] + P[:, 3]).max() - P[:, 1].min()))
+
+
+def rung0_tighten_frac() -> float:
+    """PARTNER_RUNG0_TIGHTEN=1 (default off): frame anneal after a rung-0 win.
+
+    `_tighten` is the ladder's frame anneal: it shrinks both max edges a few
+    percent, drags the edge-seated tag blocks onto the new walls and
+    re-legalizes, keeping the tightest frame that still closes.  Every EXPAND
+    rung calls it on success -- but the rung-0 (fixed-frame) success path does
+    not: it goes straight from `legalize_soft` to `_assemble_clusters` and
+    ships `r.P`.  Because `_seed_tags` seats the tagged blocks flush against
+    the rung-0 walls, that layout's bbox IS the rung-0 frame constant
+    (`frame_scale_set()` * `area_ref`), so a rung-0 candidate ships an area
+    the expand rungs would have annealed away.  Measured on the frame-scale
+    campaign (docs/experiments/2026-08-11-...): the arm that forced rung 0 to
+    FAIL (scale 1.00) had mean bb/area_ref 1.0670 against 1.1044 for the arm
+    that shipped rung-0 frames -- i.e. most of the frame-scale win was "do not
+    close on an un-annealed frame".  This flag closes the remaining gap on the
+    rung-0 path itself, and is orthogonal to the scale constant.
+
+    Returns 0.0 when off (the shipped path, bit for bit); otherwise the share
+    of the remaining ladder budget the anneal may spend.  The expand rungs
+    take `PARTNER_ANYTIME_TIGHTEN` (0.45) of what is left under ANYTIME and an
+    absolute 3.0 s otherwise; rung 0 uses the fractional form unconditionally
+    (`PARTNER_RUNG0_TIGHTEN_FRAC`, default 0.45) because at the shipped 0.3 s
+    tier ANYTIME is off and the absolute constant would hand the anneal the
+    whole ladder tail -- and unlike an expand rung, a rung-0 success is the
+    COMMON path, whose leftover budget funds the refiner (step 5)."""
+    if not _flag_on("PARTNER_RUNG0_TIGHTEN"):
+        return 0.0
+    return anytime_frac("PARTNER_RUNG0_TIGHTEN_FRAC", 0.45)
+
+
+def rung0_tighten_min_slack() -> float:
+    """PARTNER_RUNG0_TIGHTEN_MIN_SLACK (default 0.0 = ungated).
+
+    `_tighten` shrinks BOTH max edges by a factor from a fixed schedule
+    (0.97, 0.988), i.e. it can only ever try frames at 94.1% / 97.6% of the
+    current bbox area.  `area_ref` is `total_block_area / 0.97`, so a rung-0
+    frame at `scale * area_ref` with the shipped `scale = 1.02` already sits
+    at 95.1% utilization and even the gentle step asks for 97.4% -- measured
+    on a full-100 probe, every anneal whose frame was exactly `1.02 *
+    area_ref` failed both steps and returned the SAME bbox after 0.07-0.16 s
+    of refiner time (4 of 6 events).  The 2 that paid off both started from a
+    frame the preplaced lock clamp had inflated ABOVE the constant
+    (bb/area_ref 1.0612 -> 1.0359).
+
+    So the anneal is worth its budget exactly when the rung-0 frame carries
+    slack over the area reference it was sized from.  This returns the
+    minimum relative slack `(W*H) / (scale * area_ref) - 1` required to run
+    it; 0.0 keeps every rung-0 success eligible.  It is a frame/area
+    statistic, never a case id."""
+    raw = os.environ.get("PARTNER_RUNG0_TIGHTEN_MIN_SLACK")
+    if raw is None:
+        return 0.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.0
+    return v if 0.0 <= v <= 0.5 else 0.0
+
+
+def tighten_fine_floor() -> float:
+    """PARTNER_TIGHTEN_FINE=<floor> (default 0.0 = off, shipped schedule).
+
+    `_tighten`'s schedule (0.97, 0.988) is ABSOLUTE: it always asks for a
+    frame at 94.1% / 97.6% of the current bbox area, whatever that bbox
+    already is.  The full-100 stop-cause probe at the 0.3 s point
+    (`PARTNER_TIGHTEN_DEBUG`) shows the schedule splits the anneal into two
+    populations:
+
+      * loose-rung candidates (bbox/area_ref 1.26-1.68) -- 0.97 lands 3-7
+        times in a row at 1-6 ms per step and the call ends on the deadline;
+      * tight-rung candidates (bbox/area_ref 1.05-1.13), which are the ones
+        that WIN the r in [1.035, 1.08] band -- `r0:0.97:f` then
+        `r0:0.988:f`, 0.09-0.21 s spent for a bbox that does not move.
+
+    The second population is arithmetic, not bad luck: `area_ref` is
+    `total_block_area / 0.97`, so at bbox = 1.055 * area_ref the 0.97 step
+    asks for a frame at 0.993 * area_ref -- BELOW the total block area, i.e.
+    provably unpackable -- and 0.988 asks for 1.030 * area_ref (94.2%
+    utilization), at or under the empirical floor.
+
+    This returns the smallest frame area, as a multiple of `area_ref`, that
+    is worth one `legalize_soft` attempt.  Non-zero rebuilds the per-round
+    schedule relative to it: every factor that would undercut the floor is
+    dropped (they are the guaranteed-dead attempts) and the factor that
+    lands exactly ON the floor is appended, so a tight candidate spends its
+    anneal budget on the one step that can still succeed.  It is a
+    frame/area statistic of the instance, never a case id."""
+    raw = os.environ.get("PARTNER_TIGHTEN_FINE")
+    if raw is None:
+        return 0.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.0
+    return v if 1.0 <= v <= 1.5 else 0.0
+
+
+def tighten_fine_steps() -> int:
+    """PARTNER_TIGHTEN_FINE_STEPS (default 1): how many attempts the
+    floor-relative schedule appends.  2 adds a half-step (halfway between
+    "no shrink" and the floor), which is the continuation arm: it only ever
+    runs after the floor step itself failed, and only while budget is left.
+    Ignored when `tighten_fine_floor()` is off."""
+    raw = os.environ.get("PARTNER_TIGHTEN_FINE_STEPS")
+    if raw is None:
+        return 1
+    try:
+        v = int(raw)
+    except ValueError:
+        return 1
+    return v if 1 <= v <= 4 else 1
 
 
 class _AxisCons:
@@ -3799,13 +3945,54 @@ class _Refiner:
         tightest frame that still legalizes — far stronger than local
         squeezing because every round may restructure the packing."""
         P = self.P
-        for _ in range(rounds):
+        # floor-relative schedule (PARTNER_TIGHTEN_FINE, default 0.0 -> the
+        # tuple below is the shipped constant and this is one dead `if`).
+        _fine = tighten_fine_floor()
+        _fine_ref = max(float(getattr(self.opt, "area_ref", 0.0)), 1e-9) \
+            if _fine > 0.0 else 0.0
+        _fine_k = tighten_fine_steps() if _fine > 0.0 else 0
+        if _TG_DBG:
+            _tg_aref = max(float(getattr(self.opt, "area_ref", 0.0)), 1e-9)
+            _tg_t0 = time.time()
+            _tg_a0 = _bbox_area_of(P) / _tg_aref
+            _tg_stop = "rounds"
+            _tg_ok = 0
+            _tg_tr: List[str] = []
+        for _rd in range(rounds):
             if time.time() >= deadline:
+                if _TG_DBG:
+                    _tg_stop = "time"
                 break
             bx1 = float((P[:, 0] + P[:, 2]).max())
             by1 = float((P[:, 1] + P[:, 3]).max())
             done = False
-            for f in (0.97, 0.988):
+            sched = (0.97, 0.988)
+            if _fine > 0.0:
+                # smallest factor whose resulting frame still clears the
+                # feasibility floor.  Both max edges move, so the area cut
+                # is f**2 on the CURRENT bbox.
+                cur = max((bx1 - self.xmin) * (by1 - self.ymin), 1e-9)
+                fmin = math.sqrt(max(_fine * _fine_ref / cur, 1e-12))
+                if fmin >= 1.0 - 1e-9:
+                    # already at or under the floor: every remaining attempt
+                    # is a guaranteed-dead `legalize_soft`.
+                    if _TG_DBG:
+                        _tg_stop = "floor"
+                    break
+                keep = tuple(f for f in sched if f >= fmin)
+                if not keep:
+                    # every shipped factor undercuts the floor -- replace the
+                    # guaranteed-dead attempts with the one that lands on it
+                    # (plus, at STEPS >= 2, a half-step continuation).
+                    add = [fmin]
+                    for _s in range(1, _fine_k):
+                        add.append(1.0 - (1.0 - add[-1]) * 0.5)
+                    sched = tuple(a for a in add if a < 1.0 - 1e-9)
+                else:
+                    # the shipped schedule still has a feasible step: leave
+                    # this round bit-exact.
+                    sched = keep
+            for f in sched:
                 snap = P.copy()
                 frame = (self.xmin, self.xmax, self.ymin, self.ymax)
                 nx = self.xmin + (bx1 - self.xmin) * f
@@ -3815,6 +4002,9 @@ class _Refiner:
                 if self.lock_ymax is not None:
                     ny = max(ny, self.lock_ymax)
                 if nx >= self.xmax - 1e-9 and ny >= self.ymax - 1e-9:
+                    if _TG_DBG:
+                        _tg_stop = "clamp"
+                        _tg_tr.append(f"r{_rd}:{f}:clamp")
                     break
                 moved = set()
                 for i in np.nonzero(self.satR)[0]:
@@ -3832,13 +4022,36 @@ class _Refiner:
                                    ny - (float(P[i, 1]) + float(P[i, 3])), 1)
                 self.xmax = nx
                 self.ymax = ny
+                if _TG_DBG:
+                    _f_t0 = time.time()
                 if self.legalize_soft(10, deadline=deadline):
                     done = True
+                    if _TG_DBG:
+                        _tg_ok += 1
+                        _tg_tr.append(f"r{_rd}:{f}:ok:"
+                                      f"{time.time() - _f_t0:.3f}")
                     break
+                if _TG_DBG:
+                    # a failed shrink that still had budget left is a REAL
+                    # packing failure; one that ran the deadline out is a
+                    # truncation.  The two demand opposite remedies.
+                    _late = time.time() >= deadline
+                    _tg_stop = "failtime" if _late else "fail"
+                    _tg_tr.append(f"r{_rd}:{f}:{'fT' if _late else 'f'}:"
+                                  f"{time.time() - _f_t0:.3f}")
                 P[...] = snap
                 self.xmin, self.xmax, self.ymin, self.ymax = frame
             if not done:
                 break
+        if _TG_DBG:
+            import sys as _sys
+            print(f"[tg] cid={_TG_CUR[0]} site={_TG_SITE[0]} n={self.n} "
+                  f"a0={_tg_a0:.4f} a1={_bbox_area_of(P) / _tg_aref:.4f} "
+                  f"nok={_tg_ok} stop={_tg_stop} "
+                  f"dt={time.time() - _tg_t0:.4f} "
+                  f"rem={deadline - time.time():.4f} "
+                  f"tr={'|'.join(_tg_tr[-8:])}",
+                  file=_sys.stderr, flush=True)
         if _DEBUG:
             print(f"[tighten] frame {self.xmax - self.xmin:.1f}"
                   f"x{self.ymax - self.ymin:.1f}", flush=True)
@@ -5645,6 +5858,10 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
 
     Returns refined positions or None if no attempt legalized."""
     try:
+        if _TG_DBG:
+            _TG_CID[0] += 1
+            _TG_CUR[0] = f"{os.getpid()}.{_TG_CID[0]}"
+            _tg_cid = _TG_CUR[0]
         if opt.n < 2 or time.time() >= deadline:
             # rung (-1): a worker handed no budget at all still costs a pool
             # slot; a legal input is a free candidate.  Off -> None, as shipped.
@@ -5827,6 +6044,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                     if bw > 1e-6 and bh > 1e-6:
                         H = math.sqrt(aref * bh / bw)
                         W = aref / H
+                _r0_salv = 0
                 if W is not None:
                     k2i = np.nonzero(r.kind == 2)[0]
                     if len(k2i):
@@ -5854,6 +6072,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         # the tag seats survive intact
                         r.xmax += 0.02 * W
                         r.ymax += 0.02 * H
+                        _r0_salv = 1
                         # the salvage is the fixed-frame rung's last chance and
                         # the highest-value branch in the ladder: under ANYTIME
                         # it gets the whole remaining tight window (the reserve
@@ -5866,6 +6085,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         # tagged/fixed — sacrifice the tag seat (V+1) for the
                         # tight frame; the cross-candidate selection judges
                         r._ignore_tags = True
+                        _r0_salv = 2
                         try:
                             rects = r._free_rects(8)
                             for a, b in r._overlap_pairs(4):
@@ -5895,6 +6115,13 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         finally:
                             r._ignore_tags = False
                     if ok0 and not r._has_overlap():
+                        if _TG_DBG:
+                            import sys as _sys
+                            print(f"[cl] cid={_TG_CUR[0]} rung=r0 n={opt.n} "
+                                  f"fs={_fs:.3f} salv={_r0_salv} "
+                                  f"bbr={_bbox_area_of(r.P) / max(opt.area_ref, 1e-9):.4f} "
+                                  f"frame={(r.xmax - r.xmin) * (r.ymax - r.ymin) / max(opt.area_ref, 1e-9):.4f}",
+                                  file=_sys.stderr, flush=True)
                         if _DEBUG:
                             bb = ((r.P[:, 0] + r.P[:, 2]).max()
                                   - r.P[:, 0].min()) * \
@@ -5902,9 +6129,73 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                                  - r.P[:, 1].min())
                             print(f"[rp] rung FIXED legal bbox={bb:.0f} "
                                   f"aref={opt.area_ref:.0f}", flush=True)
+                        # rung-0 frame anneal (PARTNER_RUNG0_TIGHTEN, default
+                        # off -> `_r0tg == 0.0` and the block below is one
+                        # dead `if`, so the branch stays bit-exact).  Mirrors
+                        # the expand rungs' `_tighten` + `_assemble_clusters`
+                        # order; see `rung0_tighten_frac`.
+                        _r0tg = rung0_tighten_frac()
+                        _r0tg_snap = None
+                        if _r0tg > 0.0:
+                            # slack gate: skip the anneal on a frame that is
+                            # already AT the area reference, where the shrink
+                            # schedule provably cannot take a step.  Default
+                            # 0.0 -> every rung-0 success is eligible.
+                            _r0tg_ms = rung0_tighten_min_slack()
+                            if _r0tg_ms > 0.0 and (
+                                    W * H <= aref * (1.0 + _r0tg_ms)):
+                                _r0tg = 0.0
+                                if _R0TG_DBG:
+                                    import sys as _sys
+                                    print(f"[r0tg] n={opt.n} SKIP slack="
+                                          f"{W * H / max(aref, 1e-9) - 1.0:.5f}",
+                                          file=_sys.stderr, flush=True)
+                        if _r0tg > 0.0 and time.time() < deadline:
+                            # revert points: an anneal that ends in an
+                            # unassemblable layout must not COST a rung-0
+                            # success -- off, that success is banked here, and
+                            # falling through to the expand ladder would pay a
+                            # full rebuild out of the same slice.
+                            _r0tg_snap = (r.P.copy(),
+                                          (r.xmin, r.xmax, r.ymin, r.ymax))
+                            _r0tg_t0 = time.time()
+                            _r0tg_end = time.time() + _r0tg * max(
+                                0.0, deadline - time.time())
+                            if _TG_DBG:
+                                _TG_SITE[0] = "r0"
+                            r._tighten(min(deadline, _r0tg_end))
+                            if _R0TG_DBG:
+                                import sys as _sys
+                                _bb0 = _bbox_area_of(_r0tg_snap[0])
+                                _bb1 = _bbox_area_of(r.P)
+                                _R0TG_STATS.append(
+                                    (int(opt.n),
+                                     round(_bb0 / max(opt.area_ref, 1e-9), 6),
+                                     round(_bb1 / max(opt.area_ref, 1e-9), 6),
+                                     round(time.time() - _r0tg_t0, 4)))
+                                print(f"[r0tg] n={opt.n} "
+                                      f"bb0={_bb0 / max(opt.area_ref, 1e-9):.4f} "
+                                      f"bb1={_bb1 / max(opt.area_ref, 1e-9):.4f} "
+                                      f"t={time.time() - _r0tg_t0:.4f}",
+                                      file=_sys.stderr, flush=True)
                         r._assemble_clusters(saved_cg)
                         if not r._has_overlap():
                             legal = r.P.copy()
+                        elif _r0tg_snap is not None:
+                            # the anneal's layout could not be assembled:
+                            # replay the shipped (un-annealed) assembly, which
+                            # is a pure function of (P, frame) -- so this arm
+                            # can only ever ADD a legal rung-0 close.
+                            r.P[...] = _r0tg_snap[0]
+                            (r.xmin, r.xmax, r.ymin, r.ymax) = _r0tg_snap[1]
+                            r._assemble_clusters(saved_cg)
+                            if not r._has_overlap():
+                                legal = r.P.copy()
+                            if _R0TG_DBG:
+                                import sys as _sys
+                                print(f"[r0tg] n={opt.n} REVERTED "
+                                      f"ok={int(legal is not None)}",
+                                      file=_sys.stderr, flush=True)
                     elif os.environ.get("PARTNER_RUNG05"):
                         # rung 0.5: fixed-frame salvage.  The min-displacement
                         # toolkit preserves structure but stalls 20-35 overlaps
@@ -6139,6 +6430,15 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                     "PARTNER_ANYTIME_TIGHTEN", 0.45)
                     * max(0.0, deadline - time.time())) if _any \
                     else (time.time() + 3.0)
+                if _TG_DBG:
+                    import sys as _sys
+                    print(f"[cl] cid={_TG_CUR[0]} rung=e{expand} n={opt.n} "
+                          f"pins={int(use_pins)} "
+                          f"bbr={_bbox_area_of(r.P) / max(opt.area_ref, 1e-9):.4f} "
+                          f"win={min(deadline, _tg_end) - time.time():.4f}",
+                          file=_sys.stderr, flush=True)
+                if _TG_DBG:
+                    _TG_SITE[0] = f"e{expand}"
                 r._tighten(min(deadline, _tg_end))
                 r._assemble_clusters(saved_cg)
                 if not r._has_overlap():
@@ -6352,6 +6652,13 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             # matrix and never pays for a cost evaluation at all.
             if _admit_legal_input(opt, pred, "cmp") is not None:
                 out = _guard_pick(opt, out, (), pred)
+        if _TG_DBG:
+            import sys as _sys
+            _fq = np.asarray(out, dtype=np.float64)
+            print(f"[fin] cid={_tg_cid} depth={_depth} n={opt.n} "
+                  f"bb={_bbox_area_of(_fq):.6f} "
+                  f"bbr={_bbox_area_of(_fq) / max(opt.area_ref, 1e-9):.4f}",
+                  file=_sys.stderr, flush=True)
         return out
     except Exception:
         if _DEBUG:
