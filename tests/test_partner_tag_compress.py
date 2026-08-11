@@ -116,6 +116,31 @@ def test_off_is_identity(monkeypatch):
     assert not boom                        # never called
 
 
+def test_constructor_warms_dependencies_only_when_enabled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tc, "warm_dependencies",
+                        lambda: calls.append("warm"))
+
+    _opt()
+    assert calls == []
+
+    monkeypatch.setenv("PARTNER_TAG_COMPRESS", "1")
+    _opt()
+    assert calls == ["warm"]
+
+
+def test_warm_dependencies_is_idempotent():
+    previous = tc._EXACT_VIOL_FN
+    try:
+        tc._EXACT_VIOL_FN = None
+        first = tc.warm_dependencies()
+        second = tc.warm_dependencies()
+        assert callable(first)
+        assert second is first
+    finally:
+        tc._EXACT_VIOL_FN = previous
+
+
 def test_failure_is_contained(monkeypatch):
     n, at, cons, tpos, b2b, p2b, pins, rects = _single()
     monkeypatch.setenv("PARTNER_TAG_COMPRESS", "1")

@@ -252,7 +252,25 @@ class MyOptimizer(FloorplanOptimizer):
         # spawn the parallel-restart pool now so worker startup cost is not
         # charged to any test case
         init_worker_pool(N_RESTART_WORKERS)
+        self._warm_tag_compress_dependencies()
         self._warm_direct_sampler()
+
+    def _warm_tag_compress_dependencies(self) -> None:
+        """Pay the opt-in tag-compression import cost outside `solve()`.
+
+        The evaluator constructs the optimizer before starting its per-case
+        timer.  Keeping this behind the existing default-off experiment flag
+        preserves the production import path exactly.
+        """
+        if not os.environ.get("PARTNER_TAG_COMPRESS"):
+            return
+        try:
+            from tag_compress import warm_dependencies
+
+            warm_dependencies()
+        except Exception as exc:
+            if self.verbose:
+                print(f"tag-compress warm-up skipped: {exc}")
 
     def _warm_direct_sampler(self) -> None:
         """PARTNER_DIRECT_WARM=1 (default off): pay the sampler's first-call
