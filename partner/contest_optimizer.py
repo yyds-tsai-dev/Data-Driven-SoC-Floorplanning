@@ -555,6 +555,9 @@ class MyOptimizer(FloorplanOptimizer):
             result = self._final_seat(
                 result, area_targets, constraints, target_positions,
                 b2b, p2b, pins, direct_box)
+            result = self._tag_compress(
+                result, area_targets, constraints, target_positions,
+                b2b, p2b, pins, direct_box)
             if os.environ.get("PARTNER_EARLY_EXIT_DEBUG"):
                 # per-case time anatomy: serial head (heuristic seed + GPU
                 # seed-diffusion + parse), the deadline-bounded solve, and
@@ -678,6 +681,61 @@ class MyOptimizer(FloorplanOptimizer):
                 print(f"[fseat] n={len(out)} moved={nmoved} "
                       f"V={v0}->{v1}", file=sys.stderr, flush=True)
             return [tuple(map(float, r)) for r in seated]
+        except Exception:
+            return out
+
+    def _tag_compress(self, out, at, cons, tpos, b2b, p2b, pins, direct_box):
+        """Compact the FINAL layout onto its preplaced boundary-tag lines
+        (PARTNER_TAG_COMPRESS=1).  See partner/tag_compress.py.
+
+        `_edge_seat` (and so `_final_seat`) can only translate, dilate or
+        pull at most 8 rigid outliers; the blocks that overshoot a preplaced
+        tag line sit in packed chains 6-16 deep, so the shipped n>=100
+        layouts still hand the evaluator a bbox edge past a hard-locked
+        block's own tagged edge.  This pushes the whole chain back onto the
+        line, absorbing the residual through the soft blocks' unused 1% area
+        tolerance.
+
+        Runs LAST, after `_final_seat`, because the pass is monotone: it
+        commits only on a strict drop in the evaluator's own
+        boundary+grouping+MIB total, or on an unchanged total with a
+        strictly smaller bbox and no HPWL regression.  Nothing downstream
+        can undo it.
+
+        Off: returns the SAME list object -- no import, no scorer build,
+        byte-identical pipeline.  Contained: any failure returns `out`."""
+        if not os.environ.get("PARTNER_TAG_COMPRESS"):
+            return out
+        try:
+            from tag_compress import tag_compress
+            scorer = direct_box[0][1] if direct_box else _ColumnOptimizer(
+                [tuple(map(float, r)) for r in out], at, cons, tpos,
+                b2b, p2b, pins, time.time() + 1.0, seed=0)
+            packed = tag_compress(scorer, out)
+            if os.environ.get("PARTNER_TAG_COMPRESS_DEBUG"):
+                # self-paired accounting on the SAME layout in the SAME run:
+                # a pass that can only lower V is measurable without a second
+                # run, so this readout is immune to the SA's run-to-run drift.
+                import numpy as _np
+                a = _np.asarray([tuple(map(float, r)) for r in out],
+                                dtype=float)
+                b = _np.asarray([tuple(map(float, r)) for r in packed],
+                                dtype=float)
+                nmoved = (int((_np.abs(a - b) > 1e-12).any(axis=1).sum())
+                          if a.shape == b.shape else -1)
+                try:
+                    from violation_killer import _violations_exact
+                    v0, v1 = (_violations_exact(scorer, a),
+                              _violations_exact(scorer, b))
+                except Exception:
+                    v0 = v1 = -1
+                ar = [float(((p[:, 0] + p[:, 2]).max() - p[:, 0].min())
+                            * ((p[:, 1] + p[:, 3]).max() - p[:, 1].min()))
+                      for p in (a, b)]
+                print(f"[tcomp] n={len(out)} moved={nmoved} V={v0}->{v1} "
+                      f"darea={(ar[1] / max(ar[0], 1e-9) - 1) * 100:.3f}%",
+                      file=sys.stderr, flush=True)
+            return [tuple(map(float, r)) for r in packed]
         except Exception:
             return out
 
