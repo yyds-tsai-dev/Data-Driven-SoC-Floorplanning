@@ -24,6 +24,15 @@ guard-MIN_N=0(+0.0019=旗標碰不到的帶的噪音;n=90-94 無軌跡可仲裁,
 
 單 rep 噪音 ±0.012、3-rep 兩臂差 2σ 地板 0.0078 ⇒ 促轉門檻 3-rep ≥0.008 或 ≥8 reps;每鏈帶 inert null 臂;跨 session 絕對值不可比(deadline SA 對機器負載敏感,OFF 錨定漂移 1.1647→1.1716 實證);live-tree eval 禁與同檔編輯並行;判讀一律加權 total_score_no_runtime;GPU 訓練與 CPU eval 同機互污(+0.007 級),headline 數字必須乾淨窗口。
 
+## 5a. 0811 晨-午續章:SEAT_FINAL 促轉、殘餘槓桿全裁決、repack v3c 定版
+
+- **SEAT_FINAL 促轉(commit 7e29066,構造保證制)**:管線順序漏洞(出貨 layout 從未被 seat);自我配對 3 V-bits(−0.0048)、括號 sanity 無劣化、100/100×6、~ms/案。**促轉學說新增:效應低於括號解析力(0.0078)的「只降 V」pass,以機制保證+自我配對讀數促轉,括號僅 sanity。**
+- **V_rel 池解剖**:74% = preplaced 框架越界(W 不釘+FRAME_WPIN 覆蓋 H 釘);B 型 cluster 1:1 交易被 1% 面積容差封死;結構死區 −0.0091 永久扣除(鴿籠+golden 也違規);真實可修池 −0.0449。
+- **area 線終審**:可達地板探針(10-20× 窗、~270 次嘗試零 deadline 截斷)證 move set 為出貨版面不動點;golden 版面被原封接受 ⇒ 赤字 100% 建構側。細步排程被上界分析當場判死(rung-0 族群完美上界 −0.0025);「細步只在報酬可忽略處被需要」通則入 kill list。
+- **本波判死**:TAGPIN(direct 全勝、column 臂永不出貨)、TAG_ANCHOR/MIX(3/3 一致劣化 +0.025/+0.032)、TAG_COMPRESS(離線 0.65ms vs 在線 tail +0.15-0.19s,shapely V 閘門成本主導;重工條件=numba 廉價閘)、fine-shrink、_tighten 呼叫點、guard-MIN_N、retrieval 餵料(0/537 硬合法)。
+- **量測紀律新增**:rep 內臂序位置漂移(固定臂序下末位 null 系統性最低 −0.0113)⇒ latin-square 輪替強制;bisect 後 checkout 必回 branch 名(detached HEAD 事故一次)。
+- **repack 譜系**:v1 c2dd42bb(1.1647)→ v2 618755a7(+frame-scale,1.1522)→ **v3c 2b9348c9(+SEAT_FINAL,HEAD 逐檔一致,1.1533,定版)**。tag_compress.py 因 closure 靜態掃描 lazy import 入包(default off 無害)。
+
 ## 5. 未決/在途
 
 G1-a v2 訓練收斂與死刑條款判定|repack v2 乾淨窗口 headline 補釘(verify_full100.sh,GPU 空後)|DIRECT_SEAT_FIX(官方分 −0.0031)入 final repack 候選|rung-0 後補 _tighten(正交槓桿)|preplaced-aware 拓撲抽取(G1 合法率天花板 40% 的解)|beta 重傳上傳決策(8/12,新包 618755a7 vs 舊包 c2dd42bb)。
