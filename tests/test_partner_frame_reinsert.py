@@ -16,7 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "partner") not in sys.path:
     sys.path.insert(0, str(ROOT / "partner"))
 
-from frame_reinsert import FrameTarget, frame_targets, reinsert_to_target  # noqa: E402
+from frame_reinsert import (  # noqa: E402
+    FrameReinsertResult,
+    FrameTarget,
+    frame_reinsert,
+    frame_targets,
+    reinsert_to_target,
+)
 
 
 def _top_fixture():
@@ -87,3 +93,80 @@ def test_reinsertion_aborts_when_an_outlier_belongs_to_cluster():
     )
 
     assert got is None
+
+
+class _FakeOpt:
+    def __init__(self):
+        self.n = 3
+        self.kind = [0, 0, 2]
+        self.boundary = [0, 0, 4]
+        self.cluster = [0, 0, 0]
+
+    @staticmethod
+    def _hpwl(_positions):
+        return 0.0
+
+
+def _top_violation(_opt, positions):
+    p = np.asarray(positions)
+    owner_top = p[2, 1] + p[2, 3]
+    return int(np.max(p[:, 1] + p[:, 3]) > owner_top + 1e-6)
+
+
+def test_guarded_pass_accepts_strict_v_drop_without_quality_regression():
+    rects, _locked, _boundary, _cluster = _top_fixture()
+
+    got = frame_reinsert(
+        _FakeOpt(),
+        [tuple(row) for row in rects],
+        viol_fn=_top_violation,
+        hpwl_fn=lambda _p: 0.0,
+    )
+
+    assert isinstance(got, FrameReinsertResult)
+    assert got.attempted == 1
+    assert got.accepted == 1
+    assert _top_violation(_FakeOpt(), np.asarray(got.rects)) == 0
+
+
+def test_guarded_pass_rejects_equal_violation_count():
+    rects, _locked, _boundary, _cluster = _top_fixture()
+    source = [tuple(row) for row in rects]
+
+    got = frame_reinsert(
+        _FakeOpt(), source, viol_fn=lambda _opt, _p: 1,
+        hpwl_fn=lambda _p: 0.0,
+    )
+
+    assert got.accepted == 0
+    assert got.rects is source
+    assert got.reason == "no_monotone_candidate"
+
+
+def test_guarded_pass_rejects_hpwl_regression():
+    rects, _locked, _boundary, _cluster = _top_fixture()
+    source = [tuple(row) for row in rects]
+
+    got = frame_reinsert(
+        _FakeOpt(), source, viol_fn=_top_violation,
+        hpwl_fn=lambda p: -float(np.asarray(p)[1, 1]),
+    )
+
+    assert got.accepted == 0
+    assert got.rects is source
+
+
+def test_guarded_pass_contains_failures_and_returns_original_object():
+    class _Broken:
+        n = 3
+
+        def __getattr__(self, _name):
+            raise RuntimeError("broken")
+
+    rects, _locked, _boundary, _cluster = _top_fixture()
+    source = [tuple(row) for row in rects]
+    got = frame_reinsert(_Broken(), source)
+
+    assert got.rects is source
+    assert got.accepted == 0
+    assert got.reason == "exception"

@@ -8,7 +8,8 @@ decision.  Shapes and locked rectangles are immutable.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
+from itertools import permutations, product
+import time
 from typing import Callable, Sequence
 
 import numpy as np
@@ -25,6 +26,17 @@ class FrameTarget:
     side: int
     line: float
     owner: int
+
+
+@dataclass(frozen=True)
+class FrameReinsertResult:
+    """Guarded pass outcome and lightweight G0 instrumentation."""
+
+    rects: list[tuple[float, float, float, float]]
+    attempted: int
+    accepted: int
+    elapsed_s: float
+    reason: str
 
 
 def frame_targets(
@@ -172,3 +184,91 @@ def reinsert_to_target(
             return None
     q[lk] = p[lk]
     return q
+
+
+def _bbox_area(p: np.ndarray) -> float:
+    return float(((p[:, 0] + p[:, 2]).max() - p[:, 0].min())
+                 * ((p[:, 1] + p[:, 3]).max() - p[:, 1].min()))
+
+
+def _has_overlap(p: np.ndarray) -> bool:
+    for i in range(len(p)):
+        if _overlaps(p[i], np.delete(p, i, axis=0)):
+            return True
+    return False
+
+
+def frame_reinsert(
+    opt,
+    out: list[tuple[float, float, float, float]],
+    *,
+    viol_fn=None,
+    hpwl_fn=None,
+) -> FrameReinsertResult:
+    """Try one- and two-wall reinsertion sequences under monotone guards."""
+    started = time.perf_counter()
+
+    def result(rects, attempted, accepted, reason):
+        return FrameReinsertResult(
+            rects=rects,
+            attempted=attempted,
+            accepted=accepted,
+            elapsed_s=time.perf_counter() - started,
+            reason=reason,
+        )
+
+    try:
+        n = int(opt.n)
+        p0 = np.asarray(out, dtype=np.float64)
+        if p0.shape != (n, 4) or n < 2:
+            return result(out, 0, 0, "invalid_input")
+        kind = np.asarray(opt.kind, dtype=np.int64)
+        locked = kind == 2
+        boundary = np.asarray(opt.boundary, dtype=np.int64)
+        cluster = np.asarray(opt.cluster, dtype=np.int64)
+        targets = frame_targets(p0, locked, boundary)
+        if not targets:
+            return result(out, 0, 0, "no_target")
+        if viol_fn is None:
+            from violation_killer import _violations_exact
+
+            viol_fn = _violations_exact
+        if hpwl_fn is None:
+            hpwl_fn = opt._hpwl
+
+        v0 = int(viol_fn(opt, p0))
+        hp0 = float(hpwl_fn(p0))
+        area0 = _bbox_area(p0)
+        attempted = 0
+        best = None
+        sequences = [(target,) for target in targets]
+        sequences.extend(permutations(targets, 2))
+        for sequence in sequences:
+            attempted += 1
+            q = p0
+            for target in sequence:
+                q = reinsert_to_target(q, target, locked, cluster, hpwl_fn)
+                if q is None:
+                    break
+            if q is None:
+                continue
+            if not np.array_equal(q[:, 2:], p0[:, 2:]):
+                continue
+            if not np.array_equal(q[locked], p0[locked]):
+                continue
+            if not np.isfinite(q).all() or _has_overlap(q):
+                continue
+            v = int(viol_fn(opt, q))
+            hp = float(hpwl_fn(q))
+            area = _bbox_area(q)
+            if v >= v0 or hp > hp0 + EPS or area > area0 + EPS:
+                continue
+            key = (v, area, hp)
+            if best is None or key < best[0]:
+                best = (key, q)
+        if best is None:
+            return result(out, attempted, 0, "no_monotone_candidate")
+        rects = [tuple(map(float, row)) for row in best[1]]
+        return result(rects, attempted, 1, "accepted")
+    except Exception:
+        return result(out, 0, 0, "exception")
