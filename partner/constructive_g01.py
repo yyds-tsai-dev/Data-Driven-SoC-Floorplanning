@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import time
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -41,6 +41,8 @@ class OracleCodes:
     log_aspect: np.ndarray
     regions: np.ndarray
     region_bins: int
+    frame_aspect_code: int
+    utilization_code: int
 
 
 def default_policies() -> tuple[ConstructivePolicy, ...]:
@@ -75,6 +77,11 @@ def encode_oracle_codes(rects: np.ndarray, *, region_bins: int = 16) -> OracleCo
     # Morton-like coarse traversal: only region cells, never raw coordinates,
     # decide the encoded priority. Area breaks same-cell ties deterministically.
     area = rects[:, 2] * rects[:, 3]
+    frame_aspect_code = int(
+        np.clip(np.floor((np.clip(math.log(span[0] / span[1]), -2.0, 2.0) + 2.0) / 4.0 * 32), 0, 31)
+    )
+    utilization = float(np.clip(area.sum() / (span[0] * span[1]), 0.2, 1.0))
+    utilization_code = int(np.clip(np.floor((utilization - 0.2) / 0.8 * 32), 0, 31))
     order = tuple(
         sorted(
             range(len(rects)),
@@ -87,7 +94,14 @@ def encode_oracle_codes(rects: np.ndarray, *, region_bins: int = 16) -> OracleCo
             ),
         )
     )
-    return OracleCodes(order, log_aspect, regions, region_bins)
+    return OracleCodes(
+        order,
+        log_aspect,
+        regions,
+        region_bins,
+        frame_aspect_code,
+        utilization_code,
+    )
 
 
 def _constraint_column(constraints: np.ndarray, column: int, n: int) -> np.ndarray:
@@ -196,11 +210,12 @@ def _choose_next_block(
         + (_constraint_column(constraints, 3, n) != 0).astype(np.float64)
         + (_constraint_column(constraints, 4, n) != 0).astype(np.float64)
     )
+    boundary = _constraint_column(constraints, 4, n) != 0
 
     def rank(block: int) -> tuple[float, ...]:
         closure = _placed_neighbor_weight(block, placed, b2b)
         if mode == "oracle" and oracle_priority is not None:
-            return (float(oracle_priority.get(block, n)), block)
+            return (0.0 if boundary[block] else 1.0, float(oracle_priority.get(block, n)), block)
         if mode == "large_first":
             return (-area[block], -degree[block], -constrained[block], block)
         if mode == "constraint_first":
@@ -305,12 +320,23 @@ def _candidate_points(
                 (x, y - height),
             }
         )
+        if anchor is not None:
+            points.update(
+                {
+                    (x + other_w, anchor[1]),
+                    (x - width, anchor[1]),
+                    (anchor[0], y + other_h),
+                    (anchor[0], y - height),
+                }
+            )
     x_min = float(placed[:, 0].min())
     y_min = float(placed[:, 1].min())
     x_max = float((placed[:, 0] + placed[:, 2]).max())
     y_max = float((placed[:, 1] + placed[:, 3]).max())
     points.update({(x_max, y_min), (x_min - width, y_min), (x_min, y_max), (x_min, y_min - height)})
-    return sorted(points)
+    if anchor is not None:
+        return sorted(points, key=lambda point: (abs(point[0] - anchor[0]) + abs(point[1] - anchor[1]), point))[:48]
+    return sorted(points)[:48]
 
 
 def _incremental_hpwl(
@@ -342,22 +368,90 @@ def _incremental_hpwl(
     return score
 
 
+def _oracle_frame(
+    total_area: float,
+    frame_codes: tuple[int, int] | None,
+    preplaced_rects: np.ndarray,
+) -> tuple[float, float, float, float]:
+    if frame_codes is None:
+        aspect = 1.0
+        utilization = 0.72
+    else:
+        aspect_code, utilization_code = frame_codes
+        aspect = math.exp(-2.0 + (float(aspect_code) + 0.5) / 32.0 * 4.0)
+        utilization = 0.2 + (float(utilization_code) + 0.5) / 32.0 * 0.8
+    frame_area = max(total_area, 1.0) / max(utilization, 0.2)
+    width = math.sqrt(frame_area * aspect)
+    height = math.sqrt(frame_area / aspect)
+    x0 = y0 = 0.0
+    if len(preplaced_rects):
+        x0 = min(x0, float(preplaced_rects[:, 0].min()))
+        y0 = min(y0, float(preplaced_rects[:, 1].min()))
+        width = max(width, float((preplaced_rects[:, 0] + preplaced_rects[:, 2]).max()) - x0)
+        height = max(height, float((preplaced_rects[:, 1] + preplaced_rects[:, 3]).max()) - y0)
+    return x0, y0, x0 + width, y0 + height
+
+
 def _region_anchor(
     block: int,
     width: float,
     height: float,
     region_codes: np.ndarray | None,
     region_bins: int,
-    total_area: float,
+    frame: tuple[float, float, float, float],
 ) -> tuple[float, float] | None:
     if region_codes is None:
         return None
     regions = np.asarray(region_codes)
     if regions.shape != (len(regions), 2) or block >= len(regions):
         raise ValueError("region_codes must have shape [N,2]")
-    side = math.sqrt(max(total_area, 1.0) / 0.72)
-    centre = (regions[block].astype(np.float64) + 0.5) / region_bins * side
+    x0, y0, x1, y1 = frame
+    normalized = (regions[block].astype(np.float64) + 0.5) / region_bins
+    centre = np.array([x0, y0]) + normalized * np.array([x1 - x0, y1 - y0])
     return float(centre[0] - width / 2.0), float(centre[1] - height / 2.0)
+
+
+def _seat_in_frame(
+    point: tuple[float, float],
+    width: float,
+    height: float,
+    boundary_code: int,
+    frame: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    x0, y0, x1, y1 = frame
+    x = min(max(point[0], x0), x1 - width)
+    y = min(max(point[1], y0), y1 - height)
+    if boundary_code & 1:
+        x = x0
+    if boundary_code & 2:
+        x = x1 - width
+    if boundary_code & 4:
+        y = y1 - height
+    if boundary_code & 8:
+        y = y0
+    return x, y
+
+
+def _boundary_violations(rects: np.ndarray, boundary: np.ndarray, tol: float = 1e-6) -> int:
+    if not len(rects):
+        return 0
+    x0 = float(rects[:, 0].min())
+    y0 = float(rects[:, 1].min())
+    x1 = float((rects[:, 0] + rects[:, 2]).max())
+    y1 = float((rects[:, 1] + rects[:, 3]).max())
+    violations = 0
+    for block, code in enumerate(boundary):
+        if code == 0:
+            continue
+        x, y, width, height = rects[block]
+        satisfied = (
+            (not code & 1 or abs(x - x0) < tol)
+            and (not code & 2 or abs(x + width - x1) < tol)
+            and (not code & 4 or abs(y + height - y1) < tol)
+            and (not code & 8 or abs(y - y0) < tol)
+        )
+        violations += int(not satisfied)
+    return violations
 
 
 def _hard_legal(
@@ -401,6 +495,7 @@ def construct_candidate(
     aspect_codes: np.ndarray | None = None,
     oracle_order: tuple[int, ...] | None = None,
     region_bins: int = 16,
+    frame_codes: tuple[int, int] | None = None,
 ) -> ConstructiveResult:
     """Build one deterministic, hard-legal candidate for a G0/G1 policy."""
     started = time.perf_counter()
@@ -413,6 +508,7 @@ def construct_candidate(
     shapes = _shape_array(area, constraints, target_positions, aspect_codes)
     preplaced = _constraint_column(constraints, 1, len(area)) != 0
     cluster = _constraint_column(constraints, 3, len(area))
+    boundary = _constraint_column(constraints, 4, len(area))
     oracle_priority = (
         {block: priority for priority, block in enumerate(oracle_order)}
         if oracle_order is not None
@@ -426,6 +522,8 @@ def construct_candidate(
         rects[block] = target_positions[block]
         placed_mask[block] = True
         order.append(int(block))
+
+    frame = _oracle_frame(float(area.sum()), frame_codes, rects[placed_mask])
 
     scale = math.sqrt(max(float(area.sum()), 1.0))
     disconnected_cluster_fallbacks = 0
@@ -458,10 +556,12 @@ def construct_candidate(
         group_mask = placed_mask & (cluster == cluster[block]) if cluster[block] else np.zeros(len(area), dtype=bool)
         placed_group = rects[group_mask]
         anchor = _region_anchor(
-            block, width, height, region_codes, region_bins, float(area.sum())
+            block, width, height, region_codes, region_bins, frame
         )
         choices: list[tuple[float, float, float, np.ndarray]] = []
         for x, y in _candidate_points(width, height, placed, anchor):
+            if region_codes is not None:
+                x, y = _seat_in_frame((x, y), width, height, int(boundary[block]), frame)
             candidate = np.array([x, y, width, height], dtype=np.float64)
             if _overlaps_any(candidate, placed):
                 continue
@@ -510,6 +610,7 @@ def construct_candidate(
         diagnostics={
             "fallbacks": fallback_count,
             "disconnected_cluster_fallbacks": disconnected_cluster_fallbacks,
+            "boundary_violations": _boundary_violations(rects, boundary),
         },
     )
 
@@ -539,6 +640,52 @@ def construct_portfolio(
             aspect_codes=oracle_codes.log_aspect if oracle_codes is not None else None,
             oracle_order=oracle_codes.order if oracle_codes is not None else None,
             region_bins=oracle_codes.region_bins if oracle_codes is not None else 16,
+            frame_codes=(oracle_codes.frame_aspect_code, oracle_codes.utilization_code)
+            if oracle_codes is not None
+            else None,
         )
         for policy in selected
     ]
+
+
+def weighted_score(costs: Sequence[float], block_counts: Sequence[int]) -> float:
+    """Contest aggregation: weighted mean with ``lambda_i = exp(n_i / 12)``."""
+    if len(costs) != len(block_counts) or not costs:
+        raise ValueError("costs and block_counts must have the same non-zero length")
+    counts = np.asarray(block_counts, dtype=np.float64)
+    weights = np.exp((counts - counts.max()) / 12.0)
+    return float(np.average(np.asarray(costs, dtype=np.float64), weights=weights))
+
+
+def summarize_g1(
+    rows: Sequence[Mapping[str, float | int]],
+    all_block_counts: Sequence[int],
+) -> dict[str, float | int | bool]:
+    """Aggregate the 21-case portfolio using the full-100 score denominator."""
+    if not rows or not all_block_counts:
+        raise ValueError("G1 rows and full validation block counts are required")
+    counts = [int(row["n"]) for row in rows]
+    baseline = [float(row["baseline_cost"]) for row in rows]
+    candidate = [float(row["candidate_cost"]) for row in rows]
+    wins = sum(cand < base - 1e-12 for base, cand in zip(baseline, candidate))
+    legal = sum(int(row["legal_candidates"]) for row in rows)
+    attempted = sum(int(row["candidate_count"]) for row in rows)
+    legal_coverage = legal / max(attempted, 1)
+
+    maximum = max(int(n) for n in all_block_counts)
+    full_weights = np.exp((np.asarray(all_block_counts, dtype=np.float64) - maximum) / 12.0)
+    row_weights = np.exp((np.asarray(counts, dtype=np.float64) - maximum) / 12.0)
+    gain = float(
+        np.dot(row_weights, np.asarray(baseline) - np.asarray(candidate))
+        / full_weights.sum()
+    )
+    return {
+        "wins": wins,
+        "legal_candidates": legal,
+        "candidate_count": attempted,
+        "legal_coverage": legal_coverage,
+        "tail_baseline_score": weighted_score(baseline, counts),
+        "tail_candidate_score": weighted_score(candidate, counts),
+        "full_total_equivalent_gain": gain,
+        "passed": wins >= 4 and gain >= 0.005 and legal_coverage >= 0.90,
+    }
