@@ -22,6 +22,7 @@ from frame_reinsert import (  # noqa: E402
     frame_reinsert,
     frame_targets,
     reinsert_to_target,
+    weighted_score,
 )
 
 
@@ -170,3 +171,17 @@ def test_guarded_pass_contains_failures_and_returns_original_object():
     assert got.rects is source
     assert got.accepted == 0
     assert got.reason == "exception"
+
+
+def test_weighted_score_uses_full_case_denominator():
+    counts = list(range(21, 121))
+    before = [1.0] * 100
+    after = before.copy()
+    after[-1] = 0.9
+
+    score_before = weighted_score(before, counts)
+    score_after = weighted_score(after, counts)
+
+    expected_weight_120 = 1.0 / sum(np.exp((n - 120) / 12.0) for n in counts)
+    assert score_before == 1.0
+    assert abs((score_before - score_after) - 0.1 * expected_weight_120) < 1e-12

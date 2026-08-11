@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import permutations, product
+import math
 import time
 from typing import Callable, Sequence
 
@@ -16,6 +17,16 @@ import numpy as np
 
 
 EPS = 1e-6
+
+
+def weighted_score(costs: Sequence[float], block_counts: Sequence[int]) -> float:
+    """Evaluator `exp(n/12)` aggregation with a numerically stable scale."""
+    if len(costs) != len(block_counts) or not costs:
+        raise ValueError("costs and block_counts must have the same nonzero length")
+    max_n = max(int(n) for n in block_counts)
+    weights = [math.exp((int(n) - max_n) / 12.0) for n in block_counts]
+    return float(sum(float(c) * w for c, w in zip(costs, weights))
+                 / sum(weights))
 
 
 @dataclass(frozen=True, order=True)
