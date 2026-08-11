@@ -69,3 +69,15 @@ the user-locked 0.300 s average target.
   byte-identical.
 - Do not revive column split/merge G1: its separately recorded G0 tail
   expectation was non-positive.
+
+## Final package verification
+
+- Archive: `submission/cadc1013_0811d_tagcompress.tar.gz`
+- MD5: `aab0c6553e387275301674095a0cd709`
+- Contents: 32 tar entries; no `__pycache__`, `.pyc`, `.nbi`, or `.nbc`
+- Source closure: packaged `tag_compress.py` is byte-identical to
+  `partner/tag_compress.py`; packaged `op_src.py` is byte-identical to
+  `partner/contest_optimizer.py`
+- Fresh extraction validation: PASS; interface smoke runtime 0.057 s
+- Fresh extraction full-100: noRT **1.152956051**, average runtime
+  **0.290269905 s**, 100/100 hard feasible
