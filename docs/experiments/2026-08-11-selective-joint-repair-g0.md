@@ -35,7 +35,7 @@ gates.  Case 89 (`n=110`) contributes the largest weighted improvement,
 `0.003301697`, but requires `1.791` seconds of repair time and would raise the
 average runtime to about `0.308177` seconds before paying for any generic
 selection logic.  The full measured gain is concentrated in four accepted
-wall/topology edits (`n=101, 110, 111, 120`); most other cases spend 1--9
+grouping-bridge topology edits (`n=101, 110, 111, 120`); most other cases spend 1--9
 seconds for negligible improvement.
 
 ## Decision
@@ -45,11 +45,11 @@ solver.  It misses the stated G0 gain/runtime frontier by a large margin, and
 a validation-case-specific gate would not be a legitimate architecture
 improvement.  Keep the final 0811d package unchanged.
 
-The useful architectural signal is narrower: topology-edit candidates can
+The useful architectural signal is narrower: grouping-bridge candidates can
 occasionally remove a large soft-constraint penalty, but the current LP-based
-candidate evaluation is too expensive.  A successor must predict or construct
-the edit without running the full repair pipeline and must be judged as a new
-mechanism, not as selective deployment of this one.
+candidate evaluation is too expensive.  A successor must construct the bridge
+without running the full repair pipeline and must be judged as a new mechanism,
+not as selective deployment of this one.
 
 ## Reproduction assets
 
