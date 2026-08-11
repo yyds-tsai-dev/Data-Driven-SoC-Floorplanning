@@ -81,8 +81,9 @@ def test_reinsertion_aborts_when_an_outlier_is_locked():
     assert got is None
 
 
-def test_reinsertion_aborts_when_an_outlier_belongs_to_cluster():
+def test_reinsertion_can_move_cluster_outlier_when_slot_keeps_edge_contact():
     rects, locked, _boundary, cluster = _top_fixture()
+    cluster[0] = 7
     cluster[1] = 7
 
     got = reinsert_to_target(
@@ -93,7 +94,16 @@ def test_reinsertion_aborts_when_an_outlier_belongs_to_cluster():
         lambda _p: 0.0,
     )
 
-    assert got is None
+    assert got is not None
+    x_touch = abs(got[1, 0] - (got[0, 0] + got[0, 2])) <= 1e-9 \
+        or abs(got[0, 0] - (got[1, 0] + got[1, 2])) <= 1e-9
+    y_touch = abs(got[1, 1] - (got[0, 1] + got[0, 3])) <= 1e-9 \
+        or abs(got[0, 1] - (got[1, 1] + got[1, 3])) <= 1e-9
+    x_overlap = min(got[0, 0] + got[0, 2], got[1, 0] + got[1, 2]) \
+        - max(got[0, 0], got[1, 0]) > 1e-9
+    y_overlap = min(got[0, 1] + got[0, 3], got[1, 1] + got[1, 3]) \
+        - max(got[0, 1], got[1, 1]) > 1e-9
+    assert (x_touch and y_overlap) or (y_touch and x_overlap)
 
 
 class _FakeOpt:

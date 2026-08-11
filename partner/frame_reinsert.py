@@ -126,7 +126,7 @@ def reinsert_to_target(
     """Move every movable outlier into an obstacle-edge slot in the frame."""
     p = np.asarray(rects, dtype=np.float64)
     lk = np.asarray(locked, dtype=bool)
-    clu = np.asarray(cluster, dtype=np.int64)
+    np.asarray(cluster, dtype=np.int64)  # validated by the exact V guard later
     if p.ndim != 2 or p.shape[1] != 4 or len(lk) != len(p):
         return None
     if not np.isfinite(p).all() or (p[:, 2:] <= 0.0).any():
@@ -156,7 +156,7 @@ def reinsert_to_target(
     ids = np.flatnonzero(outlier)
     if not len(ids):
         return None
-    if bool(lk[ids].any()) or bool((clu[ids] != 0).any()):
+    if bool(lk[ids].any()):
         return None
 
     q = p.copy()
