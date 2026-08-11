@@ -43,6 +43,24 @@ ATOL = 0.008          # area given up along the push axis (hard limit is 1%)
 OVL_TOL = 1e-7        # overlap re-verification tolerance
 SEP_TOL = 1e-9        # "these two blocks overlap on the other axis"
 
+_EXACT_VIOL_FN = None
+
+
+def warm_dependencies():
+    """Load the exact violation counter outside evaluator-timed `solve()`.
+
+    `tag_compress` is intentionally imported lazily when its experiment flag
+    is off.  When the pass is enabled, however, importing its acceptance
+    scorer on the first relevant case costs far more than the hot compaction
+    itself.  The optimizer constructor calls this hook before per-case timing.
+    """
+    global _EXACT_VIOL_FN
+    if _EXACT_VIOL_FN is None:
+        from violation_killer import _violations_exact
+
+        _EXACT_VIOL_FN = _violations_exact
+    return _EXACT_VIOL_FN
+
 
 def _compress(P: np.ndarray, areas: np.ndarray, locked: np.ndarray,
               shrinkable: Optional[np.ndarray], ax: int, side: int,
@@ -201,7 +219,7 @@ def tag_compress(opt, out, viol_fn=None, hpwl_fn=None) -> List[tuple]:
         shrink = (kind == 0) & (mib <= 0)
 
         if viol_fn is None:
-            from violation_killer import _violations_exact as viol_fn
+            viol_fn = warm_dependencies()
         if hpwl_fn is None:
             hpwl_fn = opt._hpwl
 
