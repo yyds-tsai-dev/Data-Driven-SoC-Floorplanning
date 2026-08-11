@@ -54,6 +54,21 @@ def _shape_array(
     hard = fixed | preplaced
     if hard.any():
         shapes[hard] = target_positions[hard, 2:4]
+    mib = _constraint_column(constraints, 2, n)
+    for group in sorted(set(mib) - {0}):
+        members = np.flatnonzero(mib == group)
+        hard_members = members[hard[members]]
+        if len(hard_members):
+            reference = shapes[hard_members[0]].copy()
+            reference_area = float(reference[0] * reference[1])
+            compatible = (
+                np.abs(area[members] - reference_area) / np.maximum(area[members], 1e-12)
+                <= 0.005
+            )
+            shapes[members[compatible]] = reference
+        elif np.ptp(area[members]) / max(float(area[members].max()), 1e-12) <= 0.005:
+            side = math.sqrt(float(np.mean(area[members])))
+            shapes[members] = (side, side)
     return shapes
 
 
@@ -97,7 +112,21 @@ def _block_order(
         free.sort(key=lambda block: (-constrained[block], -degree[block], -area[block], block))
     else:
         free.sort(key=lambda block: (-degree[block], -area[block], block))
-    return list(np.flatnonzero(preplaced)) + free
+    cluster = _constraint_column(constraints, 3, n)
+    grouped: list[int] = []
+    emitted: set[int] = set()
+    for block in free:
+        if block in emitted:
+            continue
+        group = cluster[block]
+        if group == 0:
+            grouped.append(block)
+            emitted.add(block)
+            continue
+        members = [member for member in free if cluster[member] == group and member not in emitted]
+        grouped.extend(members)
+        emitted.update(members)
+    return list(np.flatnonzero(preplaced)) + grouped
 
 
 def _overlaps_any(rect: np.ndarray, placed: np.ndarray) -> bool:
@@ -110,6 +139,20 @@ def _overlaps_any(rect: np.ndarray, placed: np.ndarray) -> bool:
         rect[1], placed[:, 1]
     )
     return bool(((overlap_x > 1e-7) & (overlap_y > 1e-7)).any())
+
+
+def _edge_touches_any(rect: np.ndarray, others: np.ndarray, tol: float = 1e-7) -> bool:
+    if len(others) == 0:
+        return False
+    overlap_x = np.minimum(rect[0] + rect[2], others[:, 0] + others[:, 2]) - np.maximum(
+        rect[0], others[:, 0]
+    )
+    overlap_y = np.minimum(rect[1] + rect[3], others[:, 1] + others[:, 3]) - np.maximum(
+        rect[1], others[:, 1]
+    )
+    vertical = (np.abs(overlap_x) <= tol) & (overlap_y > tol)
+    horizontal = (np.abs(overlap_y) <= tol) & (overlap_x > tol)
+    return bool((vertical | horizontal).any())
 
 
 def _bbox_area(rects: np.ndarray) -> float:
@@ -222,6 +265,7 @@ def construct_candidate(
     pins = np.asarray(pins, dtype=np.float64)
     shapes = _shape_array(area, constraints, target_positions)
     preplaced = _constraint_column(constraints, 1, len(area)) != 0
+    cluster = _constraint_column(constraints, 3, len(area))
     order = _block_order(area, constraints, b2b_edges, preplaced, policy.order_mode)
 
     rects = np.zeros((len(area), 4), dtype=np.float64)
@@ -231,15 +275,21 @@ def construct_candidate(
         placed_mask[block] = True
 
     scale = math.sqrt(max(float(area.sum()), 1.0))
+    disconnected_cluster_fallbacks = 0
+    fallback_count = 0
     for block in order:
         if placed_mask[block]:
             continue
         width, height = shapes[block]
         placed = rects[placed_mask]
+        group_mask = placed_mask & (cluster == cluster[block]) if cluster[block] else np.zeros(len(area), dtype=bool)
+        placed_group = rects[group_mask]
         choices: list[tuple[float, float, float, np.ndarray]] = []
         for x, y in _candidate_points(width, height, placed):
             candidate = np.array([x, y, width, height], dtype=np.float64)
             if _overlaps_any(candidate, placed):
+                continue
+            if len(placed_group) and not _edge_touches_any(candidate, placed_group):
                 continue
             trial = np.vstack((placed, candidate))
             score = policy.bbox_weight * _bbox_area(trial) / max(float(area.sum()), 1.0)
@@ -251,9 +301,21 @@ def construct_candidate(
             choices.sort(key=lambda item: (item[0], item[1], item[2]))
             rects[block] = choices[0][3]
         else:
-            x = float((placed[:, 0] + placed[:, 2]).max()) if len(placed) else 0.0
-            y = float(placed[:, 1].min()) if len(placed) else 0.0
-            rects[block] = (x, y, width, height)
+            fallback_count += 1
+            fallback = None
+            if len(placed_group):
+                for x, y in _candidate_points(width, height, placed_group):
+                    candidate = np.array([x, y, width, height], dtype=np.float64)
+                    if not _overlaps_any(candidate, placed) and _edge_touches_any(candidate, placed_group):
+                        fallback = candidate
+                        break
+            if fallback is None:
+                x = float((placed[:, 0] + placed[:, 2]).max()) if len(placed) else 0.0
+                y = float(placed[:, 1].min()) if len(placed) else 0.0
+                fallback = np.array([x, y, width, height], dtype=np.float64)
+                if len(placed_group):
+                    disconnected_cluster_fallbacks += 1
+            rects[block] = fallback
         placed_mask[block] = True
 
     elapsed = time.perf_counter() - started
@@ -264,5 +326,8 @@ def construct_candidate(
         order=tuple(order),
         elapsed_s=elapsed,
         hard_legal=legal,
-        diagnostics={"fallbacks": 0},
+        diagnostics={
+            "fallbacks": fallback_count,
+            "disconnected_cluster_fallbacks": disconnected_cluster_fallbacks,
+        },
     )
