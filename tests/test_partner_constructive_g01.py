@@ -1,6 +1,12 @@
 import numpy as np
 
-from constructive_g01 import ConstructivePolicy, construct_candidate
+from constructive_g01 import (
+    ConstructivePolicy,
+    construct_candidate,
+    construct_portfolio,
+    default_policies,
+    encode_oracle_codes,
+)
 from icdc.engine import verify_hard_legal
 
 
@@ -138,3 +144,54 @@ def test_cluster_members_are_scheduled_as_one_connected_frontier():
         frontier.extend(unseen)
     assert reached == {0, 1, 2}
     assert result.diagnostics["disconnected_cluster_fallbacks"] == 0
+
+
+def test_default_policies_are_stable_and_choose_distinct_orders():
+    policies = default_policies()
+    assert [policy.name for policy in policies] == [
+        "net_closure",
+        "constraint_first",
+        "large_first",
+        "pin_gravity",
+    ]
+    area = np.array([100.0, 4.0, 4.0, 9.0], dtype=np.float64)
+    constraints = np.zeros((4, 5), dtype=np.float64)
+    target_positions = np.full((4, 4), -1.0, dtype=np.float64)
+    b2b = np.array([[1.0, 2.0, 20.0]], dtype=np.float64)
+    p2b = np.array([[0.0, 3.0, 30.0]], dtype=np.float64)
+    pins = np.array([[50.0, 50.0]], dtype=np.float64)
+
+    results = construct_portfolio(
+        area,
+        constraints,
+        target_positions,
+        b2b,
+        p2b,
+        pins,
+        policies=policies,
+    )
+
+    assert [result.policy for result in results] == [policy.name for policy in policies]
+    assert len({result.order[0] for result in results}) >= 3
+    assert all(result.hard_legal for result in results)
+
+
+def test_oracle_region_encoding_discards_within_bin_coordinate_changes():
+    first = np.array(
+        [
+            [0.0, 0.0, 1.0, 1.0],
+            [15.0, 15.0, 1.0, 1.0],
+            [4.10, 5.10, 2.0, 2.0],
+        ],
+        dtype=np.float64,
+    )
+    second = first.copy()
+    second[2, :2] += 0.05
+
+    code_a = encode_oracle_codes(first, region_bins=16)
+    code_b = encode_oracle_codes(second, region_bins=16)
+
+    assert np.array_equal(code_a.regions, code_b.regions)
+    assert code_a.order == code_b.order
+    assert np.issubdtype(code_a.regions.dtype, np.integer)
+    assert not hasattr(code_a, "rects")
