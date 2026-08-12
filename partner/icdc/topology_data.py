@@ -1,18 +1,22 @@
-"""Leak-free data contracts for the sparse topology prior."""
+"""Strict, leak-free data contracts for topology-prior training."""
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+import os
+import tempfile
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping, Sequence, Tuple
 
 import torch
 
 CORPUS_KEYS = {"instance_id", "n", "area", "cons", "tp", "b2b", "p2b", "pins", "hpwl_ref", "area_ref"}
+_FORBIDDEN = {"test_id", "golden", "validation", "loader", "provenance"}
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CANONICAL_ROOT = (_REPO_ROOT / "FloorSet" / "floorset_lite").resolve()
 _DEFAULT_ROOT = object()
-
 
 @dataclass(frozen=True)
 class SparseEdge:
@@ -24,130 +28,119 @@ class ContactLabel:
 
 @dataclass(frozen=True)
 class TopologyLabel:
-    instance_id: str; n: int; sample_seed: int; teacher_cost: float; base_cost: float
-    record_weight: float; edges: Tuple[SparseEdge, ...]; contacts: Tuple[ContactLabel, ...]
-    pin_paths: Tuple[Tuple[int, ...], ...]
+    instance_id: str; n: int; sample_seed: int; teacher_cost: float; base_cost: float; record_weight: float
+    edges: Tuple[SparseEdge, ...]; contacts: Tuple[ContactLabel, ...]; pin_paths: Tuple[Tuple[int, ...], ...]
 
 @dataclass(frozen=True)
 class SparseTopologyBatch:
-    edge_batch: torch.Tensor; edge_src: torch.Tensor; edge_dst: torch.Tensor
-    edge_axis: torch.Tensor; edge_margin: torch.Tensor; edge_weight: torch.Tensor
-    contact_batch: torch.Tensor; contact_a: torch.Tensor; contact_b: torch.Tensor
-    contact_axis: torch.Tensor; contact_order: torch.Tensor; contact_margin: torch.Tensor
+    edge_batch: torch.Tensor; edge_src: torch.Tensor; edge_dst: torch.Tensor; edge_axis: torch.Tensor
+    edge_margin: torch.Tensor; edge_weight: torch.Tensor; contact_batch: torch.Tensor; contact_a: torch.Tensor
+    contact_b: torch.Tensor; contact_axis: torch.Tensor; contact_order: torch.Tensor; contact_margin: torch.Tensor
     contact_weight: torch.Tensor
 
-
-def _finite(x: Any) -> bool:
-    if isinstance(x, (int, float)) and not isinstance(x, bool): return math.isfinite(float(x))
-    if isinstance(x, (list, tuple)): return all(_finite(v) for v in x)
-    return True
-
-def _canon(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+def _num(v: Any, *, positive: bool = False, nonnegative: bool = False) -> bool:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+        return False
+    return (not positive or float(v) > 0) and (not nonnegative or float(v) >= 0)
 
 def _sanitize(case: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(case, Mapping): raise ValueError("case")
-    if "test_id" in case: raise ValueError("test_id is forbidden")
-    if any(k in case for k in ("validation", "source_split", "loader", "provenance")):
-        if case.get("source_split") not in (None, "train") or any(k in case for k in ("validation", "loader", "provenance")):
-            raise ValueError("validation/test provenance is forbidden")
-    if not isinstance(case.get("instance_id"), str) or not case["instance_id"]: raise ValueError("instance_id")
-    out = {k: case[k] for k in CORPUS_KEYS if k in case}
-    if set(out) != CORPUS_KEYS: raise ValueError("corpus schema mismatch")
+    if not isinstance(case, Mapping): raise ValueError("case must be mapping")
+    if any(k in case for k in ("test_id", "validation", "loader", "provenance")): raise ValueError("forbidden provenance")
+    if "source_split" in case and case["source_split"] != "train": raise ValueError("source_split")
+    allowed_input = CORPUS_KEYS | {"golden", "source_split"}
+    if set(case) - allowed_input: raise ValueError("unknown corpus key")
+    if not CORPUS_KEYS.issubset(case): raise ValueError("missing corpus key")
+    if not isinstance(case["instance_id"], str) or not case["instance_id"].strip(): raise ValueError("instance_id")
     n = case["n"]
-    if not isinstance(n, int) or isinstance(n, bool) or n < 0: raise ValueError("n")
-    if any(not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(float(x)) or float(x) <= 0 for x in case["area"]): raise ValueError("area")
-    if any(not isinstance(x, list) or len(x) != 2 or any(type(v) is not int or v not in (0, 1) for v in x) for x in case["cons"]): raise ValueError("cons")
-    for k in ("area", "cons", "tp"):
-        if len(case[k]) != n: raise ValueError("shape mismatch")
-    if any(not isinstance(row, list) or len(row) != 4 or any(isinstance(v, bool) or not isinstance(v, (int,float)) for v in row) for row in case["tp"]): raise ValueError("tp")
-    for k, width in (("b2b", 3), ("p2b", 3), ("pins", 2)):
-        if not isinstance(case[k], list) or any(not isinstance(row, list) or len(row) != width or any(isinstance(v,bool) or not isinstance(v,(int,float)) for v in row) for row in case[k]): raise ValueError(k)
-    for row in case["b2b"]:
-        if any(type(row[i]) is not int or not 0 <= row[i] < n for i in (0, 1)) or row[2] < 0: raise ValueError("b2b endpoints")
-    for row in case["p2b"]:
-        if type(row[0]) is not int or type(row[1]) is not int or not 0 <= row[0] < len(case["pins"]) or not 0 <= row[1] < n or row[2] < 0: raise ValueError("p2b endpoints")
-    if any(not isinstance(case[k], (int,float)) or isinstance(case[k], bool) or not math.isfinite(float(case[k])) or float(case[k]) <= 0 for k in ("hpwl_ref", "area_ref")): raise ValueError("refs")
-    if not _finite(out): raise ValueError("nonfinite value")
-    tp = []
-    for i, row in enumerate(case["tp"]):
-        if len(row) != 4: raise ValueError("shape mismatch")
-        c = case["cons"][i]
-        fixed = bool(c[0]) if len(c) else False
-        pre = bool(c[1]) if len(c) > 1 else False
-        tp.append([float(row[j]) if (pre or (fixed and j >= 2)) else -1.0 for j in range(4)])
-    out["tp"] = tp
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0: raise ValueError("n")
+    for key in ("area", "cons", "tp"):
+        if not isinstance(case[key], (list, tuple)) or len(case[key]) != n: raise ValueError(key)
+    if any(not _num(x, positive=True) for x in case["area"]): raise ValueError("area")
+    if any(not isinstance(r, (list, tuple)) or len(r) != 2 or any(type(x) is not int or x not in (0, 1) for x in r) for r in case["cons"]): raise ValueError("cons")
+    for r in case["tp"]:
+        if not isinstance(r, (list, tuple)) or len(r) != 4 or any(not _num(x) for x in r): raise ValueError("tp")
+    for key, width in (("b2b", 3), ("p2b", 3), ("pins", 2)):
+        if not isinstance(case[key], (list, tuple)): raise ValueError(key)
+        if any(not isinstance(r, (list, tuple)) or len(r) != width or any(not _num(x) for x in r) for r in case[key]): raise ValueError(key)
+    for r in case["b2b"]:
+        if type(r[0]) is not int or type(r[1]) is not int or not (0 <= r[0] < n and 0 <= r[1] < n) or r[0] == r[1] or not _num(r[2], nonnegative=True): raise ValueError("b2b endpoint")
+    for r in case["p2b"]:
+        if type(r[0]) is not int or type(r[1]) is not int or not (0 <= r[0] < len(case["pins"]) and 0 <= r[1] < n) or not _num(r[2], nonnegative=True): raise ValueError("p2b endpoint")
+    if not _num(case["hpwl_ref"], positive=True) or not _num(case["area_ref"], positive=True): raise ValueError("reference")
+    out = {k: case[k] for k in CORPUS_KEYS}
+    out["tp"] = [[float(v) if (c[1] or (c[0] and j >= 2)) else -1.0 for j, v in enumerate(r)] for r, c in zip(case["tp"], case["cons"])]
     return out
 
+def _canonical(obj: Any) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+
 def fingerprint_case(case: Mapping[str, Any]) -> str:
-    clean = _sanitize(case); clean.pop("instance_id", None)
-    return hashlib.sha256(_canon(clean).encode()).hexdigest()
+    clean = _sanitize(case); clean.pop("instance_id")
+    return hashlib.sha256(_canonical(clean)).hexdigest()
 
 def split_for_id(instance_id: str, heldout_mod: int = 10) -> str:
-    if not isinstance(instance_id, str) or not instance_id: raise ValueError("instance_id")
-    if not isinstance(heldout_mod, int) or isinstance(heldout_mod, bool) or heldout_mod <= 0: raise ValueError("heldout_mod")
-    bucket = int(hashlib.sha256(instance_id.encode()).hexdigest()[:16], 16) % heldout_mod
-    return "heldout" if bucket == 0 else "train"
+    if not isinstance(instance_id, str) or not instance_id.strip(): raise ValueError("instance_id")
+    if isinstance(heldout_mod, bool) or not isinstance(heldout_mod, int) or heldout_mod <= 0: raise ValueError("heldout_mod")
+    return "heldout" if int(hashlib.sha256(instance_id.encode()).hexdigest(), 16) % heldout_mod == 0 else "train"
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
 
 def save_sanitized_corpus(path: str | Path, cases: Sequence[Mapping[str, Any]], *, source_root: str | Path | None | object = _DEFAULT_ROOT) -> None:
-    if source_root is None: raise ValueError("source_root must be canonical")
-    if source_root is not _DEFAULT_ROOT and Path(source_root).resolve() != (Path("FloorSet/floorset_lite").resolve()):
-        raise ValueError("source must be FloorSet/floorset_lite")
+    if source_root is None or (source_root is not _DEFAULT_ROOT and Path(source_root).resolve() != _CANONICAL_ROOT): raise ValueError("source_root")
     rows = [_sanitize(c) for c in cases]
-    fps = [fingerprint_case(r) for r in rows]
-    if len(set(fps)) != len(fps): raise ValueError("duplicate fingerprint")
-    Path(path).write_text("".join(_canon(r) + "\n" for r in rows), encoding="utf-8")
+    if len({fingerprint_case(r) for r in rows}) != len(rows): raise ValueError("duplicate fingerprint")
+    _atomic_write(Path(path), b"".join(_canonical(r) + b"\n" for r in rows))
 
 def load_sanitized_corpus(path: str | Path) -> list[dict[str, Any]]:
-    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line]
+    rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
     clean = [_sanitize(r) for r in rows]
     if len({fingerprint_case(r) for r in clean}) != len(clean): raise ValueError("duplicate fingerprint")
     return clean
 
-def canonical_jsonl_sha256(path: str | Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
 def canonical_jsonl(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    """Write rows in the byte-stable sorted-key JSONL representation."""
-    forbidden = {"test_id", "golden", "validation", "loader", "provenance"}
-    def walk(x):
+    def check(x: Any) -> None:
         if isinstance(x, Mapping):
-            if forbidden.intersection(x) or ("source_split" in x and x["source_split"] != "train"):
-                raise ValueError("forbidden canonical field")
-            for v in x.values(): walk(v)
-        elif isinstance(x, list):
-            for v in x: walk(v)
-    for r in rows:
-        if not isinstance(r, Mapping):
-            raise ValueError("forbidden canonical field")
-        walk(r)
-    Path(path).write_text("".join(_canon(r) + "\n" for r in rows), encoding="utf-8")
+            if _FORBIDDEN.intersection(x) or ("source_split" in x and x["source_split"] != "train"): raise ValueError("forbidden canonical field")
+            for v in x.values(): check(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x: check(v)
+    for row in rows:
+        if not isinstance(row, Mapping): raise ValueError("row")
+        check(row)
+    _atomic_write(Path(path), b"".join(_canonical(r) + b"\n" for r in rows))
 
-def sha256_manifest(path: str | Path, files: Sequence[str | Path]) -> dict[str, str]:
-    return write_sha256_manifest(path, files)
-
+def canonical_jsonl_sha256(path: str | Path) -> str: return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def sha256_manifest(path: str | Path, files: Sequence[str | Path]) -> dict[str, str]: return write_sha256_manifest(path, files)
 def write_sha256_manifest(path: str | Path, files: Sequence[str | Path]) -> dict[str, str]:
     resolved = [Path(f).resolve() for f in files]
-    if len(set(resolved)) != len(resolved):
-        raise ValueError("duplicate manifest path")
-    manifest = {str(f): canonical_jsonl_sha256(f) for f in sorted(resolved, key=str)}
-    Path(path).write_text(_canon(manifest) + "\n", encoding="utf-8")
+    if len(set(resolved)) != len(resolved): raise ValueError("duplicate manifest path")
+    manifest = {str(p): canonical_jsonl_sha256(p) for p in sorted(resolved, key=str)}
+    _atomic_write(Path(path), _canonical(manifest) + b"\n")
     return manifest
 
 def collate_labels(labels: Sequence[TopologyLabel], device: torch.device, dtype: torch.dtype) -> SparseTopologyBatch:
-    e=[]; c=[]
+    if not isinstance(labels, (list, tuple)): raise ValueError("labels")
+    edges: list[tuple] = []; contacts: list[tuple] = []
     for bi, label in enumerate(labels):
-        if not isinstance(label, TopologyLabel) or not isinstance(label.instance_id, str) or not label.instance_id or type(label.n) is not int or label.n < 0:
-            raise ValueError("malformed label")
-        vals = (label.teacher_cost, label.base_cost, label.record_weight)
-        if any(isinstance(v, bool) or not isinstance(v, (int,float)) or not math.isfinite(float(v)) for v in vals) or label.record_weight < 0: raise ValueError("label weights")
-        for x in label.edges:
-            if type(x.src) is not int or type(x.dst) is not int or not (0 <= x.src < label.n and 0 <= x.dst < label.n) or x.src == x.dst or x.axis not in (0,1) or not math.isfinite(x.margin) or x.margin < 0 or not math.isfinite(x.weight) or x.weight < 0: raise ValueError("edge")
-        for x in label.contacts:
-            if not (0 <= x.a < label.n and 0 <= x.b < label.n) or x.a == x.b or x.axis not in (0,1) or type(x.a_before_b) is not bool or not math.isfinite(x.perp_margin) or x.perp_margin < 0 or not math.isfinite(x.weight) or x.weight < 0: raise ValueError("contact")
-        for path in label.pin_paths:
-            if not path or any(type(i) is not int or not 0 <= i < label.n for i in path): raise ValueError("pin path")
-        e += [(bi,x.src,x.dst,x.axis,x.margin,x.weight*label.record_weight) for x in label.edges]
-        c += [(bi,x.a,x.b,x.axis,int(x.a_before_b),x.perp_margin,x.weight*label.record_weight) for x in label.contacts]
-    def t(vals, dt=torch.long): return torch.tensor(vals, device=device, dtype=dt)
-    return SparseTopologyBatch(t([x[0] for x in e]), t([x[1] for x in e]), t([x[2] for x in e]), t([x[3] for x in e]), t([x[4] for x in e],dtype), t([x[5] for x in e],dtype), t([x[0] for x in c]), t([x[1] for x in c]), t([x[2] for x in c]), t([x[3] for x in c]), t([x[4] for x in c]), t([x[5] for x in c],dtype), t([x[6] for x in c],dtype))
+        if type(label) is not TopologyLabel or not isinstance(label.instance_id, str) or not label.instance_id.strip() or type(label.n) is not int or label.n < 0 or type(label.sample_seed) is not int: raise ValueError("label")
+        if any(not _num(v, positive=True) for v in (label.teacher_cost, label.base_cost, label.record_weight)): raise ValueError("cost")
+        if type(label.edges) is not tuple or type(label.contacts) is not tuple or type(label.pin_paths) is not tuple: raise ValueError("containers")
+        for e in label.edges:
+            if type(e) is not SparseEdge or type(e.src) is not int or type(e.dst) is not int or not (0 <= e.src < label.n and 0 <= e.dst < label.n) or e.src == e.dst or type(e.axis) is not int or e.axis not in (0, 1) or not isinstance(e.kind, str) or not e.kind.strip() or not _num(e.margin, nonnegative=True) or not _num(e.weight, positive=True): raise ValueError("edge")
+            edges.append((bi, e.src, e.dst, e.axis, e.margin, e.weight * label.record_weight))
+        for c in label.contacts:
+            if type(c) is not ContactLabel or type(c.a) is not int or type(c.b) is not int or not (0 <= c.a < label.n and 0 <= c.b < label.n) or c.a == c.b or type(c.axis) is not int or c.axis not in (0, 1) or type(c.a_before_b) is not bool or not _num(c.perp_margin, positive=True) or not _num(c.weight, positive=True): raise ValueError("contact")
+            contacts.append((bi, c.a, c.b, c.axis, int(c.a_before_b), c.perp_margin, c.weight * label.record_weight))
+        for p in label.pin_paths:
+            if type(p) is not tuple or not p or any(type(i) is not int or not 0 <= i < label.n for i in p) or any(a == b for a, b in zip(p, p[1:])): raise ValueError("pin path")
+    def tensor(vals: list, dt: torch.dtype) -> torch.Tensor: return torch.tensor(vals, device=device, dtype=dt)
+    el = lambda i, dt=torch.long: tensor([x[i] for x in edges], dt)
+    cl = lambda i, dt=torch.long: tensor([x[i] for x in contacts], dt)
+    return SparseTopologyBatch(el(0), el(1), el(2), el(3), el(4, dtype), el(5, dtype), cl(0), cl(1), cl(2), cl(3), cl(4), cl(5, dtype), cl(6, dtype))
