@@ -261,6 +261,132 @@ def test_teacher_g0_state_precedence_literals():
     cases = [{**base, "trust_ok": False}, {**base, "legal": False}, {**base, "teacher_mean": 2}, {**base, "delta": 0.01}, {**base, "delta": 0.0181504738793652}, {**base, "delta": 0.0261247299384228}]
     assert [t._g0_state(c) for c in cases] == expected
     assert t._g0_state({**base, "trust_ok": False, "legal": False, "teacher_mean": 2, "delta": .03}) == "KILLED_INPUT_CHECKPOINT_OR_SCORER"
+
+
+# Additional Task 4 fail-closed review contracts.  These deliberately exercise
+# validation before any checkpoint load or pipeline work is reached.
+def _policy_for(root):
+    t = _teacher()
+    identity = {"identity_schema": "icdc_canonical_state_v1", "model_config_sha256": "a" * 64,
+                "model_keyset_sha256": "b" * 64, "ema_keyset_sha256": "c" * 64,
+                "ema_state_sha256": "d" * 64}
+    return t.TeacherTrustPolicy(root, "a" * 64, identity, "b" * 64, "contract", "2.0")
+
+
+@pytest.mark.parametrize("root_kind", ["other", "lexical", "symlink"])
+def test_teacher_rejects_noncanonical_and_symlink_roots_before_pipeline(tmp_path, root_kind):
+    t = _teacher(); canonical = tmp_path / "canonical"; canonical.mkdir()
+    other = tmp_path / "other"; other.mkdir()
+    if root_kind == "other": root = other
+    elif root_kind == "lexical": root = canonical / ".." / "other"
+    else:
+        root = tmp_path / "canonical-link"; root.symlink_to(canonical, target_is_directory=True)
+    out = tmp_path / "out"
+    args = ["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"),
+            "--checkpoint", str(tmp_path / "missing.th")]
+    with pytest.raises(ValueError): t.teacher_main(args, _trust_policy=_policy_for(canonical))
+
+
+def test_teacher_valid_canonical_root_reaches_explicit_unimplemented_without_load(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); out = tmp_path / "out"
+    monkeypatch.setattr(torch, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
+    args = ["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"),
+            "--checkpoint", str(tmp_path / "missing.th")]
+    with pytest.raises(RuntimeError, match="not implemented"):
+        t.teacher_main(args, _trust_policy=_policy_for(root))
+
+
+@pytest.mark.parametrize("bad", ["--scorer", "--unknown"])
+def test_teacher_cli_rejects_unapproved_flags(bad, tmp_path):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); out = tmp_path / "out"
+    args = ["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"),
+            "--checkpoint", str(tmp_path / "missing.th"), bad, "x"]
+    with pytest.raises(SystemExit): t.teacher_main(args, _trust_policy=_policy_for(root))
+
+
+@pytest.mark.parametrize("field,value", [("n", 1), ("n", True), ("cons", "bad"), ("tp", "bad")])
+def test_teacher_intent_rejects_malformed_case_contract(field, value):
+    t = _teacher(); rects = torch.tensor([[0., 0., 1., 1.], [1., 0., 1., 1.]])
+    case = {"n": 2, "cons": [[0, 1, 0, 0, 0]] * 2, "tp": [[-1.] * 4] * 2}
+    case[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        t._proposal_intent_holds("base", rects, case)
+
+
+def test_teacher_contact_requires_full_positive_perpendicular_overlap():
+    t = _teacher(); case = {"n": 2, "cons": [[0, 0, 0, 5, 0]] * 2, "tp": [[-1.] * 4] * 2}
+    partial = torch.tensor([[0., 0., 2., 2.], [2., 1.5, 2., 2.]])
+    exact = torch.tensor([[0., 0., 2., 2.], [2., 0., 2., 2.]])
+    assert not t._proposal_intent_holds("contact:5:0:1:0:1", partial, case)
+    assert t._proposal_intent_holds("contact:5:0:1:0:1", exact, case)
+
+
+@pytest.mark.parametrize("bad", [None, "x", True, float("nan"), float("inf"), float("-inf")])
+def test_teacher_g0_rejects_malformed_metrics(bad):
+    t = _teacher(); base = {"trust_ok": True, "scorer_ok": True, "input_ok": True, "legal": True, "coverage": True,
+                            "teacher_mean": 0.1, "delta": 0.03}
+    for field in ("teacher_mean", "delta"):
+        with pytest.raises((ValueError, TypeError)):
+            t._g0_state({**base, field: bad})
+
+
+def test_teacher_g0_failures_precede_missing_metrics():
+    t = _teacher()
+    assert t._g0_state({"trust_ok": False, "scorer_ok": True, "input_ok": True}) == "KILLED_INPUT_CHECKPOINT_OR_SCORER"
+    assert t._g0_state({"trust_ok": True, "scorer_ok": True, "input_ok": True, "legal": False}) == "KILLED_LEGALITY_OR_COVERAGE"
+
+
+@pytest.mark.parametrize("bad", [{"relative_path": "../x"}, {"relative_path": "/x"}, {"relative_path": ""},
+                                  {"relative_path": "a\\b"}, {"layout_index": -1}, {"n": -1},
+                                  {"base_cost": "x"}, {"teacher_cost": float("nan")}, {"extra": 1}])
+def test_teacher_weighted_population_rejects_untrusted_rows(bad):
+    t = _teacher(); row = {"relative_path": "a.json", "layout_index": 0, "instance_id": "a", "n": 1,
+                           "base_cost": 2., "teacher_cost": 1.}
+    with pytest.raises((ValueError, TypeError, OverflowError)):
+        t._weighted_population([{**row, **bad}])
+
+
+def test_teacher_weighted_population_rejects_duplicate_source_tuple_and_instance_id():
+    t = _teacher(); row = {"relative_path": "a.json", "layout_index": 0, "instance_id": "a", "n": 1,
+                           "base_cost": 2., "teacher_cost": 1.}
+    with pytest.raises((ValueError, TypeError)):
+        t._weighted_population([row, {**row, "instance_id": "b"}])
+    with pytest.raises((ValueError, TypeError)):
+        t._weighted_population([row, {**row, "relative_path": "b.json"}])
+
+
+def test_teacher_population_hash_omits_costs_but_metrics_change():
+    t = _teacher(); row = {"relative_path": "a.json", "layout_index": 0, "instance_id": "a", "n": 1,
+                           "base_cost": 2., "teacher_cost": 1.}
+    a = t._weighted_population([row]); b = t._weighted_population([{**row, "base_cost": 3., "teacher_cost": 2.}])
+    assert a["population_sha256"] == b["population_sha256"]
+    assert a["B_H"] != b["B_H"]
+
+
+@pytest.mark.parametrize("bad", [{"cost_no_runtime": "x"}, {"cost_no_runtime": True}, {"ordinal": -1},
+                                  {"ordinal": True}, {"name": ""}, {"name": "a\x00b"}])
+def test_teacher_winner_rejects_malformed_candidate_rows(bad):
+    t = _teacher(); base = {"name": "base", "ordinal": 0, "cost_no_runtime": 10., "energy": 1., "feasible": True}
+    with pytest.raises((ValueError, TypeError)):
+        t._select_official_winner([base, {"name": "z", "ordinal": 1, "cost_no_runtime": 4., "energy": 0., "feasible": True, **bad}])
+
+
+def test_teacher_winner_rejects_nonmapping_rows():
+    with pytest.raises((ValueError, TypeError)):
+        _teacher()._select_official_winner([None])
+
+
+@pytest.mark.parametrize("out_kind", ["existing", "symlink", "traversal"])
+def test_teacher_rejects_existing_or_escaping_output_paths(tmp_path, out_kind):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); out = tmp_path / "out"
+    if out_kind == "existing": out.mkdir()
+    elif out_kind == "symlink":
+        target = tmp_path / "target"; target.mkdir(); out.symlink_to(target, target_is_directory=True)
+    else: out = tmp_path / "canonical" / ".." / "escape"
+    args = ["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"),
+            "--checkpoint", str(tmp_path / "missing.th")]
+    with pytest.raises((ValueError, RuntimeError)):
+        t.teacher_main(args, _trust_policy=_policy_for(root))
 from icdc.topology_prior import topology_losses, extract_sparse_label
 from icdc.topology_prior import (
     ProposalConfig, ProposalResult, generate_proposals,
