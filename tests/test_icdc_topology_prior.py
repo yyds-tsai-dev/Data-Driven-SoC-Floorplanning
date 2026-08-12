@@ -713,8 +713,9 @@ def test_proposal_names_encode_pair_axis_order_and_contact_intent(proposal_fixtu
 
 def test_generator_rejects_float32_and_malformed_case_before_any_seed(proposal_fixture):
     raw, case = proposal_fixture
-    with pytest.raises((TypeError, ValueError)):
-        list(generate_proposals(raw.float(), case, ProposalConfig()))
+    # CPU floating inputs (including float32) are admitted and normalized to float64.
+    got = list(generate_proposals(raw.float(), case, ProposalConfig(0, 0, 0, 1)))
+    assert got and got[0][1].dtype == torch.float64
     for bad in (dict(case, area=[1.]), dict(case, tp=[[0., 0., 1., 1.]] * 3), dict(case, cons=[])):
         with pytest.raises((TypeError, ValueError)):
             list(generate_proposals(raw, bad, ProposalConfig()))
@@ -737,6 +738,135 @@ def test_fingerprint_distinguishes_axis_and_contact_relations_independently():
     a = torch.tensor([[0., 0., 2., 2.], [2., 1., 2., 2.]], dtype=torch.float64)
     b = a.clone(); b[1, 1] = 2.
     assert _topology_fingerprint(a, cons) != _topology_fingerprint(b, cons)
+
+
+def _topology_case(raw, cons, tp=None):
+    n = raw.shape[0]
+    return {"instance_id": "task3", "n": n, "area": (raw[:, 2] * raw[:, 3]).tolist(),
+            "cons": cons, "tp": tp or [[-1., -1., -1., -1.] for _ in range(n)],
+            "b2b": [], "p2b": [], "pins": []}
+
+
+def test_pin_generator_restores_preplaced_block_and_encodes_peer_axis_order():
+    raw = torch.tensor([[2., 3., 2., 2.], [20., 0., 3., 4.], [40., 0., 5., 6.]], dtype=torch.float64)
+    tp = [[2., 3., 2., 2.], [-1., -1., -1., -1.], [-1., -1., -1., -1.]]
+    case = _topology_case(raw, [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]], tp)
+    out = list(generate_proposals(raw, case, ProposalConfig(0, 8, 0, 32)))
+    pins = [(name, rects) for name, rects in out if name.startswith("pin:")]
+    assert pins
+    for name, rects in pins:
+        parts = name.split(":")
+        assert len(parts) == 5 and parts[0] == "pin"
+        _, peer, target, axis, order = parts
+        peer, target, axis, order = map(int, (peer, target, axis, order))
+        assert peer != target and peer != 0 and target == 0
+        assert axis in (0, 1) and order in (0, 1)
+        assert torch.equal(rects[0], raw[0])
+        assert torch.equal(rects[:, 2:], raw[:, 2:])
+        assert _topology_fingerprint(rects, case["cons"]) != _topology_fingerprint(raw, case["cons"])
+
+
+def test_pin_generator_has_no_supply_when_all_blocks_are_preplaced():
+    raw = torch.tensor([[0., 0., 2., 2.], [4., 0., 2., 2.]], dtype=torch.float64)
+    case = _topology_case(raw, [[0, 1, 0, 0, 0], [0, 1, 0, 0, 0]], [[0., 0., 2., 2.], [4., 0., 2., 2.]])
+    assert not any(name.startswith("pin:") for name, _ in generate_proposals(raw, case, ProposalConfig(0, 8, 0, 32)))
+
+
+def test_contact_generator_uses_only_cluster_pairs_and_literal_contact_geometry():
+    raw = torch.tensor([[0., 0., 2., 2.], [50., 0., 2., 2.], [10., 0., 2., 2.]], dtype=torch.float64)
+    cons = [[0, 0, 0, 7, 0], [0, 0, 0, 0, 0], [0, 0, 0, 7, 0]]
+    case = _topology_case(raw, cons)
+    out = [(n, r) for n, r in generate_proposals(raw, case, ProposalConfig(0, 0, 8, 32)) if n.startswith("contact:")]
+    assert out
+    for name, rects in out:
+        parts = name.split(":"); assert len(parts) == 5
+        _, a, b, axis, order = parts; a, b, axis, order = map(int, (a, b, axis, order))
+        assert {a, b} == {0, 2} and axis in (0, 1) and order in (0, 1)
+        assert has_exact_positive_contact(rects, a, b, axis, bool(order), 1e-12)
+        assert torch.equal(rects[:, 2:], raw[:, 2:])
+
+
+def test_contact_generator_no_supply_when_cluster_endpoints_preplaced_and_disconnected():
+    raw = torch.tensor([[0., 0., 2., 2.], [40., 0., 2., 2.]], dtype=torch.float64)
+    case = _topology_case(raw, [[0, 1, 0, 7, 0], [0, 1, 0, 7, 0]], [[0., 0., 2., 2.], [40., 0., 2., 2.]])
+    assert not any(name.startswith("contact:") for name, _ in generate_proposals(raw, case, ProposalConfig(0, 0, 8, 32)))
+
+
+def test_caps_are_exact_with_three_independent_pin_and_contact_supplies():
+    raw = torch.tensor([[float(i * 10), 0., 2., 2.] for i in range(6)], dtype=torch.float64)
+    cons = [[0, 0, 0, 11, 0], [0, 0, 0, 0, 0], [0, 0, 0, 12, 0],
+            [0, 0, 0, 0, 0], [0, 0, 0, 13, 0], [0, 0, 0, 0, 0]]
+    tp = [[-1., -1., -1., -1.]] * 6
+    case = _topology_case(raw, cons, tp)
+    out = list(generate_proposals(raw, case, ProposalConfig(0, 2, 2, 32)))
+    assert sum(n.startswith("pin:") for n, _ in out) == 2
+    assert sum(n.startswith("contact:") for n, _ in out) == 2
+
+
+def test_generator_fingerprints_are_unique_and_inputs_immutable():
+    raw = torch.tensor([[0., 0., 2., 2.], [8., 0., 2., 2.], [0., 8., 2., 2.]], dtype=torch.float64)
+    case = _topology_case(raw, [[0, 0, 0, 9, 0]] * 3); before = (raw.clone(), repr(case))
+    out = list(generate_proposals(raw, case, ProposalConfig()))
+    assert len({_topology_fingerprint(rects, case["cons"]) for _, rects in out}) == len(out)
+    assert torch.equal(raw, before[0]) and repr(case) == before[1]
+
+
+def test_proposal_config_rejects_bool_and_result_is_frozen():
+    with pytest.raises((TypeError, ValueError)): ProposalConfig(total_cap=True)
+    result = ProposalResult("x", torch.zeros((1, 4)), torch.zeros((1, 4)), torch.zeros((1, 2)), {}, None, None)
+    with pytest.raises(FrozenInstanceError): result.name = "y"
+
+
+@pytest.mark.parametrize("failure", ["drift", "nonfinite", "pin_mismatch"])
+@pytest.mark.parametrize("stage", [False, True])
+def test_admission_rejects_tfdl_failure_matrix_without_running_later_stage(monkeypatch, proposal_fixture, failure, stage):
+    raw, case = proposal_fixture; calls = []
+    class Spy:
+        def tfdl(self, rects, mask, pinned, *, pin_xy, boundary_code, exact=False):
+            calls.append((exact, rects.clone(), mask.clone(), pinned.clone(), pin_xy.clone(), boundary_code.clone()))
+            if exact == stage:
+                legal = rects.clone()
+                drift = torch.zeros((1, 4, 2), dtype=rects.dtype)
+                if failure == "drift": drift[0, 1, 0] = 1.
+                if failure == "nonfinite": legal[0, 1, 0] = float("nan")
+                if failure == "pin_mismatch": legal[0, 0, 0] += 1.
+                return legal, drift
+            return rects.clone(), torch.zeros((1, 4, 2), dtype=rects.dtype)
+    monkeypatch.setattr(topology_prior, "T", Spy())
+    assert pin_feasible_then_exact_tfdl(raw, case) is None
+    assert len(calls) == (1 if not stage else 2)
+    assert all(torch.equal(c[1], raw.unsqueeze(0)) for c in calls)
+
+
+@pytest.mark.parametrize("verification", [False, {}, {"ok": 1}, RuntimeError("boom")])
+def test_admission_rejects_verifier_failure_matrix(monkeypatch, proposal_fixture, verification):
+    raw, case = proposal_fixture; calls = []
+    class TSpy:
+        def tfdl(self, rects, mask, pinned, *, pin_xy, boundary_code, exact=False):
+            calls.append(exact); return rects.clone(), torch.zeros((1, 4, 2), dtype=rects.dtype)
+    class EngineSpy:
+        def verify_hard_legal(self, *args):
+            if isinstance(verification, Exception): raise verification
+            return verification
+    monkeypatch.setattr(topology_prior, "T", TSpy()); monkeypatch.setattr(topology_prior, "engine", EngineSpy())
+    assert pin_feasible_then_exact_tfdl(raw, case) is None
+    assert calls == [False, True]
+
+
+def test_admission_success_spy_receives_exact_original_inputs(monkeypatch, proposal_fixture):
+    raw, case = proposal_fixture; seen = {}
+    class TSpy:
+        def tfdl(self, rects, mask, pinned, *, pin_xy, boundary_code, exact=False):
+            seen.setdefault("tfdl", []).append((rects.clone(), mask.clone(), pinned.clone(), pin_xy.clone(), boundary_code.clone(), exact))
+            return rects.clone(), torch.zeros((1, 4, 2), dtype=rects.dtype)
+    class EngineSpy:
+        def verify_hard_legal(self, legal, area, cons, tp):
+            seen["verify"] = (legal.copy(), area.copy(), cons.copy(), tp.copy()); return {"ok": True}
+    monkeypatch.setattr(topology_prior, "T", TSpy()); monkeypatch.setattr(topology_prior, "engine", EngineSpy())
+    result = pin_feasible_then_exact_tfdl(raw, case)
+    assert result is not None
+    assert all(torch.equal(x[0], raw.unsqueeze(0)) for x in seen["tfdl"])
+    assert seen["verify"][1].tolist() == case["area"] and seen["verify"][2].tolist() == case["cons"] and seen["verify"][3].tolist() == case["tp"]
 
 CANONICAL_ROOT = Path("FloorSet/floorset_lite").resolve()
 
