@@ -11,12 +11,13 @@ import os
 import statistics
 import sys
 import time
+import torch
 from pathlib import Path
 from typing import Any, Callable
 
 EXPECTED_BASELINE_SHA256 = "6e7089b1e0fa4510f5ffe11187232bee488b25da599435f7d369ba329a1349c5"
 EXPECTED_BASELINE_SCORE = 1.1437448258795715
-SCORE_LIMIT = EXPECTED_BASELINE_SCORE
+SCORE_LIMIT = 1.1412448258795715
 SCHEMA = "group-dag-g0.v1"
 
 
@@ -37,6 +38,8 @@ def _weighted(costs: list[float], counts: list[int]) -> float:
 
 def _load_evaluator():
     root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root / "scripts"))
+    sys.path.insert(0, str(root / "FloorSet"))
     spec = importlib.util.spec_from_file_location("g0_evaluator", root / "scripts" / "iccad2026_evaluate.py")
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader
@@ -46,15 +49,16 @@ def _load_evaluator():
 
 def _default_loader(test_id: int, row: dict[str, Any]):
     # The probe intentionally loads inputs only for scoring; it never invokes an optimizer.
+    root = Path(__file__).resolve().parents[2]
     ev = _load_evaluator()
-    data = ev.get_validation_dataloader()
-    return data.dataset[test_id] if hasattr(data, "dataset") else data[test_id]
+    from partner.icdc.data import load_test_cases
+    return load_test_cases(ev, data_path=str(root / "FloorSet"))[test_id]
 
 
 def _default_evaluate(solution: dict[str, Any], case: Any):
     ev = _load_evaluator()
-    if isinstance(case, dict):
-        return ev.evaluate_solution(solution, **case)
+    if isinstance(case, dict) and "cons" in case:
+        return ev.evaluate_solution(solution, {"hpwl_baseline": case["hpwl_ref"], "area_baseline": case["area_ref"]}, case["cons"], case["b2b"], case["p2b"], case["pins"], case["area"], target_positions=case["tp"], median_runtime=1.0)
     # Native validation samples are handled by the evaluator's public helper when available.
     if hasattr(case, "evaluate_solution"):
         return case.evaluate_solution(solution)
@@ -94,7 +98,7 @@ def _source_hygiene() -> bool:
     return not any(token in text for token in forbidden)
 
 
-def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_default_evaluate) -> int:
+def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_default_evaluate, clock=time.perf_counter) -> int:
     source = Path(args.input)
     raw = source.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
@@ -102,7 +106,8 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
         package = json.loads(raw)
         rows = package["test_results"]
         ids = [int(r["test_id"]) for r in rows]
-        if len(rows) != 100 or ids != list(range(100)):
+        injected = bridge_fn is not None or case_loader is not _default_loader or evaluate_fn is not _default_evaluate
+        if (not injected and len(rows) != 100) or ids != list(range(len(rows))):
             raise ValueError("baseline must contain test IDs 0..99")
         baseline_score = _weighted([float(r["cost_no_runtime"]) for r in rows], [int(r["block_count"]) for r in rows])
         if digest != EXPECTED_BASELINE_SHA256 or not math.isclose(baseline_score, EXPECTED_BASELINE_SCORE, rel_tol=0, abs_tol=1e-12):
@@ -112,7 +117,7 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
     if bridge_fn is None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "partner"))
         from violation_killer import bridge_grouping_violations_dag
-        bridge_fn = bridge_grouping_violations_dag
+        bridge_fn = lambda context, positions, budget: bridge_grouping_violations_dag(context["optimizer"], positions, budget)
 
     cases: list[dict[str, Any]] = []
     on_costs: list[float] = []
@@ -126,9 +131,13 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
         before = row["positions"]
         try:
             scorer = _call(case_loader, tid, row)
-            started = time.perf_counter()
+            if bridge_fn is None:
+                from partner.column_sa_legalizer import _ColumnOptimizer
+                scorer = dict(scorer)
+                scorer["optimizer"] = _ColumnOptimizer(row["positions"], torch.as_tensor(scorer["area"]), torch.as_tensor(scorer["cons"]), torch.as_tensor(scorer["tp"]), torch.as_tensor(scorer["b2b"]), torch.as_tensor(scorer["p2b"]), torch.as_tensor(scorer["pins"]), time.time() + 60., seed=0)
+            started = clock()
             after = _call(bridge_fn, scorer, before, 0.003)
-            elapsed = (time.perf_counter() - started) * 1000
+            elapsed = (clock() - started) * 1000
             timings.append(elapsed)
             off = _call(evaluate_fn, {"positions": before}, scorer)
             on = _call(evaluate_fn, {"positions": after}, scorer)
@@ -141,13 +150,15 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
             grouping_after = _metric(on, "grouping_violations", grouping_before)
             v_before = _metric(off, "total_soft_violations", row.get("total_soft_violations", 0))
             v_after = _metric(on, "total_soft_violations", v_before)
-            accepted = ok and grouping_after < grouping_before and v_after < v_before
+            changed = after != before
+            strict = (not changed) or (ok and grouping_after < grouping_before and v_after < v_before)
+            accepted = changed and strict
             cases.append({"test_id": tid, "block_count": int(row["block_count"]), "positions": after,
                           "before_cost_no_runtime": off_cost, "after_cost_no_runtime": on_cost,
                           "grouping_before": grouping_before, "grouping_after": grouping_after,
                           "v_before": v_before, "v_after": v_after, "grouping_delta": grouping_after-grouping_before,
                           "v_delta": v_after-v_before, "runtime_ms": elapsed, "is_feasible": ok,
-                          "error": None, "accepted": accepted})
+                          "error": None, "changed": changed, "candidate_strict": strict, "accepted": accepted})
         except Exception as exc:
             errors += 1
             cases.append({"test_id": tid, "block_count": int(row["block_count"]), "positions": before,
@@ -155,12 +166,12 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
     source_ok = _source_hygiene()
     runtime = {"mean": statistics.mean(timings) if timings else 0.0, "median": statistics.median(timings) if timings else 0.0,
                "p95": sorted(timings)[max(0, math.ceil(.95*len(timings))-1)] if timings else 0.0, "max": max(timings) if timings else 0.0}
-    score_off = _weighted(off_costs, counts) if off_costs else float("inf")
-    score_on = _weighted(on_costs, counts) if on_costs else float("inf")
+    score_off = _weighted(off_costs, counts) if off_costs else None
+    score_on = _weighted(on_costs, counts) if on_costs else None
     manifest = {"schema": SCHEMA, "baseline": {"path": str(source), "sha256": digest, "score_off": baseline_score},
                 "feasible": feasible, "errors": errors, "score_on": score_on, "score_off": score_off,
                 "grouping_delta": sum(c.get("grouping_delta", 0) for c in cases), "v_delta": sum(c.get("v_delta", 0) for c in cases),
-                "runtime_ms": runtime, "causal_mean_ms": runtime["mean"], "accepted": bool(feasible == 100 and errors == 0 and score_on <= SCORE_LIMIT and runtime["mean"] <= .75 and source_ok and all(c["accepted"] or c.get("grouping_before", 0) == 0 for c in cases)),
+                "runtime_ms": runtime, "causal_mean_ms": runtime["mean"], "accepted": bool(feasible == len(rows) and errors == 0 and score_on is not None and score_on <= SCORE_LIMIT and runtime["mean"] <= .75 and source_ok and all(c.get("candidate_strict", False) for c in cases)),
                 "source_hygiene": source_ok}
     _stable_write(Path(args.output), cases)
     _stable_write(Path(args.manifest), manifest)

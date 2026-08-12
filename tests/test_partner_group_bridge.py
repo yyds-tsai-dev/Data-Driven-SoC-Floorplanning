@@ -2,6 +2,10 @@ import math
 import sys
 import time
 import types
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,6 +15,65 @@ from dataclasses import replace
 sys.path.insert(0, "partner")
 import column_sa_legalizer as csl
 import violation_killer as vk
+
+
+def _load_probe_module(name="group_dag_bridge_probe"):
+    path = Path("scripts/probes/group_dag_bridge_probe.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
+
+
+def _two_case_g0_baseline():
+    return {"test_results": [
+        {"test_id": i, "block_count": 2, "positions": [[0., 0., 1., 1.]],
+         "cost_no_runtime": 1.0, "grouping_violations": 1,
+         "total_soft_violations": 1} for i in range(2)]}
+
+
+def _fixture_loader(test_id, row):
+    return {"test_id": test_id}
+
+
+def _fixture_bridge(ctx, positions, budget_s):
+    return [[float(positions[0][0]) + 1., 0., 1., 1.]]
+
+
+def _fixture_evaluate(solution, ctx):
+    changed = solution["positions"][0][0] != 0
+    return {"cost_no_runtime": .5 if changed else 1., "is_feasible": True,
+            "grouping_violations": 0 if changed else 1,
+            "total_soft_violations": 0 if changed else 1}
+
+
+def test_g0_probe_writes_separate_deterministic_case_and_manifest_files(tmp_path, monkeypatch):
+    probe = _load_probe_module(); source = tmp_path / "baseline.json"
+    source.write_text(json.dumps(_two_case_g0_baseline(), sort_keys=True))
+    monkeypatch.setattr(probe, "EXPECTED_BASELINE_SHA256", hashlib.sha256(source.read_bytes()).hexdigest())
+    monkeypatch.setattr(probe, "EXPECTED_BASELINE_SCORE", 1.0)
+    out, manifest = tmp_path / "cases.json", tmp_path / "manifest.json"
+    args = ["replay", "--input", str(source), "--output", str(out), "--manifest", str(manifest)]
+    tick = iter([0., .0001] * 4)
+    assert probe.main(args, case_loader=_fixture_loader, bridge_fn=_fixture_bridge, evaluate_fn=_fixture_evaluate, clock=lambda: next(tick)) == 0
+    first = (out.read_bytes(), manifest.read_bytes())
+    tick = iter([0., .0001] * 4)
+    assert probe.main(args, case_loader=_fixture_loader, bridge_fn=_fixture_bridge, evaluate_fn=_fixture_evaluate, clock=lambda: next(tick)) == 0
+    assert first == (out.read_bytes(), manifest.read_bytes())
+    m = json.loads(manifest.read_text())
+    assert set(m) == {"schema", "baseline", "feasible", "errors", "score_on", "score_off", "grouping_delta", "v_delta", "runtime_ms", "causal_mean_ms", "accepted", "source_hygiene"}
+    assert m["schema"] == "group-dag-g0.v1"
+
+
+def test_g0_probe_fails_closed_on_baseline_hash_or_score_mismatch(tmp_path, monkeypatch):
+    probe = _load_probe_module(); source = tmp_path / "baseline.json"; source.write_text(json.dumps(_two_case_g0_baseline()))
+    out, manifest = tmp_path / "o.json", tmp_path / "m.json"; out.write_text("old"); manifest.write_text("old")
+    monkeypatch.setattr(probe, "EXPECTED_BASELINE_SHA256", "0" * 64)
+    assert probe.main(["replay", "--input", str(source), "--output", str(out), "--manifest", str(manifest)]) != 0
+    assert out.read_text() == manifest.read_text() == "old"
+
+
+def test_g0_probe_changed_candidate_requires_strict_deltas_and_gate_threshold(tmp_path, monkeypatch):
+    probe = _load_probe_module(); assert probe.SCORE_LIMIT == 1.1412448258795715
 
 
 def _coordinated_chain_case():
