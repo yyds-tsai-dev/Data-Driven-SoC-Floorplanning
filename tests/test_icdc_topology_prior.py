@@ -144,12 +144,20 @@ def test_teacher_manifest_hash_omits_self_and_binds_support_hashes():
 
 def test_teacher_checkpoint_hashes_bytes_before_torch_load(tmp_path, monkeypatch):
     t = _teacher(); p = tmp_path / "model.th"; payload = b"checkpoint-A"; p.write_bytes(payload)
-    policy = t.TeacherTrustPolicy(tmp_path, hashlib.sha256(payload).hexdigest(), {}, "b"*64, "c", "2")
-    seen = []
     state = {"layer.weight": torch.ones(1), "layer.bias": torch.zeros(1)}
-    monkeypatch.setattr(torch, "load", lambda fh, **k: (seen.append(fh.read()), {"model": state, "ema": {k: v.clone() for k, v in state.items()}, "model_config": {"d": 1}})[1])
+    def canon(v): return json.dumps(v, sort_keys=True, separators=(",", ":")).encode()
+    def keyset(s): return hashlib.sha256(b"".join(k.encode()+b"\0" for k in sorted(s))).hexdigest()
+    identity = {"identity_schema": "icdc_canonical_state_v1", "model_config_sha256": hashlib.sha256(canon({"d": 1})).hexdigest(), "model_keyset_sha256": keyset(state), "ema_keyset_sha256": keyset(state), "ema_state_sha256": hashlib.sha256(b"ema").hexdigest()}
+    policy = t.TeacherTrustPolicy(tmp_path, hashlib.sha256(payload).hexdigest(), identity, "b"*64, "c", "2")
+    seen = []
+    kwargs = {}
+    def fake_load(fh, **k):
+        kwargs.update(k); seen.append(fh.read())
+        return {"model": state, "ema": {k: v.clone() for k, v in state.items()}, "model_config": {"d": 1}}
+    monkeypatch.setattr(torch, "load", fake_load)
     loaded, identity = t._load_verified_checkpoint_bytes(p, policy)
     assert loaded["ema"] and seen == [payload] and identity["checkpoint_sha256"] == policy.expected_checkpoint_sha256
+    assert kwargs == {"weights_only": True, "map_location": "cpu"}
     policy_bad = dataclasses.replace(policy, expected_checkpoint_sha256="0"*64)
     with pytest.raises(ValueError, match="hash"):
         t._load_verified_checkpoint_bytes(p, policy_bad)
@@ -167,16 +175,22 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     t = _teacher(); tree = ast.parse(path.read_text())
     text = path.read_text()
     forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "BandFileSampler._instance", "shelf_fallback")
-    calls = [n.func for n in ast.walk(tree) if isinstance(n, ast.Call)]
-    assert not any(isinstance(n, ast.Name) and n.id in forbidden for n in calls)
+    def dotted(n):
+        if isinstance(n, ast.Name): return n.id
+        if isinstance(n, ast.Attribute):
+            p = dotted(n.value); return f"{p}.{n.attr}" if p else n.attr
+        return ""
+    calls = [dotted(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    assert not any(x in {"load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance"} for x in calls)
 
 
 def test_teacher_g0_state_precedence_literals():
     t = _teacher()
-    base = {"trust_ok": True, "scorer_ok": True, "input_ok": True, "legal": True, "coverage": True, "teacher_gain": 0, "delta": 0}
-    expected = ["KILLED_INPUT_CHECKPOINT_OR_SCORER", "KILLED_LEGALITY_OR_COVERAGE", "KILLED_TEACHER_GT_1_5", "STOP_HARD_GAIN_MISSED", "TARGET_GAIN_MET", "TARGET_GAIN_MISSED_NO_TRAINING_AUTHORITY"]
+    base = {"trust_ok": True, "scorer_ok": True, "input_ok": True, "legal": True, "coverage": True, "delta": 0}
+    expected = ["KILLED_INPUT_CHECKPOINT_OR_SCORER", "KILLED_LEGALITY_OR_COVERAGE", "KILLED_TEACHER_GT_1_5", "STOP_HARD_GAIN_MISSED", "TARGET_GAIN_MISSED_NO_TRAINING_AUTHORITY", "TARGET_GAIN_MET"]
     cases = [{**base, "trust_ok": False}, {**base, "legal": False}, {**base, "teacher_mean": 2}, {**base, "delta": 0.01}, {**base, "delta": 0.0181504738793652}, {**base, "delta": 0.0261247299384228}]
     assert [t._g0_state(c) for c in cases] == expected
+    assert t._g0_state({**base, "trust_ok": False, "legal": False, "teacher_mean": 2, "delta": .03}) == "KILLED_INPUT_CHECKPOINT_OR_SCORER"
 from icdc.topology_prior import topology_losses, extract_sparse_label
 from icdc.topology_prior import (
     ProposalConfig, ProposalResult, generate_proposals,
