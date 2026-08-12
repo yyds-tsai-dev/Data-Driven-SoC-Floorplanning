@@ -860,7 +860,7 @@ def test_hard_sizes_are_normalized_only_in_emitted_proposals():
 
 
 def test_mismatched_preplaced_pin_repairs_peer_and_reverses_repaired_pair_state():
-    raw = torch.tensor([[20., 0., 2., 2.], [0., 0., 2., 2.]], dtype=torch.float64)
+    raw = torch.tensor([[-20., 0., 2., 2.], [10., 0., 2., 2.]], dtype=torch.float64)
     case = _topology_case(raw, [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0]],
                           [[0., 0., 2., 2.], [-1., -1., -1., -1.]])
     out = [(name, rects) for name, rects in
