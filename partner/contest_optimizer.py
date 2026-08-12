@@ -816,11 +816,15 @@ class MyOptimizer(FloorplanOptimizer):
             from violation_killer import bridge_grouping_violations_dag
             dag_started = time.perf_counter() if dag_debug else None
             dagged = bridge_grouping_violations_dag(scorer, bridged, dag_budget)
+            dag_array = np.asarray([tuple(map(float, r)) for r in dagged], dtype=float)
+            base_array = np.asarray([tuple(map(float, r)) for r in bridged], dtype=float)
+            if dag_array.shape != base_array.shape or not np.all(np.isfinite(dag_array)):
+                return bridged
             if dag_debug:
                 elapsed_ms = (time.perf_counter() - dag_started) * 1000.0
                 from violation_killer import _grouping_count, _violations_exact, _bbox_area
-                p0 = np.asarray([tuple(map(float, r)) for r in bridged], dtype=float)
-                p1 = np.asarray([tuple(map(float, r)) for r in dagged], dtype=float)
+                p0 = base_array
+                p1 = dag_array
                 print(f"[gdag] n={len(bridged)} ms={elapsed_ms:.3f} "
                       f"grouping={_grouping_count(scorer, p0)}->{_grouping_count(scorer, p1)} "
                       f"V={_violations_exact(scorer, p0)}->{_violations_exact(scorer, p1)} "
