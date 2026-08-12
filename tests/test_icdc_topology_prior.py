@@ -4,6 +4,7 @@ import collections.abc
 import hashlib
 import io
 import json
+import math
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 from typing import Dict, Iterator, Optional, get_args, get_origin, get_type_hints
@@ -839,7 +840,12 @@ def test_axis_reverse_boundary_moves_block_exactly_and_is_named():
     raw = torch.tensor([[0., 0., 2., 2.], [4., 0., 2., 2.]], dtype=torch.float64)
     out = dict(generate_proposals(raw, _topology_case(raw, [[0, 0]] * 2), ProposalConfig(8, 0, 0, 32)))
     candidate = out["axis:0:1:0:0"]
-    assert candidate[1, 0].item() == pytest.approx(-2.)
+    expected = math.nextafter(1.0, -math.inf) - 1.0
+    assert candidate[1, 0].item() == expected
+    assert topology_prior._pair_state(candidate, 0, 1) == (0, 0)
+    assert topology_prior._proposal_fingerprint(candidate, [[0, 0]] * 2) == (
+        ("pair", 0, 1, 0, 0),
+    )
 
 
 def test_hard_sizes_are_normalized_only_in_emitted_proposals():
