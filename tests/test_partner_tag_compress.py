@@ -42,7 +42,9 @@ import contest_optimizer as co             # noqa: E402
 import layout_refiner as lr                # noqa: E402
 import tag_compress as tc                  # noqa: E402
 
-_ENV = ("PARTNER_TAG_COMPRESS", "PARTNER_TAG_COMPRESS_DEBUG")
+_ENV = ("PARTNER_TAG_COMPRESS", "PARTNER_TAG_COMPRESS_DEBUG",
+        "PARTNER_GROUP_BRIDGE", "PARTNER_GROUP_BRIDGE_BUDGET",
+        "PARTNER_GROUP_BRIDGE_DEBUG")
 
 
 @pytest.fixture(autouse=True)
@@ -127,6 +129,58 @@ def test_constructor_warms_dependencies_only_when_enabled(monkeypatch):
     monkeypatch.setenv("PARTNER_TAG_COMPRESS", "1")
     _opt()
     assert calls == ["warm"]
+
+
+def test_group_bridge_flag_warms_dependencies_in_constructor(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tc, "warm_dependencies",
+                        lambda: calls.append("warm"))
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    _opt()
+    assert calls == ["warm"]
+
+
+def test_both_final_flags_off_are_identity_without_scorer(monkeypatch):
+    out = [(0.0, 0.0, 1.0, 1.0)]
+    monkeypatch.setattr(co, "_ColumnOptimizer",
+                        lambda *a, **k: pytest.fail("scorer constructed"))
+    assert _opt()._tag_compress(out, torch.ones(1), torch.zeros((1, 5)),
+                                torch.full((1, 4), -1.0), torch.zeros((0, 3)),
+                                torch.zeros((0, 3)), torch.zeros((0, 2)), None) is out
+
+
+def test_group_bridge_works_with_tag_compress_off(monkeypatch):
+    n, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    monkeypatch.setattr(tc, "tag_compress",
+                        lambda *a, **k: pytest.fail("tag pass called"))
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations",
+                        lambda scorer, value, budget: value)
+    out = list(rects)
+    assert _opt()._tag_compress(out, at, cons, tpos, b2b, p2b, pins, None) is out
+
+
+def test_bridge_failure_preserves_tag_result(monkeypatch):
+    n, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_TAG_COMPRESS", "1")
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    accepted = [(1.0, 2.0, 3.0, 4.0)] * len(rects)
+    monkeypatch.setattr(tc, "tag_compress", lambda scorer, value: accepted)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins,
+                                None) is accepted
+
+
+def test_group_bridge_debug_reports_self_paired_fields(monkeypatch, capsys):
+    n, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE_DEBUG", "1")
+    out = list(rects)
+    _opt()._tag_compress(out, at, cons, tpos, b2b, p2b, pins, None)
+    err = capsys.readouterr().err
+    for field in ("ms=", "grouping=", "V=", "hpwl=", "bbox=", "committed="):
+        assert field in err
 
 
 def test_warm_dependencies_is_idempotent():
