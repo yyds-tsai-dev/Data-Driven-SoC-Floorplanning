@@ -87,10 +87,15 @@ def _constraints(case: Mapping[str, Any], n: int) -> list[list[int]]:
     cons = case.get("cons")
     if not isinstance(cons, (list, tuple)) or len(cons) != n:
         raise ValueError("cons")
+    widths = set()
     out = []
     for row in cons:
         if not isinstance(row, (list, tuple)) or len(row) not in (2, 5):
             raise ValueError("cons row")
+        widths.add(len(row))
+    if len(widths) > 1:
+        raise ValueError("cons row")
+    for row in cons:
         vals = []
         for value in row:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or int(value) != float(value):
