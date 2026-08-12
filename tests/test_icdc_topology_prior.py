@@ -55,7 +55,11 @@ def _teacher():
         raise ModuleNotFoundError(name)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
     return mod
 
 
@@ -74,12 +78,16 @@ def test_teacher_public_entrypoint_rejects_noncanonical_root_before_load(tmp_pat
     t = _teacher()
     monkeypatch.setattr(torch, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
     canonical = tmp_path / "canonical"; canonical.mkdir(); out = tmp_path / "out"
-    args = ["--data-root", str(tmp_path / "other"), "--out-dir", str(out), "--checkpoint", str(tmp_path / "m.th"), "--scorer", str(tmp_path / "s.py")]
+    identity = {"identity_schema": "icdc_canonical_state_v1", "model_config_sha256": "a"*64, "model_keyset_sha256": "b"*64, "ema_keyset_sha256": "c"*64, "ema_state_sha256": "d"*64}
+    policy = t.TeacherTrustPolicy(canonical, "a"*64, identity, "b"*64, "contract", "2.0")
+    args = ["--data-root", str(tmp_path / "other"), "--out-dir", str(out),
+            "--index-out", str(out / "training_index.json"),
+            "--checkpoint", str(tmp_path / "m.th")]
     with pytest.raises(ValueError, match="(canonical|provenance|validation)"):
-        t.teacher_main(args)
+        t.teacher_main(args, _trust_policy=policy)
     link = tmp_path / "link"; link.symlink_to(canonical, target_is_directory=True)
     with pytest.raises(ValueError, match="(canonical|provenance|symlink)"):
-        t.teacher_main([*args[:1], str(link), *args[2:]])
+        t.teacher_main([*args[:1], str(link), *args[2:]], _trust_policy=policy)
 
 
 def test_teacher_sample_seed_is_stable_order_independent_and_signed63():
@@ -145,29 +153,56 @@ def test_teacher_manifest_hash_omits_self_and_binds_support_hashes():
 def test_teacher_checkpoint_hashes_bytes_before_torch_load(tmp_path, monkeypatch):
     t = _teacher(); p = tmp_path / "model.th"; payload = b"checkpoint-A"; p.write_bytes(payload)
     state = {"layer.weight": torch.ones(1), "layer.bias": torch.zeros(1)}
-    def canon(v): return json.dumps(v, sort_keys=True, separators=(",", ":")).encode()
-    def keyset(s): return hashlib.sha256(b"".join(k.encode()+b"\0" for k in sorted(s))).hexdigest()
-    identity = {"identity_schema": "icdc_canonical_state_v1", "model_config_sha256": hashlib.sha256(canon({"d": 1})).hexdigest(), "model_keyset_sha256": keyset(state), "ema_keyset_sha256": keyset(state), "ema_state_sha256": hashlib.sha256(b"ema").hexdigest()}
+    def canon(v):
+        return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+    def encoded_state(s, *, include_values):
+        chunks = []
+        for key in sorted(s):
+            tensor = s[key].detach().cpu().contiguous()
+            dtype = str(tensor.dtype).removeprefix("torch.")
+            chunks.extend((key.encode("utf-8"), b"\0", dtype.encode("ascii"), b"\0",
+                           canon(list(tensor.shape)), b"\0"))
+            if include_values:
+                chunks.append(tensor.view(torch.uint8).numpy().tobytes())
+        return b"".join(chunks)
+    ema = {k: v.clone() for k, v in state.items()}
+    identity = {
+        "identity_schema": "icdc_canonical_state_v1",
+        "model_config_sha256": hashlib.sha256(canon({"d": 1})).hexdigest(),
+        "model_keyset_sha256": hashlib.sha256(encoded_state(state, include_values=False)).hexdigest(),
+        "ema_keyset_sha256": hashlib.sha256(encoded_state(ema, include_values=False)).hexdigest(),
+        "ema_state_sha256": hashlib.sha256(encoded_state(ema, include_values=True)).hexdigest(),
+    }
     policy = t.TeacherTrustPolicy(tmp_path, hashlib.sha256(payload).hexdigest(), identity, "b"*64, "c", "2")
     seen = []
     kwargs = {}
     def fake_load(fh, **k):
         kwargs.update(k); seen.append(fh.read())
-        return {"model": state, "ema": {k: v.clone() for k, v in state.items()}, "model_config": {"d": 1}}
+        return {"model": state, "ema": ema, "model_config": {"d": 1}}
     monkeypatch.setattr(torch, "load", fake_load)
-    loaded, identity = t._load_verified_checkpoint_bytes(p, policy)
-    assert loaded["ema"] and seen == [payload] and identity["checkpoint_sha256"] == policy.expected_checkpoint_sha256
+    loaded, actual_identity = t._load_verified_checkpoint_bytes(p, policy)
+    assert loaded["ema"] and seen == [payload]
+    assert actual_identity == {**identity, "checkpoint_sha256": policy.expected_checkpoint_sha256}
     assert kwargs == {"weights_only": True, "map_location": "cpu"}
     policy_bad = dataclasses.replace(policy, expected_checkpoint_sha256="0"*64)
     with pytest.raises(ValueError, match="hash"):
         t._load_verified_checkpoint_bytes(p, policy_bad)
+    identity_bad = {**identity, "ema_state_sha256": "0"*64}
+    with pytest.raises(ValueError, match="(identity|EMA|ema)"):
+        t._load_verified_checkpoint_bytes(
+            p, dataclasses.replace(policy, allowed_model_identity=identity_bad))
 
 
 def test_teacher_checkpoint_identity_schema_and_ema_requirements():
     t = _teacher()
     assert t._checkpoint_identity_schema() == "icdc_canonical_state_v1"
-    with pytest.raises((ValueError, TypeError)):
-        t._checkpoint_identity({"model": {}, "ema": {}, "model_config": {}})
+    for bad in [
+        {"model": {}, "ema": {}, "model_config": {}},
+        {"model": {"w": torch.ones(1)}, "model_config": {"d": 1}},
+        {"model": {"w": torch.ones(1)}, "ema": {}, "model_config": {"d": 1}},
+    ]:
+        with pytest.raises((ValueError, TypeError)):
+            t._checkpoint_identity(bad)
 
 
 def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
@@ -181,7 +216,8 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
             p = dotted(n.value); return f"{p}.{n.attr}" if p else n.attr
         return ""
     calls = [dotted(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
-    assert not any(x in {"load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance"} for x in calls)
+    forbidden_suffixes = ("load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance")
+    assert not any(any(x == suffix or x.endswith("." + suffix) for suffix in forbidden_suffixes) for x in calls)
 
 
 def test_teacher_g0_state_precedence_literals():
