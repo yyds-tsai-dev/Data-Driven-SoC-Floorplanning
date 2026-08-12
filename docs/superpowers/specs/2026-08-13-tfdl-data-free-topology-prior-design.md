@@ -161,6 +161,29 @@ minimum that killed pre-legalization energy training. The sparse separation,
 contact, and pin-margin losses are the only topology gradients supplied to the
 same-shape student.
 
+### Task 3 admission boundary
+
+Task 3 is intentionally narrower than teacher scoring. Its generator consumes
+a CPU floating `[N,4]` coordinate seed and emits CPU float64 `[N,4]`
+proposals. Mutations are deterministic in base → axis/order → pin → contact
+order and must realize their topology through the public TFDL recomputation;
+there is no hidden graph override. Axis/order mutations move only unpinned
+origins across the selected pair threshold. Pin repairs set every preplaced
+origin and repair the reverse incoming relation through the unpinned peer.
+Contact mutations bridge components only with exact face abutment and positive
+perpendicular overlap; dimensions and preplaced geometry remain fixed. The
+realized fingerprint covers every pair axis/direction and every exact
+cluster-contact relation, and the first realized fingerprint wins.
+
+Admission runs nonexact TFDL and exact TFDL from the original seed, requiring
+literal zero drift and bit-exact preplaced origins at both checks, then requires
+the engine hard dictionary to be all true. The public TFDL path does not call
+`shelf_fallback`; this is enforced with an AST boundary check. Task 3 verifies
+hard legality and contact intent only. It does not recompute group/boundary/MIB
+soft relations, call energy, or call `extract_sparse_label`; every
+`ProposalResult` has `cost=None` and `label=None`. Task 4 recomputes the
+evaluator-faithful soft profile/cost before extracting labels.
+
 Monitor constraint satisfaction, drift, hard legality, energy/ranking gain,
 collapse (loss diversity and output variance), and proposal/student diversity.
 Reject a run that wins by collapsing all outputs to one topology.

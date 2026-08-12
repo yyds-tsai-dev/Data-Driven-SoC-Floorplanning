@@ -234,14 +234,31 @@ def test_group_contact_requires_exact_abutment_and_positive_overlap():
   selected separation decision boundary; at most eight preplaced-aware path
   repairs; and at most eight missing grouping contacts with exact abutment and
   positive perpendicular-overlap seeds. Deduplicate by topology fingerprint
-  and stop at `total_cap`. Cast to float64. Run `T.tfdl` nonexact as the
-  equality-pinned feasibility check and require bit-exact preplaced origins
-  and zero drift, then rerun `T.tfdl(..., exact=True)` and call
-  `engine.verify_hard_legal`. Reject cycles, non-finite output, any drift,
-  overlap/hard failure, corner-only contact, loss of the intended exact
-  grouping contact after projection, or shelf use. Recompute evaluator-semantic
-  grouping/boundary/MIB relations before extracting a label. Keep `cost=None`;
-  only the teacher may call `EN.energy`, and only after these checks.
+  and stop at `total_cap`. The generator consumes a CPU floating `[N,4]`
+  coordinate seed and emits CPU float64 `[N,4]` proposals; coordinate
+  mutations must realize the requested topology when the public TFDL path
+  recomputes it, with no hidden graph override. Apply mutations in the fixed
+  base → axis/order → pin → contact order. Axis/order proposals cross the
+  selected pair threshold by moving only unpinned origins. Pin repairs set
+  all preplaced origins and repair the reverse incoming relation through the
+  unpinned peer. Contacts bridge components only through exact face abutment
+  with positive perpendicular overlap; dimensions and preplaced geometry stay
+  fixed. The realized fingerprint includes every pair axis/direction and exact
+  cluster-contact relation; the first realized fingerprint wins.
+
+  Admission runs `T.tfdl` nonexact from the original seed as the
+  equality-pinned feasibility check, requiring literal zero drift and bit-exact
+  preplaced origins, then runs exact TFDL from that same original seed and
+  calls `engine.verify_hard_legal`, whose hard dictionary must be all true.
+  Reject cycles, non-finite output, any drift, overlap/hard failure, corner-only
+  contact, loss of the intended exact grouping contact after projection, or
+  shelf use. The public TFDL path must not call `shelf_fallback`; enforce that
+  boundary with an AST check rather than runtime detection. Task 3 verifies
+  only hard legality and contact intent; it does not verify group/boundary/MIB
+  or recompute the full soft profile. Keep `cost=None` and `label=None` in
+  every `ProposalResult`; Task 3 never imports/calls energy or
+  `extract_sparse_label`. Task 4 recomputes the evaluator-faithful soft
+  profile/cost and extracts labels.
 - [ ] Run focused tests; expect PASS; run `graphify update .` without staging graph dirt; commit `git add partner/icdc/topology_prior.py tests/test_icdc_topology_prior.py && git commit -m "feat: add exact topology proposal path"`.
 
 ### Task 4: Deterministic teacher and G0
