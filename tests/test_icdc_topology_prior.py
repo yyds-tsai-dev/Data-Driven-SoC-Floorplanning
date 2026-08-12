@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
@@ -9,6 +10,7 @@ import torch
 from icdc.data import target_positions_from_rects
 
 from icdc.topology_data import (
+    CorpusSourceReceipt,
     fingerprint_case,
     load_sanitized_corpus,
     save_sanitized_corpus,
@@ -23,7 +25,10 @@ from icdc.topology_data import (
     canonical_jsonl_sha256,
     collate_labels,
     write_sha256_manifest,
+    source_instance_id,
 )
+
+import icdc.topology_data as topology_data
 
 CANONICAL_ROOT = Path("FloorSet/floorset_lite").resolve()
 
@@ -46,7 +51,309 @@ def _case(**extra):
 
 
 def _save(path, cases, **kwargs):
-    return save_sanitized_corpus(path, cases, source_root=CANONICAL_ROOT, **kwargs)
+    path = Path(path)
+    root = path.parent / "floorset_lite"
+    root.mkdir(parents=True, exist_ok=True)
+    topology_data._CANONICAL_ROOT = root.resolve()
+    source_cases = []
+    receipts = []
+    for index, case in enumerate(cases):
+        try:
+            n = int(case["n"])
+            cons = torch.as_tensor(case["cons"], dtype=torch.float64)
+            area = torch.as_tensor(case["area"], dtype=torch.float64)
+            tp = torch.as_tensor(case["tp"], dtype=torch.float64)
+            fp = []
+            for row in tp:
+                width = float(row[2]) if float(row[2]) > 0 else 1.0
+                height = float(row[3]) if float(row[3]) > 0 else 1.0
+                x = float(row[0]) if float(row[0]) >= 0 else 0.0
+                y = float(row[1]) if float(row[1]) >= 0 else 0.0
+                fp.append([width, height, x, y])
+            input_rows = torch.cat((area.reshape(n, 1), cons), dim=1)
+            shard = [
+                [input_rows],
+                [torch.as_tensor(case["b2b"], dtype=torch.float64).reshape(-1, 3)],
+                [torch.as_tensor(case["p2b"], dtype=torch.float64).reshape(-1, 3)],
+                [torch.as_tensor(case["pins"], dtype=torch.float64).reshape(-1, 2)],
+                [torch.zeros((n, 1), dtype=torch.float64)],
+                [torch.tensor(fp, dtype=torch.float64)],
+                [
+                    torch.tensor(
+                        [float(case["area_ref"]), 0.0, float(case["hpwl_ref"])],
+                        dtype=torch.float64,
+                    )
+                ],
+            ]
+            relative = "worker_0/layouts.th"
+            shard_path = root / relative
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(shard, shard_path)
+            digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
+            receipt = CorpusSourceReceipt(
+                relative_path=relative,
+                file_sha256=digest,
+                layout_index=0,
+                fingerprint="0" * 64,
+            )
+            source_cases.append(dict(case, instance_id=source_instance_id(receipt)))
+            receipts.append(receipt)
+        except Exception:
+            source_cases.append(case)
+            receipts.append(None)
+    for i, receipt in enumerate(receipts):
+        if receipt is not None:
+            receipts[i] = dataclasses.replace(
+                receipt,
+                fingerprint=fingerprint_case(source_cases[i]),
+            )
+    return save_sanitized_corpus(
+        path,
+        source_cases,
+        source_root=root,
+        source_receipts=receipts,
+        **kwargs,
+    )
+
+
+def _fake_bound_source(tmp_path, monkeypatch, count=2):
+    root = (tmp_path / "floorset_lite").resolve()
+    shard_path = root / "worker_0" / "layouts.th"
+    shard_path.parent.mkdir(parents=True)
+    raw_inputs = []
+    raw_fps = []
+    metrics = []
+    cases = []
+    for index in range(count):
+        input_rows = torch.tensor(
+            [
+                [198.0 + index, 1.0, 1.0, 2.0, 7.0, 3.0],
+                [104.0 + index, 0.0, 0.0, 4.0, 9.0, 0.0],
+            ],
+            dtype=torch.float64,
+        )
+        fp = torch.tensor(
+            [[22.0, 9.0, 40.0, 45.0], [13.0, 8.0, 3.0, 4.0]],
+            dtype=torch.float64,
+        )
+        raw_inputs.append(input_rows)
+        raw_fps.append(fp)
+        metrics.append(torch.tensor([100.0 + index, 0.0, 5.0], dtype=torch.float64))
+    shard = [
+        raw_inputs,
+        [torch.empty((0, 3), dtype=torch.float64) for _ in range(count)],
+        [torch.empty((0, 3), dtype=torch.float64) for _ in range(count)],
+        [torch.empty((0, 2), dtype=torch.float64) for _ in range(count)],
+        [torch.zeros((2, 1), dtype=torch.float64) for _ in range(count)],
+        raw_fps,
+        metrics,
+    ]
+    torch.save(shard, shard_path)
+    digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
+    for index in range(count):
+        receipt = CorpusSourceReceipt(
+            relative_path="worker_0/layouts.th",
+            file_sha256=digest,
+            layout_index=index,
+            fingerprint="0" * 64,
+        )
+        raw = raw_fps[index]
+        rects = [
+            (float(row[2]), float(row[3]), float(row[0]), float(row[1])) for row in raw
+        ]
+        case = {
+            "instance_id": source_instance_id(receipt),
+            "n": 2,
+            "area": [198.0 + index, 104.0 + index],
+            "cons": [[1, 1, 2, 7, 3], [0, 0, 4, 9, 0]],
+            "tp": target_positions_from_rects(
+                rects, raw_inputs[index][:, 1:], 2
+            ).tolist(),
+            "b2b": [],
+            "p2b": [],
+            "pins": [],
+            "hpwl_ref": 5.0,
+            "area_ref": 100.0 + index,
+        }
+        receipt = dataclasses.replace(receipt, fingerprint=fingerprint_case(case))
+        cases.append(case)
+        if index == 0:
+            first_receipt = receipt
+        else:
+            second_receipt = receipt
+    monkeypatch.setattr(topology_data, "_CANONICAL_ROOT", root)
+    return root, cases, [first_receipt, second_receipt]
+
+
+def test_source_receipt_schema_is_frozen_and_bound(tmp_path, monkeypatch):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    assert [field.name for field in fields(CorpusSourceReceipt)] == [
+        "relative_path",
+        "file_sha256",
+        "layout_index",
+        "fingerprint",
+    ]
+    assert dataclasses.is_dataclass(CorpusSourceReceipt)
+    assert CorpusSourceReceipt.__dataclass_params__.frozen
+    assert get_type_hints(CorpusSourceReceipt) == {
+        "relative_path": str,
+        "file_sha256": str,
+        "layout_index": int,
+        "fingerprint": str,
+    }
+    assert source_instance_id(receipts[0]) == "worker_0/layouts.th#0"
+    save_sanitized_corpus(
+        tmp_path / "bound.jsonl",
+        [cases[0]],
+        source_root=root,
+        source_receipts=[receipts[0]],
+    )
+    assert load_sanitized_corpus(tmp_path / "bound.jsonl")[0]["n"] == 2
+
+
+def test_receipt_rejects_arbitrary_case_and_preserves_existing_output(
+    tmp_path, monkeypatch
+):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    output = tmp_path / "bound.jsonl"
+    output.write_bytes(b"before")
+    tampered = dict(cases[0], area=[999.0, 104.0])
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            output,
+            [tampered],
+            source_root=root,
+            source_receipts=[receipts[0]],
+        )
+    assert output.read_bytes() == b"before"
+
+
+def test_receipt_for_different_raw_row_rejects(tmp_path, monkeypatch):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            tmp_path / "different-row",
+            [cases[0]],
+            source_root=root,
+            source_receipts=[receipts[1]],
+        )
+
+
+@pytest.mark.parametrize("field", ["instance_id", "fingerprint", "file_sha256"])
+def test_receipt_rejects_tampered_binding_fields(tmp_path, monkeypatch, field):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    altered_case = dict(cases[0])
+    altered_receipt = receipts[0]
+    if field == "instance_id":
+        altered_case["instance_id"] = "spoofed"
+    elif field == "fingerprint":
+        altered_receipt = dataclasses.replace(altered_receipt, fingerprint="f" * 64)
+    else:
+        altered_receipt = dataclasses.replace(altered_receipt, file_sha256="0" * 64)
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            tmp_path / f"bad-{field}",
+            [altered_case],
+            source_root=root,
+            source_receipts=[altered_receipt],
+        )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["../worker_0/layouts.th", "/tmp/layouts.th", "", "worker/link.th"],
+)
+def test_receipt_rejects_unsafe_paths(tmp_path, monkeypatch, relative_path):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    altered = dataclasses.replace(receipts[0], relative_path=relative_path)
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            tmp_path / "bad-path",
+            [cases[0]],
+            source_root=root,
+            source_receipts=[altered],
+        )
+
+
+def test_receipt_rejects_symlink_escape(tmp_path, monkeypatch):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.th"
+    outside.write_bytes((root / receipts[0].relative_path).read_bytes())
+    link = root / "worker_0" / "escape.th"
+    link.symlink_to(outside)
+    altered = dataclasses.replace(
+        receipts[0],
+        relative_path="worker_0/escape.th",
+        file_sha256=hashlib.sha256(outside.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            tmp_path / "symlink-escape",
+            [cases[0]],
+            source_root=root,
+            source_receipts=[altered],
+        )
+
+
+@pytest.mark.parametrize("layout_index", [True, -1, 2, 1.0, "0"])
+def test_receipt_rejects_bad_layout_index(tmp_path, monkeypatch, layout_index):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    altered = dataclasses.replace(receipts[0], layout_index=layout_index)
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            tmp_path / "bad-index",
+            [cases[0]],
+            source_root=root,
+            source_receipts=[altered],
+        )
+
+
+def test_receipt_rejects_wrong_type_count_and_order(tmp_path, monkeypatch):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    for bad in (object(), [receipts[0], receipts[1]], [receipts[1]]):
+        with pytest.raises(ValueError):
+            save_sanitized_corpus(
+                tmp_path / "bad-receipts",
+                cases[:1],
+                source_root=root,
+                source_receipts=bad,
+            )
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            tmp_path / "bad-order",
+            cases,
+            source_root=root,
+            source_receipts=[receipts[1], receipts[0]],
+        )
+
+
+def test_repeated_shard_path_and_integral_float_source_rows_are_valid(
+    tmp_path, monkeypatch
+):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    save_sanitized_corpus(
+        tmp_path / "repeated.jsonl",
+        cases,
+        source_root=root,
+        source_receipts=receipts,
+    )
+    assert len(load_sanitized_corpus(tmp_path / "repeated.jsonl")) == 2
+
+
+def test_corrupt_source_shard_rejects_without_partial_write(tmp_path, monkeypatch):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    shard_path = root / receipts[0].relative_path
+    shard_path.write_bytes(b"corrupt")
+    output = tmp_path / "corrupt.jsonl"
+    output.write_bytes(b"before")
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            output,
+            [cases[0]],
+            source_root=root,
+            source_receipts=[receipts[0]],
+        )
+    assert output.read_bytes() == b"before"
 
 
 def test_sanitize_excludes_golden_and_masks_non_input_geometry(tmp_path):
@@ -95,7 +402,9 @@ def test_rejects_test_id_and_explicit_none_root(tmp_path):
     with pytest.raises(ValueError):
         _save(tmp_path / "x", [_case(test_id=1)])
     with pytest.raises(ValueError):
-        save_sanitized_corpus(tmp_path / "x", [_case()], source_root=None)
+        save_sanitized_corpus(
+            tmp_path / "x", [_case()], source_root=None, source_receipts=[]
+        )
 
 
 def test_duplicate_content_under_distinct_ids_and_invalid_split():
@@ -212,15 +521,15 @@ def test_empty_case_is_valid(tmp_path):
 )
 def test_source_root_restrictions(tmp_path, root):
     with pytest.raises(ValueError):
-        save_sanitized_corpus(tmp_path / "x", [_case()], source_root=root)
+        save_sanitized_corpus(
+            tmp_path / "x", [_case()], source_root=root, source_receipts=[]
+        )
 
 
-@pytest.mark.parametrize("root", [Path("FloorSet/floorset_lite"), CANONICAL_ROOT])
-def test_explicit_canonical_source_root(tmp_path, root):
+def test_explicit_canonical_source_root(tmp_path, monkeypatch):
+    fake_root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
     save_sanitized_corpus(
-        tmp_path / "x",
-        [_case()],
-        source_root=root,
+        tmp_path / "x", cases[:1], source_root=fake_root, source_receipts=receipts[:1]
     )
 
 
@@ -389,6 +698,7 @@ def test_sequence_inputs_reject_non_sequences(tmp_path, bad):
             tmp_path / "bad",
             bad,
             source_root=CANONICAL_ROOT,
+            source_receipts=[],
         )
 
 
@@ -510,6 +820,30 @@ def test_collate_rejects_nonfloating_dtype_and_weight_overflow():
 
     with pytest.raises(ValueError):
         collate_labels([label], torch.device("meta"), torch.float32)
+
+
+def test_collate_rejects_float8_dtypes():
+    label = TopologyLabel(
+        "x",
+        2,
+        1,
+        1.0,
+        1.0,
+        1.0,
+        (SparseEdge(0, 1, 0, 1.0, "sep", 1.0),),
+        (),
+        (),
+    )
+    for name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    ):
+        dtype = getattr(torch, name, None)
+        if dtype is not None:
+            with pytest.raises(ValueError):
+                collate_labels([label], torch.device("cpu"), dtype)
 
 
 def test_collate_rejects_tensor_record_weight():

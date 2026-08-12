@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from numbers import Real
@@ -79,6 +80,14 @@ class SparseTopologyBatch:
     contact_order: torch.Tensor
     contact_margin: torch.Tensor
     contact_weight: torch.Tensor
+
+
+@dataclass(frozen=True)
+class CorpusSourceReceipt:
+    relative_path: str
+    file_sha256: str
+    layout_index: int
+    fingerprint: str
 
 
 def _path(value: str | Path) -> Path:
@@ -326,6 +335,143 @@ def split_for_id(instance_id: str, heldout_mod: int = 10) -> str:
     return "heldout" if digest % heldout_mod == 0 else "train"
 
 
+def _validate_digest(value: Any, name: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def source_instance_id(receipt: CorpusSourceReceipt) -> str:
+    if type(receipt) is not CorpusSourceReceipt:
+        raise ValueError("receipt type")
+    if not isinstance(receipt.relative_path, str) or not receipt.relative_path:
+        raise ValueError("receipt path")
+    if "\\" in receipt.relative_path:
+        raise ValueError("receipt path")
+    if Path(receipt.relative_path).is_absolute() or any(
+        part in {"", ".", ".."} for part in receipt.relative_path.split("/")
+    ):
+        raise ValueError("receipt path")
+    if type(receipt.layout_index) is not int or receipt.layout_index < 0:
+        raise ValueError("receipt index")
+    return f"{receipt.relative_path}#{receipt.layout_index}"
+
+
+def _receipt_relative_path(root: Path, receipt: CorpusSourceReceipt) -> Path:
+    if type(receipt) is not CorpusSourceReceipt:
+        raise ValueError("receipt type")
+    relative = receipt.relative_path
+    if not isinstance(relative, str) or not relative.strip():
+        raise ValueError("receipt path")
+    if "\\" in relative:
+        raise ValueError("receipt path")
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.split("/")
+    ):
+        raise ValueError("receipt path")
+    resolved = (root / relative_path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("receipt path escapes source root") from exc
+    if not resolved.is_file():
+        raise ValueError("receipt source file")
+    return resolved
+
+
+def _load_receipt_source(
+    root: Path,
+    receipt: CorpusSourceReceipt,
+    cache: dict[Path, tuple[str, Any]],
+) -> Any:
+    resolved = _receipt_relative_path(root, receipt)
+    expected_sha = _validate_digest(receipt.file_sha256, "receipt hash")
+    if resolved not in cache:
+        try:
+            actual_sha = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise ValueError("cannot hash receipt source") from exc
+        if actual_sha != expected_sha:
+            raise ValueError("receipt hash mismatch")
+        try:
+            source = torch.load(
+                resolved,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except Exception as exc:
+            raise ValueError("cannot load receipt source") from exc
+        cache[resolved] = (actual_sha, source)
+    elif cache[resolved][0] != expected_sha:
+        raise ValueError("receipt hash mismatch")
+    source = cache[resolved][1]
+    if not isinstance(source, (list, tuple)) or len(source) < 7:
+        raise ValueError("malformed receipt source")
+    for array in source[:7]:
+        if not isinstance(array, (list, tuple)):
+            raise ValueError("malformed receipt source")
+        if receipt.layout_index >= len(array):
+            raise ValueError("receipt index range")
+    return source
+
+
+def _source_case_from_receipt(
+    root: Path,
+    receipt: CorpusSourceReceipt,
+    cache: dict[Path, tuple[str, Any]],
+) -> dict[str, Any]:
+    _validate_digest(receipt.fingerprint, "receipt fingerprint")
+    if type(receipt.layout_index) is not int or isinstance(receipt.layout_index, bool):
+        raise ValueError("receipt index")
+    source = _load_receipt_source(root, receipt, cache)
+    try:
+        from .data import BandFileSampler
+
+        case = BandFileSampler._instance(source, receipt.layout_index)
+    except Exception as exc:
+        raise ValueError("cannot reconstruct receipt source") from exc
+    if not isinstance(case, Mapping):
+        raise ValueError("malformed reconstructed case")
+    reconstructed = dict(case)
+    reconstructed["instance_id"] = source_instance_id(receipt)
+    return _sanitize(reconstructed)
+
+
+def _verify_source_receipts(
+    cases: Sequence[Mapping[str, Any]],
+    source_root: Path,
+    source_receipts: Sequence[CorpusSourceReceipt],
+) -> list[dict[str, Any]]:
+    if isinstance(source_receipts, (str, bytes, Mapping)) or not isinstance(
+        source_receipts, (list, tuple)
+    ):
+        raise ValueError("source_receipts")
+    if len(source_receipts) != len(cases):
+        raise ValueError("source receipt count")
+    cache: dict[Path, tuple[str, Any]] = {}
+    verified: list[dict[str, Any]] = []
+    for case, receipt in zip(cases, source_receipts):
+        if type(receipt) is not CorpusSourceReceipt:
+            raise ValueError("receipt type")
+        expected_id = source_instance_id(receipt)
+        if not _validate_digest(receipt.fingerprint, "receipt fingerprint"):
+            raise ValueError("receipt fingerprint")
+        source_case = _source_case_from_receipt(source_root, receipt, cache)
+        source_fingerprint = fingerprint_case(source_case)
+        if source_fingerprint != receipt.fingerprint:
+            raise ValueError("receipt fingerprint mismatch")
+        if not isinstance(case, Mapping):
+            raise ValueError("case must be mapping")
+        if case.get("instance_id") != expected_id:
+            raise ValueError("instance id is not receipt-bound")
+        provided = _sanitize(case)
+        if fingerprint_case(provided) != source_fingerprint:
+            raise ValueError("case does not match receipt source")
+        verified.append(provided)
+    return verified
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -351,7 +497,8 @@ def save_sanitized_corpus(
     path: str | Path,
     cases: Sequence[Mapping[str, Any]],
     *,
-    source_root: str | Path | None,
+    source_root: str | Path,
+    source_receipts: Sequence[CorpusSourceReceipt],
 ) -> None:
     try:
         root = _path(source_root).resolve()
@@ -361,7 +508,7 @@ def save_sanitized_corpus(
         raise ValueError("source_root")
     if isinstance(cases, (str, bytes, Mapping)) or not isinstance(cases, Sequence):
         raise ValueError("cases")
-    rows = [_sanitize(case) for case in cases]
+    rows = _verify_source_receipts(cases, root, source_receipts)
     fingerprints = [fingerprint_case(row) for row in rows]
     if len(set(fingerprints)) != len(fingerprints):
         raise ValueError("duplicate fingerprint")
@@ -456,7 +603,13 @@ def _validate_device_dtype(device: torch.device, dtype: torch.dtype) -> torch.de
         raise ValueError("invalid device") from exc
     if resolved_device.type not in {"cpu", "cuda", "mps"}:
         raise ValueError("unsupported device")
-    if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+    supported_dtypes = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    }
+    if dtype not in supported_dtypes:
         raise ValueError("dtype must be floating point")
     return resolved_device
 
