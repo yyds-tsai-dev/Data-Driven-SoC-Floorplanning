@@ -175,9 +175,21 @@ perpendicular overlap; dimensions and preplaced geometry remain fixed. The
 realized fingerprint covers every pair axis/direction and every exact
 cluster-contact relation, and the first realized fingerprint wins.
 
+The Task 3 case adapter consumes the full sanitized case schema:
+`cons[:,0]=fixed`, `cons[:,1]=preplaced`, `cons[:,2]=MIB`,
+`cons[:,3]=cluster`, `cons[:,4]=boundary`, with `area[N]` and `tp[N,4]`.
+Each proposal is batched as `[1,N,4]` with `mask=area>0`,
+`pinned=(cons[:,1]!=0)&authorized_tp_origins`, `pin_xy=tp[:,:2]`, and
+`boundary_code=cons[:,4]` (or zeros for uniform two-column boundary input).
+The proposal fixture therefore uses the full five-column `cons` schema; a
+disconnected cluster pair is not represented by a two-column group shortcut.
+
 Admission runs nonexact TFDL and exact TFDL from the original seed, requiring
 literal zero drift and bit-exact preplaced origins at both checks, then requires
-the engine hard dictionary to be all true. The public TFDL path does not call
+the engine call `verify_hard_legal(P_np, area_np, cons_np, tp_np)` to return an
+all-true hard dictionary. This verifier checks shape, positive area,
+dimensions, preplaced origins, and overlap only; it does not verify
+boundary/group/MIB semantics. The public TFDL path does not call
 `shelf_fallback`; this is enforced with an AST boundary check. Task 3 verifies
 hard legality and contact intent only. It does not recompute group/boundary/MIB
 soft relations, call energy, or call `extract_sparse_label`; every

@@ -194,7 +194,8 @@ a_before_b:bool, perp_margin:float)->bool`.
 
 - [ ] Write these concrete RED tests (the local `proposal_fixture()` returns a
   four-block sanitized case with one preplaced block and one disconnected
-  grouping pair):
+  cluster pair (the full five-column `cons` schema, not a two-column group
+  shorthand):
 ```python
 def test_proposals_are_deterministic_named_and_capped():
     raw, case = proposal_fixture()
@@ -246,10 +247,24 @@ def test_group_contact_requires_exact_abutment_and_positive_overlap():
   fixed. The realized fingerprint includes every pair axis/direction and exact
   cluster-contact relation; the first realized fingerprint wins.
 
+  The Task 3 case adapter consumes the full sanitized schema with
+  `cons[:,0]=fixed`, `cons[:,1]=preplaced`, `cons[:,2]=MIB`,
+  `cons[:,3]=cluster`, and `cons[:,4]=boundary`, plus `area[N]` and
+  `tp[N,4]`. It batches each proposal as `[1,N,4]`, masks `area > 0`, and
+  derives `pinned=(cons[:,1] != 0) & authorized_tp_origins`,
+  `pin_xy=tp[:,:2]`, and `boundary_code=cons[:,4]` (or zeros for a uniform
+  two-column boundary input). The adapter preserves dimensions and fixed
+  geometry from the case rather than inferring them from proposal coordinates.
+
   Admission runs `T.tfdl` nonexact from the original seed as the
   equality-pinned feasibility check, requiring literal zero drift and bit-exact
   preplaced origins, then runs exact TFDL from that same original seed and
-  calls `engine.verify_hard_legal`, whose hard dictionary must be all true.
+  calls `engine.verify_hard_legal(P_np, area_np, cons_np, tp_np)`, whose hard
+  dictionary must be all true. That verifier checks shape, positive area,
+  dimensions, preplaced origins, and overlap only; it does not verify
+  boundary, grouping, or MIB semantics. The nonexact and exact calls each use
+  the same original seed independently and each must pass its own literal
+  zero-drift and pin-equality checks.
   Reject cycles, non-finite output, any drift, overlap/hard failure, corner-only
   contact, loss of the intended exact grouping contact after projection, or
   shelf use. The public TFDL path must not call `shelf_fallback`; enforce that
