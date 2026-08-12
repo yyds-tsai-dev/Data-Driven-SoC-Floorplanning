@@ -817,6 +817,24 @@ def test_generator_fingerprints_are_unique_and_inputs_immutable():
     assert torch.equal(raw, before[0]) and repr(case) == before[1]
 
 
+def test_generator_deduplicates_realized_fingerprints_across_proposal_kinds(proposal_fixture):
+    """Axis and pin proposals must not re-emit the same realized topology."""
+    raw, case = proposal_fixture
+    out = list(generate_proposals(raw, case, ProposalConfig()))
+    fingerprints = [_topology_fingerprint(rects, case["cons"]) for _, rects in out]
+
+    assert len(set(fingerprints)) == len(out)
+    earlier = {
+        fingerprint
+        for (name, _), fingerprint in zip(out, fingerprints)
+        if name == "base" or name.startswith("axis:")
+    }
+    assert not any(
+        name.startswith("pin:") and fingerprint in earlier
+        for (name, _), fingerprint in zip(out, fingerprints)
+    )
+
+
 def test_axis_reverse_boundary_moves_block_exactly_and_is_named():
     raw = torch.tensor([[0., 0., 2., 2.], [4., 0., 2., 2.]], dtype=torch.float64)
     out = dict(generate_proposals(raw, _topology_case(raw, [[0, 0]] * 2), ProposalConfig(8, 0, 0, 32)))
