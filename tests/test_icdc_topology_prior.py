@@ -6,6 +6,8 @@ from icdc.topology_data import (
 )
 from icdc.topology_data import ContactLabel, SparseEdge, TopologyLabel, collate_labels, canonical_jsonl, canonical_jsonl_sha256, write_sha256_manifest
 import torch
+from dataclasses import fields, FrozenInstanceError
+import dataclasses
 
 
 def _case(**extra):
@@ -66,3 +68,49 @@ def test_manifest_hash_and_collate_contract(tmp_path):
     assert batch.edge_batch.shape == (1,) and batch.edge_weight.dtype == torch.float32
     empty = collate_labels([], torch.device("cpu"), torch.float64)
     assert all(getattr(empty, f).shape == (0,) for f in empty.__dataclass_fields__)
+
+def test_schema_field_order_and_frozen_contract():
+    assert [f.name for f in fields(SparseEdge)] == ["src", "dst", "axis", "margin", "kind", "weight"]
+    assert [f.name for f in fields(ContactLabel)] == ["a", "b", "axis", "a_before_b", "perp_margin", "weight"]
+    assert [f.name for f in fields(TopologyLabel)] == ["instance_id", "n", "sample_seed", "teacher_cost", "base_cost", "record_weight", "edges", "contacts", "pin_paths"]
+    with pytest.raises(FrozenInstanceError):
+        SparseEdge(0, 1, 0, 1., "x", 1.).src = 2
+
+def test_five_column_constraints_are_retained_and_two_column_masks(tmp_path):
+    row = _case(cons=[[1, 1, 1, 0, 1], [0, 0, 1, 1, 0], [0, 1, 0, 1, 1]])
+    save_sanitized_corpus(tmp_path / "five", [row])
+    got = load_sanitized_corpus(tmp_path / "five")[0]
+    assert got["cons"] == row["cons"]
+    assert got["tp"] == [[7., 8., 2., 2.], [-1., -1., -1., -1.], [5., 6., 5., 6.]]
+
+@pytest.mark.parametrize("bad", ["abc", {"x": 1}, None, 4])
+def test_sequence_inputs_reject_non_sequences(tmp_path, bad):
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "bad", bad)
+
+def test_zero_hpwl_and_self_b2b_allowed(tmp_path):
+    row = _case(hpwl_ref=0., b2b=[[0, 0, 0.]])
+    save_sanitized_corpus(tmp_path / "ok", [row])
+    assert load_sanitized_corpus(tmp_path / "ok")[0]["hpwl_ref"] == 0.
+
+@pytest.mark.parametrize("bad", [-1., float("nan"), float("inf"), "0"])
+def test_bad_hpwl_rejected(tmp_path, bad):
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "bad", [_case(hpwl_ref=bad)])
+
+def test_canonical_nonfinite_unserializable_and_no_partial(tmp_path):
+    p = tmp_path / "x"; p.write_text("original")
+    for row in ({"x": float("nan")}, {"x": object()}):
+        with pytest.raises(ValueError): canonical_jsonl(p, [row])
+        assert p.read_text() == "original"
+
+def test_manifest_missing_and_no_partial(tmp_path):
+    p = tmp_path / "manifest"; p.write_text("original")
+    with pytest.raises(ValueError): write_sha256_manifest(p, [tmp_path / "missing"])
+    assert p.read_text() == "original"
+
+@pytest.mark.parametrize("bad", [True, 1.0, -1, "1"])
+def test_split_invalid_matrix(bad):
+    with pytest.raises(ValueError): split_for_id("x", bad)
+
+@pytest.mark.parametrize("bad", [object(), None, {"src": 1}, "x"])
+def test_collate_rejects_bad_labels_container(bad):
+    with pytest.raises(ValueError): collate_labels(bad, torch.device("cpu"), torch.float32)

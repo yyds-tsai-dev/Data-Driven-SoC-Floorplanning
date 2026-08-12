@@ -6,7 +6,7 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence, Tuple
 
@@ -56,23 +56,27 @@ def _sanitize(case: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("area", "cons", "tp"):
         if not isinstance(case[key], (list, tuple)) or len(case[key]) != n: raise ValueError(key)
     if any(not _num(x, positive=True) for x in case["area"]): raise ValueError("area")
-    if any(not isinstance(r, (list, tuple)) or len(r) != 2 or any(type(x) is not int or x not in (0, 1) for x in r) for r in case["cons"]): raise ValueError("cons")
+    widths = {len(r) for r in case["cons"] if isinstance(r, (list, tuple))}
+    if widths not in ({2}, {5}) or any(not isinstance(r, (list, tuple)) or len(r) not in (2, 5) or any(type(x) is not int or x not in (0, 1) for x in r) for r in case["cons"]): raise ValueError("cons")
     for r in case["tp"]:
         if not isinstance(r, (list, tuple)) or len(r) != 4 or any(not _num(x) for x in r): raise ValueError("tp")
     for key, width in (("b2b", 3), ("p2b", 3), ("pins", 2)):
         if not isinstance(case[key], (list, tuple)): raise ValueError(key)
         if any(not isinstance(r, (list, tuple)) or len(r) != width or any(not _num(x) for x in r) for r in case[key]): raise ValueError(key)
     for r in case["b2b"]:
-        if type(r[0]) is not int or type(r[1]) is not int or not (0 <= r[0] < n and 0 <= r[1] < n) or r[0] == r[1] or not _num(r[2], nonnegative=True): raise ValueError("b2b endpoint")
+        if type(r[0]) is not int or type(r[1]) is not int or not (0 <= r[0] < n and 0 <= r[1] < n) or not _num(r[2], nonnegative=True): raise ValueError("b2b endpoint")
     for r in case["p2b"]:
         if type(r[0]) is not int or type(r[1]) is not int or not (0 <= r[0] < len(case["pins"]) and 0 <= r[1] < n) or not _num(r[2], nonnegative=True): raise ValueError("p2b endpoint")
-    if not _num(case["hpwl_ref"], positive=True) or not _num(case["area_ref"], positive=True): raise ValueError("reference")
+    if not _num(case["hpwl_ref"], nonnegative=True) or not _num(case["area_ref"], positive=True): raise ValueError("reference")
     out = {k: case[k] for k in CORPUS_KEYS}
     out["tp"] = [[float(v) if (c[1] or (c[0] and j >= 2)) else -1.0 for j, v in enumerate(r)] for r, c in zip(case["tp"], case["cons"])]
     return out
 
 def _canonical(obj: Any) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("not canonical JSON") from exc
 
 def fingerprint_case(case: Mapping[str, Any]) -> str:
     clean = _sanitize(case); clean.pop("instance_id")
@@ -93,7 +97,12 @@ def _atomic_write(path: Path, data: bytes) -> None:
         if os.path.exists(tmp): os.unlink(tmp)
 
 def save_sanitized_corpus(path: str | Path, cases: Sequence[Mapping[str, Any]], *, source_root: str | Path | None | object = _DEFAULT_ROOT) -> None:
-    if source_root is None or (source_root is not _DEFAULT_ROOT and Path(source_root).resolve() != _CANONICAL_ROOT): raise ValueError("source_root")
+    try:
+        root_ok = source_root is _DEFAULT_ROOT or (source_root is not None and Path(source_root).resolve() == _CANONICAL_ROOT)
+    except (TypeError, ValueError, OSError) as exc:
+        raise ValueError("source_root") from exc
+    if not root_ok: raise ValueError("source_root")
+    if isinstance(cases, (str, bytes, Mapping)) or not isinstance(cases, Sequence): raise ValueError("cases")
     rows = [_sanitize(c) for c in cases]
     if len({fingerprint_case(r) for r in rows}) != len(rows): raise ValueError("duplicate fingerprint")
     _atomic_write(Path(path), b"".join(_canonical(r) + b"\n" for r in rows))
@@ -121,6 +130,7 @@ def sha256_manifest(path: str | Path, files: Sequence[str | Path]) -> dict[str, 
 def write_sha256_manifest(path: str | Path, files: Sequence[str | Path]) -> dict[str, str]:
     resolved = [Path(f).resolve() for f in files]
     if len(set(resolved)) != len(resolved): raise ValueError("duplicate manifest path")
+    if any(not p.is_file() for p in resolved): raise ValueError("manifest file")
     manifest = {str(p): canonical_jsonl_sha256(p) for p in sorted(resolved, key=str)}
     _atomic_write(Path(path), _canonical(manifest) + b"\n")
     return manifest
