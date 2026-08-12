@@ -408,10 +408,23 @@ def _load_receipt_source(
     source = cache[resolved][1]
     if not isinstance(source, (list, tuple)) or len(source) < 7:
         raise ValueError("malformed receipt source")
+    row_count: int | None = None
     for array in source[:7]:
-        if not isinstance(array, (list, tuple)):
+        if isinstance(array, torch.Tensor):
+            if array.ndim == 0 or array.shape[0] <= 0:
+                raise ValueError("malformed receipt source")
+            count = int(array.shape[0])
+        elif isinstance(array, (list, tuple)):
+            if not array:
+                raise ValueError("malformed receipt source")
+            count = len(array)
+        else:
             raise ValueError("malformed receipt source")
-        if receipt.layout_index >= len(array):
+        if row_count is None:
+            row_count = count
+        elif count != row_count:
+            raise ValueError("inconsistent receipt source batch lengths")
+        if receipt.layout_index >= count:
             raise ValueError("receipt index range")
     return source
 

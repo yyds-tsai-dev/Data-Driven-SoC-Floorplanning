@@ -7,7 +7,7 @@ from typing import get_args, get_origin, get_type_hints
 
 import pytest
 import torch
-from icdc.data import target_positions_from_rects
+from icdc.data import BandFileSampler, target_positions_from_rects
 
 from icdc.topology_data import (
     CorpusSourceReceipt,
@@ -54,6 +54,7 @@ def _save(path, cases, **kwargs):
     path = Path(path)
     root = path.parent / "floorset_lite"
     root.mkdir(parents=True, exist_ok=True)
+    old_root = topology_data._CANONICAL_ROOT
     topology_data._CANONICAL_ROOT = root.resolve()
     source_cases = []
     receipts = []
@@ -103,17 +104,23 @@ def _save(path, cases, **kwargs):
             receipts.append(None)
     for i, receipt in enumerate(receipts):
         if receipt is not None:
-            receipts[i] = dataclasses.replace(
-                receipt,
-                fingerprint=fingerprint_case(source_cases[i]),
-            )
-    return save_sanitized_corpus(
-        path,
-        source_cases,
-        source_root=root,
-        source_receipts=receipts,
-        **kwargs,
-    )
+            try:
+                receipts[i] = dataclasses.replace(
+                    receipt,
+                    fingerprint=fingerprint_case(source_cases[i]),
+                )
+            except Exception:
+                receipts[i] = None
+    try:
+        return save_sanitized_corpus(
+            path,
+            source_cases,
+            source_root=root,
+            source_receipts=receipts,
+            **kwargs,
+        )
+    finally:
+        topology_data._CANONICAL_ROOT = old_root
 
 
 def _fake_bound_source(tmp_path, monkeypatch, count=2):
@@ -140,13 +147,13 @@ def _fake_bound_source(tmp_path, monkeypatch, count=2):
         raw_fps.append(fp)
         metrics.append(torch.tensor([100.0 + index, 0.0, 5.0], dtype=torch.float64))
     shard = [
-        raw_inputs,
-        [torch.empty((0, 3), dtype=torch.float64) for _ in range(count)],
-        [torch.empty((0, 3), dtype=torch.float64) for _ in range(count)],
-        [torch.empty((0, 2), dtype=torch.float64) for _ in range(count)],
-        [torch.zeros((2, 1), dtype=torch.float64) for _ in range(count)],
-        raw_fps,
-        metrics,
+        torch.stack(raw_inputs),
+        torch.zeros((count, 0, 3), dtype=torch.float64),
+        torch.zeros((count, 0, 3), dtype=torch.float64),
+        torch.zeros((count, 0, 2), dtype=torch.float64),
+        torch.zeros((count, 2, 1), dtype=torch.float64),
+        torch.stack(raw_fps),
+        torch.stack(metrics),
     ]
     torch.save(shard, shard_path)
     digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
@@ -354,6 +361,98 @@ def test_corrupt_source_shard_rejects_without_partial_write(tmp_path, monkeypatc
             source_receipts=[receipts[0]],
         )
     assert output.read_bytes() == b"before"
+
+
+def test_tensor_batch_scalar_and_mismatched_lengths_reject_without_partial(
+    tmp_path, monkeypatch
+):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    shard_path = root / receipts[0].relative_path
+    output = tmp_path / "malformed-batch.jsonl"
+    output.write_bytes(b"before")
+    malformed = [
+        torch.tensor(1.0),
+        torch.zeros((2, 0, 3), dtype=torch.float64),
+        torch.zeros((2, 0, 3), dtype=torch.float64),
+        torch.zeros((2, 0, 2), dtype=torch.float64),
+        torch.zeros((2, 2, 1), dtype=torch.float64),
+        torch.zeros((2, 2, 4), dtype=torch.float64),
+        torch.zeros((2, 3), dtype=torch.float64),
+    ]
+    torch.save(malformed, shard_path)
+    altered = dataclasses.replace(
+        receipts[0],
+        file_sha256=hashlib.sha256(shard_path.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            output,
+            [cases[0]],
+            source_root=root,
+            source_receipts=[altered],
+        )
+    assert output.read_bytes() == b"before"
+
+    malformed[0] = torch.zeros((2, 6), dtype=torch.float64)
+    malformed[1] = torch.zeros((1, 0, 3), dtype=torch.float64)
+    torch.save(malformed, shard_path)
+    altered = dataclasses.replace(
+        receipts[0],
+        file_sha256=hashlib.sha256(shard_path.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            output,
+            [cases[0]],
+            source_root=root,
+            source_receipts=[altered],
+        )
+    assert output.read_bytes() == b"before"
+
+
+@pytest.mark.skipif(
+    not Path("FloorSet/floorset_lite/worker_26/layouts_5488.th").is_file(),
+    reason="real training shard is unavailable",
+)
+def test_real_training_shard_row_zero_is_receipt_bound(tmp_path, monkeypatch):
+    root = Path("FloorSet/floorset_lite").resolve()
+    shard_path = root / "worker_26/layouts_5488.th"
+    digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
+    source = torch.load(shard_path, map_location="cpu", weights_only=False)
+    raw_case = BandFileSampler._instance(source, 0)
+    receipt = CorpusSourceReceipt(
+        relative_path="worker_26/layouts_5488.th",
+        file_sha256=digest,
+        layout_index=0,
+        fingerprint="0" * 64,
+    )
+    case = dict(raw_case, instance_id=source_instance_id(receipt))
+    receipt = dataclasses.replace(receipt, fingerprint=fingerprint_case(case))
+    monkeypatch.setattr(topology_data, "_CANONICAL_ROOT", root)
+    output = tmp_path / "real.jsonl"
+    save_sanitized_corpus(
+        output,
+        [case],
+        source_root=root,
+        source_receipts=[receipt],
+    )
+    row = load_sanitized_corpus(output)[0]
+    assert row["n"] == 73
+    assert len(row["cons"]) == 73
+    assert len(row["cons"][0]) == 5
+    assert len(row["b2b"]) == 319
+    assert len(row["p2b"]) == 1656
+    assert len(row["pins"]) == 255
+    for constraints, target in zip(row["cons"], row["tp"]):
+        fixed, preplaced = constraints[:2]
+        if preplaced:
+            assert target[0] >= 0 and target[1] >= 0
+        else:
+            assert target[0] == -1 and target[1] == -1
+        if fixed or preplaced:
+            assert target[2] > 0 and target[3] > 0
+        else:
+            assert target == [-1.0, -1.0, -1.0, -1.0]
 
 
 def test_sanitize_excludes_golden_and_masks_non_input_geometry(tmp_path):
