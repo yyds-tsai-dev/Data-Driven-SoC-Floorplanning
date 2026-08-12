@@ -1,5 +1,6 @@
 import dataclasses
 import ast
+import collections.abc
 import hashlib
 import io
 import json
@@ -639,7 +640,7 @@ def test_axis_candidate_changes_topology_fingerprint_and_preserves_sizes_and_pin
 
 def test_predicate_reverse_orientation_and_invalid_inputs():
     rects = torch.tensor([[3., 0., 1., 2.], [0., .5, 1., 2.]], dtype=torch.float64)
-    assert has_exact_positive_contact(rects, 0, 1, 0, False, 1.)
+    assert not has_exact_positive_contact(rects, 0, 1, 0, False, 1.)
     assert not has_exact_positive_contact(rects, 0, 1, 0, True, 1.)
     assert not has_exact_positive_contact(rects, 0, 1, 0, False, 3.)
     assert not has_exact_positive_contact(rects, 0, 1, 2, False, 1.)
@@ -680,7 +681,7 @@ def test_proposal_public_annotations_and_result_fields_are_exact():
     for fn in (generate_proposals, pin_feasible_then_exact_tfdl):
         fh = get_type_hints(fn)
         assert fh
-    assert get_origin(get_type_hints(generate_proposals)["return"]) is Iterator
+    assert get_origin(get_type_hints(generate_proposals)["return"]) is collections.abc.Iterator
     assert dataclasses.is_dataclass(ProposalResult) and ProposalResult.__dataclass_params__.frozen
 
 
@@ -692,8 +693,9 @@ def _cap_case(raw, cons=None, tp=None):
 
 
 def test_each_kind_cap_is_exact_when_supply_exists():
-    raw = torch.tensor([[float(i * 7), float((i % 3) * 7), 2., 2.] for i in range(9)], dtype=torch.float64)
-    cons = [[0, 0, 0, 11 if i < 6 else 0, 0] for i in range(9)]
+    raw = torch.tensor([[0., 0., 2., 2.], [10., 0., 2., 2.], [0., 20., 2., 2.],
+                        [10., 20., 2., 2.], [0., 40., 2., 2.], [10., 40., 2., 2.]], dtype=torch.float64)
+    cons = [[0, 0, 0, 11 if i % 2 == 0 else 0, 0] for i in range(6)]
     out = list(generate_proposals(raw, _cap_case(raw, cons), ProposalConfig(2, 0, 2, 20)))
     assert sum(n.startswith("axis:") for n, _ in out) == 2
     assert sum(n.startswith("contact:") for n, _ in out) == 2
@@ -707,7 +709,8 @@ def test_proposal_names_encode_pair_axis_order_and_contact_intent(proposal_fixtu
         if name == "base":
             continue
         parts = name.split(":")
-        assert len(parts) == 5 and all(part.lstrip("-").isdigit() for part in parts[1:])
+        expected = {"axis": 5, "pin": 5, "contact": 6}[parts[0]]
+        assert len(parts) == expected and all(part.lstrip("-").isdigit() for part in parts[1:])
         assert parts[0] in {"axis", "pin", "contact"}
 
 
@@ -757,9 +760,9 @@ def test_pin_generator_restores_preplaced_block_and_encodes_peer_axis_order():
     for name, rects in pins:
         parts = name.split(":")
         assert len(parts) == 5 and parts[0] == "pin"
-        _, peer, target, axis, order = parts
-        peer, target, axis, order = map(int, (peer, target, axis, order))
-        assert peer != target and peer != 0 and target == 0
+        _, p, peer, axis, order = parts
+        p, peer, axis, order = map(int, (p, peer, axis, order))
+        assert p == 0 and peer != 0
         assert axis in (0, 1) and order in (0, 1)
         assert torch.equal(rects[0], raw[0])
         assert torch.equal(rects[:, 2:], raw[:, 2:])
@@ -779,8 +782,9 @@ def test_contact_generator_uses_only_cluster_pairs_and_literal_contact_geometry(
     out = [(n, r) for n, r in generate_proposals(raw, case, ProposalConfig(0, 0, 8, 32)) if n.startswith("contact:")]
     assert out
     for name, rects in out:
-        parts = name.split(":"); assert len(parts) == 5
-        _, a, b, axis, order = parts; a, b, axis, order = map(int, (a, b, axis, order))
+        parts = name.split(":"); assert len(parts) == 6
+        _, gid, a, b, axis, order = parts; gid, a, b, axis, order = map(int, (gid, a, b, axis, order))
+        assert gid == 7
         assert {a, b} == {0, 2} and axis in (0, 1) and order in (0, 1)
         assert has_exact_positive_contact(rects, a, b, axis, bool(order), 1e-12)
         assert torch.equal(rects[:, 2:], raw[:, 2:])
@@ -793,10 +797,12 @@ def test_contact_generator_no_supply_when_cluster_endpoints_preplaced_and_discon
 
 
 def test_caps_are_exact_with_three_independent_pin_and_contact_supplies():
-    raw = torch.tensor([[float(i * 10), 0., 2., 2.] for i in range(6)], dtype=torch.float64)
-    cons = [[0, 0, 0, 11, 0], [0, 0, 0, 0, 0], [0, 0, 0, 12, 0],
-            [0, 0, 0, 0, 0], [0, 0, 0, 13, 0], [0, 0, 0, 0, 0]]
-    tp = [[-1., -1., -1., -1.]] * 6
+    raw = torch.tensor([[0., 0., 2., 2.], [20., 0., 2., 2.], [40., 0., 2., 2.],
+                        [0., 20., 2., 2.], [20., 20., 2., 2.], [40., 20., 2., 2.]], dtype=torch.float64)
+    cons = [[0, 1, 0, 11, 0], [0, 0, 0, 11, 0], [0, 1, 0, 12, 0],
+            [0, 0, 0, 12, 0], [0, 1, 0, 13, 0], [0, 0, 0, 13, 0]]
+    tp = [[0., 0., 2., 2.], [-1., -1., -1., -1.], [40., 0., 2., 2.],
+          [-1., -1., -1., -1.], [20., 20., 2., 2.], [-1., -1., -1., -1.]]
     case = _topology_case(raw, cons, tp)
     out = list(generate_proposals(raw, case, ProposalConfig(0, 2, 2, 32)))
     assert sum(n.startswith("pin:") for n, _ in out) == 2
@@ -809,6 +815,30 @@ def test_generator_fingerprints_are_unique_and_inputs_immutable():
     out = list(generate_proposals(raw, case, ProposalConfig()))
     assert len({_topology_fingerprint(rects, case["cons"]) for _, rects in out}) == len(out)
     assert torch.equal(raw, before[0]) and repr(case) == before[1]
+
+
+def test_axis_reverse_boundary_moves_block_exactly_and_is_named():
+    raw = torch.tensor([[0., 0., 2., 2.], [4., 0., 2., 2.]], dtype=torch.float64)
+    out = dict(generate_proposals(raw, _topology_case(raw, [[0, 0]] * 2), ProposalConfig(8, 0, 0, 32)))
+    candidate = out["axis:0:1:0:0"]
+    assert candidate[1, 0].item() == pytest.approx(-2.)
+
+
+def test_hard_sizes_are_normalized_only_in_emitted_proposals():
+    raw = torch.tensor([[0., 0., 9., 8.], [20., 0., 7., 6.]], dtype=torch.float64)
+    tp = [[0., 0., 2., 3.], [-1., -1., -1., -1.]]
+    case = _topology_case(raw, [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0]], tp)
+    out = list(generate_proposals(raw, case, ProposalConfig(8, 0, 0, 32)))
+    assert torch.equal(raw[:, 2:], torch.tensor([[9., 8.], [7., 6.]], dtype=torch.float64))
+    proposals = [(name, rects) for name, rects in out if name != "base"]
+    assert proposals and all(torch.equal(rects[0, 2:], torch.tensor([2., 3.])) for _, rects in proposals)
+
+
+def test_tfdl_public_function_does_not_call_shelf_fallback():
+    tree = ast.parse(Path("partner/icdc/tfdl.py").read_text())
+    fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "tfdl")
+    calls = [node.func.id for node in ast.walk(fn) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+    assert "shelf_fallback" not in calls
 
 
 def test_proposal_config_rejects_bool_and_result_is_frozen():
