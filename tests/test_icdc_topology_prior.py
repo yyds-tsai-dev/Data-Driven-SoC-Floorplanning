@@ -30,6 +30,23 @@ from icdc.topology_data import (
 )
 
 import icdc.topology_data as topology_data
+from icdc.topology_prior import topology_losses, extract_sparse_label
+
+
+def test_topology_prior_loss_axis1_and_empty_backward():
+    rects = torch.tensor([[[0., 0., 1., 1.], [0., 2., 1., 1.]]], requires_grad=True)
+    empty = SparseTopologyBatch(*(torch.empty(0, dtype=torch.long) if n not in ('edge_margin','edge_weight','contact_margin','contact_weight') else torch.empty(0) for n in SparseTopologyBatch.__dataclass_fields__))
+    out = topology_losses(rects, empty, torch.ones(1))
+    assert out['total'].item() == 0
+    out['total'].backward()
+    assert rects.grad is not None
+
+
+def test_topology_prior_extracts_margin_and_record_weight():
+    legal = torch.tensor([[0., 0., 2., 1.], [3., 0., 1., 1.]], dtype=torch.float64)
+    label = extract_sparse_label(legal, {'n': 2, 'cons': [[0, 0], [0, 0]]}, 'x', 4, 2., 6.)
+    assert label.record_weight == 3.
+    assert label.edges[0].margin == 1.
 
 CANONICAL_ROOT = Path("FloorSet/floorset_lite").resolve()
 

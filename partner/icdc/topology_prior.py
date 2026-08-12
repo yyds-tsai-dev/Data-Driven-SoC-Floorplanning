@@ -38,7 +38,7 @@ def _validate_batch(batch: SparseTopologyBatch, rects: torch.Tensor) -> None:
         v = getattr(batch, n)
         if not v.is_floating_point() or v.dtype != rects.dtype:
             raise ValueError("float field")
-        if not torch.isfinite(v).all() or (v < 0).any():
+        if not torch.isfinite(v).all() or (n.endswith("margin") and (v < 0).any()) or (n.endswith("weight") and (v <= 0).any()):
             raise ValueError("float values")
     b, n, _ = rects.shape
     for nme in ("edge_batch", "contact_batch"):
@@ -61,8 +61,8 @@ def topology_losses(rects: torch.Tensor, labels: SparseTopologyBatch, scale: tor
     x, y, w, h = rects.unbind(-1)
     def weighted(values, weights, batch):
         if not values.numel(): return rects.sum() * 0
-        ww = weights * scale[batch]
-        return (values * ww).sum() / ww.sum().clamp_min(1e-6)
+        ww = weights.detach()
+        return (values * ww).sum() / ww.sum().clamp_min(1e-12)
     eb, es, ed, ea = labels.edge_batch, labels.edge_src, labels.edge_dst, labels.edge_axis
     src = torch.stack((x[eb, es], y[eb, es]), -1); dst = torch.stack((x[eb, ed], y[eb, ed]), -1)
     sz = torch.stack((w[eb, es], h[eb, es]), -1)
@@ -82,6 +82,7 @@ def topology_losses(rects: torch.Tensor, labels: SparseTopologyBatch, scale: tor
 
 
 def extract_sparse_label(legal: torch.Tensor, case: Mapping[str, Any], instance_id: str, sample_seed: int, teacher_cost: float, base_cost: float) -> TopologyLabel:
+    if not isinstance(case, Mapping): raise ValueError("case")
     if not isinstance(legal, torch.Tensor) or legal.device.type != "cpu" or legal.dtype != torch.float64 or legal.ndim != 2 or legal.shape[1] != 4: raise ValueError("legal")
     n = case.get("n")
     if type(n) is not int or n != legal.shape[0] or not isinstance(instance_id, str) or not instance_id.strip() or type(sample_seed) is not int or isinstance(sample_seed, bool): raise ValueError("metadata")
@@ -107,7 +108,14 @@ def extract_sparse_label(legal: torch.Tensor, case: Mapping[str, Any], instance_
                         if u in reach and v not in reach: reach.add(v); changed=True
                 if e[1] in reach: redundant=True; break
             if not redundant: edges.append(SparseEdge(e[0],e[1],axis,e[2],"sep",1.0))
-    cons=case.get("cons", [[0,0]]*n)
+    cons=case.get("cons")
+    if not isinstance(cons,(list,tuple)) or len(cons)!=n: raise ValueError("cons")
+    for row in cons:
+        if not isinstance(row,(list,tuple)) or len(row) not in (2,5): raise ValueError("cons row")
+        for k,v in enumerate(row):
+            if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(float(v)) or int(v)!=float(v): raise ValueError("cons value")
+        if int(row[0]) not in (0,1) or int(row[1]) not in (0,1): raise ValueError("cons flag")
+        if len(row)==5 and (int(row[2])<0 or int(row[3])<0 or int(row[4])<0 or int(row[4])>15): raise ValueError("cons value")
     clusters={}
     for i,row in enumerate(cons):
         if len(row)>=4 and int(row[3])>0: clusters.setdefault(int(row[3]),[]).append(i)
@@ -123,7 +131,7 @@ def extract_sparse_label(legal: torch.Tensor, case: Mapping[str, Any], instance_
                 for b in members[ii+1:]:
                     for ax in (0,1):
                         perp=1-ax; end=r[a][ax]+r[a][ax+2]; gap=abs(end-r[b][ax])
-                        if gap>1e-9 and abs((r[b][ax]+r[b][ax+2])-r[a][ax])>1e-9: continue
+                        if gap != 0 and (r[b][ax]+r[b][ax+2] != r[a][ax]): continue
                         ov=min(r[a][perp]+r[a][perp+2],r[b][perp]+r[b][perp+2])-max(r[a][perp],r[b][perp])
                         if ov>0:
                             before=(r[a][ax]+r[a][ax+2]/2)<(r[b][ax]+r[b][ax+2]/2) or ((r[a][ax]+r[a][ax+2]/2)==(r[b][ax]+r[b][ax+2]/2) and a<b)
