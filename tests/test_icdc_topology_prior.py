@@ -17,7 +17,7 @@ def _case(**extra):
 
 
 def test_sanitize_excludes_golden_and_masks_non_input_geometry(tmp_path):
-    case = _case(golden=[[99., 99., 99., 99.]], test_id=7)
+    case = _case(golden=[[99., 99., 99., 99.]])
     save_sanitized_corpus(tmp_path / "c.jsonl", [case])
     row = load_sanitized_corpus(tmp_path / "c.jsonl")[0]
     assert set(row) == {"instance_id", "n", "area", "cons", "tp", "b2b", "p2b", "pins", "hpwl_ref", "area_ref"}
@@ -36,3 +36,12 @@ def test_fingerprint_and_split_are_deterministic():
     assert fingerprint_case(_case()) == fingerprint_case(_case())
     assert split_for_id("abc") in {"train", "heldout"}
     assert split_for_id("abc") == split_for_id("abc")
+
+def test_rejects_test_id_and_explicit_none_root(tmp_path):
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "x", [_case(test_id=1)])
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "x", [_case()], source_root=None)
+
+def test_duplicate_content_under_distinct_ids_and_invalid_split():
+    with pytest.raises(ValueError): save_sanitized_corpus("/tmp/dup.jsonl", [_case(), _case(instance_id="other")])
+    for args in (("", 10), ("x", True), ("x", 0)):
+        with pytest.raises(ValueError): split_for_id(*args)
