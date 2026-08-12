@@ -21,7 +21,7 @@
 - Construct or reuse at most one `_ColumnOptimizer` scorer when either or both final passes are enabled.
 - Do not modify `submission/cadc1013/` before G1 passes. The verified `submission/cadc1013_0811d_tagcompress.tar.gz` remains the fallback.
 - G0 requires 100/100 hard feasibility, official weighted no-runtime gain at least `0.003`, and bridge computation at most `0.003` seconds per case on average.
-- G1 requires three reversed-order full100 ON/OFF pairs: ON improves no-runtime in all three, mean delta is at most `-0.002`, every ON average runtime is at most `0.300` seconds, and mean paired runtime increase is at most `0.003` seconds.
+- User-approved amendment (2026-08-12): G1 requires all six arms 100/100 feasible, ON wins 3/3, mean no-runtime delta <=`-0.002`, every committed diagnostic has grouping and total V strict drops, and no hard failure. Each ON log must contain 100 causal public bridge-call `ms` values with mean <=`0.003s`; aggregate 300-call mean <=`0.003s`. Each pair's projected production average runtime (official OFF average plus that ON log's mean bridge-call seconds) must be <=`0.300s`. The original debug-inclusive end-to-end thresholds remain historical diagnostics only. The final fresh-extracted package gate remains actual/non-projected average runtime <=`0.300s` and 100/100 feasible.
 - Implementation follows red-green-refactor; the implementer must record the failing and passing commands/output.
 
 ---
@@ -247,7 +247,7 @@ Have a fresh Terra xhigh reviewer inspect the report/result JSON and return PASS
 
 ---
 
-### Task 4: G1 online paired evaluator gate
+### Task 4: G1 online paired evaluator gate (amended 2026-08-12)
 
 **Files:**
 - Evaluator entrypoint: `scripts/probes/tag_compress_warm_wrapper.py`
@@ -261,11 +261,11 @@ Have a fresh Terra xhigh reviewer inspect the report/result JSON and return PASS
 
 - [ ] **Step 1: Run three reversed-order pairs**
 
-Source the repository `.env` for the promoted 0811d operating point. For ON set `PARTNER_GROUP_BRIDGE=1`, `PARTNER_GROUP_BRIDGE_BUDGET=0.02`, and `PARTNER_GROUP_BRIDGE_DEBUG=1`; for OFF unset all three. Invoke `scripts/iccad2026_evaluate.py --data-path ../ --evaluate scripts/probes/tag_compress_warm_wrapper.py --output <pair-json>` from `FloorSet/iccad2026contest` and capture each ON log.
+Source the repository `.env` for the promoted 0811d operating point. For ON set `PARTNER_GROUP_BRIDGE=1`, `PARTNER_GROUP_BRIDGE_BUDGET=0.02`, and `PARTNER_GROUP_BRIDGE_DEBUG=1`; for OFF unset all three. Invoke `scripts/iccad2026_evaluate.py --data-path ../ --evaluate scripts/probes/tag_compress_warm_wrapper.py --output artifacts/partner_eval/gbridge_g1_pairN_arm.json` from `FloorSet/iccad2026contest` and capture each ON log.
 
 - [ ] **Step 2: Summarize and adjudicate**
 
-Record every arm's feasibility count, no-runtime score, average runtime, ordering, and output path. Compute all three paired score/runtime deltas and their means. Parse ON diagnostics and verify every committed line has decreasing grouping and total V with no hard-guard failure.
+Record every arm's feasibility count, no-runtime score, average runtime, ordering, and output path. Compute all three paired score/runtime deltas and their means. Parse exactly 100 causal bridge-call timings from each ON log; calculate per-run and aggregate means, OFF-plus-call projected runtimes, and margins. The amended rule binds these projections, while preserving the original debug-inclusive results as historical diagnostics. Verify every committed line has decreasing grouping and total V with no hard-guard failure.
 
 - [ ] **Step 3: Independent evidence review**
 

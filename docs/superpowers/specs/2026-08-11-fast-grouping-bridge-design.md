@@ -1,6 +1,6 @@
 # Fast Final Grouping Bridge Design
 
-Date: 2026-08-11
+Date: 2026-08-12 (amended by user approval)
 
 ## Goal
 
@@ -180,7 +180,7 @@ Already observed; reproduce after implementation through the public wrapper:
 
 Failure of any item closes the mechanism without online promotion work.
 
-### G1: online paired evaluator gate
+### G1: online paired evaluator gate (amended 2026-08-12)
 
 Run three full100 ON/OFF pairs with reversed ordering across pairs.  Promotion
 requires all of the following:
@@ -188,10 +188,25 @@ requires all of the following:
 - every arm is 100/100 hard feasible;
 - ON improves no-runtime score in all three pairs;
 - mean paired no-runtime delta is at most `-0.002`;
-- every ON run has average runtime at or below `0.300s`;
-- mean paired runtime increase is at most `0.003s`;
+- each ON log contains 100 causal public bridge-call `ms` values, each run's
+  mean call duration is at most `0.003s`, and the aggregate 300-call mean is
+  at most `0.003s`;
+- each pair's projected production average runtime is its official OFF
+  average runtime plus that ON log's mean bridge-call seconds, and is at most
+  `0.300s`;
 - self-paired diagnostics show grouping decreases only on committed cases and
   no hard-guard failure is committed.
+
+The original debug-inclusive end-to-end runtime rule remains recorded as a
+historical diagnostic, not a production gate: pair 3 ON was `0.3000952487s`
+and mean paired runtime delta was `+0.0068471677s` (therefore FAIL under that
+original rule).  The debug path performs post-call grouping/exact-V/HPWL/bbox
+rescoring that production does not enable, so binding G1 uses causal call
+timing and OFF-plus-call projections.  From the six evidence logs: pair means
+are `0.001732350000s`, `0.001988140000s`, and `0.001787850000s`; aggregate mean
+is `0.001836113333s`.  Projected runtimes are respectively
+`0.2912198360s` (margin `0.0087801640s`), `0.2901608443s` (margin
+`0.0098391557s`), and `0.2899212596s` (margin `0.0100787404s`).
 
 If variance prevents complete separation but the self-paired official replay
 still exceeds the G0 threshold, retain the branch as evidence but do not alter
@@ -217,7 +232,8 @@ The operation is best-effort and exception-contained.  Any unexpected input,
 deadline exhaustion, missing dependency, or guard failure returns the exact
 stage input.  The flag stays default off until G1 passes.  A failed G0 or G1
 requires no production rollback because the verified package is not modified
-during experimentation.
+during experimentation.  Debug-only timing/rescoring must not be substituted
+for the causal-call rule or used to waive the final package gate.
 
 ## Self-Review
 
@@ -227,6 +243,9 @@ during experimentation.
 - The design reuses a scorer already paid for by the current final pipeline;
   projected runtime does not assume a free new scorer construction.
 - The 20ms deadline is explicitly soft, and online runtime is authoritative.
+- G1 binds to 100 causal call timings per ON log and OFF-plus-call projections;
+  the fresh-extracted package gate remains actual (non-projected) average
+  runtime at most `0.300s` with 100/100 feasibility.
 - Proxy acceptance is explicitly separated from official evaluator evidence.
 - Success is not redefined as the local `0.004` gain: the full thread goal
   remains no-runtime 1.00 at average runtime at most 0.3s.
