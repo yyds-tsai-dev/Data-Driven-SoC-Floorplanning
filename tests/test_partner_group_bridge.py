@@ -59,6 +59,10 @@ def test_dag_bridge_is_repeatable_and_preserves_hard_geometry():
 def test_dag_mechanism_never_calls_legacy_grouping_or_coord_polish(monkeypatch):
     opt, out = _coordinated_chain_case()
     monkeypatch.setattr(vk, '_fix_grouping', lambda *a, **k: pytest.fail('legacy grouping called'))
+    fake_coord_polish = types.SimpleNamespace(
+        polish_layout=lambda *a, **k: pytest.fail('coord polish called')
+    )
+    monkeypatch.setitem(sys.modules, 'coord_polish', fake_coord_polish)
     got = vk.bridge_grouping_violations_dag(opt, out, .2)
     assert vk._grouping_count(opt, np.asarray(got)) < vk._grouping_count(opt, np.asarray(out))
 
@@ -373,9 +377,12 @@ def test_valid_more_than_twelve_components_skip_solver_before_edge_build(monkeyp
     n = 26
     P = np.asarray([(float(3 * i), 0., 1., 1.) for i in range(n)])
     opt = types.SimpleNamespace(n=n, cluster_groups={1: list(range(n))})
+    original = [tuple(row) for row in P]
+    monkeypatch.setattr(vk, "_enumerate_separation_edges",
+                        lambda *args, **kwargs: pytest.fail("edge enumeration called"))
     monkeypatch.setattr(vk, "_solve_axis_dag",
                         lambda *args: pytest.fail("solver called"))
-    assert vk.bridge_grouping_violations_dag(opt, [tuple(row) for row in P], .2) is not None
+    assert vk.bridge_grouping_violations_dag(opt, original, .2) is original
 
 
 def _two_component_raw_cap_case():
@@ -437,6 +444,26 @@ def test_fake_clock_expiry_after_first_raw_axis_short_circuits_second(monkeypatc
         opt, P, choice, 10., deadline=10.0
     ) is None
     assert calls == [0]
+
+
+def test_dag_fake_clock_expiry_after_second_solver_keeps_exact_input_identity(monkeypatch):
+    opt, out = _coordinated_chain_case()
+    clock = [100.0]
+    monkeypatch.setattr(vk.time, "perf_counter", lambda: clock[0])
+    original_solver = vk._solve_axis_dag
+    solver_calls = []
+
+    def advancing_solver(problem):
+        solver_calls.append(problem)
+        result = original_solver(problem)
+        if len(solver_calls) == 2:
+            clock[0] = 100.25
+        return result
+
+    monkeypatch.setattr(vk, "_solve_axis_dag", advancing_solver)
+    got = vk.bridge_grouping_violations_dag(opt, out, .2)
+    assert len(solver_calls) == 2
+    assert got is out
 
 
 def test_project_changed_contact_rejects_malformed_inputs_directly():
