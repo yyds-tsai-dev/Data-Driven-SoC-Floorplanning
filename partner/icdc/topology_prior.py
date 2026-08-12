@@ -228,6 +228,8 @@ def _pin_mask(cons: Sequence[Sequence[int]], tp: torch.Tensor) -> Tuple[bool, ..
 
 def _place_for_pair(rects: torch.Tensor, first: int, second: int,
                     axis: int, order: int, moved: int) -> torch.Tensor:
+    if _pair_state(rects, first, second) == (axis, order):
+        return rects.clone()
     stationary = second if moved == first else first
     m = rects[moved]
     s = rects[stationary]
@@ -252,35 +254,95 @@ def _place_for_pair(rects: torch.Tensor, first: int, second: int,
     vl = min(0.0, delta, (delta - u0 + v0) / 2)
     projected.append((delta - vl, vl))
 
-    # Include the unmodified placement independently: it is the exact nearest
-    # answer whenever it already realizes the requested classifier state.
     targets = [(u0, v0)]
     targets.extend(projected)
     best = None
     best_dist = None
-    target_centers = []
+
+    def consider(ca: float, cp: float) -> None:
+        nonlocal best, best_dist
+        trial = rects.clone()
+        trial[moved, axis] = ca - float(m[axis + 2]) / 2
+        trial[moved, perp] = cp - float(m[perp + 2]) / 2
+        if not bool(torch.isfinite(trial[moved, :2]).all()):
+            return
+        if _pair_state(trial, first, second) != (axis, order):
+            return
+        dist = math.hypot(float(trial[moved, 0] - m[0]), float(trial[moved, 1] - m[1]))
+        if best_dist is None or dist < best_dist:
+            best, best_dist = trial, dist
+
+    def to_key(value: float) -> int:
+        struct = __import__("struct")
+        bits = struct.unpack(">Q", struct.pack(">d", value))[0]
+        return (~bits & ((1 << 64) - 1)) if bits >> 63 else (bits ^ (1 << 63))
+
+    def from_key(key: int) -> float:
+        struct = __import__("struct")
+        bits = (key ^ (1 << 63)) if key >> 63 else (~key & ((1 << 64) - 1))
+        return struct.unpack(">d", struct.pack(">Q", bits))[0]
+
+    finite_max = float.fromhex("0x1.fffffffffffffp+1023")
+    lo_key = to_key(-finite_max)
+    hi_key = to_key(finite_max)
     for u, v in targets:
-        target_centers.append((cs[axis] + sigma * u, cs[perp] + v))
-    # Bounded nextafter ladders recover strict floating-point classifier states
-    # while validating every actual rectangle state.
-    ladder_bases = list(target_centers)
-    for ca, cp in ladder_bases:
-        for ka in range(17):
-            aa = ca
-            for _ in range(ka):
-                aa = math.nextafter(aa, math.inf if sigma > 0 else -math.inf)
-            for kp in range(17):
-                pp = cp
-                for _ in range(kp):
-                    pp = math.nextafter(pp, cs[perp])
-                trial = rects.clone()
-                trial[moved, axis] = aa - float(m[axis + 2]) / 2
-                trial[moved, perp] = pp - float(m[perp + 2]) / 2
-                if _pair_state(trial, first, second) != (axis, order):
-                    continue
-                dist = sum((float(trial[moved, d] - m[d])) ** 2 for d in (0, 1))
-                if best_dist is None or dist < best_dist:
-                    best, best_dist = trial, dist
+        ca, cp = cs[axis] + sigma * u, cs[perp] + v
+        trial = rects.clone()
+        trial[moved, axis] = ca - float(m[axis + 2]) / 2
+        trial[moved, perp] = cp - float(m[perp + 2]) / 2
+        if _pair_state(trial, first, second) == (axis, order):
+            consider(ca, cp)
+            continue
+        # Search only the selected-axis origin outward; classifier validity is
+        # monotone in this direction.  Perpendicular coordinate stays fixed.
+        if not math.isfinite(ca) or not math.isfinite(cp):
+            continue
+        start = to_key(ca)
+        direction = 1 if sigma > 0 else -1
+        bound = hi_key if direction > 0 else lo_key
+        def valid_key(key: int) -> bool:
+            if key < lo_key or key > hi_key:
+                return False
+            value = from_key(key)
+            probe = rects.clone()
+            probe[moved, axis] = value - float(m[axis + 2]) / 2
+            probe[moved, perp] = cp - float(m[perp + 2]) / 2
+            if not bool(torch.isfinite(probe[moved, :2]).all()):
+                return False
+            for d in (0, 1):
+                if not math.isfinite(float(probe[moved, d] + probe[moved, d + 2])):
+                    return False
+                if not math.isfinite(float(probe[moved, d] + probe[moved, d + 2] / 2)):
+                    return False
+            return _pair_state(probe, first, second) == (axis, order)
+        if valid_key(start):
+            consider(ca, cp)
+            continue
+        step = 1
+        prev = start
+        found = None
+        while prev != bound:
+            nxt = max(bound, prev - step) if direction < 0 else min(bound, prev + step)
+            if valid_key(nxt):
+                found = nxt
+                break
+            prev = nxt
+            step = min(step * 2, 1 << 63)
+        if found is None:
+            continue
+        left, right = (found, start) if direction < 0 else (start, found)
+        while left + 1 < right:
+            mid = (left + right) // 2
+            if valid_key(mid):
+                right = mid if direction > 0 else right
+                if direction < 0:
+                    left = mid
+            elif direction > 0:
+                left = mid
+            else:
+                right = mid
+        key = right if direction > 0 else left
+        consider(from_key(key), cp)
     return best if best is not None else rects.clone()
 
 
@@ -412,6 +474,26 @@ def _contact_candidate(rects: torch.Tensor, first: int, second: int,
     return candidate
 
 
+def _validate_representable_geometry(rects: torch.Tensor) -> None:
+    for row in rects:
+        for axis in (0, 1):
+            origin = float(row[axis])
+            size = float(row[axis + 2])
+            if not (math.isfinite(origin + size) and math.isfinite(origin + size / 2)):
+                raise ValueError("unrepresentable geometry")
+    for first in range(rects.shape[0]):
+        for second in range(first + 1, rects.shape[0]):
+            for axis in (0, 1):
+                gap = _pair_gap(rects, first, second, axis)
+                if not math.isfinite(gap):
+                    raise ValueError("unrepresentable geometry")
+            for axis in (0, 1):
+                delta = float((rects[first, axis] + rects[first, axis + 2] / 2)
+                              - (rects[second, axis] + rects[second, axis + 2] / 2))
+                if not math.isfinite(delta):
+                    raise ValueError("unrepresentable geometry")
+
+
 def generate_proposals(
     raw_rects: torch.Tensor, case: Mapping[str, Any],
     cfg: ProposalConfig = ProposalConfig()
@@ -427,6 +509,7 @@ def generate_proposals(
     for index, row in enumerate(cons):
         if row[0] != 0 or row[1] != 0:
             base[index, 2:] = tp[index, 2:]
+    _validate_representable_geometry(base)
     if cfg.total_cap == 0:
         return
     seen = {_proposal_fingerprint(base, cons)}
