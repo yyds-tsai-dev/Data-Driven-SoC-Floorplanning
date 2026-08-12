@@ -2,9 +2,149 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 import torch
+
+from . import tfdl as T
+from . import engine
+
+
+@dataclass(frozen=True)
+class ProposalConfig:
+    axis_exchange_cap: int = 8
+    pin_repair_cap: int = 8
+    group_contact_cap: int = 8
+    total_cap: int = 32
+
+    def __post_init__(self):
+        for value in (self.axis_exchange_cap, self.pin_repair_cap, self.group_contact_cap, self.total_cap):
+            if type(value) is not int or value < 0:
+                raise TypeError("proposal cap")
+
+
+@dataclass(frozen=True)
+class ProposalResult:
+    name: str
+    rects: torch.Tensor
+    legal: torch.Tensor
+    drift: torch.Tensor
+    hard_checks: Mapping[str, Any]
+    cost: Any = None
+    label: Any = None
+
+
+def is_acyclic(n, edges):
+    if type(n) is not int or n <= 0 or not isinstance(edges, (list, tuple)):
+        return False
+    graph = [[] for _ in range(n)]
+    for edge in edges:
+        if not isinstance(edge, (list, tuple)) or len(edge) != 2 or any(type(x) is not int for x in edge): return False
+        a, b = edge
+        if not (0 <= a < n and 0 <= b < n) or a == b: return False
+        graph[a].append(b)
+    state = [0] * n
+    def visit(node):
+        if state[node] == 1: return False
+        if state[node] == 2: return True
+        state[node] = 1
+        if any(not visit(child) for child in graph[node]): return False
+        state[node] = 2
+        return True
+    return all(visit(i) for i in range(n))
+
+
+def _rect_cpu(rects, n):
+    return isinstance(rects, torch.Tensor) and rects.device.type == "cpu" and rects.is_floating_point() and rects.ndim in (2, 3) and rects.shape[-1] == 4 and (rects.shape[0] == n if rects.ndim == 2 else rects.shape[0] == 1 and rects.shape[1] == n) and torch.isfinite(rects).all()
+
+
+def matches_preplaced_origins(rects, case):
+    try:
+        n = case.get("n"); cons = _constraints(case, n); tp = torch.as_tensor(case.get("tp"), dtype=torch.float64)
+        if type(n) is not int or tp.shape != (n, 4) or not _rect_cpu(rects, n): return False
+        value = rects[0] if rects.ndim == 3 else rects
+        for i, row in enumerate(cons):
+            if len(row) == 5 and row[1] and torch.isfinite(tp[i, :2]).all() and (tp[i, :2] >= 0).all() and not torch.equal(value[i, :2], tp[i, :2]): return False
+        return True
+    except Exception: return False
+
+
+def has_exact_positive_contact(rects, a, b, axis, order, perp_margin):
+    try:
+        if not _rect_cpu(rects, rects.shape[-2]) or type(a) is not int or type(b) is not int or type(axis) is not int or type(order) is not bool or not isinstance(perp_margin, (int, float)) or isinstance(perp_margin, bool) or not math.isfinite(float(perp_margin)) or perp_margin <= 0 or a == b or axis not in (0, 1): return False
+        r = rects[0] if rects.ndim == 3 else rects; n = r.shape[0]
+        if not (0 <= a < n and 0 <= b < n): return False
+        perp = 1 - axis; end_a = r[a, axis] + r[a, axis + 2]; end_b = r[b, axis] + r[b, axis + 2]
+        if (end_a == r[b, axis]) != order: return False
+        overlap = min(r[a, perp] + r[a, perp + 2], r[b, perp] + r[b, perp + 2]) - max(r[a, perp], r[b, perp])
+        return bool(overlap >= perp_margin and overlap > 0)
+    except Exception: return False
+
+
+def pin_feasible_then_exact_tfdl(seed, case):
+    try:
+        n = case.get("n"); cons = _constraints(case, n); area = torch.as_tensor(case.get("area"), dtype=torch.float64)
+        tp = torch.as_tensor(case.get("tp"), dtype=torch.float64)
+        if type(n) is not int or area.shape != (n,) or tp.shape != (n, 4) or not _rect_cpu(seed, n): return None
+        if not torch.isfinite(area).all() or (area <= 0).any() or not torch.isfinite(tp[tp >= 0]).all(): return None
+        original = seed.to(torch.float64).clone().unsqueeze(0)
+        cons_t = torch.tensor(cons, dtype=torch.long).unsqueeze(0)
+        mask = area.unsqueeze(0) > 0
+        pinned = (cons_t[:, :, 1] != 0) & (tp[:, 0] >= 0).unsqueeze(0) & mask
+        pin_xy = tp[:, :2].unsqueeze(0)
+        boundary = torch.tensor([[r[4] if len(r) == 5 else 0 for r in cons]], dtype=torch.long)
+        def run(exact):
+            legal, drift = T.tfdl(original.clone(), mask, pinned, pin_xy=pin_xy, boundary_code=boundary, exact=exact)
+            if not isinstance(legal, torch.Tensor) or not isinstance(drift, torch.Tensor) or legal.shape != original.shape or drift.shape != (1, n, 2) or not torch.isfinite(legal).all() or not torch.isfinite(drift).all() or torch.count_nonzero(drift) != 0 or not matches_preplaced_origins(legal, case): return None
+            return legal, drift
+        if run(False) is None: return None
+        result = run(True)
+        if result is None: return None
+        legal, drift = result
+        checks = engine.verify_hard_legal(legal.squeeze(0).numpy(), area.numpy(), __import__("numpy").asarray(cons), tp.numpy())
+        if not isinstance(checks, Mapping) or not checks or not all(type(v) is bool or isinstance(v, __import__("numpy").bool_) for v in checks.values()) or not all(checks.values()): return None
+        return legal.squeeze(0), drift.squeeze(0)
+    except Exception: return None
+
+
+def _proposal_fingerprint(rects, cons):
+    r = rects.tolist(); out = []
+    for i in range(len(r)):
+        for j in range(i + 1, len(r)):
+            gx = max(r[i][0] - r[j][0] - r[j][2], r[j][0] - r[i][0] - r[i][2])
+            gy = max(r[i][1] - r[j][1] - r[j][3], r[j][1] - r[i][1] - r[i][3])
+            axis = 0 if gx >= gy else 1; ci = r[i][axis] + r[i][axis + 2] / 2; cj = r[j][axis] + r[j][axis + 2] / 2
+            out.append((i, j, axis, (ci, i) <= (cj, j)))
+            if len(cons[i]) == 5 and cons[i][3] == cons[j][3] and cons[i][3] > 0:
+                perp = 1 - axis; overlap = min(r[i][perp] + r[i][perp + 2], r[j][perp] + r[j][perp + 2]) - max(r[i][perp], r[j][perp])
+                if overlap > 0 and (r[i][axis] + r[i][axis + 2] == r[j][axis] or r[j][axis] + r[j][axis + 2] == r[i][axis]): out.append(("c", i, j, axis, overlap))
+    return tuple(out)
+
+
+def generate_proposals(raw, case, cfg=ProposalConfig()):
+    if type(cfg) is not ProposalConfig or not isinstance(raw, torch.Tensor) or raw.device.type != "cpu" or raw.ndim != 2 or raw.shape[1] != 4 or not raw.is_floating_point() or not torch.isfinite(raw).all() or (raw[:, 2:] <= 0).any(): raise ValueError("raw")
+    n = case.get("n"); cons = _constraints(case, n)
+    if type(n) is not int or raw.shape[0] != n: raise ValueError("case")
+    base = raw.to(torch.float64).clone(); seen = {_proposal_fingerprint(base, cons)}; emitted = 0
+    if cfg.total_cap <= 0: return
+    yield "base", base
+    emitted += 1
+    for kind, cap in (("axis", cfg.axis_exchange_cap), ("pin", cfg.pin_repair_cap), ("contact", cfg.group_contact_cap)):
+        for i in range(n):
+            if emitted >= cfg.total_cap or cap <= 0: break
+            candidate = base.clone(); target = (i + 1) % n; axis = 0
+            if kind == "axis" and len(cons[target]) >= 2 and cons[target][1] == 1:
+                continue
+            if kind == "contact" and len(cons[i]) == 5 and cons[i][3] == cons[target][3] and cons[i][3] > 0:
+                candidate[target, 0] = candidate[i, 0] + candidate[i, 2]
+            elif kind == "pin":
+                if cons[i][1] == 1: continue
+                candidate[target, 0] = candidate[i, 0] + candidate[i, 2] + 1e-6
+            else: candidate[target, axis] = candidate[i, 0] + candidate[i, 2] + 1e-6
+            fp = _proposal_fingerprint(candidate, cons)
+            if fp in seen: continue
+            seen.add(fp); yield f"{kind}:{i}:{target}", candidate; emitted += 1
 
 from .topology_data import ContactLabel, SparseEdge, SparseTopologyBatch, TopologyLabel
 
