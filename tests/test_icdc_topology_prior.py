@@ -1,4 +1,5 @@
 import dataclasses
+import ast
 import hashlib
 import io
 import json
@@ -61,6 +62,17 @@ def test_topology_prior_separation_and_contact_gradients_are_directional():
     assert out["separation"].item() == 0
     out["total"].backward()
     assert rects.grad[0, 1, 0].item() == 0
+
+
+def test_broken_separation_has_finite_nonzero_size_gradients_and_zero_fixture():
+    rects = torch.tensor([[[0., 0., 2., 2.], [1., 0., 2., 2.]]], dtype=torch.float64, requires_grad=True)
+    out = topology_losses(rects, _edge_batch(margin=1.), torch.ones(1, dtype=rects.dtype))
+    out["total"].backward()
+    assert torch.isfinite(rects.grad).all() and (rects.grad[..., 2:] != 0).any()
+    zero = torch.ones((1, 2, 4), dtype=torch.float64, requires_grad=True)
+    z = topology_losses(zero, _zero_batch(), torch.ones(1, dtype=zero.dtype))
+    z["total"].backward()
+    assert z["total"].item() == 0 and torch.isfinite(zero.grad).all()
 
 
 def test_extract_pin_paths_preserve_reduced_edges_and_ignore_forbidden_sources():
@@ -150,6 +162,12 @@ def test_contact_perpendicular_deficit_is_not_clamped():
     assert out["contact"].item() == pytest.approx(1.5)
 
 
+def test_contact_negative_overlap_and_exact_margin_scale():
+    rects = torch.tensor([[[0., 0., 2., 1.], [2., 2., 2., 1.]]], dtype=torch.float64)
+    # perpendicular intervals have overlap -1; gap 0, margin 2, scale 1 => 3
+    assert topology_losses(rects, _contact_batch(margin=2.), torch.ones(1, dtype=rects.dtype))["contact"].item() == pytest.approx(3.)
+
+
 def test_empty_labels_are_zero_same_dtype_and_backward_safe():
     rects = torch.ones((1, 2, 4), dtype=torch.float64, requires_grad=True)
     out = topology_losses(rects, _zero_batch(), torch.ones(1, dtype=rects.dtype))
@@ -164,6 +182,12 @@ def test_cross_batch_scales_are_normalized_before_global_mean():
     b = dataclasses.replace(b, edge_src=torch.tensor([0, 0]), edge_dst=torch.tensor([1, 1]), edge_batch=torch.tensor([0, 1]), edge_axis=torch.tensor([0, 0]), edge_margin=torch.tensor([1., 1.], dtype=rects.dtype), edge_weight=torch.tensor([1., 1.], dtype=rects.dtype))
     assert topology_losses(rects, b, torch.tensor([1., 100.], dtype=rects.dtype))["separation"].item() == pytest.approx(1.01)
     assert topology_losses(rects, b, torch.tensor([0., 1.], dtype=rects.dtype))["separation"].item() == pytest.approx(1_000_000.01)
+
+
+def test_cross_batch_unequal_effective_weights_are_global():
+    rects = torch.tensor([[[0., 0., 2., 2.], [1., 0., 2., 2.]], [[0., 0., 2., 2.], [1., 0., 2., 2.]]], dtype=torch.float64)
+    b = dataclasses.replace(_edge_batch(), edge_batch=torch.tensor([0, 1]), edge_src=torch.tensor([0, 0]), edge_dst=torch.tensor([1, 1]), edge_axis=torch.tensor([0, 0]), edge_margin=torch.tensor([1., 1.], dtype=rects.dtype), edge_weight=torch.tensor([1., 3.], dtype=rects.dtype))
+    assert topology_losses(rects, b, torch.tensor([1., 100.], dtype=rects.dtype))["separation"].item() == pytest.approx(.515)
 
 
 def test_direct_weights_are_detached_and_nonpositive_weights_rejected():
@@ -192,11 +216,33 @@ def test_sparse_batch_indices_axes_and_orders_rejected(field, value):
         topology_losses(torch.ones((1, 2, 4), dtype=torch.float64), dataclasses.replace(_edge_batch(), **{field: torch.tensor([value])}), torch.ones(1, dtype=torch.float64))
 
 
+@pytest.mark.parametrize("bad", [
+    dataclasses.replace(_contact_batch(order=2), contact_order=torch.tensor([2])),
+    dataclasses.replace(_contact_batch(), contact_a=torch.tensor([2])),
+    dataclasses.replace(_contact_batch(), contact_batch=torch.tensor([1])),
+    dataclasses.replace(_contact_batch(), contact_axis=torch.tensor([2])),
+    dataclasses.replace(_contact_batch(), contact_order=torch.tensor([1], dtype=torch.int32)),
+])
+def test_each_contact_batch_validation_branch_is_reached(bad):
+    with pytest.raises(ValueError): topology_losses(torch.ones((1, 2, 4), dtype=torch.float64), bad, torch.ones(1, dtype=torch.float64))
+
+
+def test_contact_batch_length_mismatch_is_rejected():
+    bad = dataclasses.replace(_contact_batch(), contact_margin=torch.tensor([1., 2.]))
+    with pytest.raises(ValueError): topology_losses(torch.ones((1, 2, 4), dtype=torch.float64), bad, torch.ones(1, dtype=torch.float64))
+
+
 def test_extractor_tie_breaks_axis_then_lower_id_and_chain_has_no_transitive_edge():
     legal = torch.tensor([[0., 0., 1., 1.], [2., 2., 1., 1.], [4., 2., 1., 1.]], dtype=torch.float64)
     label = extract_sparse_label(legal, {"n": 3, "cons": [[0, 0], [0, 0], [0, 0]]}, "x", 1, 1., 2.)
     assert (label.edges[0].axis, label.edges[0].src) == (0, 0)
     assert not any(e.kind == "sep" and e.src == 0 and e.dst == 2 for e in label.edges)
+
+
+def test_extractor_equal_axis_centres_choose_lower_id_and_axis_zero_tie():
+    legal = torch.tensor([[0., 0., 2., 2.], [0., 2., 2., 2.]], dtype=torch.float64)
+    label = extract_sparse_label(legal, {"n": 2, "cons": [[0, 0], [0, 0]]}, "x", 1, 1., 2.)
+    assert any(e.src == 0 and e.dst == 1 for e in label.edges)
 
 
 def test_cluster_contact_requires_positive_overlap():
@@ -205,10 +251,27 @@ def test_cluster_contact_requires_positive_overlap():
     assert len(label.contacts) == 1
 
 
+def test_cluster_contact_exact_face_margin_and_transitive_edges():
+    legal = torch.tensor([[0., 0., 2., 2.], [2., 0., 2., 2.], [4., 0., 2., 2.]], dtype=torch.float64)
+    label = extract_sparse_label(legal, {"n": 3, "cons": [[0, 0, 7, 7, 0], [0, 0, 7, 7, 0], [0, 0, 7, 7, 0]]}, "x", 1, 1., 2.)
+    assert { (c.a, c.b) for c in label.contacts } == {(0, 1), (1, 2)}
+    assert all(c.perp_margin == 2 for c in label.contacts)
+
+
 def test_cluster_contact_rejects_disconnected_members():
     legal = torch.tensor([[0., 0., 2., 2.], [2., 2.5, 2., 2.]], dtype=torch.float64)
     with pytest.raises(ValueError):
         extract_sparse_label(legal, {"n": 2, "cons": [[0, 0, 0, 7, 0], [0, 0, 0, 7, 0]]}, "x", 1, 1., 2.)
+
+
+def test_cluster_contact_requires_literal_positive_overlap_and_face_contact():
+    base = {"n": 2, "cons": [[0, 0, 0, 7, 0], [0, 0, 0, 7, 0]]}
+    exact = torch.tensor([[0., 0., 2., 2.], [2., 0., 2., 2.]], dtype=torch.float64)
+    assert len(extract_sparse_label(exact, base, "x", 1, 1., 2.).contacts) == 1
+    near = exact.clone(); near[1, 0] += 1e-10
+    with pytest.raises(ValueError): extract_sparse_label(near, base, "x", 1, 1., 2.)
+    corner = torch.tensor([[0., 0., 2., 2.], [2., 2., 2., 2.]], dtype=torch.float64)
+    with pytest.raises(ValueError): extract_sparse_label(corner, base, "x", 1, 1., 2.)
 
 
 def test_extractor_rejects_float32_nonfinite_nonpositive_and_metadata():
@@ -260,6 +323,34 @@ def test_extractor_transitive_chain_and_repeat_determinism():
     a = extract_sparse_label(legal, case, "x", 1, 1., 2.)
     b = extract_sparse_label(legal, case, "x", 1, 1., 2.)
     assert a == b and not any((e.src, e.dst) == (0, 2) and e.kind == "sep" for e in a.edges)
+
+
+def test_extractor_is_independent_of_non_constraint_metadata():
+    legal = torch.tensor([[0., 0., 1., 1.], [2., 0., 1., 1.]], dtype=torch.float64)
+    base = {"n": 2, "cons": [[0, 0], [0, 0]]}
+    altered = dict(base, p2b=[[99, 99, 99]], pins=[[88, 88]], b2b=[[77, 77, 77]], golden=[123])
+    assert extract_sparse_label(legal, base, "x", 1, 1., 2.) == extract_sparse_label(legal, altered, "x", 1, 1., 2.)
+
+
+def test_topology_prior_ast_has_no_forbidden_data_dependencies():
+    path = Path(__file__).parents[1] / "partner/icdc/topology_prior.py"
+    tree = ast.parse(path.read_text())
+    allowed = {"math", "typing", "torch", "icdc.topology_data"}
+    imports = {a.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in [n]}
+    imports |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    assert imports <= allowed | {"__future__", "topology_data"}
+    forbidden = {"golden", "p2b", "pins", "b2b"}
+    assert not any(isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and n.slice.value in forbidden for n in ast.walk(tree))
+    assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and any(isinstance(a, ast.Constant) and a.value in forbidden for a in n.args) for n in ast.walk(tree))
+
+
+def test_shared_pin_path_root_deduplicates_root_pin_and_sep_edges():
+    legal = torch.tensor([[0., 0., 1., 1.], [2., 0., 1., 1.], [4., 0., 1., 1.]], dtype=torch.float64)
+    case = {"n": 3, "cons": [[0, 0], [0, 1], [0, 1]]}
+    label = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    assert label.pin_paths == ((0, 1), (0, 1, 2))
+    assert [(e.src, e.dst, e.kind) for e in label.edges].count((0, 1, "pin")) == 1
+    assert [(e.src, e.dst, e.kind) for e in label.edges].count((0, 1, "sep")) == 1
 
 
 @pytest.mark.parametrize("cons", [[], [[0, 0]], [[0, 0, 1]], [[0, 0, 1, 0, 0]], [[0, 0, 1, 0, 16]]])
