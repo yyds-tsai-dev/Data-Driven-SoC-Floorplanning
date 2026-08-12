@@ -26,7 +26,12 @@
 
 ## File map
 
-Create only `partner/icdc/topology_data.py`, `partner/icdc/topology_prior.py`, `partner/icdc/train_topology_prior.py`, `tests/test_icdc_topology_prior.py`, `scripts/probes/icdc_topology_teacher.py`, `scripts/probes/icdc_topology_gate.py`, `scripts/probes/icdc_topology_3d3f_wrapper.py`, and `scripts/probes/run_icdc_topology_stage.sh`; generated evidence is under `artifacts/icdc_topology/` or `.superpowers/sdd/`, and generated gate artifacts are not committed. The Track-B wrapper may set the frozen environment and add fail-closed source-count/Flow-success receipts around inherited production methods; it may not change sampling, ranking, refinement, or selection.
+The shared checkpoint codec is solely `partner/icdc/checkpoint_identity.py`.
+Task 4 may import/re-export private helper aliases for its probe tests; Task 5
+imports/re-exports `canonical_checkpoint_identity` and never duplicates the
+codec.
+
+Create only `partner/icdc/checkpoint_identity.py`, `partner/icdc/topology_data.py`, `partner/icdc/topology_prior.py`, `partner/icdc/train_topology_prior.py`, `tests/test_icdc_topology_prior.py`, `scripts/probes/icdc_topology_teacher.py`, `scripts/probes/icdc_topology_gate.py`, `scripts/probes/icdc_topology_3d3f_wrapper.py`, and `scripts/probes/run_icdc_topology_stage.sh`; generated evidence is under `artifacts/icdc_topology/` or `.superpowers/sdd/`, and generated gate artifacts are not committed. The Track-B wrapper may set the frozen environment and add fail-closed source-count/Flow-success receipts around inherited production methods; it may not change sampling, ranking, refinement, or selection.
 
 ### Task 1: Data schema, sanitized corpus, split, manifest
 
@@ -279,7 +284,25 @@ def test_group_contact_requires_exact_abutment_and_positive_overlap():
 
 ### Task 4: Deterministic teacher and G0
 
-**Files:** Create `scripts/probes/icdc_topology_teacher.py`; modify `tests/test_icdc_topology_prior.py`.
+**Files:** Create `partner/icdc/checkpoint_identity.py` and
+`scripts/probes/icdc_topology_teacher.py`; modify
+`tests/test_icdc_topology_prior.py`.
+
+- [ ] Implement the shared identity API: `IDENTITY_SCHEMA='icdc_canonical_state_v1'`,
+  `canonical_config_sha256`, `canonical_keyset_sha256`,
+  `canonical_state_sha256`, and `canonical_checkpoint_identity`.
+  Configuration is compact sorted-key JSON with `ensure_ascii=True` and
+  `allow_nan=False`. For each sorted state key hash UTF-8 key + NUL + dtype
+  text without `torch.` + NUL + compact JSON shape + NUL; keysets concatenate
+  headers, while states concatenate headers and detached CPU-contiguous raw
+  bytes. Reject empty/nonmapping model or EMA, non-tensors/nonfinite values,
+  unsupported layouts/quantized tensors, and noncanonical config. Identity is
+  exactly `identity_schema`, `model_config_sha256`, `model_keyset_sha256`,
+  `ema_keyset_sha256`, `ema_state_sha256`. Task 4 requires equal model/EMA
+  keysets and exact equality to `TeacherTrustPolicy.allowed_model_identity`.
+  Add direct RED vectors for ordering, noncontiguous tensors, dtype-prefix
+  exclusion, shape distinction, empty EMA, and stability. The CLI has no
+  `--scorer` override; the trust policy owns scorer selection.
 
 - [ ] Write these RED tests. `write_teacher_fixture(tmp_path)` creates one
   train and one held-out non-validation case plus a tiny same-shape checkpoint;
@@ -449,10 +472,11 @@ candidate: Mapping[str, Any], *, sampler_method: str = "dpmpp",
 sampler_steps: int = 2, candidate_count: int = 6,
 portfolio_contract_sha256: str)->Dict[str, Any]` verifies config, Direct
 sampler, total candidate count, portfolio hash, state keys, shapes, and dtypes.
-Also export `frozen_portfolio_contract(flow_slots:int=3,nref:int=6)`,
-`canonical_checkpoint_identity(checkpoint)->Dict[str,str]`, and the versioned
-canonical state encoder. The encoder hashes sorted UTF-8 keys followed by NUL,
-dtype, NUL, compact JSON shape, NUL, and CPU-contiguous tensor bytes.
+Also export `frozen_portfolio_contract(flow_slots:int=3,nref:int=6)` and
+re-export `canonical_checkpoint_identity(checkpoint)->Dict[str,str]` from the
+sole codec in `partner/icdc/checkpoint_identity.py`. Use
+`canonical_state_sha256` for source EMA/C0 comparisons; do not create another
+state encoder.
 
 - [ ] Write this concrete RED contract test:
 ```python
@@ -519,8 +543,8 @@ def test_source_contract_rejects_c0_that_is_not_source_ema():
   `student_samples=3`, `production_candidates=6`, and the canonical
   `P_B_3D3F` hash. Never compute energy on raw
   coordinates or import/load validation.
-- [ ] Before training, write `source_contract.json` and stop unless canonical
-  identities prove
+- [ ] Before training, write `source_contract.json` and stop unless the shared
+  codec's `canonical_state_sha256` values prove
   `source.ema_state_sha256 == c0.model_state_sha256 == c0.ema_state_sha256`.
   Bind these known file identities: source training checkpoint
   `508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659`,

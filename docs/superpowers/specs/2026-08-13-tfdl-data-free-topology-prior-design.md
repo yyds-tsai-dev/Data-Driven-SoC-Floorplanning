@@ -365,6 +365,31 @@ binding.
 
 ## Artifacts, reproducibility, and observability
 
+### Canonical checkpoint identity (shared Task 4/5 contract)
+
+The sole codec owner is `partner/icdc/checkpoint_identity.py`; Task 4 probes
+may import/re-export its private helper aliases as needed, and Task 5 imports
+and re-exports `canonical_checkpoint_identity` rather than implementing a
+second encoder. Its API is `IDENTITY_SCHEMA="icdc_canonical_state_v1"`,
+`canonical_config_sha256`, `canonical_keyset_sha256`,
+`canonical_state_sha256`, and `canonical_checkpoint_identity`.
+Configuration is compact sorted-key JSON (`ensure_ascii=True`,
+`allow_nan=False`). For every sorted state key, the header is UTF-8 key, NUL,
+dtype text without the `torch.` prefix, NUL, compact JSON shape, NUL.
+Keyset hashing concatenates headers; state hashing concatenates each header
+and detached CPU-contiguous raw tensor bytes. Reject empty/non-mapping model
+or EMA state, non-tensors, non-finite values, unsupported layouts or
+quantized tensors, and noncanonical configuration.
+
+The identity mapping has exactly these five fields:
+`identity_schema`, `model_config_sha256`, `model_keyset_sha256`,
+`ema_keyset_sha256`, and `ema_state_sha256`. Task 4 additionally requires
+model and EMA keysets to be equal and the exact identity to equal
+`TeacherTrustPolicy.allowed_model_identity`. Direct codec RED vectors cover
+ordering, noncontiguous tensors, exclusion of the dtype prefix, shape-header
+distinction, empty EMA rejection, and stability. The CLI has no `--scorer`
+override; scorer trust is owned by the trust policy.
+
 Task 4 emits exactly eight canonical files: `train_corpus.jsonl`,
 `heldout_corpus.jsonl`, `train_labels.jsonl`, `heldout_labels.jsonl`,
 `proposals.jsonl`, `rejections.jsonl`, `training_index.json`, and
