@@ -1157,6 +1157,41 @@ def _final_guards_ok(opt, P0: np.ndarray, P: np.ndarray,
     return _overlap_ok(P)
 
 
+def bridge_grouping_violations(opt, out, budget_s: float = 0.02):
+    """Apply only the bounded grouping repair, preserving identity on failure."""
+    try:
+        budget = float(budget_s)
+        if not math.isfinite(budget) or budget <= 0.0:
+            return out
+        P0 = np.asarray(
+            [[float(r[0]), float(r[1]), float(r[2]), float(r[3])] for r in out],
+            dtype=np.float64,
+        )
+        if P0.shape != (int(opt.n), 4) or not np.isfinite(P0).all():
+            return out
+        grouping0 = _grouping_count(opt, P0)
+        if grouping0 <= 0:
+            return out
+        ctx = _Ctx(opt, P0)
+        kind = list(opt.kind)
+        areas = list(opt.areas)
+        score0, violations0 = ctx.score(P0)
+        P, _score, _violations = _fix_grouping(
+            ctx, P0.copy(), score0, violations0,
+            kind, areas, time.time() + budget,
+        )
+        score1, violations1 = ctx.score(P)
+        if _grouping_count(opt, P) >= grouping0:
+            return out
+        if violations1 >= violations0 or score1 >= score0 - 1e-12:
+            return out
+        if not _final_guards_ok(opt, P0, P, kind, areas):
+            return out
+        return [tuple(map(float, r)) for r in P]
+    except Exception:
+        return out
+
+
 def _kill(out: List[Rect], area_targets, constraints, target_positions,
           b2b, p2b, pins, budget: float, verbose: bool):
     t_end = time.time() + max(budget, 0.2)
