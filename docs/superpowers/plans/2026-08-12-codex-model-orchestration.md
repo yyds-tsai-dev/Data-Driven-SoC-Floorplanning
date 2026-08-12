@@ -160,10 +160,14 @@ Expected: `Codex orchestration TOML contracts: PASS`.
 Run:
 
 ```bash
-codex --strict-config features list >/dev/null
+codex exec --strict-config --ephemeral --sandbox read-only --json \
+  "Reply with exactly OK. Do not call tools."
 ```
 
-Expected: exit status 0. A stale temporary-directory warning is acceptable; an unknown-key or invalid-value error is not.
+Expected: exit status 0 with an `agent_message` containing `OK`. A stale
+temporary-directory warning is acceptable; an unknown-key, invalid-value, or
+model-loading error is not. `codex 0.147.0` rejects `--strict-config` for the
+`features` and `debug` subcommands, so use the ephemeral read-only `exec` path.
 
 - [ ] **Step 7: Commit the project configuration and custom agents**
 
@@ -345,7 +349,8 @@ assert deep["name"] in agents and fast["name"] in agents
 assert "Subagent-Driven" in agents
 print("Integrated model orchestration: PASS")
 PY
-codex --strict-config features list >/dev/null
+codex exec --strict-config --ephemeral --sandbox read-only --json \
+  "Reply with exactly OK. Do not call tools."
 git diff --check
 git status --short
 ```
