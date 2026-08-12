@@ -77,13 +77,155 @@ def _batch(edge_margin=0.5, contact_margin=0.1, *, dtype=torch.float64):
     return SparseTopologyBatch(torch.tensor([0], dtype=torch.long), torch.tensor([0], dtype=torch.long), torch.tensor([1], dtype=torch.long), torch.tensor([0], dtype=torch.long), torch.tensor([edge_margin], dtype=dtype), torch.ones(1, dtype=dtype), empty_i, empty_i, empty_i, empty_i, empty_i, empty_f, empty_f)
 
 
-@pytest.mark.parametrize("case", range(15))
-def test_topology_contract_regression_cases(case):
-    rects = torch.tensor([[[0., 0., 1., 1.], [1.2 if case % 2 else 2., 0., 1., 1.]]], dtype=torch.float64, requires_grad=True)
-    out = topology_losses(rects, _batch(dtype=rects.dtype), torch.ones(1, dtype=rects.dtype))
-    assert torch.isfinite(out["total"])
+def _empty_i(dtype=torch.long):
+    return torch.empty(0, dtype=dtype)
+
+
+def _empty_f(dtype=torch.float64):
+    return torch.empty(0, dtype=dtype)
+
+
+def _edge_batch(*, src=0, dst=1, axis=0, margin=1., weight=1., batch=0, dtype=torch.float64):
+    return SparseTopologyBatch(
+        torch.tensor([batch], dtype=torch.long), torch.tensor([src], dtype=torch.long),
+        torch.tensor([dst], dtype=torch.long), torch.tensor([axis], dtype=torch.long),
+        torch.tensor([margin], dtype=dtype), torch.tensor([weight], dtype=dtype),
+        _empty_i(), _empty_i(), _empty_i(), _empty_i(), _empty_i(), _empty_f(dtype), _empty_f(dtype),
+    )
+
+
+def _contact_batch(*, a=0, b=1, axis=0, order=1, margin=2., weight=1., batch=0, dtype=torch.float64):
+    return SparseTopologyBatch(
+        _empty_i(), _empty_i(), _empty_i(), _empty_i(), _empty_f(dtype), _empty_f(dtype),
+        torch.tensor([batch], dtype=torch.long), torch.tensor([a], dtype=torch.long),
+        torch.tensor([b], dtype=torch.long), torch.tensor([axis], dtype=torch.long),
+        torch.tensor([order], dtype=torch.long), torch.tensor([margin], dtype=dtype),
+        torch.tensor([weight], dtype=dtype),
+    )
+
+
+def _zero_batch(dtype=torch.float64):
+    return SparseTopologyBatch(*([_empty_i()] * 4 + [_empty_f(dtype)] * 2 + [_empty_i()] * 5 + [_empty_f(dtype)] * 2))
+
+
+def test_separation_axis0_has_hand_computed_loss_and_directional_gradient():
+    rects = torch.tensor([[[0., 0., 2., 2.], [1., 0., 2., 2.]]], dtype=torch.float64, requires_grad=True)
+    out = topology_losses(rects, _edge_batch(), torch.ones(1, dtype=rects.dtype))
+    assert out["separation"].item() == pytest.approx(2.)
+    out["total"].backward()
+    assert rects.grad[0, 1, 0] < 0 and rects.grad[0, 0, 0] > 0
+
+
+def test_separation_axis1_has_hand_computed_loss_and_directional_gradient():
+    rects = torch.tensor([[[0., 0., 2., 2.], [0., 1., 2., 2.]]], dtype=torch.float64, requires_grad=True)
+    out = topology_losses(rects, _edge_batch(axis=1), torch.ones(1, dtype=rects.dtype))
+    assert out["separation"].item() == pytest.approx(2.)
+    out["total"].backward()
+    assert rects.grad[0, 1, 1] < 0 and rects.grad[0, 0, 1] > 0
+
+
+def test_contact_margin_is_scaled_and_has_positive_gradients():
+    rects = torch.tensor([[[0., 0., 2., 2.], [2.5, .5, 2., 2.]]], dtype=torch.float64, requires_grad=True)
+    out = topology_losses(rects, _contact_batch(), torch.tensor([10.], dtype=rects.dtype))
+    assert out["contact"].item() == pytest.approx(.1)
+    out["total"].backward()
+    assert rects.grad[0, 1, 0] > 0 and rects.grad[0, 1, 1] > 0
+
+
+@pytest.mark.parametrize("axis,order,rects", [
+    (0, 1, [[[0., 0., 2., 2.], [2., 0., 2., 2.]]]),
+    (0, 0, [[[2., 0., 2., 2.], [0., 0., 2., 2.]]]),
+    (1, 1, [[[0., 0., 2., 2.], [0., 2., 2., 2.]]]),
+    (1, 0, [[[0., 2., 2., 2.], [0., 0., 2., 2.]]]),
+])
+def test_exact_contacts_have_zero_loss(axis, order, rects):
+    value = torch.tensor(rects, dtype=torch.float64, requires_grad=True)
+    out = topology_losses(value, _contact_batch(axis=axis, order=order, margin=2.), torch.ones(1, dtype=value.dtype))
+    assert out["contact"].item() == pytest.approx(0.)
+
+
+def test_contact_perpendicular_deficit_is_not_clamped():
+    rects = torch.tensor([[[0., 0., 2., 1.], [2., .5, 2., 1.]]], dtype=torch.float64)
+    out = topology_losses(rects, _contact_batch(margin=2.), torch.ones(1, dtype=rects.dtype))
+    assert out["contact"].item() == pytest.approx(1.5)
+
+
+def test_empty_labels_are_zero_same_dtype_and_backward_safe():
+    rects = torch.ones((1, 2, 4), dtype=torch.float64, requires_grad=True)
+    out = topology_losses(rects, _zero_batch(), torch.ones(1, dtype=rects.dtype))
+    assert out["total"].dtype == rects.dtype and out["total"].item() == 0.
     out["total"].backward()
     assert rects.grad is not None
+
+
+def test_cross_batch_scales_are_normalized_before_global_mean():
+    rects = torch.tensor([[[0., 0., 2., 2.], [1., 0., 2., 2.]], [[0., 0., 2., 2.], [1., 0., 2., 2.]]], dtype=torch.float64)
+    b = dataclasses.replace(_edge_batch(), edge_batch=torch.tensor([0]), edge_weight=torch.tensor([1.], dtype=rects.dtype))
+    b = dataclasses.replace(b, edge_src=torch.tensor([0, 0]), edge_dst=torch.tensor([1, 1]), edge_batch=torch.tensor([0, 1]), edge_axis=torch.tensor([0, 0]), edge_margin=torch.tensor([1., 1.], dtype=rects.dtype), edge_weight=torch.tensor([1., 1.], dtype=rects.dtype))
+    assert topology_losses(rects, b, torch.tensor([1., 100.], dtype=rects.dtype))["separation"].item() == pytest.approx(1.01)
+    assert topology_losses(rects, b, torch.tensor([0., 1.], dtype=rects.dtype))["separation"].item() == pytest.approx(1_000_000.01)
+
+
+def test_direct_weights_are_detached_and_nonpositive_weights_rejected():
+    rects = torch.tensor([[[0., 0., 2., 2.], [1., 0., 2., 2.]]], dtype=torch.float64, requires_grad=True)
+    weights = torch.tensor([2.], dtype=torch.float64, requires_grad=True)
+    out = topology_losses(rects, dataclasses.replace(_edge_batch(), edge_weight=weights), torch.ones(1, dtype=rects.dtype))
+    out["total"].backward(); assert rects.grad is not None and weights.grad is None
+    for value in (0., -1.):
+        with pytest.raises(ValueError): topology_losses(rects.detach(), dataclasses.replace(_edge_batch(), edge_weight=torch.tensor([value])), torch.ones(1, dtype=rects.dtype))
+
+
+@pytest.mark.parametrize("bad", [torch.tensor([-1.]), torch.tensor([float('nan')])])
+def test_scale_zero_negative_nan_contract(bad):
+    with pytest.raises(ValueError): topology_losses(torch.ones((1, 2, 4), dtype=torch.float64), _edge_batch(), bad.to(torch.float64))
+
+
+def test_nonempty_zero_contact_margin_rejected_but_positive_accepted():
+    rects = torch.ones((1, 2, 4), dtype=torch.float64)
+    with pytest.raises(ValueError): topology_losses(rects, _contact_batch(margin=0.), torch.ones(1, dtype=rects.dtype))
+    assert torch.isfinite(topology_losses(rects, _contact_batch(margin=1.), torch.ones(1, dtype=rects.dtype))["total"])
+
+
+@pytest.mark.parametrize("field,value", [("edge_batch", 1), ("edge_src", 2), ("edge_axis", 2), ("contact_order", 2)])
+def test_sparse_batch_indices_axes_and_orders_rejected(field, value):
+    with pytest.raises(ValueError):
+        topology_losses(torch.ones((1, 2, 4), dtype=torch.float64), dataclasses.replace(_edge_batch(), **{field: torch.tensor([value])}), torch.ones(1, dtype=torch.float64))
+
+
+def test_extractor_tie_breaks_axis_then_lower_id_and_chain_has_no_transitive_edge():
+    legal = torch.tensor([[0., 0., 1., 1.], [2., 2., 1., 1.], [4., 2., 1., 1.]], dtype=torch.float64)
+    label = extract_sparse_label(legal, {"n": 3, "cons": [[0, 0], [0, 0], [0, 0]]}, "x", 1, 1., 2.)
+    assert (label.edges[0].axis, label.edges[0].src) == (0, 0)
+    assert not any(e.kind == "sep" and e.src == 0 and e.dst == 2 for e in label.edges)
+
+
+def test_cluster_contact_requires_positive_overlap():
+    legal = torch.tensor([[0., 0., 2., 2.], [2., .5, 2., 2.]], dtype=torch.float64)
+    label = extract_sparse_label(legal, {"n": 2, "cons": [[0, 0, 0, 7, 0], [0, 0, 0, 7, 0]]}, "x", 1, 1., 2.)
+    assert len(label.contacts) == 1
+
+
+def test_cluster_contact_rejects_disconnected_members():
+    legal = torch.tensor([[0., 0., 2., 2.], [2., 2.5, 2., 2.]], dtype=torch.float64)
+    with pytest.raises(ValueError):
+        extract_sparse_label(legal, {"n": 2, "cons": [[0, 0, 0, 7, 0], [0, 0, 0, 7, 0]]}, "x", 1, 1., 2.)
+
+
+def test_extractor_rejects_float32_nonfinite_nonpositive_and_metadata():
+    base = {"n": 1, "cons": [[0, 0]]}
+    for legal in (torch.ones((1, 4), dtype=torch.float32), torch.tensor([[0., 0., 0., 1.]], dtype=torch.float64), torch.tensor([[0., 0., float('nan'), 1.]], dtype=torch.float64)):
+        with pytest.raises(ValueError): extract_sparse_label(legal, base, "x", 1, 1., 2.)
+    for seed, iid, teacher, cost in [(True, "x", 1., 2.), (1, "", 1., 2.), (1, "x", 3., 2.), (1, "x", 1., 0.)]:
+        with pytest.raises(ValueError): extract_sparse_label(torch.ones((1, 4), dtype=torch.float64), base, iid, seed, teacher, cost)
+
+
+def test_mixed_constraint_row_widths_are_rejected():
+    with pytest.raises(ValueError):
+        extract_sparse_label(
+            torch.ones((2, 4), dtype=torch.float64),
+            {"n": 2, "cons": [[0, 0], [0, 0, 0, 0, 0]]},
+            "x", 1, 1., 2.,
+        )
 
 
 def test_scale_dtype_mismatch_rejected():
