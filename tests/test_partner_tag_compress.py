@@ -380,9 +380,12 @@ def test_dag_exception_preserves_local_identity(monkeypatch):
     _, at, cons, tpos, b2b, p2b, pins, rects = _single()
     monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
     local = [(3.0, 4.0, 1.0, 1.0)] * len(rects)
+    called = []
     monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: local)
-    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: (_ for _ in ()).throw(RuntimeError("dag")))
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 1)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: (called.append(True), (_ for _ in ()).throw(RuntimeError("dag")))[1])
     assert _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None) is local
+    assert called == [True]
 
 
 def test_dag_budget_fallback_and_debug_literal_one(monkeypatch, capsys):
