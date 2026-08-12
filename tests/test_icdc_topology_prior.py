@@ -4,6 +4,8 @@ import collections.abc
 import hashlib
 import io
 import importlib
+import importlib.util
+import sys
 import json
 import math
 from dataclasses import FrozenInstanceError, fields
@@ -44,12 +46,23 @@ import icdc.topology_prior as topology_prior
 # suite collectible while making each frozen teacher contract fail loudly
 # until scripts/probes/icdc_topology_teacher.py is implemented.
 def _teacher():
-    return importlib.import_module("scripts.probes.icdc_topology_teacher")
+    name = "scripts.probes.icdc_topology_teacher"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = Path("scripts/probes/icdc_topology_teacher.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError(name)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_teacher_policy_is_frozen_and_has_exact_fields(tmp_path):
     t = _teacher()
-    policy = t.TeacherTrustPolicy(Path("/canonical"), "a" * 64, {"model": "x"}, "b" * 64, "contract", "2.0")
+    identity = {"identity_schema": "icdc_canonical_state_v1", "model_config_sha256": "a"*64, "model_keyset_sha256": "b"*64, "ema_keyset_sha256": "c"*64, "ema_state_sha256": "d"*64}
+    policy = t.TeacherTrustPolicy(Path("/canonical"), "a" * 64, identity, "b" * 64, "contract", "2.0")
     assert [f.name for f in dataclasses.fields(policy)] == [
         "canonical_root", "expected_checkpoint_sha256", "allowed_model_identity",
         "expected_scorer_sha256", "scorer_contract", "shapely_version"]
@@ -60,10 +73,11 @@ def test_teacher_policy_is_frozen_and_has_exact_fields(tmp_path):
 def test_teacher_public_entrypoint_rejects_noncanonical_root_before_load(tmp_path, monkeypatch):
     t = _teacher()
     monkeypatch.setattr(torch, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
-    args = ["--data-root", str(tmp_path), "--out-dir", str(tmp_path / "out"), "--checkpoint", str(tmp_path / "m.th"), "--scorer", str(tmp_path / "s.py")]
+    canonical = tmp_path / "canonical"; canonical.mkdir(); out = tmp_path / "out"
+    args = ["--data-root", str(tmp_path / "other"), "--out-dir", str(out), "--checkpoint", str(tmp_path / "m.th"), "--scorer", str(tmp_path / "s.py")]
     with pytest.raises(ValueError, match="(canonical|provenance|validation)"):
         t.teacher_main(args)
-    link = tmp_path / "link"; link.symlink_to(tmp_path, target_is_directory=True)
+    link = tmp_path / "link"; link.symlink_to(canonical, target_is_directory=True)
     with pytest.raises(ValueError, match="(canonical|provenance|symlink)"):
         t.teacher_main([*args[:1], str(link), *args[2:]])
 
@@ -78,16 +92,17 @@ def test_teacher_sample_seed_is_stable_order_independent_and_signed63():
 
 def test_teacher_intent_parser_requires_exact_realized_geometry():
     t = _teacher(); rects = torch.tensor([[0., 0., 1., 1.], [2., 0., 1., 1.]])
-    case = {"n": 2, "cons": [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0]], "pins": [], "tp": [[-1]*4]*2, "groups": [[0, 1]]}
+    case = {"n": 2, "cons": [[0, 1, 5, 5, 5], [0, 0, 5, 5, 5]], "pins": [], "tp": [[0., 0., 1., 1.], [-1]*4], "groups": [[0, 1]]}
     assert t._proposal_intent_holds("base", rects, case)
     axis = rects.clone(); axis[1, 0] = 1.
-    assert t._proposal_intent_holds("axis:0:1:x", axis, case)
-    assert not t._proposal_intent_holds("axis:0:1:y", axis, case)
+    assert t._proposal_intent_holds("axis:0:1:0:1", axis, case)
+    assert not t._proposal_intent_holds("axis:0:1:1:1", axis, case)
     assert not t._proposal_intent_holds("axis:malformed", rects, case)
-    assert t._proposal_intent_holds("contact:0:1:0", torch.tensor([[0., 0., 1., 1.], [1., .25, 1., 1.]]), case)
+    assert t._proposal_intent_holds("pin:0:1:0:1", torch.tensor([[0., 0., 1., 1.], [1., 0., 1., 1.]]), case)
+    assert t._proposal_intent_holds("contact:5:0:1:0:1", torch.tensor([[0., 0., 1., 1.], [1., .25, 1., 1.]]), case)
     gap = torch.tensor([[0., 0., 1., 1.], [1. + torch.finfo(torch.float64).eps, .25, 1., 1.]])
-    assert not t._proposal_intent_holds("contact:0:1:0", gap, case)
-    assert not t._proposal_intent_holds("contact:99:0:1", rects, case)
+    assert not t._proposal_intent_holds("contact:5:0:1:0:1", gap, case)
+    assert not t._proposal_intent_holds("contact:99:0:1:0:1", rects, case)
 
 
 def test_teacher_official_winner_uses_cost_ordinal_name_and_keeps_base():
@@ -107,10 +122,10 @@ def test_teacher_weighted_population_is_sorted_and_exact():
     rows = [{"relative_path": "b.json", "layout_index": 1, "instance_id": "b", "n": 12, "base_cost": 10., "teacher_cost": 7.},
             {"relative_path": "a.json", "layout_index": 0, "instance_id": "a", "n": 0, "base_cost": 4., "teacher_cost": 3.}]
     out = t._weighted_population(list(reversed(rows)))
-    assert out["base_mean"] == pytest.approx((10.*(1+math.e)+4.)/(2+math.e))
-    assert out["teacher_mean"] == pytest.approx((7.*(1+math.e)+3.)/(2+math.e))
-    assert out["gain"] == pytest.approx(out["base_mean"] - out["teacher_mean"])
-    assert out["denominator"] == pytest.approx(2 + math.e)
+    assert out["B_H"] == pytest.approx((10.*math.e+4.)/(1+math.e))
+    assert out["T_H"] == pytest.approx((7.*math.e+3.)/(1+math.e))
+    assert out["Delta_H"] == pytest.approx(out["B_H"] - out["T_H"])
+    assert out["denominator"] == pytest.approx(1 + math.e)
     assert out["population_sha256"] == t._weighted_population(rows)["population_sha256"]
     forged = [dict(r, weight=999.) for r in rows]
     try:
@@ -134,7 +149,7 @@ def test_teacher_checkpoint_hashes_bytes_before_torch_load(tmp_path, monkeypatch
     state = {"layer.weight": torch.ones(1), "layer.bias": torch.zeros(1)}
     monkeypatch.setattr(torch, "load", lambda fh, **k: (seen.append(fh.read()), {"model": state, "ema": {k: v.clone() for k, v in state.items()}, "model_config": {"d": 1}})[1])
     loaded, identity = t._load_verified_checkpoint_bytes(p, policy)
-    assert loaded["ema"] == {} and seen == [payload] and identity["sha256"] == policy.expected_checkpoint_sha256
+    assert loaded["ema"] and seen == [payload] and identity["checkpoint_sha256"] == policy.expected_checkpoint_sha256
     policy_bad = dataclasses.replace(policy, expected_checkpoint_sha256="0"*64)
     with pytest.raises(ValueError, match="hash"):
         t._load_verified_checkpoint_bytes(p, policy_bad)
@@ -159,8 +174,8 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
 def test_teacher_g0_state_precedence_literals():
     t = _teacher()
     base = {"trust_ok": True, "scorer_ok": True, "input_ok": True, "legal": True, "coverage": True, "teacher_gain": 0, "delta": 0}
-    expected = ["trust/scorer/input", "legality/coverage", "teacher>1.5", "delta<hard", "hard<=delta<target", "delta>=target"]
-    cases = [{**base, "trust_ok": False}, {**base, "legal": False}, {**base, "teacher_gain": 2}, {**base, "delta": 0.1}, {**base, "delta": 0.7}, {**base, "delta": 1.2}]
+    expected = ["KILLED_INPUT_CHECKPOINT_OR_SCORER", "KILLED_LEGALITY_OR_COVERAGE", "KILLED_TEACHER_GT_1_5", "STOP_HARD_GAIN_MISSED", "TARGET_GAIN_MET", "TARGET_GAIN_MISSED_NO_TRAINING_AUTHORITY"]
+    cases = [{**base, "trust_ok": False}, {**base, "legal": False}, {**base, "teacher_mean": 2}, {**base, "delta": 0.01}, {**base, "delta": 0.0181504738793652}, {**base, "delta": 0.0261247299384228}]
     assert [t._g0_state(c) for c in cases] == expected
 from icdc.topology_prior import topology_losses, extract_sparse_label
 from icdc.topology_prior import (
