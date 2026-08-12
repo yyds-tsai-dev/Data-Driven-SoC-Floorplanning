@@ -239,6 +239,7 @@ def test_dag_only_runs_local_then_dag_with_one_scorer(monkeypatch):
     monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
     made, events, sentinel = [], [], object()
     monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: made.append(1) or sentinel)
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 1)
     monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda s, v, b: events.append(("local", s)) or v)
     monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda s, v, b: events.append(("dag", s)) or v)
     _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
@@ -254,6 +255,125 @@ def test_dag_literal_zero_is_disabled(monkeypatch):
     monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: events.append("dag") or a[1])
     _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
     assert events == ["local"]
+
+
+def test_dag_only_literal_zero_is_exact_identity_without_scorer(monkeypatch):
+    out = [(0.0, 0.0, 1.0, 1.0)]
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "0")
+    monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: pytest.fail("scorer constructed"))
+    assert _opt()._tag_compress(out, torch.ones(1), torch.zeros((1, 5)), torch.full((1, 4), -1.0), torch.zeros((0, 3)), torch.zeros((0, 3)), torch.zeros((0, 2)), None) is out
+
+
+def test_dag_only_warms_tag_dependencies_once(monkeypatch):
+    calls = []
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    monkeypatch.setattr(tc, "warm_dependencies", lambda: calls.append("warm"))
+    _opt()
+    assert calls == ["warm"]
+
+
+def test_all_flags_are_ordered_tag_local_dag_and_share_scorer(monkeypatch):
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_TAG_COMPRESS", "1")
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    made, events, sentinel = [], [], object()
+    monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: made.append(1) or sentinel)
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 1)
+    tagged = [(1.0, 1.0, 1.0, 1.0)] * len(rects)
+    local = [(2.0, 2.0, 1.0, 1.0)] * len(rects)
+    dag = np.asarray([(3.0, 3.0, 1.0, 1.0)] * len(rects))
+    monkeypatch.setattr(tc, "tag_compress", lambda s, v: events.append(("tag", s, v)) or tagged)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda s, v, b: events.append(("local", s, v)) or local)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda s, v, b: events.append(("dag", s, v)) or dag)
+    got = _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
+    assert made == [1]
+    assert [event[0] for event in events] == ["tag", "local", "dag"]
+    assert events[1][2] is tagged and events[2][2] is local
+    assert got is dag
+
+
+@pytest.mark.parametrize("debug", [None, "1"])
+def test_zero_residual_grouping_skips_dag_and_preserves_local_identity(monkeypatch, debug):
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    if debug is not None:
+        monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE_DEBUG", debug)
+    local = [(4.0, 5.0, 1.0, 1.0)] * len(rects)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: local)
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 0)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: pytest.fail("DAG called"))
+    assert _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None) is local
+
+
+def test_dag_debug_ndarray_candidate_is_preserved_and_reports_commit(monkeypatch, capsys):
+    from types import SimpleNamespace
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE_DEBUG", "1")
+    clock = [10.0]
+    scorer = SimpleNamespace(_hpwl=lambda p: 2.0)
+    local = [(4.0, 5.0, 1.0, 1.0)] * len(rects)
+    candidate = np.asarray([(6.0, 7.0, 1.0, 1.0)] * len(rects))
+    monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: scorer)
+    monkeypatch.setattr(co.time, "perf_counter", lambda: clock.__setitem__(0, clock[0] + 0.25) or clock[0])
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: local)
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 1)
+    monkeypatch.setattr("violation_killer._violations_exact", lambda *a: 0)
+    monkeypatch.setattr("violation_killer._bbox_area", lambda *a: 3.0)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: candidate)
+    got = _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
+    err = capsys.readouterr().err
+    assert got is candidate
+    assert "ms=250.000" in err
+    assert "grouping=" in err and "V=" in err and "hpwl=" in err and "bbox=" in err and "committed=1" in err
+
+
+def test_dag_debug_equal_candidate_reports_zero_commit(monkeypatch, capsys):
+    from types import SimpleNamespace
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE_DEBUG", "1")
+    scorer = SimpleNamespace(_hpwl=lambda p: 2.0)
+    local = [(4.0, 5.0, 1.0, 1.0)] * len(rects)
+    monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: scorer)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: local)
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 1)
+    monkeypatch.setattr("violation_killer._violations_exact", lambda *a: 0)
+    monkeypatch.setattr("violation_killer._bbox_area", lambda *a: 3.0)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: list(local))
+    _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
+    assert "committed=0" in capsys.readouterr().err
+
+
+def test_dag_debug_diagnostic_failure_does_not_discard_candidate(monkeypatch):
+    from types import SimpleNamespace
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE_DEBUG", "1")
+    local = [(4.0, 5.0, 1.0, 1.0)] * len(rects)
+    candidate = np.asarray([(6.0, 7.0, 1.0, 1.0)] * len(rects))
+    scorer = SimpleNamespace(_hpwl=lambda p: (_ for _ in ()).throw(RuntimeError("diag")))
+    monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: scorer)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: local)
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 1)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: candidate)
+    assert _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None) is candidate
+
+
+@pytest.mark.parametrize("bad", [np.zeros((1, 3)), np.full((1, 4), np.nan), object()])
+def test_invalid_dag_output_preserves_exact_local_identity(monkeypatch, bad):
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    local = [(4.0, 5.0, 1.0, 1.0)] * len(rects)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: local)
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 1)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: bad)
+    assert _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None) is local
+
+
+def test_dag_env_cleanup_names_are_all_registered():
+    assert {"PARTNER_GROUP_DAG_BRIDGE", "PARTNER_GROUP_DAG_BRIDGE_BUDGET", "PARTNER_GROUP_DAG_BRIDGE_DEBUG"} <= set(_ENV)
 
 
 def test_dag_exception_preserves_local_identity(monkeypatch):
@@ -272,6 +392,7 @@ def test_dag_budget_fallback_and_debug_literal_one(monkeypatch, capsys):
     monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE_DEBUG", "true")
     seen = []
     monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: a[1])
+    monkeypatch.setattr("violation_killer._grouping_count", lambda *a: 1)
     monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda s, v, b: seen.append(b) or v)
     _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
     assert seen == [pytest.approx(0.003)]

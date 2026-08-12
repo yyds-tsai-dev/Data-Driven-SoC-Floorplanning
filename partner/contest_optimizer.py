@@ -79,6 +79,31 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _print_dag_bridge_diag(scorer, before_array: np.ndarray,
+                           after_array: np.ndarray, elapsed_ms: float,
+                           committed: bool) -> None:
+    """Emit observational DAG-bridge accounting without affecting results."""
+    try:
+        from violation_killer import _bbox_area, _grouping_count, _violations_exact
+
+        grouping0 = _grouping_count(scorer, before_array)
+        grouping1 = _grouping_count(scorer, after_array)
+        violations0 = _violations_exact(scorer, before_array)
+        violations1 = _violations_exact(scorer, after_array)
+        hpwl0 = float(scorer._hpwl(before_array))
+        hpwl1 = float(scorer._hpwl(after_array))
+        bbox0 = _bbox_area(before_array)
+        bbox1 = _bbox_area(after_array)
+        print(f"[gdag] n={len(before_array)} ms={elapsed_ms:.3f} "
+              f"grouping={grouping0}->{grouping1} V={violations0}->{violations1} "
+              f"hpwl={hpwl0:.6f}->{hpwl1:.6f} "
+              f"bbox={bbox0:.6f}->{bbox1:.6f} "
+              f"committed={int(bool(committed))}",
+              file=sys.stderr, flush=True)
+    except Exception:
+        return
+
+
 # Historical defaults; env-overridable so experiments can rescale the
 # per-case budget without editing code (defaults reproduce old behavior).
 BUDGET_SCALE = _env_float("PARTNER_BUDGET_SCALE", 0.06)
@@ -805,8 +830,17 @@ class MyOptimizer(FloorplanOptimizer):
         if not dag_on:
             return bridged
 
-        dag_debug = os.environ.get("PARTNER_GROUP_DAG_BRIDGE_DEBUG") == "1"
         try:
+            base_array = np.asarray(
+                [tuple(map(float, r)) for r in bridged], dtype=float)
+            if base_array.ndim != 2 or base_array.shape[1] != 4 \
+                    or not np.all(np.isfinite(base_array)):
+                return bridged
+            from violation_killer import _grouping_count
+            if _grouping_count(scorer, base_array) == 0:
+                return bridged
+
+            dag_debug = os.environ.get("PARTNER_GROUP_DAG_BRIDGE_DEBUG") == "1"
             try:
                 dag_budget = float(os.environ.get("PARTNER_GROUP_DAG_BRIDGE_BUDGET", "0.003"))
             except (TypeError, ValueError):
@@ -817,21 +851,13 @@ class MyOptimizer(FloorplanOptimizer):
             dag_started = time.perf_counter() if dag_debug else None
             dagged = bridge_grouping_violations_dag(scorer, bridged, dag_budget)
             dag_array = np.asarray([tuple(map(float, r)) for r in dagged], dtype=float)
-            base_array = np.asarray([tuple(map(float, r)) for r in bridged], dtype=float)
             if dag_array.shape != base_array.shape or not np.all(np.isfinite(dag_array)):
                 return bridged
             if dag_debug:
                 elapsed_ms = (time.perf_counter() - dag_started) * 1000.0
-                from violation_killer import _grouping_count, _violations_exact, _bbox_area
-                p0 = base_array
-                p1 = dag_array
-                print(f"[gdag] n={len(bridged)} ms={elapsed_ms:.3f} "
-                      f"grouping={_grouping_count(scorer, p0)}->{_grouping_count(scorer, p1)} "
-                      f"V={_violations_exact(scorer, p0)}->{_violations_exact(scorer, p1)} "
-                      f"hpwl={float(scorer._hpwl(p0)):.6f}->{float(scorer._hpwl(p1)):.6f} "
-                      f"bbox={_bbox_area(p0):.6f}->{_bbox_area(p1):.6f} "
-                      f"committed={int(dagged is not bridged and dagged != bridged)}",
-                      file=sys.stderr, flush=True)
+                _print_dag_bridge_diag(
+                    scorer, base_array, dag_array, elapsed_ms,
+                    not np.array_equal(base_array, dag_array))
             return dagged
         except Exception:
             return bridged
