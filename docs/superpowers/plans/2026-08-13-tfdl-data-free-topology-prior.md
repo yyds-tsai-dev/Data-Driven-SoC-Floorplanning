@@ -36,11 +36,13 @@ per case; a bare `save_sanitized_corpus(path, cases)` call is invalid and must
 not appear in fixtures or documentation.  Verification hashes each exact
 source file, loads its bytes once from a `BytesIO` buffer using
 `weights_only=True`, validates the exact seven-tensor shard schema (input
-`(batch,n+1,6)`, then widths `3,3,2,3,4`, tree/fingerprint/metrics dimensions),
-and reconstructs canonical geometry by mapping raw `(w,h,x,y)` to `(x,y,w,h)`.
+`[B,N,6]`, tree `[B,N-1,3]`, fingerprint `[B,N,4]`, metrics `[B,8]`, plus
+the remaining exact validated tensor widths), and reconstructs canonical
+geometry by mapping raw `(w,h,x,y)` to `(x,y,w,h)`.
 The receipt's relative path, SHA256, layout index, and sanitized fingerprint
-are immutable provenance; `source_root` and receipts are required manifest
-fields and define the trust boundary.
+are immutable provenance.  `source_root` and receipts are required save-time
+inputs and define the source verification boundary; later sealed index/manifest
+artifacts carry the experiment-level reproducibility boundary.
 
 **Files:** Create `partner/icdc/topology_data.py`; create/modify `tests/test_icdc_topology_prior.py`.
 

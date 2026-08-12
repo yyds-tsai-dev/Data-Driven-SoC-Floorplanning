@@ -152,16 +152,16 @@ arguments to `save_sanitized_corpus`—there is no unbound corpus-writing API.
 Receipt verification hashes the exact source bytes first, then loads those
 bytes through a single in-memory buffer with `torch.load(...,
 weights_only=True, map_location="cpu")`.  Only the exact seven-tensor raw shard
-schema is accepted: input rows `(batch, n+1, 6)`, followed by tensors with
-widths `3, 3, 2, 3, 4`, a tree dimension of `n`, a fingerprint dimension of
-`n+1`, and metrics `(batch, 8)`.  All tensors must be finite CPU tensors with
-matching batch dimensions; no arbitrary pickle/object source is trusted.
+schema is accepted: input rows `[B,N,6]`, tree `[B,N-1,3]`, fingerprint
+ `[B,N,4]`, and metrics `[B,8]` (with the remaining raw tensors retaining their
+ exact validated widths).  All tensors must be finite CPU tensors with
+ matching batch dimensions; no arbitrary pickle/object source is trusted.
 
 The source adapter maps raw `(w,h,x,y)` geometry to the canonical
 `(x,y,w,h)` representation and masks non-input coordinates before fingerprinting.
-Golden/validation fields are never serialized or read.  This exact immutable
-source boundary, including `source_root` plus the complete receipt list, is
-part of the corpus manifest and must be reverified on reload.
+Golden/validation fields are never serialized or read.  The implementation
+verifies `source_root` and the complete receipt list while saving; later sealed
+index/manifest artifacts provide the experiment-level reproducibility boundary.
 
 Training and held-out data come from a non-validation instance pool. Validation
 cases are never used for proposal tuning, repeated feedback, threshold choice,
