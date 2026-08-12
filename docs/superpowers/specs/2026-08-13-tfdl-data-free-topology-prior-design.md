@@ -17,6 +17,43 @@ authoritative development baseline is
 No package review is requested until a final result reaches exactly `1.00` at
 `<=0.300` s/case.
 
+### Approved 3-Direct / 3-Flow amendment
+
+Preflight found that the historical wrapper requested six refinement seats but
+`PARTNER_FLOW_SLOTS=10`; on the normal successful path, quota allocation
+therefore replaced all six Direct samples with Flow samples. A changed Direct
+checkpoint could not causally affect the historical portfolio. The user
+approved this narrow amendment on 2026-08-13:
+
+- total refinement candidates remain exactly `6`;
+- the normal pool path contains exactly `3` Direct and `3` Flow candidates;
+- Direct uses DPM++ with exactly `2` steps;
+- Flow uses Euler with exactly `8` steps;
+- the Flow checkpoint, seeds, candidate ranker, six refinement seats, and all
+  other solver policy remain frozen;
+- retrieval, GPU second-wave, Direct/Flow noise optimization, Flow Z-order,
+  physics guidance, and oracle paths are disabled for the causal gate; and
+- a no-pool path, Flow failure, oversampling, or any observed mix other than
+  `3/3` is a contract failure, not a valid blind result.
+
+The legacy optimizer intentionally swallows Flow, pool, and solver failures,
+so raising inside a sampling override is not a reliable invalidation boundary.
+The experiment wrapper must instead trace the actual Direct-decode, Flow-call,
+Direct-gate, pool, parallel-solve, and outer-row-fallback boundaries without
+changing their returned arrays or order. If a contract violation is observed,
+the wrapper atomically writes an invalid receipt and terminates the evaluator
+subprocess non-zero from the outer subclass `solve`, after inherited `solve`
+returns but before the evaluator scores that case. The runner rejects any
+non-zero arm, incomplete receipt, missing completion marker, or fallback trace;
+an evaluator error row is never accepted as a substitute.
+
+Changing the Flow quota invalidates the historical artifact as a causal
+control. Its `1.1437448258795715` score remains the authoritative development
+baseline and the source of the absolute G1 outcome bar, but G1 attribution uses
+a newly frozen matched pair under the same 3-Direct/3-Flow contract: production
+Direct EMA versus the held-out-selected Track-B EMA. Both arms stay concealed
+until both full100 artifacts and manifests are immutable.
+
 Historical closure is commit `d31781e`. The old TFDL energy-pooling result had
 Spearman `0.9904`; an untrained bank was legal on only `40%` of cases, with the
 sole preplaced-drift failure; the best fine-tuned median was `2.65` versus a
@@ -45,9 +82,11 @@ The development path is:
 5. Convert only sparse critical constraints into labels.
 6. Distill those labels into a `DirectDenoiser` checkpoint with the SAME SHAPE.
 
-Production changes the checkpoint only: same configuration and tensor shapes,
-same two-step sampler, same candidate count, and no online TFDL, proposal bank,
-dense head, or extra graph pass.
+Production changes the Direct checkpoint inside the approved fixed portfolio:
+same configuration and tensor shapes, same DPM++ two-step sampler, exactly
+three Direct plus three Flow candidates, and no online TFDL, proposal bank,
+dense head, or extra graph pass. The quota amendment changes no model or online
+topology machinery and keeps the total candidate/refinement count at six.
 
 ### Proposal policy
 
@@ -76,13 +115,14 @@ Student outputs remain coordinates and aspect variables. No golden coordinates
 are teacher targets. The teacher explains topology constraints, rather than
 providing dense labels or exact-coordinate imitation.
 
-Run the production-aligned differentiable two-step sampler before computing
-the student losses. The student objective is a weighted sum of:
+Run three samples from the production-aligned differentiable two-step sampler
+before computing the student losses. The student objective is a weighted sum
+of:
 
 - differentiable normalized hinge separation loss
   `mean(max(0, (margin - signed_separation) / scale))` over labeled edges;
-- contact loss combining normalized equality error with a hinge enforcing the
-  perpendicular positive-overlap margin;
+- contact loss combining `abs(contact_axis_gap)/scale` with
+  `max(0, (perpendicular_margin-overlap)/scale)`;
 - pin/topology consistency loss for pin-support paths and required ordering;
 - a detached teacher-quality/ranking weight for each sparse-label record; and
 - base-checkpoint and EMA-anchor penalties to retain the Direct solution.
@@ -103,16 +143,13 @@ Reject a run that wins by collapsing all outputs to one topology.
 Training and held-out data come from a non-validation instance pool. Validation
 cases are never used for proposal tuning, repeated feedback, threshold choice,
 or checkpoint selection. The checkpoint is selected solely by held-out gates.
-Before the first full100 run, freeze a complete stage schedule: the held-out
-selection rule, one checkpoint per stage, thresholds, stop rules, and the final
-confirmation rule. Each predeclared stage may receive at most one blind paired
-full100 injection after its checkpoint is frozen. A stage result may only
-promote the already-declared next stage or terminate the track; it may not tune
-training, thresholds, proposals, losses, seeds, or checkpoint choice. All
-later checkpoints remain selected solely from non-validation held-out evidence.
-Reserve a separate final paired full100 confirmation for the final checkpoint,
-which must likewise be frozen without using earlier full100 outcomes as a
-selection signal.
+Before the first full100 run, freeze the complete currently authorized
+schedule: held-out selection, the immutable `g1_n100_3d3f.pt` checkpoint, 3/3
+portfolio/environment contract, matched control and candidate hashes, arm
+concealment/order, thresholds, and stop rule. G1 receives exactly one blind
+matched pair after both arms are frozen. Its result may only establish the
+predeclared high-tail causal proof or terminate; it may not tune training,
+thresholds, proposals, losses, seeds, quota, or checkpoint choice.
 
 The exact current weighted decomposition is:
 
@@ -122,9 +159,13 @@ The exact current weighted decomposition is:
 
 `q_band = 1.0829742560590576` corresponds to full100 minus `0.015` under
 100%-replacement. Even perfecting `n >= 100` while leaving all other cases
-unchanged yields only `1.0601728508910383`; therefore the track must expand
-after proof to `60–99` and ultimately all cases. `n >= 100` alone cannot reach
-`1.00`.
+unchanged yields only `1.0601728508910383`. The approved quota amendment does
+not change `PARTNER_DIRECT_MIN=0.3`; under the frozen budget, Direct opens at
+`n=99` and remains closed for `n<=98`. Therefore the currently authorized
+Track-B work can establish only the high-tail G1 proof. Expansion to `60–98`
+and the final `1.00` requires a separate, explicitly approved production-policy
+specification for the Direct gate/portfolio and a new matched runtime/control
+study. It must not be inferred from the 3/3 approval.
 
 ## Gates and stop conditions
 
@@ -138,42 +179,109 @@ student margin. The hard minimum is
 
 ### G1 — same-shape student
 
-Require held-out zero drift and hard legality under an exact TFDL audit. The
-one-time blind full100 paired injection must remain `100/100` feasible and
-achieve no-runtime `<=1.1287448258795715` (at least `0.015` gain) with runtime
-`<=0.300` s/case. Verify that model configuration, sampler method and steps,
-candidate count, state-dict key set, tensor shapes, and dtypes match the frozen
-production contract. G1 is not the final goal.
+Require held-out zero drift and hard legality under an exact TFDL audit and
+retain at least `75%` of the teacher gain over records with positive teacher
+gain. Before the blind pair, a deterministic non-validation causal smoke must
+prove that both arms execute the normal pool with exactly six candidates split
+3 Direct/3 Flow, Direct raw hashes differ, Flow raw hashes are identical, and
+at least one predeclared witness changes after ranking or in the final layout.
 
-### G2 — expansion
+Freeze the held-out-selected candidate at
+`artifacts/icdc_topology/checkpoints/g1_n100_3d3f.pt` plus an immutable manifest.
+The manifest binds the candidate, the C0 submission Direct checkpoint, the Flow
+checkpoint, source training checkpoint, portfolio, teacher data, held-out
+audit, schedule, seeds, and source commit by SHA256. The known input identities
+are:
 
-Expand weighted coverage to `60–99` and then all block counts using sampling
-aligned to `exp(n/12)`. The implementation plan must predeclare the checkpoints
-and held-out counterparts for milestones `<=1.10`, `<=1.05`, and ultimately
-exactly verified `1.00`. Each stage gets at most its scheduled blind paired
-full100 promotion-or-termination run, never an adaptation loop. The final
-checkpoint gets the reserved confirmation for `1.00`, `<=0.300 s`, `100/100`
-feasibility, and zero errors. Never claim the goal at G1.
+- training source file:
+  `508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659`;
+- C0 submission Direct file:
+  `2b9ce827aed93443e442a002d178e8e6282cb4c6148818c9122a6ff0411c8a02`;
+- source EMA and C0 model/EMA canonical state:
+  `0efb3c706d627f6230e6f550d83e88741dc1f5a95e6c3450d7ed1e4a882a4d87`;
+  and
+- frozen Flow file:
+  `110c1d84d74ee88d94cf8d3be9ac464602747db8c301d95b3ca69a2cb8bd2f09`.
 
-Kill the track if the oracle is above `1.5` with no trend, proposal coverage or
-pin support fails, the student cannot retain the held-out benefit, or runtime
-changes. Track A may spend at most `0.75` ms, leaving approximately `0.434` ms;
-Track B production remains replace-only, with actual full100 runtime binding.
+Run one concealed matched full100 pair: C0 uses the frozen production Direct
+EMA and C1 uses the frozen Track-B EMA, with every other input identical. Do not
+unmask or inspect either outcome until both artifacts, logs, environment
+receipts, and hashes are sealed. C1 passes only if all of the following hold:
+
+- C0 and C1 each independently have `100/100` feasibility, zero errors,
+  average runtime `<=0.300` s/case, valid freeze/environment/checkpoint hashes,
+  and complete valid portfolio receipts;
+- the arms have identical ordered `(case ordinal, block count, Direct-gate
+  status, pool status)` vectors; every Direct-gate-open case has exactly one
+  normal-pool receipt and every Direct-gate-closed case is explicitly recorded;
+- weighted no-runtime `<=1.1287448258795715`;
+- weighted no-runtime `<= C0 - 0.015`;
+- the receipts prove Direct DPM++/2, Flow Euler/8, total six, and exact 3D/3F.
+
+Verify that model configuration, state-dict keys, tensor shapes, and dtypes
+match the frozen Direct contract. G1 is a high-tail causal proof, not the final
+goal.
+
+### G2 — separate authority required
+
+No G2 blind run, Direct-gate change, or all-count checkpoint schedule is
+authorized by the 3D/3F amendment. Under the frozen contract, Direct is not
+sampled for `n<=98`; reaching `1.10`, `1.05`, or exact `1.00` therefore needs a
+separate production-policy specification and explicit user approval. That new
+specification must predeclare a lower-count Direct gate/portfolio, matched
+control and runtime study, non-validation causal smoke, checkpoints, held-out
+counterparts, blind schedule, and confirmation policy. G1 may only transition
+to `STOP_REQUIRES_SEPARATE_APPROVAL`, never silently into G2.
+
+Kill the track if the oracle is above `1.5`, proposal coverage or pin support
+fails, the student cannot retain the held-out benefit, any receipt violates the
+normal-pool contract, either blind arm fails, or the candidate misses either G1
+score gate, legality, or runtime. Track A may spend at most `0.75` ms, leaving
+approximately `0.434` ms. Track B changes only the Direct checkpoint within the
+approved fixed six-candidate 3D/3F portfolio; actual matched full100 runtime is
+binding.
 
 ## Artifacts, reproducibility, and observability
 
-Persist a versioned manifest containing baseline commit/checkpoint hash,
-instance split hash, the predeclared stage/checkpoint/full100 schedule,
+Persist a versioned manifest containing baseline commit/checkpoint identities,
+canonical model/EMA/keyset/config hashes, Flow identity, portfolio/environment
+hash, instance split hash, the predeclared G1 checkpoint/full100 schedule,
 deterministic seeds, proposal caps, accepted/rejected counts and reasons, exact
 scorer version, label schema version, normalization scales, training config,
-held-out metrics, checkpoint tensor-key hash, and paired full100 results. Emit
-per-case proposal coverage, drift, overlap, hard-error, topology-satisfaction,
-energy, runtime, and diversity metrics.
+held-out metrics, causal-smoke receipt, and the concealed paired full100
+results. Emit per-case proposal coverage, drift, overlap, hard-error,
+topology-satisfaction, energy, runtime, candidate-source counts, and diversity
+metrics.
+
+Environment identity has two distinct hashes. Each arm retains its literal
+`full_execution_env_sha256` for audit. For matched comparison, compute
+`matched_solver_env_sha256` after replacing `DIRECT_CKPT` by one fixed token
+and excluding only the runner-owned receipt destination and opaque arm ID.
+Those three fields are the closed allowlist of per-arm differences; the Direct
+checkpoint identity is separately bound to the sealed mapping/freeze manifest.
+Any other environment difference, especially any additional solver namespace
+key or value, invalidates the pair.
 
 Every artifact must be regenerable from the manifest without validation data.
-Retain teacher proposals, sparse labels, rejection logs, checkpoints, and gate
-reports as immutable evidence. Rollback is a single checkpoint replacement to
-the frozen Direct baseline; production has no new runtime state to migrate.
+Retain teacher proposals, sparse labels, rejection logs, checkpoints, freeze
+manifests, environment receipts, and gate reports as immutable evidence. Before
+either blind arm, start from a scrubbed solver environment and admit only the
+declared 3D/3F contract; inherited `PARTNER_`, `DIRECT_`, `FLOW_`, or `VKILL`
+state is forbidden. False values for flags consumed through raw environment
+truthiness must be empty/unset, never the non-empty string `"0"`; in
+particular, `DIRECT_OFF` must remain false so the Direct arm is actually
+loaded. Rollback restores both the frozen production Direct
+checkpoint and the pre-amendment portfolio; production has no new online model
+state to migrate. No package review follows G1.
+
+Normal receipts are written atomically at interpreter exit, after the evaluator
+has finished all timed cases; invalid receipts are written immediately before
+process termination. The runner owns the receipt path and requires a schema,
+arm ID, `complete=true` marker, exactly 100 ordered case-status entries, no
+fallback/exception events, and matching output/log/environment hashes before
+sealing an arm. A mutable selection artifact is never trusted by path: the
+held-out audit and causal smoke record the candidate's canonical identity, and
+the freeze gate rejects unless both identities equal the frozen candidate.
 
 ## File ownership and rejected alternatives
 
@@ -198,8 +306,11 @@ Track-B direction.
 
 ## Completion condition
 
-Track B is complete only after G0, G1, and G2 pass with reproducible manifests,
-held-out evidence, one blind paired full100 verification, exact `1.00` no-runtime
-and `<=0.300` s/case, `100/100` feasibility, zero hard errors, and a tested
-one-checkpoint rollback. Until then, report the current baseline and gate
-status, not completion.
+The currently approved Track-B phase is complete only as
+`HIGH_TAIL_CAUSAL_PROOF` after G0 and every G1 prerequisite pass, the one sealed
+matched pair clears both score gates plus runtime/legality, and the immutable
+record transitions to `STOP_REQUIRES_SEPARATE_APPROVAL`. This does not complete
+the overall goal. Exact `1.00`, `<=0.300` s/case, `100/100`, zero errors, and
+the final confirmation remain pending a separately approved G2 policy. Until
+then, report the current baseline and gate status, never Track-B or submission
+completion.
