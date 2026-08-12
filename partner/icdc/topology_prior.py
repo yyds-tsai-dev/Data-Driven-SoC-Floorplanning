@@ -35,8 +35,10 @@ def _validate_batch(batch: SparseTopologyBatch, rects: torch.Tensor) -> None:
                 raise ValueError("integer field")
         elif not value.is_floating_point() or value.dtype != rects.dtype or not torch.isfinite(value).all():
             raise ValueError("float field")
-        if n.endswith("margin") and (value < 0).any():
+        if n == "edge_margin" and (value < 0).any():
             raise ValueError("margin")
+        if n == "contact_margin" and (value <= 0).any():
+            raise ValueError("contact margin")
         if n.endswith("weight") and (value <= 0).any():
             raise ValueError("weight")
     b, n, _ = rects.shape
@@ -54,7 +56,7 @@ def _validate_batch(batch: SparseTopologyBatch, rects: torch.Tensor) -> None:
 
 def topology_losses(rects: torch.Tensor, labels: SparseTopologyBatch, scale: torch.Tensor) -> dict[str, torch.Tensor]:
     _validate_rects(rects)
-    if not isinstance(scale, torch.Tensor) or not scale.is_floating_point() or scale.ndim != 1 or scale.shape[0] != rects.shape[0] or scale.device != rects.device or not torch.isfinite(scale).all() or (scale < 0).any():
+    if not isinstance(scale, torch.Tensor) or not scale.is_floating_point() or scale.dtype != rects.dtype or scale.ndim != 1 or scale.shape[0] != rects.shape[0] or scale.device != rects.device or not torch.isfinite(scale).all() or (scale < 0).any():
         raise ValueError("scale")
     _validate_batch(labels, rects)
     x, y, w, h = rects.unbind(-1)

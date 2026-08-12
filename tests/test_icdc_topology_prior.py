@@ -70,6 +70,60 @@ def test_extract_pin_paths_preserve_reduced_edges_and_ignore_forbidden_sources()
     assert label.pin_paths == ((0, 1, 2),)
     assert [(e.src, e.dst, e.kind) for e in label.edges].count((0, 1, "pin")) == 1
 
+
+def _batch(edge_margin=0.5, contact_margin=0.1, *, dtype=torch.float64):
+    empty_i = torch.empty(0, dtype=torch.long)
+    empty_f = torch.empty(0, dtype=dtype)
+    return SparseTopologyBatch(torch.tensor([0], dtype=torch.long), torch.tensor([0], dtype=torch.long), torch.tensor([1], dtype=torch.long), torch.tensor([0], dtype=torch.long), torch.tensor([edge_margin], dtype=dtype), torch.ones(1, dtype=dtype), empty_i, empty_i, empty_i, empty_i, empty_i, empty_f, empty_f)
+
+
+@pytest.mark.parametrize("case", range(15))
+def test_topology_contract_regression_cases(case):
+    rects = torch.tensor([[[0., 0., 1., 1.], [1.2 if case % 2 else 2., 0., 1., 1.]]], dtype=torch.float64, requires_grad=True)
+    out = topology_losses(rects, _batch(dtype=rects.dtype), torch.ones(1, dtype=rects.dtype))
+    assert torch.isfinite(out["total"])
+    out["total"].backward()
+    assert rects.grad is not None
+
+
+def test_scale_dtype_mismatch_rejected():
+    with pytest.raises(ValueError):
+        topology_losses(torch.zeros((1, 2, 4), dtype=torch.float64), _batch(), torch.ones(1, dtype=torch.float32))
+
+
+def test_direct_margin_contracts_reject_bad_values():
+    bad_edge = _batch(edge_margin=-1)
+    with pytest.raises(ValueError): topology_losses(torch.zeros((1, 2, 4), dtype=torch.float64) + 1, bad_edge, torch.ones(1, dtype=torch.float64))
+    bad = _batch()
+    bad = dataclasses.replace(bad, contact_margin=torch.zeros(0, dtype=torch.float64))
+    topology_losses(torch.ones((1, 2, 4), dtype=torch.float64), bad, torch.ones(1, dtype=torch.float64))
+
+
+@pytest.mark.parametrize("bad", [torch.tensor([-1.]), torch.tensor([float("nan")]), torch.tensor([float("inf")])])
+def test_scale_invalid_values_rejected(bad):
+    with pytest.raises(ValueError):
+        topology_losses(torch.ones((1, 2, 4), dtype=torch.float64), _batch(), bad.to(torch.float64))
+
+
+def test_extractor_rejects_bad_cost_and_seed_types():
+    legal = torch.ones((2, 4), dtype=torch.float64)
+    case = {"n": 2, "cons": [[0, 0], [0, 0]]}
+    with pytest.raises(ValueError): extract_sparse_label(legal, case, "x", True, 1., 2.)
+    with pytest.raises(ValueError): extract_sparse_label(legal, case, "x", 1, 2., 1.)
+
+
+def test_extractor_transitive_chain_and_repeat_determinism():
+    legal = torch.tensor([[0., 0., 1., 1.], [2., 0., 1., 1.], [4., 0., 1., 1.]], dtype=torch.float64)
+    case = {"n": 3, "cons": [[0, 0], [0, 0], [0, 0]]}
+    a = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    b = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    assert a == b and not any((e.src, e.dst) == (0, 2) and e.kind == "sep" for e in a.edges)
+
+
+@pytest.mark.parametrize("cons", [[], [[0, 0]], [[0, 0, 1]], [[0, 0, 1, 0, 0]], [[0, 0, 1, 0, 16]]])
+def test_extractor_malformed_constraints_are_controlled(cons):
+    with pytest.raises(ValueError): extract_sparse_label(torch.ones((2, 4), dtype=torch.float64), {"n": 2, "cons": cons}, "x", 1, 1., 2.)
+
 CANONICAL_ROOT = Path("FloorSet/floorset_lite").resolve()
 
 
