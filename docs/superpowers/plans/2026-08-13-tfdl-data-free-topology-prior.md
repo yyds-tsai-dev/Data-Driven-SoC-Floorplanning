@@ -58,34 +58,27 @@ Export `fingerprint_case(case: Mapping[str, Any])->str`,
 dtype: torch.dtype)->SparseTopologyBatch`, canonical JSONL read/write,
 sanitized corpus save/load, and SHA256 manifest helpers.
 
-- [ ] Write this concrete RED test:
+- [ ] Write this concrete RED test (the repository test helper pattern):
 ```python
 def test_sanitize_excludes_golden_and_masks_non_input_geometry(tmp_path):
-    case = {
-        "instance_id": "train-7", "n": 3,
-        "area": [4.0, 12.0, 30.0],
-        "cons": [[0, 0], [1, 0], [0, 1]],
-        "tp": [[7., 8., 2., 2.], [9., 9., 3., 4.], [5., 6., 5., 6.]],
-        "b2b": [], "p2b": [], "pins": [],
-        "hpwl_ref": 10.0, "area_ref": 100.0,
-        "golden": [[99., 99., 99., 99.]],
-    }
-    # Production call also requires the immutable source_root and receipts;
-    # this fixture must construct those explicitly (no unbound corpus API).
-    save_sanitized_corpus(
-        tmp_path / "c.jsonl", [case], source_root=source_root,
-        source_receipts=[receipt],
-    )
+    case = _case(golden=[[99.0, 99.0, 99.0, 99.0]])
+    _save(tmp_path / "c.jsonl", [case])
     row = load_sanitized_corpus(tmp_path / "c.jsonl")[0]
     assert set(row) == {
         "instance_id", "n", "area", "cons", "tp", "b2b", "p2b",
         "pins", "hpwl_ref", "area_ref",
     }
     assert row["tp"] == [
-        [-1., -1., -1., -1.], [-1., -1., 3., 4.], [5., 6., 5., 6.],
+        [-1.0, -1.0, -1.0, -1.0], [-1.0, -1.0, 3.0, 4.0],
+        [5.0, 6.0, 5.0, 6.0],
     ]
     assert "golden" not in row and "test_id" not in row
 ```
+
+Here `_save` constructs a matching exact seven-tensor temporary source shard,
+receipt-derived `instance_id` and fingerprint, and binds the test-only
+canonical root; the fixture therefore exercises the real receipt-bound API
+without undefined `source_root`/`receipt` variables.
 - [ ] Run `uv run pytest tests/test_icdc_topology_prior.py::test_sanitize_excludes_golden_and_masks_non_input_geometry -q`; expect RED.
 - [ ] Implement `@dataclass(frozen=True)`, canonical sorted-key JSON, and a
   SHA256 manifest. The exact corpus key allowlist is the set asserted above.

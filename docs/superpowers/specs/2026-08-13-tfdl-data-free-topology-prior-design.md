@@ -159,7 +159,8 @@ schema is accepted: input rows `[B,N,6]`, tree `[B,N-1,3]`, fingerprint
 
 The source adapter maps raw `(w,h,x,y)` geometry to the canonical
 `(x,y,w,h)` representation and masks non-input coordinates before fingerprinting.
-Golden/validation fields are never serialized or read.  The implementation
+Golden coordinates are never serialized or used as targets; raw `fp` is read
+only to derive input-authorized fixed/preplaced geometry.  The implementation
 verifies `source_root` and the complete receipt list while saving; later sealed
 index/manifest artifacts provide the experiment-level reproducibility boundary.
 
