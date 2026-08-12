@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 import torch
 
 from . import tfdl as T
 from . import engine
+from .topology_data import ContactLabel, SparseEdge, SparseTopologyBatch, TopologyLabel
 
 
 @dataclass(frozen=True)
@@ -21,7 +22,7 @@ class ProposalConfig:
     def __post_init__(self):
         for value in (self.axis_exchange_cap, self.pin_repair_cap, self.group_contact_cap, self.total_cap):
             if type(value) is not int or value < 0:
-                raise TypeError("proposal cap")
+                raise ValueError("proposal caps must be non-negative integers")
 
 
 @dataclass(frozen=True)
@@ -30,123 +31,487 @@ class ProposalResult:
     rects: torch.Tensor
     legal: torch.Tensor
     drift: torch.Tensor
-    hard_checks: Mapping[str, Any]
-    cost: Any = None
-    label: Any = None
+    hard_checks: Dict[str, bool]
+    cost: Optional[float] = None
+    label: Optional[TopologyLabel] = None
 
 
-def is_acyclic(n, edges):
+def is_acyclic(n: int, edges: Sequence[Tuple[int, int]]) -> bool:
     if type(n) is not int or n <= 0 or not isinstance(edges, (list, tuple)):
         return False
     graph = [[] for _ in range(n)]
     for edge in edges:
-        if not isinstance(edge, (list, tuple)) or len(edge) != 2 or any(type(x) is not int for x in edge): return False
+        if not isinstance(edge, (list, tuple)) or len(edge) != 2 or any(type(x) is not int for x in edge):
+            return False
         a, b = edge
-        if not (0 <= a < n and 0 <= b < n) or a == b: return False
+        if not (0 <= a < n and 0 <= b < n) or a == b:
+            return False
         graph[a].append(b)
     state = [0] * n
-    def visit(node):
-        if state[node] == 1: return False
-        if state[node] == 2: return True
+    def visit(node: int) -> bool:
+        if state[node] == 1:
+            return False
+        if state[node] == 2:
+            return True
         state[node] = 1
-        if any(not visit(child) for child in graph[node]): return False
+        if any(not visit(child) for child in graph[node]):
+            return False
         state[node] = 2
         return True
     return all(visit(i) for i in range(n))
 
 
-def _rect_cpu(rects, n):
-    return isinstance(rects, torch.Tensor) and rects.device.type == "cpu" and rects.is_floating_point() and rects.ndim in (2, 3) and rects.shape[-1] == 4 and (rects.shape[0] == n if rects.ndim == 2 else rects.shape[0] == 1 and rects.shape[1] == n) and torch.isfinite(rects).all()
+def _rect_cpu(rects: torch.Tensor, n: int, positive_sizes: bool = False) -> bool:
+    if not isinstance(rects, torch.Tensor) or rects.device.type != "cpu":
+        return False
+    if not rects.is_floating_point() or rects.ndim not in (2, 3) or rects.shape[-1] != 4:
+        return False
+    shape_ok = rects.shape == (n, 4) if rects.ndim == 2 else rects.shape == (1, n, 4)
+    if not shape_ok or not bool(torch.isfinite(rects).all()):
+        return False
+    return not positive_sizes or bool((rects[..., 2:] > 0).all())
 
 
-def matches_preplaced_origins(rects, case):
+def _case_tp(case: Mapping[str, Any], n: int) -> Optional[torch.Tensor]:
+    value = case.get("tp")
     try:
-        n = case.get("n"); cons = _constraints(case, n); tp = torch.as_tensor(case.get("tp"), dtype=torch.float64)
-        if type(n) is not int or tp.shape != (n, 4) or not _rect_cpu(rects, n): return False
+        tp = torch.as_tensor(value, dtype=torch.float64, device="cpu")
+    except Exception:
+        return None
+    if tp.shape != (n, 4) or not bool(torch.isfinite(tp).all()):
+        return None
+    return tp
+
+
+def matches_preplaced_origins(rects: torch.Tensor, case: Mapping[str, Any]) -> bool:
+    try:
+        if not isinstance(case, Mapping):
+            return False
+        n = case.get("n")
+        if type(n) is not int or n <= 0:
+            return False
+        cons = _constraints(case, n)
+        tp = _case_tp(case, n)
+        if tp is None or not _rect_cpu(rects, n):
+            return False
         value = rects[0] if rects.ndim == 3 else rects
         for i, row in enumerate(cons):
-            if len(row) == 5 and row[1] and torch.isfinite(tp[i, :2]).all() and (tp[i, :2] >= 0).all() and not torch.equal(value[i, :2], tp[i, :2]): return False
+            authorized = row[1] != 0 and bool((tp[i, :2] >= 0).all())
+            if authorized and not torch.equal(value[i, :2], tp[i, :2]):
+                return False
         return True
-    except Exception: return False
+    except Exception:
+        return False
 
 
-def has_exact_positive_contact(rects, a, b, axis, order, perp_margin):
+def has_exact_positive_contact(rects: torch.Tensor, a: int, b: int, axis: int,
+                               a_before_b: bool, perp_margin: float) -> bool:
     try:
-        if not _rect_cpu(rects, rects.shape[-2]) or type(a) is not int or type(b) is not int or type(axis) is not int or type(order) is not bool or not isinstance(perp_margin, (int, float)) or isinstance(perp_margin, bool) or not math.isfinite(float(perp_margin)) or perp_margin <= 0 or a == b or axis not in (0, 1): return False
-        r = rects[0] if rects.ndim == 3 else rects; n = r.shape[0]
-        if not (0 <= a < n and 0 <= b < n): return False
-        perp = 1 - axis; end_a = r[a, axis] + r[a, axis + 2]; end_b = r[b, axis] + r[b, axis + 2]
-        if (end_a == r[b, axis]) != order: return False
+        if type(a) is not int or type(b) is not int or type(axis) is not int:
+            return False
+        if type(a_before_b) is not bool or axis not in (0, 1) or a == b:
+            return False
+        if isinstance(perp_margin, bool) or not isinstance(perp_margin, (int, float)):
+            return False
+        if not math.isfinite(float(perp_margin)) or perp_margin <= 0:
+            return False
+        n = rects.shape[-2] if isinstance(rects, torch.Tensor) and rects.ndim in (2, 3) else -1
+        if not _rect_cpu(rects, n, positive_sizes=True):
+            return False
+        r = rects[0] if rects.ndim == 3 else rects
+        if not (0 <= a < n and 0 <= b < n):
+            return False
+        perp = 1 - axis
+        a_end = r[a, axis] + r[a, axis + 2]
+        b_end = r[b, axis] + r[b, axis + 2]
+        exact_face = (a_end == r[b, axis]) if a_before_b else (b_end == r[a, axis])
+        if not bool(exact_face):
+            return False
         overlap = min(r[a, perp] + r[a, perp + 2], r[b, perp] + r[b, perp + 2]) - max(r[a, perp], r[b, perp])
-        return bool(overlap >= perp_margin and overlap > 0)
-    except Exception: return False
+        return bool(overlap >= float(perp_margin) and overlap > 0)
+    except Exception:
+        return False
 
 
-def pin_feasible_then_exact_tfdl(seed, case):
-    try:
-        n = case.get("n"); cons = _constraints(case, n); area = torch.as_tensor(case.get("area"), dtype=torch.float64)
-        tp = torch.as_tensor(case.get("tp"), dtype=torch.float64)
-        if type(n) is not int or area.shape != (n,) or tp.shape != (n, 4) or not _rect_cpu(seed, n): return None
-        if not torch.isfinite(area).all() or (area <= 0).any() or not torch.isfinite(tp[tp >= 0]).all(): return None
-        original = seed.to(torch.float64).clone().unsqueeze(0)
-        cons_t = torch.tensor(cons, dtype=torch.long).unsqueeze(0)
-        mask = area.unsqueeze(0) > 0
-        pinned = (cons_t[:, :, 1] != 0) & (tp[:, 0] >= 0).unsqueeze(0) & mask
-        pin_xy = tp[:, :2].unsqueeze(0)
-        boundary = torch.tensor([[r[4] if len(r) == 5 else 0 for r in cons]], dtype=torch.long)
-        def run(exact):
-            legal, drift = T.tfdl(original.clone(), mask, pinned, pin_xy=pin_xy, boundary_code=boundary, exact=exact)
-            if not isinstance(legal, torch.Tensor) or not isinstance(drift, torch.Tensor) or legal.shape != original.shape or drift.shape != (1, n, 2) or not torch.isfinite(legal).all() or not torch.isfinite(drift).all() or torch.count_nonzero(drift) != 0 or not matches_preplaced_origins(legal, case): return None
-            return legal, drift
-        if run(False) is None: return None
-        result = run(True)
-        if result is None: return None
-        legal, drift = result
-        checks = engine.verify_hard_legal(legal.squeeze(0).numpy(), area.numpy(), __import__("numpy").asarray(cons), tp.numpy())
-        if not isinstance(checks, Mapping) or not checks or not all(type(v) is bool or isinstance(v, __import__("numpy").bool_) for v in checks.values()) or not all(checks.values()): return None
-        return legal.squeeze(0), drift.squeeze(0)
-    except Exception: return None
+def _validate_proposal_case(case: Mapping[str, Any]) -> Tuple[int, torch.Tensor, list[list[int]], torch.Tensor]:
+    if not isinstance(case, Mapping):
+        raise TypeError("case must be a mapping")
+    n = case.get("n")
+    if type(n) is not int or n <= 0:
+        raise ValueError("n")
+    cons = _constraints(case, n)
+    area_value = case.get("area")
+    if not isinstance(area_value, (list, tuple)) or len(area_value) != n:
+        raise ValueError("area")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not math.isfinite(float(value)) or float(value) <= 0
+           for value in area_value):
+        raise ValueError("area")
+    area = torch.tensor(area_value, dtype=torch.float64, device="cpu")
+    tp = _case_tp(case, n)
+    if tp is None:
+        raise ValueError("tp")
+    for index, row in enumerate(cons):
+        fixed_or_preplaced = row[0] != 0 or row[1] != 0
+        if fixed_or_preplaced and (tp[index, 2] <= 0 or tp[index, 3] <= 0):
+            raise ValueError("fixed dimensions")
+        if row[1] != 0 and (tp[index, 0] < 0 or tp[index, 1] < 0):
+            raise ValueError("preplaced origin")
+    return n, area, cons, tp
 
 
-def _proposal_fingerprint(rects, cons):
-    r = rects.tolist(); out = []
-    for i in range(len(r)):
-        for j in range(i + 1, len(r)):
-            gx = max(r[i][0] - r[j][0] - r[j][2], r[j][0] - r[i][0] - r[i][2])
-            gy = max(r[i][1] - r[j][1] - r[j][3], r[j][1] - r[i][1] - r[i][3])
-            axis = 0 if gx >= gy else 1; ci = r[i][axis] + r[i][axis + 2] / 2; cj = r[j][axis] + r[j][axis + 2] / 2
-            out.append((i, j, axis, (ci, i) <= (cj, j)))
-            if len(cons[i]) == 5 and cons[i][3] == cons[j][3] and cons[i][3] > 0:
-                perp = 1 - axis; overlap = min(r[i][perp] + r[i][perp + 2], r[j][perp] + r[j][perp + 2]) - max(r[i][perp], r[j][perp])
-                if overlap > 0 and (r[i][axis] + r[i][axis + 2] == r[j][axis] or r[j][axis] + r[j][axis + 2] == r[i][axis]): out.append(("c", i, j, axis, overlap))
-    return tuple(out)
+def _authorized_preplaced(cons: Sequence[Sequence[int]], tp: torch.Tensor) -> Tuple[int, ...]:
+    return tuple(index for index, row in enumerate(cons)
+                 if row[1] != 0 and bool((tp[index, :2] >= 0).all()))
 
 
-def generate_proposals(raw, case, cfg=ProposalConfig()):
-    if type(cfg) is not ProposalConfig or not isinstance(raw, torch.Tensor) or raw.device.type != "cpu" or raw.ndim != 2 or raw.shape[1] != 4 or not raw.is_floating_point() or not torch.isfinite(raw).all() or (raw[:, 2:] <= 0).any(): raise ValueError("raw")
-    n = case.get("n"); cons = _constraints(case, n)
-    if type(n) is not int or raw.shape[0] != n: raise ValueError("case")
-    base = raw.to(torch.float64).clone(); seen = {_proposal_fingerprint(base, cons)}; emitted = 0
-    if cfg.total_cap <= 0: return
-    yield "base", base
-    emitted += 1
-    for kind, cap in (("axis", cfg.axis_exchange_cap), ("pin", cfg.pin_repair_cap), ("contact", cfg.group_contact_cap)):
-        for i in range(n):
-            if emitted >= cfg.total_cap or cap <= 0: break
-            candidate = base.clone(); target = (i + 1) % n; axis = 0
-            if kind == "axis" and len(cons[target]) >= 2 and cons[target][1] == 1:
+def _pair_gap(rects: torch.Tensor, first: int, second: int, axis: int) -> float:
+    a = rects[first]
+    b = rects[second]
+    return max(float(a[axis] - b[axis] - b[axis + 2]),
+               float(b[axis] - a[axis] - a[axis + 2]))
+
+
+def _pair_state(rects: torch.Tensor, first: int, second: int) -> Tuple[int, int]:
+    gap_x = _pair_gap(rects, first, second, 0)
+    gap_y = _pair_gap(rects, first, second, 1)
+    axis = 0 if gap_x >= gap_y else 1
+    first_center = float(rects[first, axis] + rects[first, axis + 2] / 2)
+    second_center = float(rects[second, axis] + rects[second, axis + 2] / 2)
+    return axis, int((first_center, first) <= (second_center, second))
+
+
+def _contact_relation(rects: torch.Tensor, first: int, second: int,
+                      axis: int, order: int) -> bool:
+    if rects.ndim == 3:
+        rects = rects[0]
+    if order == 1:
+        exact = rects[first, axis] + rects[first, axis + 2] == rects[second, axis]
+    else:
+        exact = rects[second, axis] + rects[second, axis + 2] == rects[first, axis]
+    perp = 1 - axis
+    overlap = min(float(rects[first, perp] + rects[first, perp + 2]),
+                  float(rects[second, perp] + rects[second, perp + 2])) - max(
+                      float(rects[first, perp]), float(rects[second, perp]))
+    return bool(exact and overlap > 0)
+
+
+def _cluster_contacts(rects: torch.Tensor, cons: Sequence[Sequence[int]]) -> Tuple[Tuple[int, int, int, int], ...]:
+    contacts = []
+    for first in range(len(cons)):
+        for second in range(first + 1, len(cons)):
+            if len(cons[first]) < 4 or len(cons[second]) < 4:
                 continue
-            if kind == "contact" and len(cons[i]) == 5 and cons[i][3] == cons[target][3] and cons[i][3] > 0:
-                candidate[target, 0] = candidate[i, 0] + candidate[i, 2]
-            elif kind == "pin":
-                if cons[i][1] == 1: continue
-                candidate[target, 0] = candidate[i, 0] + candidate[i, 2] + 1e-6
-            else: candidate[target, axis] = candidate[i, 0] + candidate[i, 2] + 1e-6
-            fp = _proposal_fingerprint(candidate, cons)
-            if fp in seen: continue
-            seen.add(fp); yield f"{kind}:{i}:{target}", candidate; emitted += 1
+            if cons[first][3] <= 0 or cons[first][3] != cons[second][3]:
+                continue
+            for axis in (0, 1):
+                for order in (0, 1):
+                    if _contact_relation(rects, first, second, axis, order):
+                        contacts.append((cons[first][3], first, second, axis, order))
+    return tuple(contacts)
 
-from .topology_data import ContactLabel, SparseEdge, SparseTopologyBatch, TopologyLabel
+
+def _proposal_fingerprint(rects: torch.Tensor, cons: Sequence[Sequence[int]]) -> Tuple[Tuple[Any, ...], ...]:
+    fingerprint = []
+    for first in range(rects.shape[0]):
+        for second in range(first + 1, rects.shape[0]):
+            axis, order = _pair_state(rects, first, second)
+            fingerprint.append(("pair", first, second, axis, order))
+    fingerprint.extend(("contact", gid, first, second, axis, order)
+                       for gid, first, second, axis, order in _cluster_contacts(rects, cons))
+    return tuple(fingerprint)
+
+
+def _pin_mask(cons: Sequence[Sequence[int]], tp: torch.Tensor) -> Tuple[bool, ...]:
+    return tuple(index in _authorized_preplaced(cons, tp) for index in range(len(cons)))
+
+
+def _clearance(rects: torch.Tensor) -> float:
+    max_dimension = float(rects[:, 2:].max())
+    span_x = float(rects[:, 0].max() - rects[:, 0].min()) + max_dimension
+    span_y = float(rects[:, 1].max() - rects[:, 1].min()) + max_dimension
+    return max(max_dimension, span_x, span_y) + 1.0
+
+
+def _place_for_pair(rects: torch.Tensor, first: int, second: int,
+                    axis: int, order: int, moved: int) -> torch.Tensor:
+    candidate = rects.clone()
+    stationary = second if moved == first else first
+    other_axis = 1 - axis
+    target_gap = abs(_pair_gap(rects, moved, stationary, other_axis)) + _clearance(rects)
+    stationary_start = float(rects[stationary, axis])
+    stationary_end = stationary_start + float(rects[stationary, axis + 2])
+    moved_size = float(rects[moved, axis + 2])
+    if moved == first:
+        before = order == 1
+    else:
+        before = order == 0
+    if before:
+        candidate[moved, axis] = stationary_start - moved_size - target_gap
+    else:
+        candidate[moved, axis] = stationary_end + target_gap
+    return candidate
+
+
+def _repair_preplaced(rects: torch.Tensor, cons: Sequence[Sequence[int]],
+                      tp: torch.Tensor) -> torch.Tensor:
+    repaired = rects.clone()
+    for index in _authorized_preplaced(cons, tp):
+        repaired[index, :2] = tp[index, :2]
+    return repaired
+
+
+def _bool_result(value: Any) -> bool:
+    value_type = type(value)
+    return value_type is bool or (value_type.__module__ == "numpy" and value_type.__name__ == "bool")
+
+
+def _admission_run(seed: torch.Tensor, mask: torch.Tensor, pinned: torch.Tensor,
+                   pin_xy: torch.Tensor, boundary: torch.Tensor, case: Mapping[str, Any],
+                   exact: bool) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    try:
+        legal, drift = T.tfdl(seed.clone(), mask, pinned, pin_xy=pin_xy,
+                              boundary_code=boundary, exact=exact)
+    except Exception:
+        return None
+    if (not isinstance(legal, torch.Tensor) or not isinstance(drift, torch.Tensor)
+            or legal.shape != seed.shape or drift.shape != (1, seed.shape[1], 2)
+            or legal.dtype is not torch.float64 or drift.dtype is not torch.float64
+            or legal.device.type != "cpu" or drift.device.type != "cpu"
+            or not bool(torch.isfinite(legal).all()) or not bool(torch.isfinite(drift).all())
+            or torch.count_nonzero(drift).item() != 0
+            or not matches_preplaced_origins(legal, case)):
+        return None
+    return legal, drift
+
+
+def pin_feasible_then_exact_tfdl(
+    proposal: torch.Tensor, case: Mapping[str, Any]
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    try:
+        n, area, cons, tp = _validate_proposal_case(case)
+        if (not isinstance(proposal, torch.Tensor) or proposal.device.type != "cpu"
+                or proposal.ndim != 2 or proposal.dtype is not torch.float64
+                or not _rect_cpu(proposal, n, True)):
+            return None
+        if not matches_preplaced_origins(proposal, case):
+            return None
+        seed = proposal.clone().unsqueeze(0)
+        cons_tensor = torch.tensor(cons, dtype=torch.long, device="cpu").unsqueeze(0)
+        area_tensor = area.unsqueeze(0)
+        mask = area_tensor > 0
+        authorized = (tp[:, 0] >= 0) & (tp[:, 1] >= 0)
+        pinned = (cons_tensor[:, :, 1] != 0) & authorized.unsqueeze(0) & mask
+        pin_xy = tp[:, :2].unsqueeze(0)
+        boundary = torch.tensor(
+            [[row[4] if len(row) == 5 else 0 for row in cons]],
+            dtype=torch.long, device="cpu")
+        if _admission_run(seed, mask, pinned, pin_xy, boundary, case, False) is None:
+            return None
+        exact_result = _admission_run(seed, mask, pinned, pin_xy, boundary, case, True)
+        if exact_result is None:
+            return None
+        legal, drift = exact_result
+        checks = engine.verify_hard_legal(
+            legal.squeeze(0).numpy(), area.numpy(), cons_tensor.squeeze(0).numpy(), tp.numpy())
+        if (not isinstance(checks, Mapping) or not checks
+                or not all(_bool_result(value) for value in checks.values())
+                or not all(bool(value) for value in checks.values())):
+            return None
+        return legal.squeeze(0), drift.squeeze(0)
+    except Exception:
+        return None
+
+
+def _emit_candidate(name: str, candidate: torch.Tensor, kind: str,
+                    cap: int, seen: set, names: set, total: int,
+                    total_cap: int, cons: Sequence[Sequence[int]]) -> Optional[Tuple[str, torch.Tensor]]:
+    current_count = sum(existing.startswith(kind + ":") for existing in names)
+    if (total >= total_cap or current_count >= cap or name in names
+            or cap <= 0):
+        return None
+    fingerprint = _proposal_fingerprint(candidate, cons)
+    if fingerprint in seen:
+        return None
+    seen.add(fingerprint)
+    names.add(name)
+    return name, candidate
+
+
+def _contact_components(rects: torch.Tensor, cons: Sequence[Sequence[int]]) -> Dict[int, Tuple[Tuple[int, ...], ...]]:
+    groups: Dict[int, list[int]] = {}
+    for index, row in enumerate(cons):
+        if len(row) >= 4 and row[3] > 0:
+            groups.setdefault(row[3], []).append(index)
+    output: Dict[int, Tuple[Tuple[int, ...], ...]] = {}
+    contact_pairs = {(first, second) for _, first, second, _, _ in _cluster_contacts(rects, cons)}
+    for gid, members in sorted(groups.items()):
+        parent = {member: member for member in members}
+
+        def find(node: int) -> int:
+            while parent[node] != node:
+                parent[node] = parent[parent[node]]
+                node = parent[node]
+            return node
+
+        for first in members:
+            for second in members:
+                if first < second and (first, second) in contact_pairs:
+                    parent[find(first)] = find(second)
+        components: Dict[int, list[int]] = {}
+        for member in members:
+            components.setdefault(find(member), []).append(member)
+        output[gid] = tuple(sorted((tuple(sorted(component)) for component in components.values())))
+    return output
+
+
+def _contact_candidate(rects: torch.Tensor, first: int, second: int,
+                       axis: int, order: int, moved: int) -> torch.Tensor:
+    candidate = rects.clone()
+    stationary = second if moved == first else first
+    stationary_start = float(rects[stationary, axis])
+    stationary_end = stationary_start + float(rects[stationary, axis + 2])
+    moved_size = float(rects[moved, axis + 2])
+    if moved == first:
+        before = order == 1
+    else:
+        before = order == 0
+    candidate[moved, axis] = stationary_start - moved_size if before else stationary_end
+    candidate[moved, 1 - axis] = rects[stationary, 1 - axis]
+    return candidate
+
+
+def generate_proposals(
+    raw_rects: torch.Tensor, case: Mapping[str, Any],
+    cfg: ProposalConfig = ProposalConfig()
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    if type(cfg) is not ProposalConfig:
+        raise TypeError("cfg")
+    n, _area, cons, tp = _validate_proposal_case(case)
+    if (not isinstance(raw_rects, torch.Tensor) or raw_rects.device.type != "cpu"
+            or raw_rects.ndim != 2 or not raw_rects.is_floating_point()
+            or not _rect_cpu(raw_rects, n, True)):
+        raise ValueError("raw_rects")
+    base = raw_rects.to(dtype=torch.float64).clone()
+    if cfg.total_cap == 0:
+        return
+    seen = {_proposal_fingerprint(base, cons)}
+    names = {"base"}
+    total = 0
+    yield "base", base.clone()
+    total += 1
+    pinned = _pin_mask(cons, tp)
+    clearance = _clearance(base)
+
+    for first in range(n):
+        for second in range(first + 1, n):
+            if total >= cfg.total_cap:
+                return
+            if cfg.axis_exchange_cap <= sum(name.startswith("axis:") for name in names):
+                break
+            if pinned[first] and pinned[second]:
+                continue
+            moved = first if pinned[second] else second
+            if not pinned[first] and not pinned[second]:
+                moved = second
+            current_axis, current_order = _pair_state(base, first, second)
+            intents = ((current_axis, 1 - current_order),
+                       (1 - current_axis, 1 - current_order))
+            for axis, order in intents:
+                candidate = _place_for_pair(base, first, second, axis, order, moved)
+                actual_axis, actual_order = _pair_state(candidate, first, second)
+                if (actual_axis, actual_order) != (axis, order):
+                    continue
+                name = f"axis:{first}:{second}:{actual_axis}:{actual_order}"
+                emitted = _emit_candidate(name, candidate, "axis", cfg.axis_exchange_cap,
+                                           seen, names, total, cfg.total_cap, cons)
+                if emitted is not None:
+                    yield emitted
+                    total += 1
+                    if total >= cfg.total_cap:
+                        return
+
+    pin_base = _repair_preplaced(base, cons, tp)
+    preplaced = _authorized_preplaced(cons, tp)
+    if preplaced:
+        mismatched = tuple(index for index in preplaced
+                           if not torch.equal(base[index, :2], tp[index, :2]))
+        if mismatched and cfg.pin_repair_cap > 0:
+            target = mismatched[0]
+            peer = next((index for index in range(n)
+                         if index != target and not pinned[index]), None)
+            if peer is not None:
+                axis, order = _pair_state(pin_base, target, peer)
+                name = f"pin:{target}:{peer}:{axis}:{order}"
+                emitted = _emit_candidate(name, pin_base.clone(), "pin",
+                                           cfg.pin_repair_cap, seen, names,
+                                           total, cfg.total_cap, cons)
+                if emitted is not None:
+                    yield emitted
+                    total += 1
+                    if total >= cfg.total_cap:
+                        return
+        for target in preplaced:
+            for peer in range(n):
+                if peer == target or pinned[peer]:
+                    continue
+                current_axis, current_order = _pair_state(pin_base, target, peer)
+                candidate = _place_for_pair(pin_base, target, peer, current_axis,
+                                            1 - current_order, peer)
+                actual_axis, actual_order = _pair_state(candidate, target, peer)
+                if (actual_axis, actual_order) != (current_axis, 1 - current_order):
+                    continue
+                if not matches_preplaced_origins(candidate, case):
+                    continue
+                name = f"pin:{target}:{peer}:{actual_axis}:{actual_order}"
+                emitted = _emit_candidate(name, candidate, "pin", cfg.pin_repair_cap,
+                                           seen, names, total, cfg.total_cap, cons)
+                if emitted is not None:
+                    yield emitted
+                    total += 1
+                    if total >= cfg.total_cap:
+                        return
+                if sum(name.startswith("pin:") for name in names) >= cfg.pin_repair_cap:
+                    break
+            if sum(name.startswith("pin:") for name in names) >= cfg.pin_repair_cap:
+                break
+
+    contact_base = pin_base
+    contact_components = _contact_components(contact_base, cons)
+    for gid, components in sorted(contact_components.items()):
+        for left_index, left in enumerate(components):
+            for right in components[left_index + 1:]:
+                for first in left:
+                    for second in right:
+                        if total >= cfg.total_cap:
+                            return
+                        if sum(name.startswith("contact:") for name in names) >= cfg.group_contact_cap:
+                            return
+                        if pinned[first] and pinned[second]:
+                            continue
+                        moved = first if pinned[second] else second
+                        if not pinned[first] and not pinned[second]:
+                            moved = max(first, second)
+                        for axis in (0, 1):
+                            for order in (0, 1):
+                                candidate = _contact_candidate(contact_base, first, second,
+                                                                axis, order, moved)
+                                margin = min(float(candidate[first, 3 - axis]),
+                                             float(candidate[second, 3 - axis]))
+                                if not has_exact_positive_contact(candidate, first, second,
+                                                                   axis, bool(order), margin):
+                                    continue
+                                if not matches_preplaced_origins(candidate, case):
+                                    continue
+                                name = f"contact:{gid}:{first}:{second}:{axis}:{order}"
+                                emitted = _emit_candidate(name, candidate, "contact",
+                                                           cfg.group_contact_cap, seen, names,
+                                                           total, cfg.total_cap, cons)
+                                if emitted is not None:
+                                    yield emitted
+                                    total += 1
+                                    if total >= cfg.total_cap:
+                                        return
 
 
 def _validate_rects(rects: torch.Tensor) -> None:
