@@ -583,13 +583,67 @@ def test_extractor_is_independent_of_non_constraint_metadata():
 def test_topology_prior_ast_has_no_forbidden_data_dependencies():
     path = Path(__file__).parents[1] / "partner/icdc/topology_prior.py"
     tree = ast.parse(path.read_text())
-    allowed = {"math", "typing", "torch", "icdc.topology_data"}
-    imports = {a.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in [n]}
+    allowed = {"math", "typing", "dataclasses", "torch", "icdc.topology_data", "topology_data", "tfdl", "engine"}
+    imports = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module is not None}
     imports |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     assert imports <= allowed | {"__future__", "topology_data"}
     forbidden = {"golden", "p2b", "pins", "b2b"}
     assert not any(isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and n.slice.value in forbidden for n in ast.walk(tree))
     assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and any(isinstance(a, ast.Constant) and a.value in forbidden for a in n.args) for n in ast.walk(tree))
+
+
+def _called_names(fn_node):
+    return {
+        node.func.attr
+        for node in ast.walk(fn_node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+
+def test_proposal_functions_are_topology_only_and_do_not_import_heavy_helpers():
+    path = Path(__file__).parents[1] / "partner/icdc/topology_prior.py"
+    tree = ast.parse(path.read_text())
+    forbidden = {"energy", "coord_polish", "violation_killer", "shelf_fallback", "extract_sparse_label"}
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    for name in ("generate_proposals", "pin_feasible_then_exact_tfdl"):
+        assert forbidden.isdisjoint(_called_names(funcs[name]))
+        assert not any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in ast.walk(funcs[name]))
+
+
+def test_proposals_have_independent_per_kind_caps_when_supply_is_available():
+    raw = torch.tensor([[float(i * 5), 0., 2., 2.] for i in range(6)], dtype=torch.float64)
+    case = {"n": 6, "area": [4.] * 6,
+            "cons": [[0, 0, 0, 9 if i in (0, 1, 2) else 0, 0] for i in range(6)],
+            "tp": [[-1., -1., -1., -1.]] * 6}
+    cfg = ProposalConfig(axis_exchange_cap=2, pin_repair_cap=2, group_contact_cap=2, total_cap=20)
+    out = list(generate_proposals(raw, case, cfg))
+    counts = {kind: sum(name.startswith(kind + ":") for name, _ in out) for kind in ("axis", "pin", "contact")}
+    caps = {"axis": cfg.axis_exchange_cap, "pin": cfg.pin_repair_cap, "contact": cfg.group_contact_cap}
+    assert all(counts[k] <= caps[k] for k in counts)
+    assert len(out) <= cfg.total_cap
+
+
+def _topology_fingerprint(rects, cons):
+    return topology_prior._proposal_fingerprint(rects, cons)
+
+
+def test_axis_candidate_changes_topology_fingerprint_and_preserves_sizes_and_pins(proposal_fixture):
+    raw, case = proposal_fixture
+    out = list(generate_proposals(raw, case, ProposalConfig(8, 0, 0, 32)))
+    base_fp = _topology_fingerprint(raw, case["cons"])
+    axis = next((r for name, r in out if name.startswith("axis:")), None)
+    assert axis is not None and _topology_fingerprint(axis, case["cons"]) != base_fp
+    assert torch.equal(axis[:, 2:], raw[:, 2:])
+    assert torch.equal(axis[0, :2], raw[0, :2])
+
+
+def test_predicate_reverse_orientation_and_invalid_inputs():
+    rects = torch.tensor([[3., 0., 1., 2.], [0., .5, 1., 2.]], dtype=torch.float64)
+    assert has_exact_positive_contact(rects, 0, 1, 0, False, 1.)
+    assert not has_exact_positive_contact(rects, 0, 1, 0, True, 1.)
+    assert not has_exact_positive_contact(rects, 0, 1, 0, False, 3.)
+    assert not has_exact_positive_contact(rects, 0, 1, 2, False, 1.)
+    assert not has_exact_positive_contact(torch.ones((2, 3)), 0, 1, 0, False, 1.)
 
 
 def test_shared_pin_path_root_deduplicates_root_pin_and_sep_edges():
