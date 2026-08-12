@@ -112,17 +112,22 @@ def _contact_forest(P, members):
     return tuple(out)
 
 def _soft_profile(opt, P):
-    boundary = frozenset((int(i), int(code)) for i, code in _boundary_violators(opt, P) for code in range(1, 9) if not (code & int(code)))
-    # Store satisfied boundary bits; evaluator codes are powers of two.
-    boundary = frozenset((i, bit) for i in range(len(P)) for bit in (1,2,4,8,16,32,64,128)
-                         if (i, bit) not in {(int(j), int(c)) for j, c in _boundary_violators(opt, P)})
+    X0, Y0, X1, Y1 = _bbox(P)
+    boundary = set()
+    for i, code in zip(opt._bnd_idx, opt._bnd_codes):
+        i, code = int(i), int(code)
+        checks = ((1, P[i, 0], X0), (2, P[i, 0] + P[i, 2], X1),
+                  (4, P[i, 1] + P[i, 3], Y1), (8, P[i, 1], Y0))
+        for bit, value, edge in checks:
+            if code & bit and abs(value - edge) < B_EPS:
+                boundary.add((i, bit))
     grouping = set()
     for gid, members in opt.cluster_groups.items():
         for comp in _components(P, np.asarray(sorted(members), dtype=np.int64)):
             for i, a in enumerate(sorted(comp)):
                 for b in sorted(comp)[i+1:]: grouping.add((int(gid), a, b))
     mib = set()
-    for gid, members in enumerate(opt._mib_arrays):
+    for gid, members in opt.mib_groups.items():
         for i, a in enumerate(sorted(members)):
             for b in sorted(members)[i+1:]:
                 if (round(float(P[a,2]),4),round(float(P[a,3]),4)) == (round(float(P[b,2]),4),round(float(P[b,3]),4)):
@@ -179,8 +184,26 @@ def _enumerate_contact_choices(opt,P,max_contacts=4):
     return out
 
 def _project_changed_contact(opt,P,choice,budget_s=.003):
+    try:
+        if (not math.isfinite(float(budget_s)) or budget_s <= 0
+                or not isinstance(P, np.ndarray) or P.shape != (int(opt.n), 4)
+                or not np.isfinite(P).all() or (P[:, 2:] <= 0).any()):
+            return None
+        if (isinstance(choice.axis, (bool, np.bool_))
+                or not isinstance(choice.axis, numbers.Integral)
+                or int(choice.axis) not in (0, 1)):
+            return None
+        for value in (choice.a, choice.b):
+            if (isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, numbers.Integral)
+                    or not 0 <= int(value) < len(P)):
+                return None
+        if choice.a == choice.b or choice.group_id not in opt.cluster_groups:
+            return None
+    except Exception:
+        return None
     deadline = time.perf_counter() + float(budget_s)
-    if not math.isfinite(float(budget_s)) or budget_s <= 0 or time.perf_counter() >= deadline:
+    if time.perf_counter() >= deadline:
         return None
     forest=[]
     for gid,m in sorted(opt.cluster_groups.items()):
