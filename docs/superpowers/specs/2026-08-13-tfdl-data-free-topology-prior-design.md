@@ -156,8 +156,9 @@ of:
 - a detached teacher-quality/ranking weight for each sparse-label record; and
 - base-checkpoint and EMA-anchor penalties to retain the Direct solution.
 
-Evaluator-faithful energy is used offline to select proposals and derive that
-detached record weight. It is not evaluated directly on the student's raw,
+Official `cost_no_runtime` is used offline to select proposals and derive the
+detached record weight. `EN.energy` is evaluated only after admission as a
+diagnostic; it never selects proposals or derives weights. It is not evaluated directly on the student's raw,
 possibly overlapping coordinates: doing so would restore the degenerate blob
 minimum that killed pre-legalization energy training. The sparse separation,
 contact, and pin-margin losses are the only topology gradients supplied to the
@@ -260,7 +261,7 @@ study. It must not be inferred from the 3/3 approval.
 ### G0 — teacher oracle
 
 Define the eligible held-out population `H` by the immutable receipt-bound
-index (`n >= 100`, `split_for_id(instance_id) mod 10`), with exactly one fixed
+index (`n >= 100`, `split_for_id(instance_id, heldout_mod=10) == "heldout"`), with exactly one fixed
 Direct seed per case.  Do not compare an absolute held-out statistic with the
 validation/full100-derived `1.075` or `1.0829742560590576` bars.  With
 `w=exp(n/12)`, bind the ordered IDs, `n`, weights, denominator, population
@@ -278,20 +279,25 @@ authority; only the target permits Task 5.  G1 remains the sole causal
 transfer proof.
 
 For every generated proposal (base and mutations) that passes exact admission
-and named-intent survival, call official `evaluate_solution(runtime=1,
-median_runtime=1)`.  `EN.energy` is called only after exact legal admission,
-recorded diagnostically, and never shortlists or filters.  Select by deterministic
-`(cost,candidate_ordinal,name)`, always including baseline.  If no proposal
+and named-intent survival, call official `evaluate_solution({"positions": ..., "runtime": 1.0}, ...,
+median_runtime=1.0).cost_no_runtime`;
+`EN.energy` is called only after exact legal admission, recorded diagnostically,
+and never shortlists or filters. Select by deterministic
+`(cost_no_runtime, ordinal, name)`, always including baseline; `B_H`, `T_H`,
+labels, and record weights use `cost_no_runtime`. If no proposal
 improves, select baseline with `teacher_cost == base_cost`, explicit
 no-improvement status, and retained label/evidence (`record_weight=1`).  The
 coverage denominator is every eligible held-out case and exactly one officially
 scored winner per case; separately report mutation admission, intent survival,
 and positive-gain weighted coverage.
 
-G0 terminal states are `KILLED_INPUT_OR_CHECKPOINT`,
+G0 terminal states are `KILLED_INPUT_CHECKPOINT_OR_SCORER`,
 `KILLED_LEGALITY_OR_COVERAGE`, `KILLED_TEACHER_GT_1_5`,
 `STOP_HARD_GAIN_MISSED`, `TARGET_GAIN_MET`, and
-`TARGET_GAIN_MISSED_NO_TRAINING_AUTHORITY`.  Only `TARGET_GAIN_MET` advances.
+`TARGET_GAIN_MISSED_NO_TRAINING_AUTHORITY`. Precedence is exactly that order;
+retain all secondary reasons. The last state applies only when a policy
+condition clears hard but not target, avoiding impossible overlap. Only
+`TARGET_GAIN_MET` advances.
 
 ### G1 — same-shape student
 
@@ -365,7 +371,11 @@ Task 4 emits exactly eight canonical files: `train_corpus.jsonl`,
 `g0_manifest.json`. Every proposal envelope binds receipt/partition/instance,
 seed/ordinal/name, intended/seed/realized fingerprint or named intent,
 admission status/reason, available drift/hard evidence, diagnostic energy,
-official score/feasible, and winner/status. Manifest hashes every artifact.
+official score/feasible, and winner/status. The manifest hashes exactly the
+seven support artifacts by fixed relative basename, excluding itself. It stores
+`self_sha256 = SHA256(canonical g0_manifest JSON with the self_sha256 field
+omitted)`; an external freeze may later hash final manifest bytes. No absolute
+paths and no `topology_data.write_sha256_manifest` are allowed.
 Opaque public admission failures may be `admission_failed`; zero drift/hard
 claims apply only to admitted/scored/winner records and coverage. Every
 eligible held-out case contributes exactly one official winner, including the
@@ -373,10 +383,14 @@ baseline when there is no improvement.
 
 The source boundary is the exact canonical root, checked before any checkpoint
 load; sorted approved worker/layout paths are hashed by exact bytes and loaded
-via the same `BytesIO` with `torch.load(weights_only=True)`. Production rejects
-symlinks/noncanonical roots, streams source/corpus processing, and records an
+via the same `BytesIO` with `torch.load(weights_only=True)`, one sorted shard at
+a time; process all rows, append canonical partition JSONL incrementally,
+`fsync`, and evict tensors before the next shard. Retain only index metadata,
+digests, and gate aggregates; no whole-corpus save/load API is permitted.
+Production rejects symlinks/noncanonical roots and records an
 environment identity without claiming cross-hardware bit identity. Output is
-transactionally staged; `index-out` must be exactly `out-dir/training_index.json`,
+staged in a sibling directory, fsynced, and atomically renamed into a previously
+absent destination; `index-out` must be exactly `out-dir/training_index.json`,
 and a failed write cannot produce a completed manifest. Completion requires
 manifest `status=complete` and a terminal G0 state. Artifacts contain no
 timestamps or absolute paths. The production checkpoint expected SHA is
@@ -385,6 +399,12 @@ exact bytes before deserialization and bind canonical config, key/shape/dtype,
 and selected EMA tensor identity. Missing EMA, mismatch, Shapely dependency,
 or scorer source SHA/version mismatch fails closed. Fixtures may use only a
 test-injected expected hash helper.
+
+Before model or G0 scoring, freeze scorer identity: `scripts/iccad2026_evaluate.py`
+SHA256 is `7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1`,
+with the declared scorer schema/version identifier, `SHAPELY_AVAILABLE=true`,
+and Shapely `2.0.5`. A legitimate source change requires a written
+specification amendment and new freeze; it is never auto-accepted.
 
 Persist a versioned manifest containing baseline commit/checkpoint identities,
 canonical model/EMA/keyset/config hashes, Flow identity, portfolio/environment

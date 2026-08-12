@@ -17,8 +17,8 @@
 - Track A leaves approximately `0.434` ms from its `0.75` ms allowance; the matched candidate arm must bind runtime to the actual full100 result.
 - Training IDs/fingerprints and deterministic held-out IDs are allowed; validation IDs, validation loaders, and validation outcomes are forbidden for proposal tuning, training, thresholds, or checkpoint selection.
 - Never edit existing TFDL, energy, engine, sampler, optimizer, submission, or package code. No online TFDL, proposal bank, dense head, extra graph pass, or changed Direct/Flow sampler. The only approved production-policy difference from the historical wrapper is the exact 3D/3F quota at unchanged total six.
-- Every admitted, named-intent-surviving proposal (including base) is scored by official `evaluate_solution(runtime=1, median_runtime=1)`; `EN.energy` is diagnostic only after admission and never a shortlist/filter. Select deterministic `(cost,candidate_ordinal,name)`, always include base, and retain an explicit no-improvement base winner with `teacher_cost==base_cost` and `record_weight=1`. Corpus stores hpwl/area references, never golden coordinate targets.
-- G0 uses eligible held-out `H` from the immutable receipt-bound index (`n>=100`, `split_for_id mod 10`), one fixed Direct seed/case, and `w=exp(n/12)`. Bind ordered IDs/ns/weights/denominator/population SHA and `B_H`, `T_H`, `Delta_H=B_H-T_H`. Hard `Delta_H>=0.0181504738793652`; target `Delta_H>=0.0261247299384228`; these are predictive gates, not absolute full100 comparisons. `T_H>1.5` is diagnostic kill only. Between hard/target STOP with no training authority; only target advances Task 5. G1 remains sole causal transfer proof.
+- Every admitted, named-intent-surviving proposal (including base) is scored by `evaluate_solution({"positions": ..., "runtime": 1.0}, ..., median_runtime=1.0).cost_no_runtime`; require finite feasibility, then select deterministic `(cost_no_runtime, ordinal, name)`. `B_H`, `T_H`, labels, and `record_weight` use that official cost. `EN.energy` is a post-admission diagnostic only and never selects proposals or derives weights. Always include base, retaining an explicit no-improvement base winner with `teacher_cost==base_cost` and `record_weight=1`. Corpus stores hpwl/area references, never golden coordinate targets.
+- G0 uses eligible held-out `H` from the immutable receipt-bound index (`n>=100`, `split_for_id(instance_id, heldout_mod=10) == "heldout"`), one fixed Direct seed/case, and `w=exp(n/12)`. Bind ordered IDs/ns/weights/denominator/population SHA and `B_H`, `T_H`, `Delta_H=B_H-T_H`. Hard `Delta_H>=0.0181504738793652`; target `Delta_H>=0.0261247299384228`; these are predictive gates, not absolute full100 comparisons. `T_H>1.5` is diagnostic kill only. Between hard/target STOP with no training authority; only target advances Task 5. G1 remains sole causal transfer proof.
 - G1 requires retained teacher gain `>=75%`; non-validation causal smoke; then candidate no-runtime both `<=1.1287448258795715` and `<=C0-0.015`, runtime `<=.300`, `100/100`, zero errors, and valid 3D/3F receipts.
 - Kill on oracle `>1.5`, failed coverage/pin support, lost held-out benefit, receipt mismatch, runtime failure, drift, shelf fallback, hard illegality, missing blind arm, or either G1 score gate. On G1 pass write `HIGH_TAIL_CAUSAL_PROOF` followed by `STOP_REQUIRES_SEPARATE_APPROVAL`; do not start G2 and do not package.
 
@@ -350,14 +350,22 @@ canonical source root is checked before any checkpoint load; reject symlinks or
 noncanonical roots in production. Hash exact checkpoint bytes, then deserialize
 the same bytes with `torch.load(BytesIO(...), weights_only=True)`.
 
-Process source/corpus rows as a stream; never materialize the approximately
-million-case connectivity set. Production rejects missing scorer dependencies
+Process sorted shards one at a time: read each verified byte stream once, hash
+and load it from `BytesIO` with `weights_only=True`, process all rows, append
+canonical partition JSONL to staging, `fsync`, evict tensors, then continue.
+Retain only index metadata, digests, and gate aggregates; no whole-corpus
+save/load API is permitted for G0. Production rejects missing scorer dependencies
 (including Shapely) or scorer source SHA/version mismatches before G0. Verify
 default checkpoint SHA
 `508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659`, canonical
 config, state keys/shapes/dtypes, and selected EMA tensor identity; missing EMA
 or mismatch fails closed. Fixtures may inject an expected hash only through a
 test helper, never a permissive CLI bypass.
+
+Freeze scorer before model/G0 scoring: `scripts/iccad2026_evaluate.py` SHA256
+`7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1`, declared
+scorer schema/version, `SHAPELY_AVAILABLE=true`, and Shapely `2.0.5`. A
+legitimate source change requires a written spec amendment and new freeze.
 
 Derive `tp` only from fixed/preplaced input geometry and retain only metric
 references, never golden coordinates. Every generated candidate envelope in
@@ -369,10 +377,13 @@ winner/status. Opaque public Task 3 admission failures may be
 winner records and coverage. Recheck axis/pin/contact intent locally and
 publicly after projection; do not reopen the Task 3 API.
 
-Call official `evaluate_solution(runtime=1, median_runtime=1)` on every exact
-admitted intent-surviving candidate; call `EN.energy` only afterward for
-diagnostics. Deterministically select `(cost,candidate_ordinal,name)` with
-baseline included. If no improvement, record the baseline winner,
+Call official `evaluate_solution({"positions": ..., "runtime": 1.0}, ...,
+median_runtime=1.0).cost_no_runtime` on every exact
+admitted intent-surviving candidate; require finite feasible results. `EN.energy`
+is only a post-admission diagnostic.
+Deterministically select `(cost_no_runtime, ordinal, name)` with
+baseline included; `B_H`, `T_H`, labels, and record weights use that official
+cost. If no improvement, record the baseline winner,
 `teacher_cost==base_cost`, explicit status and evidence, and `record_weight=1`.
 Coverage is exactly one official winner per eligible held-out case; separately
 record admission, intent survival, and positive-gain weighted coverage. Compute
@@ -382,13 +393,19 @@ is diagnostic kill only; hard/target delta gates are
 `0.0181504738793652`/`0.0261247299384228`, and no training is authorized below
 the target.
 
-Write outputs transactionally to staging, require `index-out` to equal exactly
-`out-dir/training_index.json`, and never write a completed manifest on an
-infrastructure/write failure. A complete gate manifest has `status=complete`
-and a terminal G0 state. Canonical artifacts contain no timestamps or absolute
-paths. Manifest hashes all eight artifacts: `train_corpus`, `heldout_corpus`,
-`train_labels`, `heldout_labels`, `proposals`, `rejections`,
-`training_index`, and `g0_manifest`.
+Write to a sibling staging directory, fsync each file and directory, then
+atomically rename staging into a previously absent destination; never replace
+an existing output or publish a partial destination. Require `index-out` to
+equal exactly `out-dir/training_index.json`, and never write a completed
+manifest on an infrastructure/write failure. A complete gate manifest has
+`status=complete` and a terminal G0 state. Canonical artifacts contain no
+timestamps or absolute paths. There are eight output files, but the manifest
+hashes exactly seven support artifacts by fixed relative basename (excluding
+itself): `train_corpus.jsonl`, `heldout_corpus.jsonl`, `train_labels.jsonl`,
+`heldout_labels.jsonl`, `proposals.jsonl`, `rejections.jsonl`, and
+`training_index.json`. Store `self_sha256 = SHA256(canonical g0_manifest JSON
+with the self_sha256 field omitted)`; an external freeze may hash final
+manifest bytes. Never use `topology_data.write_sha256_manifest` for this schema.
 - [ ] Run `uv run python scripts/probes/icdc_topology_teacher.py --help` and fixture test; expect PASS; run `graphify update .` without staging graph dirt.
 - [ ] Add red-team tests for root/symlink rejection before load, verified-byte TOCTOU, exact partition/manifest, soft golden masking, byte-identical rerun, official-vs-energy selection, delta/population hash, intent/rejection accounting, no-improvement baseline, EMA identity, transactional output, and fail-closed gate. Keep vertical fixture/`--help`; an explicit bounded `--max-files` plumbing slice must never authorize G0. The real full-corpus command remains unchanged.
 - [ ] Commit `git add scripts/probes/icdc_topology_teacher.py tests/test_icdc_topology_prior.py && git commit -m "feat: add deterministic topology teacher"`.
