@@ -31,6 +31,7 @@ from icdc.topology_data import (
 )
 
 import icdc.topology_data as topology_data
+import icdc.topology_prior as topology_prior
 from icdc.topology_prior import topology_losses, extract_sparse_label
 from icdc.topology_prior import (
     ProposalConfig, ProposalResult, generate_proposals,
@@ -43,11 +44,13 @@ from icdc.topology_prior import (
 def proposal_fixture():
     """Small legal seed: one fixed block and a disconnected grouping pair."""
     raw = torch.tensor([[0., 0., 2., 2.], [4., 0., 2., 2.],
-                        [0., 5., 2., 2.], [4., 5., 2., 2.]], dtype=torch.float32)
-    # cons columns are (group, preplaced); group 5 joins blocks 2 and 3.
-    case = {"n": 4, "cons": [[0, 1], [0, 0], [5, 0], [5, 0]],
-            "tp": [[0., 0.], [0., 0.], [0., 0.], [0., 0.]],
-            "boundary": [20., 20.]}
+                        [0., 5., 2., 2.], [4., 5., 2., 2.]], dtype=torch.float64)
+    case = {"instance_id": "proposal-4", "n": 4, "area": [4.] * 4,
+            "cons": [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0],
+                     [0, 0, 0, 5, 0], [0, 0, 0, 5, 0]],
+            "tp": [[0., 0., 2., 2.], [-1., -1., -1., -1.],
+                   [-1., -1., -1., -1.], [-1., -1., -1., -1.]],
+            "b2b": [], "p2b": [], "pins": [], "hpwl_ref": 1., "area_ref": 16.}
     return raw, case
 
 
@@ -173,10 +176,25 @@ def test_matches_preplaced_rejects_malformed():
     assert not matches_preplaced_origins(torch.ones((3, 4)), {"n": 4, "cons": [[0, 1]] * 4})
 
 
-def test_pin_admission_returns_optional_tuple_or_none(proposal_fixture):
+def test_pin_admission_calls_nonexact_then_exact_on_original_seed(proposal_fixture, monkeypatch):
     raw, case = proposal_fixture
-    result = pin_feasible_then_exact_tfdl(raw.to(torch.float64), case)
-    assert result is None or (len(result) == 2 and result[0].shape[-1] == 4 and result[1].shape[-1] == 2)
+    calls = []
+    class TSpy:
+        def tfdl(self, rects, mask, pinned, *, pin_xy, boundary_code, exact=False):
+            calls.append((rects.clone(), mask.clone(), pinned.clone(), pin_xy.clone(), boundary_code.clone(), exact))
+            return rects.clone(), torch.zeros((1, 4, 2), dtype=rects.dtype)
+    class EngineSpy:
+        def verify_hard_legal(self, p, area, cons, tp):
+            return {"all": True}
+    monkeypatch.setattr(topology_prior, "T", TSpy(), raising=False)
+    monkeypatch.setattr(topology_prior, "engine", EngineSpy(), raising=False)
+    result = pin_feasible_then_exact_tfdl(raw, case)
+    assert result is not None and result[0].shape == (4, 4) and result[1].shape == (4, 2)
+    assert [c[-1] for c in calls] == [False, True]
+    assert all(torch.equal(c[0], raw.unsqueeze(0)) for c in calls)
+    assert all(torch.equal(c[2], torch.tensor([[True, False, False, False]])) for c in calls)
+    assert all(torch.equal(c[3], torch.tensor([[[0., 0.], [-1., -1.], [-1., -1.], [-1., -1.]]])) for c in calls)
+    assert all(torch.equal(c[4], torch.tensor([[0, 0, 0, 0]])) for c in calls)
 
 
 def test_contact_topology_not_collapsed_into_base(proposal_fixture):
