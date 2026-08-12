@@ -77,8 +77,8 @@ The development path is:
 1. Freeze the Direct baseline checkpoint and configuration.
 2. Generate bounded, deterministic offline topology proposals.
 3. Run an equality-pinned preplaced-feasibility check.
-4. Evaluate admitted proposals with exact TFDL (no shelf fallback), the
-   evaluator-faithful energy shortlist, and exact boundary/grouping geometry.
+4. Evaluate admitted proposals with exact TFDL (no shelf fallback), official
+   evaluator scoring, diagnostic energy, and exact boundary/grouping geometry.
 5. Convert only sparse critical constraints into labels.
 6. Distill those labels into a `DirectDenoiser` checkpoint with the SAME SHAPE.
 
@@ -143,7 +143,9 @@ teacher JSONL envelope/manifest keyed by `instance_id` and `sample_seed`, not
 frozen `TopologyLabel` fields.
 
 Run three samples from the production-aligned differentiable two-step sampler
-before computing the student losses. The student objective is a weighted sum
+before computing the student losses (this Task 5 trajectory count is unrelated
+to Task 4, which uses exactly one fixed teacher sample per eligible case). The
+student objective is a weighted sum
 of:
 
 - differentiable normalized hinge separation loss
@@ -257,11 +259,39 @@ study. It must not be inferred from the 3/3 approval.
 
 ### G0 — teacher oracle
 
-On held-out, non-validation instances, require 100% per-case proposal
-coverage; every admitted proposal must be exactly hard-legal, with zero drift,
-zero shelf fallback, and exact scoring. Target `q_band <= 1.075` to leave
-student margin. The hard minimum is
-`q_band <= 1.0829742560590576`; stop if it is missed.
+Define the eligible held-out population `H` by the immutable receipt-bound
+index (`n >= 100`, `split_for_id(instance_id) mod 10`), with exactly one fixed
+Direct seed per case.  Do not compare an absolute held-out statistic with the
+validation/full100-derived `1.075` or `1.0829742560590576` bars.  With
+`w=exp(n/12)`, bind the ordered IDs, `n`, weights, denominator, population
+SHA, official weighted base mean `B_H`, teacher mean `T_H`, and gain
+`Delta_H=B_H-T_H`.
+
+The predictive held-out gates are hard minimum
+`Delta_H >= 0.0181504738793652` (the predeclared
+`1.1011247299384228 - 1.0829742560590576`) and target
+`Delta_H >= 0.0261247299384228` (the predeclared
+`1.1011247299384228 - 1.075`).  These are selection gates, not claims that
+`T_H` equals the full100 high-tail statistic.  `T_H > 1.5` remains a
+diagnostic kill only.  Between hard and target, stop with no training
+authority; only the target permits Task 5.  G1 remains the sole causal
+transfer proof.
+
+For every generated proposal (base and mutations) that passes exact admission
+and named-intent survival, call official `evaluate_solution(runtime=1,
+median_runtime=1)`.  `EN.energy` is called only after exact legal admission,
+recorded diagnostically, and never shortlists or filters.  Select by deterministic
+`(cost,candidate_ordinal,name)`, always including baseline.  If no proposal
+improves, select baseline with `teacher_cost == base_cost`, explicit
+no-improvement status, and retained label/evidence (`record_weight=1`).  The
+coverage denominator is every eligible held-out case and exactly one officially
+scored winner per case; separately report mutation admission, intent survival,
+and positive-gain weighted coverage.
+
+G0 terminal states are `KILLED_INPUT_OR_CHECKPOINT`,
+`KILLED_LEGALITY_OR_COVERAGE`, `KILLED_TEACHER_GT_1_5`,
+`STOP_HARD_GAIN_MISSED`, `TARGET_GAIN_MET`, and
+`TARGET_GAIN_MISSED_NO_TRAINING_AUTHORITY`.  Only `TARGET_GAIN_MET` advances.
 
 ### G1 — same-shape student
 
@@ -328,6 +358,33 @@ approved fixed six-candidate 3D/3F portfolio; actual matched full100 runtime is
 binding.
 
 ## Artifacts, reproducibility, and observability
+
+Task 4 emits exactly eight canonical files: `train_corpus.jsonl`,
+`heldout_corpus.jsonl`, `train_labels.jsonl`, `heldout_labels.jsonl`,
+`proposals.jsonl`, `rejections.jsonl`, `training_index.json`, and
+`g0_manifest.json`. Every proposal envelope binds receipt/partition/instance,
+seed/ordinal/name, intended/seed/realized fingerprint or named intent,
+admission status/reason, available drift/hard evidence, diagnostic energy,
+official score/feasible, and winner/status. Manifest hashes every artifact.
+Opaque public admission failures may be `admission_failed`; zero drift/hard
+claims apply only to admitted/scored/winner records and coverage. Every
+eligible held-out case contributes exactly one official winner, including the
+baseline when there is no improvement.
+
+The source boundary is the exact canonical root, checked before any checkpoint
+load; sorted approved worker/layout paths are hashed by exact bytes and loaded
+via the same `BytesIO` with `torch.load(weights_only=True)`. Production rejects
+symlinks/noncanonical roots, streams source/corpus processing, and records an
+environment identity without claiming cross-hardware bit identity. Output is
+transactionally staged; `index-out` must be exactly `out-dir/training_index.json`,
+and a failed write cannot produce a completed manifest. Completion requires
+manifest `status=complete` and a terminal G0 state. Artifacts contain no
+timestamps or absolute paths. The production checkpoint expected SHA is
+`508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659`; verify
+exact bytes before deserialization and bind canonical config, key/shape/dtype,
+and selected EMA tensor identity. Missing EMA, mismatch, Shapely dependency,
+or scorer source SHA/version mismatch fails closed. Fixtures may use only a
+test-injected expected hash helper.
 
 Persist a versioned manifest containing baseline commit/checkpoint identities,
 canonical model/EMA/keyset/config hashes, Flow identity, portfolio/environment

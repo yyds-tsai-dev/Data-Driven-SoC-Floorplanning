@@ -17,8 +17,9 @@
 - Track A leaves approximately `0.434` ms from its `0.75` ms allowance; the matched candidate arm must bind runtime to the actual full100 result.
 - Training IDs/fingerprints and deterministic held-out IDs are allowed; validation IDs, validation loaders, and validation outcomes are forbidden for proposal tuning, training, thresholds, or checkpoint selection.
 - Never edit existing TFDL, energy, engine, sampler, optimizer, submission, or package code. No online TFDL, proposal bank, dense head, extra graph pass, or changed Direct/Flow sampler. The only approved production-policy difference from the historical wrapper is the exact 3D/3F quota at unchanged total six.
-- Energy `EN.energy` is called only on exact legal layouts for offline shortlist/record weights; official score/gates call evaluator `evaluate_solution`. Corpus stores hpwl/area references, never golden coordinate targets.
-- G0 target `q_band<=1.075`, hard minimum `<=1.0829742560590576`. G1 requires retained teacher gain `>=75%`; non-validation causal smoke; then candidate no-runtime both `<=1.1287448258795715` and `<=C0-0.015`, runtime `<=.300`, `100/100`, zero errors, and valid 3D/3F receipts.
+- Every admitted, named-intent-surviving proposal (including base) is scored by official `evaluate_solution(runtime=1, median_runtime=1)`; `EN.energy` is diagnostic only after admission and never a shortlist/filter. Select deterministic `(cost,candidate_ordinal,name)`, always include base, and retain an explicit no-improvement base winner with `teacher_cost==base_cost` and `record_weight=1`. Corpus stores hpwl/area references, never golden coordinate targets.
+- G0 uses eligible held-out `H` from the immutable receipt-bound index (`n>=100`, `split_for_id mod 10`), one fixed Direct seed/case, and `w=exp(n/12)`. Bind ordered IDs/ns/weights/denominator/population SHA and `B_H`, `T_H`, `Delta_H=B_H-T_H`. Hard `Delta_H>=0.0181504738793652`; target `Delta_H>=0.0261247299384228`; these are predictive gates, not absolute full100 comparisons. `T_H>1.5` is diagnostic kill only. Between hard/target STOP with no training authority; only target advances Task 5. G1 remains sole causal transfer proof.
+- G1 requires retained teacher gain `>=75%`; non-validation causal smoke; then candidate no-runtime both `<=1.1287448258795715` and `<=C0-0.015`, runtime `<=.300`, `100/100`, zero errors, and valid 3D/3F receipts.
 - Kill on oracle `>1.5`, failed coverage/pin support, lost held-out benefit, receipt mismatch, runtime failure, drift, shelf fallback, hard illegality, missing blind arm, or either G1 score gate. On G1 pass write `HIGH_TAIL_CAUSAL_PROOF` followed by `STOP_REQUIRES_SEPARATE_APPROVAL`; do not start G2 and do not package.
 
 ---
@@ -295,8 +296,8 @@ def test_teacher_cli_writes_split_evidence(tmp_path):
     assert rc == 0
     assert {p.name for p in out.iterdir()} == {
         "train_corpus.jsonl", "heldout_corpus.jsonl", "train_labels.jsonl",
-        "heldout_labels.jsonl", "rejections.jsonl", "training_index.json",
-        "g0_manifest.json",
+        "heldout_labels.jsonl", "proposals.jsonl", "rejections.jsonl",
+        "training_index.json", "g0_manifest.json",
     }
 
 
@@ -340,19 +341,56 @@ uv run python scripts/probes/icdc_topology_teacher.py \
   --out-dir artifacts/icdc_topology \
   --seed 20260813 --heldout-mod 10 --n-min 100
 ```
-Build the index by sorted training-file path and in-file row, recording path,
-file SHA256, row count, block count, and input fingerprint before deterministic
-`split_for_id`. Derive `tp` only from fixed/preplaced input geometry and retain
-only metric references, never the other golden coordinates. Run the frozen
-Direct two-step sampler, bounded proposals, exact TFDL/hard audit, then use
-`EN.energy` only to shortlist legal proposals. Use evaluator
-`evaluate_solution` for final proposal cost without constructing a validation
-dataset. Compute held-out oracle `q_band` with `exp(n/12)` weights and the best
-admitted proposal per case. Emit scorer/checkpoint/index hashes, proposal
-coverage, drift/shelf counts, and rejection reasons. Hard-kill when oracle is
-`>1.5`; G0 requires 100% held-out coverage, zero drift/shelf/hard errors, target
-`q_band<=1.075`, and hard minimum `<=1.0829742560590576` or stop.
+Build the index by sorted approved worker/layout paths and in-file row,
+recording every discovered row (including `excluded_n_min`), exact train plus
+held-out partition of eligible rows, source bytes SHA, row count, block count,
+and input fingerprint before deterministic `split_for_id`. Use a stable
+hash-derived seed from global seed, instance, and sample ordinal. The exact
+canonical source root is checked before any checkpoint load; reject symlinks or
+noncanonical roots in production. Hash exact checkpoint bytes, then deserialize
+the same bytes with `torch.load(BytesIO(...), weights_only=True)`.
+
+Process source/corpus rows as a stream; never materialize the approximately
+million-case connectivity set. Production rejects missing scorer dependencies
+(including Shapely) or scorer source SHA/version mismatches before G0. Verify
+default checkpoint SHA
+`508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659`, canonical
+config, state keys/shapes/dtypes, and selected EMA tensor identity; missing EMA
+or mismatch fails closed. Fixtures may inject an expected hash only through a
+test helper, never a permissive CLI bypass.
+
+Derive `tp` only from fixed/preplaced input geometry and retain only metric
+references, never golden coordinates. Every generated candidate envelope in
+canonical `proposals.jsonl` binds receipt, partition, instance, seed, ordinal,
+name, intended/seed/realized fingerprint or named intent, admission status and
+reason, drift/hard evidence, diagnostic energy, official score/feasibility,
+winner/status. Opaque public Task 3 admission failures may be
+`admission_failed`; zero-drift/hard claims apply only to admitted, scored,
+winner records and coverage. Recheck axis/pin/contact intent locally and
+publicly after projection; do not reopen the Task 3 API.
+
+Call official `evaluate_solution(runtime=1, median_runtime=1)` on every exact
+admitted intent-surviving candidate; call `EN.energy` only afterward for
+diagnostics. Deterministically select `(cost,candidate_ordinal,name)` with
+baseline included. If no improvement, record the baseline winner,
+`teacher_cost==base_cost`, explicit status and evidence, and `record_weight=1`.
+Coverage is exactly one official winner per eligible held-out case; separately
+record admission, intent survival, and positive-gain weighted coverage. Compute
+`B_H`, `T_H`, and `Delta_H` over ordered eligible `H` with `w=exp(n/12)`, bind
+population hash and denominator, and emit the six terminal G0 states. `T_H>1.5`
+is diagnostic kill only; hard/target delta gates are
+`0.0181504738793652`/`0.0261247299384228`, and no training is authorized below
+the target.
+
+Write outputs transactionally to staging, require `index-out` to equal exactly
+`out-dir/training_index.json`, and never write a completed manifest on an
+infrastructure/write failure. A complete gate manifest has `status=complete`
+and a terminal G0 state. Canonical artifacts contain no timestamps or absolute
+paths. Manifest hashes all eight artifacts: `train_corpus`, `heldout_corpus`,
+`train_labels`, `heldout_labels`, `proposals`, `rejections`,
+`training_index`, and `g0_manifest`.
 - [ ] Run `uv run python scripts/probes/icdc_topology_teacher.py --help` and fixture test; expect PASS; run `graphify update .` without staging graph dirt.
+- [ ] Add red-team tests for root/symlink rejection before load, verified-byte TOCTOU, exact partition/manifest, soft golden masking, byte-identical rerun, official-vs-energy selection, delta/population hash, intent/rejection accounting, no-improvement baseline, EMA identity, transactional output, and fail-closed gate. Keep vertical fixture/`--help`; an explicit bounded `--max-files` plumbing slice must never authorize G0. The real full-corpus command remains unchanged.
 - [ ] Commit `git add scripts/probes/icdc_topology_teacher.py tests/test_icdc_topology_prior.py && git commit -m "feat: add deterministic topology teacher"`.
 
 ### Task 5: Same-shape trainer and contract
