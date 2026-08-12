@@ -69,6 +69,13 @@ class _AxisEdge:
 
 
 @dataclass(frozen=True)
+class _EdgeEnumeration:
+    edges: Tuple[_AxisEdge, ...]
+    over_cap: bool = False
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
 class _AxisProblem:
     coords: np.ndarray
     sizes: np.ndarray
@@ -94,16 +101,20 @@ def _positive_shared_edge(P, c):
     overlap = min(P[a,p]+P[a,2+p], P[b,p]+P[b,2+p])-max(P[a,p],P[b,p])
     return bool(abut and overlap > 0.0)
 
-def _contact_forest(P, members):
+def _contact_forest(P, members, deadline: Optional[float] = None):
     comps = _components(P, np.asarray(sorted(members), dtype=np.int64))
     out = []
     for k, comp in enumerate(comps):
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
         root = min(comp)
         reached = {root}
         while len(reached) < len(comp):
             candidates = []
             for u in sorted(reached):
                 for v in sorted(set(comp)-reached):
+                    if deadline is not None and time.perf_counter() >= deadline:
+                        return None
                     for axis in (0, 1):
                         for before in (True, False):
                             if _positive_shared_edge(P, _ContactChoice(0, u, v, axis, before, 0.)):
@@ -138,13 +149,45 @@ def _soft_profile(opt, P):
         for i, a in enumerate(sorted(members)):
             for b in sorted(members)[i+1:]:
                 if (round(float(P[a,2]),4),round(float(P[a,3]),4)) == (round(float(P[b,2]),4),round(float(P[b,3]),4)):
-                    mib.add((gid, a, b))
+                    mib.add((int(gid), a, b))
     return _SoftProfile(frozenset(boundary), frozenset(grouping), frozenset(mib))
 
 def _profile_nonregressing(before, after):
     return (before.boundary_satisfied <= after.boundary_satisfied
             and before.grouping_connected <= after.grouping_connected
             and before.mib_equal <= after.mib_equal)
+
+
+def _dag_debug(reason: str, *, elapsed_ms: Optional[float] = None,
+               candidate_index: Optional[int] = None,
+               group_id: Optional[int] = None,
+               components: Optional[int] = None,
+               raw_edges: Optional[Tuple[int, int]] = None) -> None:
+    if os.environ.get("PARTNER_GROUP_DAG_BRIDGE_DEBUG") != "1":
+        return
+    fields = ["dag_bridge", f"reason={reason}"]
+    if candidate_index is not None:
+        fields.append(f"candidate={int(candidate_index)}")
+    if group_id is not None:
+        fields.append(f"group={int(group_id)}")
+    if components is not None:
+        fields.append(f"components={int(components)}")
+    if raw_edges is not None:
+        fields.append(f"raw_edges={int(raw_edges[0])},{int(raw_edges[1])}")
+    if elapsed_ms is not None:
+        elapsed = max(float(elapsed_ms), 0.0)
+        if elapsed < 1.0:
+            bucket = "lt1ms"
+        elif elapsed < 5.0:
+            bucket = "1to5ms"
+        elif elapsed < 25.0:
+            bucket = "5to25ms"
+        else:
+            bucket = "ge25ms"
+        fields.append(f"timing={bucket}")
+        fields.append(f"elapsed_ms={elapsed:.3f}")
+    print(" ".join(fields))
+
 
 def _forest_equalities(P, forest):
     x = []
@@ -154,14 +197,30 @@ def _forest_equalities(P, forest):
         y.append(_AxisEquality(u, v, float(P[v, 1] - P[u, 1])))
     return tuple(x), tuple(y)
 
-def _separation_edges(P, axis):
+def _enumerate_separation_edges(
+    P: np.ndarray, axis: int, deadline: Optional[float] = None,
+    max_edges: Optional[int] = None,
+) -> _EdgeEnumeration:
     if not isinstance(P, np.ndarray) or P.ndim != 2 or P.shape[1] != 4:
-        return tuple()
+        return _EdgeEnumeration(())
     if axis not in (0, 1) or not np.isfinite(P).all() or np.any(P[:, 2:] <= 0):
-        return tuple()
-    out=[]; n=len(P)
+        return _EdgeEnumeration(())
+    if deadline is not None:
+        try:
+            if not math.isfinite(float(deadline)):
+                return _EdgeEnumeration((), timed_out=True)
+        except (TypeError, ValueError, OverflowError):
+            return _EdgeEnumeration((), timed_out=True)
+    if max_edges is not None and max_edges < 0:
+        return _EdgeEnumeration((), over_cap=True)
+    out: List[_AxisEdge] = []
+    n = len(P)
     for a in range(n):
+        if deadline is not None and time.perf_counter() >= deadline:
+            return _EdgeEnumeration(tuple(out), timed_out=True)
         for b in range(a+1,n):
+            if deadline is not None and time.perf_counter() >= deadline:
+                return _EdgeEnumeration(tuple(out), timed_out=True)
             candidates=[]
             for ax in (0,1):
                 ae=P[a,ax]+P[a,2+ax]; be=P[b,ax]+P[b,2+ax]
@@ -169,35 +228,57 @@ def _separation_edges(P, axis):
                 elif be<=P[a,ax]: candidates.append((ax,P[a,ax]-be,b,a))
             if not candidates: continue
             best=max(candidates,key=lambda z:(z[1]/max(P[z[2],2+z[0]]+P[z[3],2+z[0]],1e-12),-z[0]))
-            if best[0]==axis: out.append(_AxisEdge(best[2],best[3],float(P[best[2],2+axis]+best[1])))
-    return tuple(out)
+            if best[0] == axis:
+                out.append(_AxisEdge(best[2], best[3],
+                                     float(P[best[2], 2 + axis] + best[1])))
+                if max_edges is not None and len(out) > max_edges:
+                    return _EdgeEnumeration(tuple(out), over_cap=True)
+    return _EdgeEnumeration(tuple(out))
+
+
+def _separation_edges(
+    P: np.ndarray, axis: int, deadline: Optional[float] = None,
+    max_edges: Optional[int] = None,
+) -> Tuple[_AxisEdge, ...]:
+    """Return all normally assigned edges for direct primitive callers."""
+    result = _enumerate_separation_edges(P, axis, deadline, max_edges)
+    return result.edges if not result.over_cap and not result.timed_out else tuple()
 
 def _make_axis_problem(P, axis, equalities, edges, kind):
     span=float(np.sum(P[:,2+axis])); lo=float(np.min(P[:,axis])-span); hi=float(np.max(P[:,axis]+P[:,2+axis])+span)
     return _AxisProblem(P[:,axis].copy(),P[:,2+axis].copy(),np.full(len(P),lo),np.full(len(P),hi),np.asarray(kind,dtype=np.int64)==2,tuple(equalities),tuple(edges))
 
-def _enumerate_contact_choices(opt,P,max_contacts=4):
+def _enumerate_contact_choices(opt, P, max_contacts=4,
+                               deadline: Optional[float] = None):
     out=[]
     for gid, members in sorted(opt.cluster_groups.items()):
+        if deadline is not None and time.perf_counter() >= deadline:
+            return out
         comps=_components(P,np.asarray(sorted(members),dtype=np.int64))
         if len(comps) > 12:
             return []
         for i,left in enumerate(comps):
             for right in comps[i+1:]:
+                if deadline is not None and time.perf_counter() >= deadline:
+                    return out
                 for a in sorted(left):
                     for b in sorted(right):
+                        if deadline is not None and time.perf_counter() >= deadline:
+                            return out
                         for axis in (0,1):
                             if P[a,axis]+P[a,2+axis] <= P[b,axis]: before=True
                             elif P[b,axis]+P[b,2+axis] <= P[a,axis]: before=False
                             else: continue
                             p=1-axis; lo=-P[b,2+p]+JOIN; hi=P[a,2+p]-JOIN; d=float(np.clip(P[b,p]-P[a,p],lo,hi))
                             c=_ContactChoice(int(gid),a,b,axis,before,d)
-                            if not _positive_shared_edge(P,c): out.append(c)
-                            else: out.append(c)
+                            out.append(c)
                             if len(out)>=max_contacts:return out
     return out
 
-def _project_changed_contact(opt,P,choice,budget_s=.003):
+def _project_changed_contact_impl(opt, P, choice, budget_s=.003, *,
+                                  deadline: Optional[float] = None,
+                                  candidate_index: Optional[int] = None):
+    started = time.perf_counter()
     try:
         if (not math.isfinite(float(budget_s)) or budget_s <= 0
                 or not isinstance(P, np.ndarray) or P.shape != (int(opt.n), 4)
@@ -212,7 +293,10 @@ def _project_changed_contact(opt,P,choice,budget_s=.003):
                     or not isinstance(value, numbers.Integral)
                     or not 0 <= int(value) < len(P)):
                 return None
-        if choice.a == choice.b or choice.group_id not in opt.cluster_groups:
+        if (isinstance(choice.group_id, (bool, np.bool_))
+                or not isinstance(choice.group_id, numbers.Integral)
+                or choice.a == choice.b
+                or choice.group_id not in opt.cluster_groups):
             return None
         if (not isinstance(choice.a_before_b, (bool, np.bool_))
                 or not isinstance(choice.perp_delta, numbers.Real)
@@ -237,75 +321,190 @@ def _project_changed_contact(opt,P,choice,budget_s=.003):
             return None
     except Exception:
         return None
-    deadline = time.perf_counter() + float(budget_s)
+    if deadline is None:
+        deadline = time.perf_counter() + float(budget_s)
+    else:
+        try:
+            deadline = float(deadline)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(deadline):
+            return None
     if time.perf_counter() >= deadline:
         return None
-    forest=[]
+    forest = []
     for gid,m in sorted(opt.cluster_groups.items()):
         if time.perf_counter() >= deadline: return None
-        part = _contact_forest(P,m)
+        part = _contact_forest(P, m, deadline)
         if part is None: return None
         forest.extend(part)
-    xe,ye=_forest_equalities(P,forest); before=choice.a if choice.a_before_b else choice.b; after=choice.b if choice.a_before_b else choice.a
-    comps=_components(P,np.asarray(sorted(opt.cluster_groups[choice.group_id]))); ml=next(set(c) for c in comps if choice.a in c); mr=next(set(c) for c in comps if choice.b in c)
-    def stale(e): return (e.before in ml and e.after in mr) or (e.before in mr and e.after in ml)
-    ce=_AxisEquality(before,after,float(P[before,2+choice.axis])); pe=_AxisEquality(choice.a,choice.b,choice.perp_delta)
-    raw_axis_edges = _separation_edges(P, choice.axis)
-    raw_perp_edges = _separation_edges(P, 1 - choice.axis)
-    if len(raw_axis_edges) > 8192 or len(raw_perp_edges) > 8192:
-        return None
-    axis_edges = tuple(e for e in raw_axis_edges if not stale(e))
-    perp_edges = tuple(e for e in raw_perp_edges if not stale(e))
     if time.perf_counter() >= deadline:
         return None
-    qx=_solve_axis_dag(_make_axis_problem(P,choice.axis,xe+(ce,),axis_edges,opt.kind))
+    xe, ye = _forest_equalities(P, forest)
+    before = choice.a if choice.a_before_b else choice.b
+    after = choice.b if choice.a_before_b else choice.a
+    comps = _components(P, np.asarray(sorted(opt.cluster_groups[choice.group_id])))
+    ml = next(set(c) for c in comps if choice.a in c)
+    mr = next(set(c) for c in comps if choice.b in c)
+    def stale(e): return (e.before in ml and e.after in mr) or (e.before in mr and e.after in ml)
+    ce = _AxisEquality(before, after, float(P[before, 2 + choice.axis]))
+    pe = _AxisEquality(choice.a, choice.b, choice.perp_delta)
+    axis_result = _enumerate_separation_edges(
+        P, choice.axis, deadline=deadline, max_edges=8192
+    )
+    if axis_result.over_cap or axis_result.timed_out:
+        _dag_debug(
+            "edge_reject", candidate_index=candidate_index,
+            group_id=choice.group_id,
+            components=len(comps), raw_edges=(len(axis_result.edges), 0),
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
+        return None
+    if time.perf_counter() >= deadline:
+        return None
+    perp_result = _enumerate_separation_edges(
+        P, 1 - choice.axis, deadline=deadline, max_edges=8192
+    )
+    if perp_result.over_cap or perp_result.timed_out:
+        _dag_debug(
+            "edge_reject", candidate_index=candidate_index,
+            group_id=choice.group_id,
+            components=len(comps), raw_edges=(len(axis_result.edges), len(perp_result.edges)),
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
+        return None
+    axis_edges = tuple(e for e in axis_result.edges if not stale(e))
+    perp_edges = tuple(e for e in perp_result.edges if not stale(e))
+    if time.perf_counter() >= deadline:
+        return None
+    qx = _solve_axis_dag(
+        _make_axis_problem(P, choice.axis, xe + (ce,), axis_edges, opt.kind)
+    )
     if qx is None or time.perf_counter() >= deadline: return None
-    qy=_solve_axis_dag(_make_axis_problem(P,1-choice.axis,ye+(pe,),perp_edges,opt.kind))
-    if qy is None or time.perf_counter() >= deadline:return None
-    Q=P.copy(); Q[:,choice.axis]=qx; Q[:,1-choice.axis]=qy
+    qy = _solve_axis_dag(
+        _make_axis_problem(P, 1 - choice.axis, ye + (pe,), perp_edges, opt.kind)
+    )
+    if qy is None or time.perf_counter() >= deadline:
+        return None
+    Q = P.copy()
+    Q[:, choice.axis] = qx
+    Q[:, 1 - choice.axis] = qy
+    if time.perf_counter() >= deadline:
+        return None
     return Q if _positive_shared_edge(Q,choice) else None
 
+
+def _project_changed_contact(opt, P, choice, budget_s=.003, *,
+                             deadline: Optional[float] = None,
+                             candidate_index: Optional[int] = None):
+    try:
+        return _project_changed_contact_impl(
+            opt, P, choice, budget_s, deadline=deadline,
+            candidate_index=candidate_index,
+        )
+    except Exception:
+        return None
+
 def bridge_grouping_violations_dag(opt,out,budget_s=.003):
+    started = time.perf_counter()
+
+    def reject(reason: str, **kwargs):
+        _dag_debug(reason, elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                   **kwargs)
+        return out
+
     try:
         budget=float(budget_s)
-        if not math.isfinite(budget) or budget<=0: return out
-        deadline=time.perf_counter()+budget
+        if not math.isfinite(budget) or budget<=0:
+            return reject("invalid_budget")
+        deadline=started+budget
         P=np.asarray(out,dtype=float)
-        if P.shape != (int(opt.n),4) or not np.isfinite(P).all() or np.any(P[:,2:] <= 0): return out
+        if P.shape != (int(opt.n),4) or not np.isfinite(P).all() or np.any(P[:,2:] <= 0):
+            return reject("invalid_layout")
+        if time.perf_counter() >= deadline:
+            return reject("deadline")
         grouping=_grouping_count(opt,P)
-        if grouping<=0: return out
+        if time.perf_counter() >= deadline:
+            return reject("deadline")
+        if grouping<=0:
+            return reject("no_grouping")
+        component_counts = {}
         for members in opt.cluster_groups.values():
+            if not isinstance(members, (list, tuple, np.ndarray)):
+                return reject("malformed_group")
+            for member in members:
+                if (isinstance(member, (bool, np.bool_))
+                        or not isinstance(member, numbers.Integral)
+                        or not 0 <= int(member) < len(P)):
+                    return reject("malformed_group")
             try:
                 components = _components(P, np.asarray(sorted(members), dtype=np.int64))
             except (TypeError, ValueError, IndexError):
-                return out
+                return reject("malformed_group")
+            component_counts[id(members)] = len(components)
+            if time.perf_counter() >= deadline:
+                return reject("deadline")
             if len(components) > 12:
-                return out
+                return reject("component_cap", components=len(components))
         ctx=_Ctx(opt,P)
-        if time.perf_counter() >= deadline: return out
+        if time.perf_counter() >= deadline:
+            return reject("deadline")
         s0,v0=ctx.score(P)
-        if time.perf_counter() >= deadline: return out
+        if time.perf_counter() >= deadline:
+            return reject("deadline")
         profile0=_soft_profile(opt,P)
-        if time.perf_counter() >= deadline: return out
-        for c in _enumerate_contact_choices(opt,P):
-            if time.perf_counter() >= deadline: return out
-            Q=_project_changed_contact(opt,P,c,max(0.0,deadline-time.perf_counter()))
-            if Q is None or time.perf_counter() >= deadline:
+        if time.perf_counter() >= deadline:
+            return reject("deadline")
+        choices = _enumerate_contact_choices(opt, P, deadline=deadline)
+        if time.perf_counter() >= deadline:
+            return reject("deadline")
+        for candidate_index, c in enumerate(choices):
+            if time.perf_counter() >= deadline:
+                return reject("deadline", candidate_index=candidate_index,
+                              group_id=c.group_id)
+            Q=_project_changed_contact(
+                opt, P, c, budget, deadline=deadline,
+                candidate_index=candidate_index,
+            )
+            if Q is None:
+                _dag_debug("candidate_reject", candidate_index=candidate_index,
+                           group_id=c.group_id, components=component_counts.get(
+                               id(opt.cluster_groups.get(c.group_id)), 0),
+                           elapsed_ms=(time.perf_counter() - started) * 1000.0)
+                if time.perf_counter() >= deadline:
+                    return reject("deadline", candidate_index=candidate_index,
+                                  group_id=c.group_id)
                 continue
-            if time.perf_counter() >= deadline: return out
+            if time.perf_counter() >= deadline:
+                return reject("deadline", candidate_index=candidate_index,
+                              group_id=c.group_id)
             score1, violations1 = ctx.score(Q)
-            if time.perf_counter() >= deadline: return out
+            if time.perf_counter() >= deadline:
+                return reject("deadline", candidate_index=candidate_index,
+                              group_id=c.group_id)
             profile1 = _soft_profile(opt, Q)
-            if time.perf_counter() >= deadline: return out
-            accepted = (_grouping_count(opt,Q)<grouping and violations1<v0
+            if time.perf_counter() >= deadline:
+                return reject("deadline", candidate_index=candidate_index,
+                              group_id=c.group_id)
+            grouping1 = _grouping_count(opt, Q)
+            if time.perf_counter() >= deadline:
+                return reject("deadline", candidate_index=candidate_index,
+                              group_id=c.group_id)
+            accepted = (grouping1 < grouping and violations1 < v0
                         and score1 < s0 - 1e-12
                         and _profile_nonregressing(profile0, profile1))
             if accepted and time.perf_counter() < deadline:
                 accepted = _final_guards_ok(opt,P,Q,list(opt.kind),list(opt.areas))
             if accepted and time.perf_counter() < deadline:
+                _dag_debug("accept", candidate_index=candidate_index,
+                           group_id=c.group_id,
+                           components=component_counts.get(
+                               id(opt.cluster_groups.get(c.group_id)), 0),
+                           elapsed_ms=(time.perf_counter() - started) * 1000.0)
                 return [tuple(map(float,r)) for r in Q]
-        return out
-    except Exception:return out
+        return reject("no_accept")
+    except Exception:
+        return reject("exception")
 
 
 def _axis_problem_shapes_ok(problem: _AxisProblem, n: int) -> bool:

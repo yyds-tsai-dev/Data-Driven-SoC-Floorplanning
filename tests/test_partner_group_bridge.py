@@ -299,3 +299,173 @@ def test_axis_solver_rejects_malformed_scalar_gaps(value):
                            np.full(2, 10.), np.zeros(2, dtype=bool), (), ())
     assert vk._solve_axis_dag(replace(base, equalities=(vk._AxisEquality(0, 1, value),))) is None
     assert vk._solve_axis_dag(replace(base, edges=(vk._AxisEdge(0, 1, value),))) is None
+
+
+def _soft_profile_regression_cases():
+    before = np.asarray([
+        (0., 0., 1., 1.),
+        (0., 2., 1., 1.),
+        (1., 2., 1., 1.),
+        (4., 0., 1., 1.),
+        (0., 4., 1., 1.),
+    ])
+    n = len(before)
+    areas = torch.ones(n)
+    constraints = torch.zeros((n, 5))
+    constraints[:, 0] = 1.
+    constraints[0, 4] = 1 | 2 | 4 | 8
+    constraints[1:3, 2] = 1.
+    constraints[1:3, 3] = 1.
+    targets = torch.full((n, 4), -1.)
+    targets[:, 2:] = 1.
+    empty3 = torch.zeros((0, 3))
+    pins = torch.zeros((0, 2))
+    opt = csl._ColumnOptimizer(before, areas, constraints, targets, empty3,
+                               empty3, pins, time.time() + 60., seed=0)
+    assert 1 in opt.mib_groups
+    bit_swap = before.copy()
+    bit_swap[0, :2] = (4., 4.)
+    pair_loss = before.copy()
+    pair_loss[2, :2] = (2., 2.)
+    return opt, before, bit_swap, pair_loss
+
+
+def test_soft_profile_preserves_exact_boundary_group_and_mib_relations():
+    opt, before, bit_swap, pair_loss = _soft_profile_regression_cases()
+    p0 = vk._soft_profile(opt, before)
+    assert p0.boundary_satisfied == frozenset({(0, 1), (0, 8)})
+    assert p0.grouping_connected == frozenset({(1, 1, 2)})
+    assert p0.mib_equal == frozenset({(1, 1, 2)})
+    assert not vk._profile_nonregressing(p0, vk._soft_profile(opt, bit_swap))
+    assert not vk._profile_nonregressing(p0, vk._soft_profile(opt, pair_loss))
+
+
+def test_contact_forest_equalities_keep_exact_offsets_for_normal_and_reversed_ids():
+    opt, out = _coordinated_chain_case()
+    normal = np.asarray(out, float)
+    forest = vk._contact_forest(normal, opt.cluster_groups[1])
+    assert forest == ((0, 0, 1), (1, 2, 3))
+    x_eq, y_eq = vk._forest_equalities(normal, forest)
+    assert [(e.left, e.right, e.delta) for e in x_eq] == [(0, 1, 1.), (2, 3, 1.)]
+    assert [(e.left, e.right, e.delta) for e in y_eq] == [(0, 1, 0.), (2, 3, 0.)]
+    reversed_ids = np.asarray([
+        (1., 0., 1., 1.), (0., 0., 1., 1.),
+        (2., 2., 1., 1.), (1., 2., 1., 1.),
+    ])
+    reversed_forest = vk._contact_forest(reversed_ids, opt.cluster_groups[1])
+    assert reversed_forest == ((0, 0, 1), (1, 2, 3))
+    rx_eq, ry_eq = vk._forest_equalities(reversed_ids, reversed_forest)
+    assert [(e.left, e.right, e.delta) for e in rx_eq] == [(0, 1, -1.), (2, 3, -1.)]
+    assert [(e.left, e.right, e.delta) for e in ry_eq] == [(0, 1, 0.), (2, 3, 0.)]
+
+
+def test_separation_edges_include_exact_y_axis_delta_tuple():
+    _, out = _coordinated_chain_case()
+    P = np.asarray(out, float)
+    assert vk._separation_edges(P, 1) == (
+        vk._AxisEdge(0, 2, 2.),
+        vk._AxisEdge(1, 2, 2.),
+        vk._AxisEdge(1, 3, 2.),
+    )
+
+
+def test_valid_more_than_twelve_components_skip_solver_before_edge_build(monkeypatch):
+    n = 26
+    P = np.asarray([(float(3 * i), 0., 1., 1.) for i in range(n)])
+    opt = types.SimpleNamespace(n=n, cluster_groups={1: list(range(n))})
+    monkeypatch.setattr(vk, "_solve_axis_dag",
+                        lambda *args: pytest.fail("solver called"))
+    assert vk.bridge_grouping_violations_dag(opt, [tuple(row) for row in P], .2) is not None
+
+
+def _two_component_raw_cap_case():
+    n = 182
+    P = np.zeros((n, 4), dtype=float)
+    P[:, 2:] = 1.
+    P[:91, 1] = np.arange(91, dtype=float)
+    P[91:, 0] = 1000.
+    P[91:, 1] = np.arange(91, dtype=float)
+    opt = types.SimpleNamespace(
+        n=n,
+        cluster_groups={1: list(range(n))},
+        kind=np.ones(n, dtype=int),
+    )
+    choice = vk._ContactChoice(1, 0, 91, 0, True, 0.)
+    return opt, P, choice
+
+
+def test_raw_separation_cap_stops_at_cap_plus_one_before_solver(monkeypatch):
+    opt, P, choice = _two_component_raw_cap_case()
+    result = vk._enumerate_separation_edges(
+        P, 0, time.perf_counter() + 10., max_edges=8192
+    )
+    assert result.over_cap is True
+    assert result.timed_out is False
+    assert len(result.edges) == 8193
+    monkeypatch.setattr(vk, "_solve_axis_dag",
+                        lambda *args: pytest.fail("solver called"))
+    assert vk._project_changed_contact(opt, P, choice, 10.) is None
+
+
+def test_expired_first_raw_axis_never_enters_second_builder(monkeypatch):
+    opt, P, choice = _two_component_raw_cap_case()
+    calls = []
+
+    def fake_edges(layout, axis, deadline, max_edges=8192):
+        calls.append(axis)
+        return vk._EdgeEnumeration((), over_cap=False, timed_out=(axis == 0))
+
+    monkeypatch.setattr(vk, "_enumerate_separation_edges", fake_edges)
+    assert vk._project_changed_contact(opt, P, choice, 10.) is None
+    assert calls == [0]
+
+
+def test_fake_clock_expiry_after_first_raw_axis_short_circuits_second(monkeypatch):
+    opt, P, choice = _two_component_raw_cap_case()
+    calls = []
+    clock = [0.0]
+    monkeypatch.setattr(vk.time, "perf_counter", lambda: clock[0])
+
+    def fake_edges(layout, axis, deadline, max_edges=8192):
+        calls.append(axis)
+        if axis == 0:
+            clock[0] = deadline + 1.0
+        return vk._EdgeEnumeration((), over_cap=False, timed_out=False)
+
+    monkeypatch.setattr(vk, "_enumerate_separation_edges", fake_edges)
+    assert vk._project_changed_contact(
+        opt, P, choice, 10., deadline=10.0
+    ) is None
+    assert calls == [0]
+
+
+def test_project_changed_contact_rejects_malformed_inputs_directly():
+    opt, out = _coordinated_chain_case()
+    P = np.asarray(out, float)
+    choice = vk._ContactChoice(1, 0, 2, 0, True, 1. - vk.JOIN)
+    for bad in (None, np.zeros((3, 4)), np.full((4, 4), np.nan),
+                np.asarray([(0., 0., 0., 1.), *out[1:]])):
+        assert vk._project_changed_contact(opt, bad, choice, 1.) is None
+    for bad_choice in (
+        replace(choice, axis=2),
+        replace(choice, a=-1),
+        replace(choice, b=99),
+        replace(choice, group_id=99),
+        replace(choice, perp_delta=float("nan")),
+    ):
+        assert vk._project_changed_contact(opt, P, bad_choice, 1.) is None
+    malformed = types.SimpleNamespace(n=4, cluster_groups={1: [0, 2, 99, 3]})
+    assert vk._project_changed_contact(malformed, P, choice, 1.) is None
+
+
+def test_dag_debug_output_is_stable_and_default_off(monkeypatch, capsys):
+    opt, out = _coordinated_chain_case()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE_DEBUG", "1")
+    assert vk.bridge_grouping_violations_dag(opt, out, 0.) is out
+    debug = capsys.readouterr().out
+    assert "dag_bridge" in debug
+    assert "reason=invalid_budget" in debug
+    assert "elapsed_ms=" in debug
+    monkeypatch.delenv("PARTNER_GROUP_DAG_BRIDGE_DEBUG")
+    assert vk.bridge_grouping_violations_dag(opt, out, 0.) is out
+    assert capsys.readouterr().out == ""
