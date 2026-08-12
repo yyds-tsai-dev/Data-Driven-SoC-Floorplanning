@@ -99,16 +99,21 @@ def test_teacher_sample_seed_is_stable_order_independent_and_signed63():
 
 
 def test_teacher_intent_parser_requires_exact_realized_geometry():
-    t = _teacher(); rects = torch.tensor([[0., 0., 1., 1.], [2., 0., 1., 1.]])
+    t = _teacher(); rects = torch.tensor(
+        [[0., 0., 1., 1.], [2., 0., 1., 1.]], dtype=torch.float64)
     case = {"n": 2, "cons": [[0, 1, 5, 5, 5], [0, 0, 5, 5, 5]], "pins": [], "tp": [[0., 0., 1., 1.], [-1]*4], "groups": [[0, 1]]}
     assert t._proposal_intent_holds("base", rects, case)
     axis = rects.clone(); axis[1, 0] = 1.
     assert t._proposal_intent_holds("axis:0:1:0:1", axis, case)
     assert not t._proposal_intent_holds("axis:0:1:1:1", axis, case)
     assert not t._proposal_intent_holds("axis:malformed", rects, case)
-    assert t._proposal_intent_holds("pin:0:1:0:1", torch.tensor([[0., 0., 1., 1.], [1., 0., 1., 1.]]), case)
-    assert t._proposal_intent_holds("contact:5:0:1:0:1", torch.tensor([[0., 0., 1., 1.], [1., .25, 1., 1.]]), case)
-    gap = torch.tensor([[0., 0., 1., 1.], [1. + torch.finfo(torch.float64).eps, .25, 1., 1.]])
+    assert t._proposal_intent_holds("pin:0:1:0:1", torch.tensor(
+        [[0., 0., 1., 1.], [1., 0., 1., 1.]], dtype=torch.float64), case)
+    assert t._proposal_intent_holds("contact:5:0:1:0:1", torch.tensor(
+        [[0., 0., 1., 1.], [1., .25, 1., 1.]], dtype=torch.float64), case)
+    gap = torch.tensor(
+        [[0., 0., 1., 1.], [1. + torch.finfo(torch.float64).eps, .25, 1., 1.]],
+        dtype=torch.float64)
     assert not t._proposal_intent_holds("contact:5:0:1:0:1", gap, case)
     assert not t._proposal_intent_holds("contact:99:0:1:0:1", rects, case)
 
