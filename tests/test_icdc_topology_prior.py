@@ -889,6 +889,46 @@ def test_tfdl_public_function_does_not_call_shelf_fallback():
     assert "shelf_fallback" not in calls
 
 
+def test_axis_generation_covers_strict_y_state_beyond_sixteen_ulps():
+    raw = torch.tensor([
+        [-99.06493409184773, -3.451637618002451, .1977101460089326, 2.652096962005815],
+        [-27.707874173400654, 86.47846882804183, .7517050889780816, .2384398881245246],
+    ], dtype=torch.float64)
+    case = _topology_case(raw, [[0, 0], [0, 0]], [[-1., -1., -1., -1.]] * 2)
+    out = dict(generate_proposals(raw, case, ProposalConfig(64, 0, 0, 32)))
+    assert "axis:0:1:1:0" in out
+    candidate = out["axis:0:1:1:0"]
+    assert topology_prior._pair_state(candidate, 0, 1) == (1, 0)
+    assert torch.isfinite(candidate).all()
+
+
+@pytest.mark.parametrize("raw", [
+    [[1e308, 0., 1e308, 1.], [-1e308, 0., 1e308, 1.]],
+    [[1e308, 0., 1e308, 1.], [0., 0., 1e308, 1.]],
+])
+def test_generator_rejects_finite_but_unrepresentable_geometry(raw):
+    raw = torch.tensor(raw, dtype=torch.float64)
+    case = _topology_case(raw, [[0, 0], [0, 0]], [[-1., -1., -1., -1.]] * 2)
+    with pytest.raises(ValueError):
+        list(generate_proposals(raw, case, ProposalConfig(8, 0, 0, 32)))
+
+
+def test_place_for_pair_returns_already_valid_seed_without_ulp_search(monkeypatch):
+    raw = torch.tensor([[0., 0., 2., 2.], [4., 0., 2., 2.]], dtype=torch.float64)
+    calls = 0
+    original = topology_prior.math.nextafter
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(topology_prior.math, "nextafter", spy)
+    got = topology_prior._place_for_pair(raw, 0, 1, 0, 1, 1)
+    assert torch.equal(got, raw)
+    assert calls == 0
+
+
 def test_proposal_config_rejects_bool_and_result_is_frozen():
     with pytest.raises((TypeError, ValueError)): ProposalConfig(total_cap=True)
     result = ProposalResult("x", torch.zeros((1, 4)), torch.zeros((1, 4)), torch.zeros((1, 2)), {}, None, None)
