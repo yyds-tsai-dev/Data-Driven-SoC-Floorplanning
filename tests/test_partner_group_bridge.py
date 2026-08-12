@@ -192,7 +192,7 @@ def test_axis_solver_rejects_malformed_top_level_and_containers():
     assert vk._solve_axis_dag(replace(base, edges=(object(),))) is None
 
 
-@pytest.mark.parametrize("value", ["x", object(), 1 + 0j, True, float("nan"), float("inf")])
+@pytest.mark.parametrize("value", ["x", object(), 1 + 0j, True, float("nan"), float("inf"), 10 ** 400, -(10 ** 400)])
 def test_axis_solver_rejects_malformed_scalar_gaps(value):
     base = vk._AxisProblem(np.zeros(2), np.ones(2), np.full(2, -10.),
                            np.full(2, 10.), np.zeros(2, dtype=bool), (), ())

@@ -165,7 +165,10 @@ def _solve_axis_dag(problem: _AxisProblem) -> Optional[np.ndarray]:
         if not isinstance(eq, _AxisEquality): return None
         if (isinstance(eq.delta, (bool, np.bool_)) or not isinstance(eq.delta, numbers.Real)):
             return None
-        delta = float(eq.delta)
+        try:
+            delta = float(eq.delta)
+        except (TypeError, ValueError, OverflowError):
+            return None
         if not np.isfinite(delta): return None
         if (isinstance(eq.left, (bool, np.bool_)) or isinstance(eq.right, (bool, np.bool_))
                 or not isinstance(eq.left, numbers.Integral) or not isinstance(eq.right, numbers.Integral)
@@ -193,7 +196,10 @@ def _solve_axis_dag(problem: _AxisProblem) -> Optional[np.ndarray]:
     for edge in problem.edges:
         if not isinstance(edge, _AxisEdge): return None
         if (isinstance(edge.gap, (bool, np.bool_)) or not isinstance(edge.gap, numbers.Real)): return None
-        edge_gap = float(edge.gap)
+        try:
+            edge_gap = float(edge.gap)
+        except (TypeError, ValueError, OverflowError):
+            return None
         if not np.isfinite(edge_gap): return None
         if (isinstance(edge.before, (bool, np.bool_)) or isinstance(edge.after, (bool, np.bool_))
                 or not isinstance(edge.before, numbers.Integral) or not isinstance(edge.after, numbers.Integral)
