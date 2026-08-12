@@ -81,9 +81,11 @@ class _AxisProblem:
 
 def _axis_problem_shapes_ok(problem: _AxisProblem, n: int) -> bool:
     try:
-        arrays = tuple(np.asarray(a) for a in (problem.coords, problem.sizes,
-                                                problem.lower, problem.upper))
-        pinned = np.asarray(problem.pinned)
+        raw_arrays = (problem.coords, problem.sizes, problem.lower, problem.upper)
+        if not all(isinstance(a, np.ndarray) for a in raw_arrays) or not isinstance(problem.pinned, np.ndarray):
+            return False
+        arrays = tuple(np.asarray(a) for a in raw_arrays)
+        pinned = problem.pinned
         numeric = all(a.shape == (n,) and a.dtype.kind in "fiu" and a.dtype.kind != "b"
                       for a in arrays)
         return (numeric and pinned.shape == (n,) and pinned.dtype.kind == "b"
@@ -142,8 +144,12 @@ def _axis_solution_ok(problem: _AxisProblem, result: np.ndarray) -> bool:
 
 
 def _solve_axis_dag(problem: _AxisProblem) -> Optional[np.ndarray]:
-    n = len(problem.coords)
+    if not isinstance(problem, _AxisProblem) or not isinstance(problem.coords, np.ndarray) or problem.coords.ndim != 1:
+        return None
+    n = problem.coords.shape[0]
     if not _axis_problem_shapes_ok(problem, n):
+        return None
+    if not isinstance(problem.equalities, tuple) or not isinstance(problem.edges, tuple):
         return None
     parent = np.arange(n, dtype=np.int64)
     offset = np.zeros(n, dtype=np.float64)
@@ -156,16 +162,20 @@ def _solve_axis_dag(problem: _AxisProblem) -> Optional[np.ndarray]:
         return int(parent[i]), float(offset[i])
 
     for eq in problem.equalities:
+        if not isinstance(eq, _AxisEquality): return None
+        if (isinstance(eq.delta, (bool, np.bool_)) or not isinstance(eq.delta, numbers.Real)):
+            return None
+        delta = float(eq.delta)
+        if not np.isfinite(delta): return None
         if (isinstance(eq.left, (bool, np.bool_)) or isinstance(eq.right, (bool, np.bool_))
                 or not isinstance(eq.left, numbers.Integral) or not isinstance(eq.right, numbers.Integral)
-                or not (0 <= int(eq.left) < n and 0 <= int(eq.right) < n)
-                or not np.isfinite(eq.delta)):
+                or not (0 <= int(eq.left) < n and 0 <= int(eq.right) < n)):
             return None
         ra, da = find(int(eq.left)); rb, db = find(int(eq.right))
         if ra == rb:
-            if not np.isclose(db - da, eq.delta, atol=1e-9, rtol=0.0): return None
+            if not np.isclose(db - da, delta, atol=1e-9, rtol=0.0): return None
         else:
-            parent[rb] = ra; offset[rb] = da + eq.delta - db
+            parent[rb] = ra; offset[rb] = da + delta - db
     roots = sorted({find(i)[0] for i in range(n)})
     root_index = {root: k for k, root in enumerate(roots)}
     root_lo = np.full(len(roots), -np.inf); root_hi = np.full(len(roots), np.inf)
@@ -181,11 +191,14 @@ def _solve_axis_dag(problem: _AxisProblem) -> Optional[np.ndarray]:
     for k, value in pin_value.items(): root_lo[k] = root_hi[k] = value
     reduced: Dict[Tuple[int, int], float] = {}
     for edge in problem.edges:
+        if not isinstance(edge, _AxisEdge): return None
+        if (isinstance(edge.gap, (bool, np.bool_)) or not isinstance(edge.gap, numbers.Real)): return None
+        edge_gap = float(edge.gap)
+        if not np.isfinite(edge_gap): return None
         if (isinstance(edge.before, (bool, np.bool_)) or isinstance(edge.after, (bool, np.bool_))
                 or not isinstance(edge.before, numbers.Integral) or not isinstance(edge.after, numbers.Integral)
-                or not (0 <= int(edge.before) < n and 0 <= int(edge.after) < n)
-                or not np.isfinite(edge.gap)): return None
-        ra, da = find(int(edge.before)); rb, db = find(int(edge.after)); gap = da + edge.gap - db
+                or not (0 <= int(edge.before) < n and 0 <= int(edge.after) < n)): return None
+        ra, da = find(int(edge.before)); rb, db = find(int(edge.after)); gap = da + edge_gap - db
         if ra == rb:
             if gap > 1e-9: return None
         else:

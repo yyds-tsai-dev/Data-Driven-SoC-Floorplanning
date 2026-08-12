@@ -175,3 +175,26 @@ def test_axis_solver_rejects_non_bool_pinned_and_nonfinite_fields():
     for field in ("coords", "sizes", "lower", "upper"):
         bad = np.zeros(2); bad[0] = np.nan
         assert vk._solve_axis_dag(replace(base, **{field: bad})) is None
+
+
+def test_axis_solver_rejects_malformed_top_level_and_containers():
+    base = vk._AxisProblem(np.zeros(2), np.ones(2), np.full(2, -10.),
+                           np.full(2, 10.), np.zeros(2, dtype=bool), (), ())
+    for bad in (None, 1, "x"):
+        assert vk._solve_axis_dag(bad) is None
+    for field in ("coords", "sizes", "lower", "upper", "pinned"):
+        for bad in (0., [0., 0.], (0., 0.)):
+            assert vk._solve_axis_dag(replace(base, **{field: bad})) is None
+    for field in ("equalities", "edges"):
+        for bad in (None, [], "x", [base.equalities]):
+            assert vk._solve_axis_dag(replace(base, **{field: bad})) is None
+    assert vk._solve_axis_dag(replace(base, equalities=(object(),))) is None
+    assert vk._solve_axis_dag(replace(base, edges=(object(),))) is None
+
+
+@pytest.mark.parametrize("value", ["x", object(), 1 + 0j, True, float("nan"), float("inf")])
+def test_axis_solver_rejects_malformed_scalar_gaps(value):
+    base = vk._AxisProblem(np.zeros(2), np.ones(2), np.full(2, -10.),
+                           np.full(2, 10.), np.zeros(2, dtype=bool), (), ())
+    assert vk._solve_axis_dag(replace(base, equalities=(vk._AxisEquality(0, 1, value),))) is None
+    assert vk._solve_axis_dag(replace(base, edges=(vk._AxisEdge(0, 1, value),))) is None
