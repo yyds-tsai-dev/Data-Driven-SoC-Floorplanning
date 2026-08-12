@@ -296,6 +296,32 @@ def test_teacher_valid_canonical_root_reaches_explicit_unimplemented_without_loa
         t.teacher_main(args, _trust_policy=_policy_for(root))
 
 
+def test_teacher_default_policy_binds_frozen_production_inputs():
+    t = _teacher()
+    policy = t._production_trust_policy()
+    assert policy.canonical_root == Path("FloorSet/floorset_lite").resolve()
+    assert policy.expected_checkpoint_sha256 == "508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659"
+    assert set(policy.allowed_model_identity) == {
+        "identity_schema", "model_config_sha256", "model_keyset_sha256",
+        "ema_keyset_sha256", "ema_state_sha256"}
+    assert policy.allowed_model_identity["ema_state_sha256"] == "0efb3c706d627f6230e6f550d83e88741dc1f5a95e6c3450d7ed1e4a882a4d87"
+    assert policy.expected_scorer_sha256 == "7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1"
+    assert policy.scorer_contract == "iccad2026_evaluate_cost_no_runtime_v1"
+    assert policy.shapely_version == "2.0.5"
+
+
+def test_teacher_default_relative_root_and_bounded_flags_reach_unimplemented(monkeypatch, tmp_path):
+    t = _teacher(); out = tmp_path / "out"
+    monkeypatch.setattr(torch, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
+    args = ["--data-root", "FloorSet/floorset_lite", "--out-dir", str(out),
+            "--index-out", str(out / "training_index.json"),
+            "--checkpoint", "partner/checkpoints/direct_v2_cont/eval_step1p2M.pt",
+            "--seed", "20260813", "--heldout-mod", "10", "--n-min", "100",
+            "--max-files", "1"]
+    with pytest.raises(RuntimeError, match="not implemented"):
+        t.teacher_main(args)
+
+
 @pytest.mark.parametrize("bad", ["--scorer", "--unknown"])
 def test_teacher_cli_rejects_unapproved_flags(bad, tmp_path):
     t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); out = tmp_path / "out"
@@ -309,15 +335,37 @@ def test_teacher_intent_rejects_malformed_case_contract(field, value):
     t = _teacher(); rects = torch.tensor([[0., 0., 1., 1.], [1., 0., 1., 1.]])
     case = {"n": 2, "cons": [[0, 1, 0, 0, 0]] * 2, "tp": [[-1.] * 4] * 2}
     case[field] = value
-    with pytest.raises((TypeError, ValueError)):
-        t._proposal_intent_holds("base", rects, case)
+    assert not t._proposal_intent_holds("base", rects, case)
 
 
-def test_teacher_contact_requires_full_positive_perpendicular_overlap():
+def test_teacher_intent_rejects_wrong_rect_contract_and_unauthorized_pin():
+    t = _teacher()
+    case = {"n": 2, "cons": [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0]],
+            "tp": [[-1., -1., 1., 1.], [-1.] * 4]}
+    assert not t._proposal_intent_holds(
+        "base", torch.tensor([[0., 0., 1., 1.]]), case)
+    assert not t._proposal_intent_holds(
+        "base", torch.tensor([[0, 0, 1, 1], [1, 0, 1, 1]]), case)
+    rects = torch.tensor(
+        [[-1., -1., 1., 1.], [0., -1., 1., 1.]], dtype=torch.float64)
+    assert not t._proposal_intent_holds("pin:0:1:0:1", rects, case)
+    authorized = {**case, "tp": [[0., 0., 1., 1.], [-1.] * 4]}
+    drift = torch.tensor(
+        [[torch.nextafter(torch.tensor(0., dtype=torch.float64),
+                          torch.tensor(1., dtype=torch.float64)), 0., 1., 1.],
+         [1., 0., 1., 1.]], dtype=torch.float64)
+    assert not t._proposal_intent_holds("pin:0:1:0:1", drift, authorized)
+
+
+def test_teacher_contact_requires_exact_face_and_positive_perpendicular_overlap():
     t = _teacher(); case = {"n": 2, "cons": [[0, 0, 0, 5, 0]] * 2, "tp": [[-1.] * 4] * 2}
     partial = torch.tensor([[0., 0., 2., 2.], [2., 1.5, 2., 2.]])
+    no_overlap = torch.tensor([[0., 0., 2., 2.], [2., 2., 2., 2.]])
+    face_gap = torch.tensor([[0., 0., 2., 2.], [2.01, 0., 2., 2.]])
     exact = torch.tensor([[0., 0., 2., 2.], [2., 0., 2., 2.]])
-    assert not t._proposal_intent_holds("contact:5:0:1:0:1", partial, case)
+    assert t._proposal_intent_holds("contact:5:0:1:0:1", partial, case)
+    assert not t._proposal_intent_holds("contact:5:0:1:0:1", no_overlap, case)
+    assert not t._proposal_intent_holds("contact:5:0:1:0:1", face_gap, case)
     assert t._proposal_intent_holds("contact:5:0:1:0:1", exact, case)
 
 
@@ -355,6 +403,18 @@ def test_teacher_weighted_population_rejects_duplicate_source_tuple_and_instance
         t._weighted_population([row, {**row, "relative_path": "b.json"}])
 
 
+def test_teacher_weighted_population_rejects_nonfinite_weighted_arithmetic():
+    t = _teacher()
+    base = {"relative_path": "a.json", "layout_index": 0, "instance_id": "a",
+            "n": 1, "base_cost": 2., "teacher_cost": 1.}
+    for bad in [
+        {**base, "n": 100_000},
+        {**base, "base_cost": 1e308, "teacher_cost": 1e308},
+    ]:
+        with pytest.raises((ValueError, OverflowError)):
+            t._weighted_population([bad])
+
+
 def test_teacher_population_hash_omits_costs_but_metrics_change():
     t = _teacher(); row = {"relative_path": "a.json", "layout_index": 0, "instance_id": "a", "n": 1,
                            "base_cost": 2., "teacher_cost": 1.}
@@ -385,7 +445,7 @@ def test_teacher_rejects_existing_or_escaping_output_paths(tmp_path, out_kind):
     else: out = tmp_path / "canonical" / ".." / "escape"
     args = ["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"),
             "--checkpoint", str(tmp_path / "missing.th")]
-    with pytest.raises((ValueError, RuntimeError)):
+    with pytest.raises(ValueError):
         t.teacher_main(args, _trust_policy=_policy_for(root))
 from icdc.topology_prior import topology_losses, extract_sparse_label
 from icdc.topology_prior import (
