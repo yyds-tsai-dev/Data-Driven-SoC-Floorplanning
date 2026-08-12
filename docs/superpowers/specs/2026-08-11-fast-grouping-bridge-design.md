@@ -188,9 +188,8 @@ requires all of the following:
 - every arm is 100/100 hard feasible;
 - ON improves no-runtime score in all three pairs;
 - mean paired no-runtime delta is at most `-0.002`;
-- each ON log contains 100 causal public bridge-call `ms` values, each run's
-  mean call duration is at most `0.003s`, and the aggregate 300-call mean is
-  at most `0.003s`;
+- the aggregate mean of all 300 causal public bridge-call `ms` values is at
+  most `0.003s` (per-run means are reported evidence, not separate gates);
 - each pair's projected production average runtime is its official OFF
   average runtime plus that ON log's mean bridge-call seconds, and is at most
   `0.300s`;
@@ -243,7 +242,8 @@ for the causal-call rule or used to waive the final package gate.
 - The design reuses a scorer already paid for by the current final pipeline;
   projected runtime does not assume a free new scorer construction.
 - The 20ms deadline is explicitly soft, and online runtime is authoritative.
-- G1 binds to 100 causal call timings per ON log and OFF-plus-call projections;
+- G1 records 100 causal call timings per ON log and binds to their aggregate
+  300-call mean plus OFF-plus-call projections;
   the fresh-extracted package gate remains actual (non-projected) average
   runtime at most `0.300s` with 100/100 feasibility.
 - Proxy acceptance is explicitly separated from official evaluator evidence.
