@@ -219,10 +219,10 @@ def test_bridge_debug_ms_covers_bridge_call(monkeypatch, capsys):
     n, at, cons, tpos, b2b, p2b, pins, rects = _single()
     monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
     monkeypatch.setenv("PARTNER_GROUP_BRIDGE_DEBUG", "1")
-    clock = iter((10.0, 10.25))
-    monkeypatch.setattr(co.time, "perf_counter", lambda: next(clock))
+    clock = [10.0]
+    monkeypatch.setattr(co.time, "perf_counter", lambda: clock[0])
     monkeypatch.setattr("violation_killer.bridge_grouping_violations",
-                        lambda *a: a[1])
+                        lambda *a: (clock.__setitem__(0, clock[0] + 0.25) or a[1]))
     _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
     assert "ms=250.000" in capsys.readouterr().err
 
