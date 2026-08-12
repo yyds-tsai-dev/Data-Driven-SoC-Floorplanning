@@ -229,52 +229,56 @@ def _pin_mask(cons: Sequence[Sequence[int]], tp: torch.Tensor) -> Tuple[bool, ..
 def _place_for_pair(rects: torch.Tensor, first: int, second: int,
                     axis: int, order: int, moved: int) -> torch.Tensor:
     stationary = second if moved == first else first
-    perp = 1 - axis
-    before = (moved == first) == bool(order)
     m = rects[moved]
     s = rects[stationary]
-    u_face = float(s[axis] - m[axis + 2]) if before else float(s[axis] + s[axis + 2])
+    perp = 1 - axis
+    before = (moved == first) == bool(order)
     sigma = -1.0 if before else 1.0
-    q0 = sigma * (float(m[axis]) - u_face)
-    lo = float(s[perp] - m[perp + 2])
-    hi = float(s[perp] + s[perp + 2])
-    t0 = float(m[perp])
-    qmin = max(0.0, t0 - hi, lo - t0)
-    candidates = []
-    if q0 >= qmin:
-        candidates.append((q0, t0))
-    clamp_t = min(max(t0, lo), hi)
-    candidates.append((0.0, clamp_t))
-    r = max(0.0, 0.5 * (q0 + t0 - hi))
-    candidates.append((r, hi + r))
-    r = max(0.0, 0.5 * (q0 - t0 + lo))
-    candidates.append((r, lo - r))
+    cm = [float(m[d] + m[d + 2] / 2) for d in (0, 1)]
+    cs = [float(s[d] + s[d + 2] / 2) for d in (0, 1)]
+    z0a = cm[axis] - cs[axis]
+    v0 = cm[perp] - cs[perp]
+    ha = (float(m[axis + 2]) + float(s[axis + 2])) / 2
+    hp = (float(m[perp + 2]) + float(s[perp + 2])) / 2
+    delta = ha - hp
+    u0 = sigma * z0a
+    projected = []
+    if u0 >= 0 and u0 >= abs(v0) + delta:
+        projected.append((u0, v0))
+    if delta <= 0:
+        projected.append((0.0, min(max(v0, delta), -delta)))
+    vr = max(0.0, -delta, (u0 + v0 - delta) / 2)
+    projected.append((vr + delta, vr))
+    vl = min(0.0, delta, (delta - u0 + v0) / 2)
+    projected.append((delta - vl, vl))
+
+    # Include the unmodified placement independently: it is the exact nearest
+    # answer whenever it already realizes the requested classifier state.
+    targets = [(u0, v0)]
+    targets.extend(projected)
     best = None
     best_dist = None
-    for q, t in candidates:
-        trial = rects.clone()
-        trial[moved, axis] = u_face + sigma * q
-        trial[moved, perp] = t
-        if _pair_state(trial, first, second) != (axis, order):
-            continue
-        dist = (float(trial[moved, axis] - m[axis]) ** 2
-                + float(trial[moved, perp] - m[perp]) ** 2)
-        if best_dist is None or dist < best_dist:
-            best, best_dist = trial, dist
-    if best is None and axis == 1:
-        # Account for floating-point cancellation at a strict topology tie.
-        for q, t in candidates:
-            trial = rects.clone()
-            trial[moved, axis] = math.nextafter(u_face + sigma * q,
-                                                  math.inf if sigma > 0 else -math.inf)
-            trial[moved, perp] = t
-            if t < lo:
-                trial[moved, perp] = math.nextafter(t, hi)
-            elif t > hi:
-                trial[moved, perp] = math.nextafter(t, lo)
-            if _pair_state(trial, first, second) == (axis, order):
-                dist = (float(trial[moved, axis] - m[axis]) ** 2
-                        + float(trial[moved, perp] - m[perp]) ** 2)
+    target_centers = []
+    for u, v in targets:
+        target_centers.append((cs[axis] + sigma * u, cs[perp] + v))
+    # Bounded nextafter ladders recover strict floating-point classifier states
+    # while validating every actual rectangle state.
+    ladder_bases = list(target_centers)
+    for ca, cp in ladder_bases:
+        for ka in range(17):
+            aa = ca
+            for _ in range(ka):
+                aa = math.nextafter(aa, math.inf if sigma > 0 else -math.inf)
+            for kp in range(17):
+                pp = cp
+                for _ in range(kp):
+                    pp = math.nextafter(pp, cs[perp])
+                trial = rects.clone()
+                trial[moved, axis] = aa - float(m[axis + 2]) / 2
+                trial[moved, perp] = pp - float(m[perp + 2]) / 2
+                if _pair_state(trial, first, second) != (axis, order):
+                    continue
+                dist = sum((float(trial[moved, d] - m[d])) ** 2 for d in (0, 1))
                 if best_dist is None or dist < best_dist:
                     best, best_dist = trial, dist
     return best if best is not None else rects.clone()
@@ -463,7 +467,6 @@ def generate_proposals(
     pin_base = _repair_preplaced(base, cons, tp)
     preplaced = _authorized_preplaced(cons, tp)
     if preplaced:
-        pin_seen: set = set()
         for target in preplaced:
             for peer in range(n):
                 if peer == target or pinned[peer]:
@@ -478,7 +481,7 @@ def generate_proposals(
                     continue
                 name = f"pin:{target}:{peer}:{actual_axis}:{actual_order}"
                 emitted = _emit_candidate(name, candidate, "pin", cfg.pin_repair_cap,
-                                           pin_seen, names, total, cfg.total_cap, cons)
+                                           seen, names, total, cfg.total_cap, cons)
                 if emitted is not None:
                     yield emitted
                     total += 1
