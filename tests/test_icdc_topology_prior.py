@@ -4,6 +4,8 @@ from icdc.topology_data import (
     fingerprint_case, load_sanitized_corpus, save_sanitized_corpus,
     split_for_id,
 )
+from icdc.topology_data import ContactLabel, SparseEdge, TopologyLabel, collate_labels, canonical_jsonl, canonical_jsonl_sha256, write_sha256_manifest
+import torch
 
 
 def _case(**extra):
@@ -45,3 +47,22 @@ def test_duplicate_content_under_distinct_ids_and_invalid_split():
     with pytest.raises(ValueError): save_sanitized_corpus("/tmp/dup.jsonl", [_case(), _case(instance_id="other")])
     for args in (("", 10), ("x", True), ("x", 0)):
         with pytest.raises(ValueError): split_for_id(*args)
+
+@pytest.mark.parametrize("bad", [None, "abc", {"x": 1}, [[1, 2]]])
+def test_nested_schema_errors_are_value_errors(tmp_path, bad):
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "x", [_case(b2b=bad)])
+
+def test_geometry_indices_and_recursive_canonical_forbidden(tmp_path):
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "x", [_case(b2b=[[True, 1, 1]])])
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "x", [_case(b2b=[[0, 9, 1]])])
+    with pytest.raises(ValueError): canonical_jsonl(tmp_path / "x", [{"nested": [{"golden": 1}]}])
+
+def test_manifest_hash_and_collate_contract(tmp_path):
+    p = tmp_path / "x.jsonl"; canonical_jsonl(p, [{"b": 1, "a": 2}])
+    assert canonical_jsonl_sha256(p) == canonical_jsonl_sha256(p)
+    assert write_sha256_manifest(tmp_path / "m", [p])[str(p)] == canonical_jsonl_sha256(p)
+    label = TopologyLabel("x", 2, 1, 1., 1., 1., (SparseEdge(0, 1, 0, 1., "sep", 1.),), (), ())
+    batch = collate_labels([label], torch.device("cpu"), torch.float32)
+    assert batch.edge_batch.shape == (1,) and batch.edge_weight.dtype == torch.float32
+    empty = collate_labels([], torch.device("cpu"), torch.float64)
+    assert all(getattr(empty, f).shape == (0,) for f in empty.__dataclass_fields__)

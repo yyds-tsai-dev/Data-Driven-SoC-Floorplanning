@@ -63,6 +63,10 @@ def _sanitize(case: Mapping[str, Any]) -> dict[str, Any]:
     if any(not isinstance(row, list) or len(row) != 4 or any(isinstance(v, bool) or not isinstance(v, (int,float)) for v in row) for row in case["tp"]): raise ValueError("tp")
     for k, width in (("b2b", 3), ("p2b", 3), ("pins", 2)):
         if not isinstance(case[k], list) or any(not isinstance(row, list) or len(row) != width or any(isinstance(v,bool) or not isinstance(v,(int,float)) for v in row) for row in case[k]): raise ValueError(k)
+    for row in case["b2b"]:
+        if any(type(row[i]) is not int or not 0 <= row[i] < n for i in (0, 1)) or row[2] < 0: raise ValueError("b2b endpoints")
+    for row in case["p2b"]:
+        if type(row[0]) is not int or type(row[1]) is not int or not 0 <= row[0] < len(case["pins"]) or not 0 <= row[1] < n or row[2] < 0: raise ValueError("p2b endpoints")
     if any(not isinstance(case[k], (int,float)) or isinstance(case[k], bool) or not math.isfinite(float(case[k])) or float(case[k]) <= 0 for k in ("hpwl_ref", "area_ref")): raise ValueError("refs")
     if not _finite(out): raise ValueError("nonfinite value")
     tp = []
@@ -106,16 +110,27 @@ def canonical_jsonl_sha256(path: str | Path) -> str:
 def canonical_jsonl(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> None:
     """Write rows in the byte-stable sorted-key JSONL representation."""
     forbidden = {"test_id", "golden", "validation", "loader", "provenance"}
+    def walk(x):
+        if isinstance(x, Mapping):
+            if forbidden.intersection(x) or ("source_split" in x and x["source_split"] != "train"):
+                raise ValueError("forbidden canonical field")
+            for v in x.values(): walk(v)
+        elif isinstance(x, list):
+            for v in x: walk(v)
     for r in rows:
-        if not isinstance(r, Mapping) or forbidden.intersection(r) or r.get("source_split") not in (None, "train"):
+        if not isinstance(r, Mapping):
             raise ValueError("forbidden canonical field")
+        walk(r)
     Path(path).write_text("".join(_canon(r) + "\n" for r in rows), encoding="utf-8")
 
 def sha256_manifest(path: str | Path, files: Sequence[str | Path]) -> dict[str, str]:
     return write_sha256_manifest(path, files)
 
 def write_sha256_manifest(path: str | Path, files: Sequence[str | Path]) -> dict[str, str]:
-    manifest = {str(Path(f)): canonical_jsonl_sha256(f) for f in sorted(files, key=str)}
+    resolved = [Path(f).resolve() for f in files]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("duplicate manifest path")
+    manifest = {str(f): canonical_jsonl_sha256(f) for f in sorted(resolved, key=str)}
     Path(path).write_text(_canon(manifest) + "\n", encoding="utf-8")
     return manifest
 
