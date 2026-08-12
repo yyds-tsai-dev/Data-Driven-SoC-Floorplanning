@@ -24,6 +24,7 @@ input unchanged.  Deterministic (no RNG).  Debug prints via VKILL_DEBUG=1.
 from __future__ import annotations
 
 import math
+import numbers
 import os
 import time
 import traceback
@@ -79,16 +80,17 @@ class _AxisProblem:
 
 
 def _axis_problem_shapes_ok(problem: _AxisProblem, n: int) -> bool:
-    arrays = (problem.coords, problem.sizes, problem.lower, problem.upper,
-              problem.pinned)
-    return (all(np.asarray(a).shape == (n,) for a in arrays)
-            and np.issubdtype(np.asarray(problem.pinned).dtype, np.bool_)
-            and np.all(np.isfinite(problem.coords))
-            and np.all(np.isfinite(problem.sizes))
-            and np.all(np.isfinite(problem.lower))
-            and np.all(np.isfinite(problem.upper))
-            and np.all(problem.sizes >= 0)
-            and np.all(problem.lower <= problem.upper))
+    try:
+        arrays = tuple(np.asarray(a) for a in (problem.coords, problem.sizes,
+                                                problem.lower, problem.upper))
+        pinned = np.asarray(problem.pinned)
+        numeric = all(a.shape == (n,) and a.dtype.kind in "fiu" and a.dtype.kind != "b"
+                      for a in arrays)
+        return (numeric and pinned.shape == (n,) and pinned.dtype.kind == "b"
+                and all(np.all(np.isfinite(a)) for a in arrays)
+                and np.all(arrays[1] >= 0) and np.all(arrays[2] <= arrays[3]))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _topological_order(n: int, edges: Tuple[Tuple[int, int], ...]) -> Optional[List[int]]:
@@ -154,9 +156,12 @@ def _solve_axis_dag(problem: _AxisProblem) -> Optional[np.ndarray]:
         return int(parent[i]), float(offset[i])
 
     for eq in problem.equalities:
-        if not (0 <= eq.left < n and 0 <= eq.right < n and np.isfinite(eq.delta)):
+        if (isinstance(eq.left, (bool, np.bool_)) or isinstance(eq.right, (bool, np.bool_))
+                or not isinstance(eq.left, numbers.Integral) or not isinstance(eq.right, numbers.Integral)
+                or not (0 <= int(eq.left) < n and 0 <= int(eq.right) < n)
+                or not np.isfinite(eq.delta)):
             return None
-        ra, da = find(eq.left); rb, db = find(eq.right)
+        ra, da = find(int(eq.left)); rb, db = find(int(eq.right))
         if ra == rb:
             if not np.isclose(db - da, eq.delta, atol=1e-9, rtol=0.0): return None
         else:
@@ -176,8 +181,11 @@ def _solve_axis_dag(problem: _AxisProblem) -> Optional[np.ndarray]:
     for k, value in pin_value.items(): root_lo[k] = root_hi[k] = value
     reduced: Dict[Tuple[int, int], float] = {}
     for edge in problem.edges:
-        if not (0 <= edge.before < n and 0 <= edge.after < n and np.isfinite(edge.gap)): return None
-        ra, da = find(edge.before); rb, db = find(edge.after); gap = da + edge.gap - db
+        if (isinstance(edge.before, (bool, np.bool_)) or isinstance(edge.after, (bool, np.bool_))
+                or not isinstance(edge.before, numbers.Integral) or not isinstance(edge.after, numbers.Integral)
+                or not (0 <= int(edge.before) < n and 0 <= int(edge.after) < n)
+                or not np.isfinite(edge.gap)): return None
+        ra, da = find(int(edge.before)); rb, db = find(int(edge.after)); gap = da + edge.gap - db
         if ra == rb:
             if gap > 1e-9: return None
         else:

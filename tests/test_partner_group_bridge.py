@@ -142,3 +142,36 @@ def test_axis_solver_preserves_pin_satisfies_edges_and_is_repeatable():
     assert first[0] == 0.
     assert first[1] >= first[0] + 3.
     assert first[2] == pytest.approx(first[1] + 4., abs=1e-9)
+
+
+@pytest.mark.parametrize("bad_index", [0.0, True, -1, 2])
+def test_axis_solver_rejects_malformed_indices(bad_index):
+    base = vk._AxisProblem(np.zeros(2), np.ones(2), np.full(2, -10.),
+                           np.full(2, 10.), np.zeros(2, dtype=bool), (), ())
+    assert vk._solve_axis_dag(replace(base, equalities=(vk._AxisEquality(bad_index, 1, 0.),))) is None
+    assert vk._solve_axis_dag(replace(base, edges=(vk._AxisEdge(0, bad_index, 0.),))) is None
+
+
+@pytest.mark.parametrize("delta", [float("nan"), float("inf"), -float("inf")])
+def test_axis_solver_rejects_nonfinite_deltas(delta):
+    base = vk._AxisProblem(np.zeros(2), np.ones(2), np.full(2, -10.),
+                           np.full(2, 10.), np.zeros(2, dtype=bool), (), ())
+    assert vk._solve_axis_dag(replace(base, equalities=(vk._AxisEquality(0, 1, delta),))) is None
+    assert vk._solve_axis_dag(replace(base, edges=(vk._AxisEdge(0, 1, delta),))) is None
+
+
+@pytest.mark.parametrize("field", ["coords", "sizes", "lower", "upper"])
+@pytest.mark.parametrize("bad", [np.array(["x", "y"]), np.array([1 + 0j, 2 + 0j]), np.array([True, False]), np.array([object(), object()])])
+def test_axis_solver_rejects_malformed_numeric_arrays(field, bad):
+    base = vk._AxisProblem(np.zeros(2), np.ones(2), np.full(2, -10.),
+                           np.full(2, 10.), np.zeros(2, dtype=bool), (), ())
+    assert vk._solve_axis_dag(replace(base, **{field: bad})) is None
+
+
+def test_axis_solver_rejects_non_bool_pinned_and_nonfinite_fields():
+    base = vk._AxisProblem(np.zeros(2), np.ones(2), np.full(2, -10.),
+                           np.full(2, 10.), np.zeros(2, dtype=bool), (), ())
+    assert vk._solve_axis_dag(replace(base, pinned=np.array([0, 1]))) is None
+    for field in ("coords", "sizes", "lower", "upper"):
+        bad = np.zeros(2); bad[0] = np.nan
+        assert vk._solve_axis_dag(replace(base, **{field: bad})) is None
