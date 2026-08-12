@@ -767,33 +767,37 @@ class MyOptimizer(FloorplanOptimizer):
         if not bridge_on:
             return current
         try:
-            from violation_killer import bridge_grouping_violations, _grouping_count, _violations_exact, _bbox_area
-            import numpy as _np
-            started = time.perf_counter()
-            before = current
-            P0 = _np.asarray([tuple(map(float, r)) for r in before], dtype=float)
-            grouping0 = _grouping_count(scorer, P0)
-            violations0 = _violations_exact(scorer, P0)
-            hpwl0 = float(scorer._hpwl(P0))
-            bbox0 = _bbox_area(P0)
             try:
                 budget = float(os.environ.get("PARTNER_GROUP_BRIDGE_BUDGET", "0.02"))
             except (TypeError, ValueError):
                 budget = 0.02
-            bridged = bridge_grouping_violations(scorer, before, budget)
-            P1 = _np.asarray([tuple(map(float, r)) for r in bridged], dtype=float)
-            grouping1 = _grouping_count(scorer, P1)
-            violations1 = _violations_exact(scorer, P1)
-            hpwl1 = float(scorer._hpwl(P1))
-            bbox1 = _bbox_area(P1)
-            if os.environ.get("PARTNER_GROUP_BRIDGE_DEBUG") == "1":
+            from violation_killer import bridge_grouping_violations
+            bridged = bridge_grouping_violations(scorer, current, budget)
+        except Exception:
+            return current
+        if os.environ.get("PARTNER_GROUP_BRIDGE_DEBUG") == "1":
+            try:
+                from violation_killer import _grouping_count, _violations_exact, _bbox_area
+                import numpy as _np
+                started = time.perf_counter()
+                before = current
+                P0 = _np.asarray([tuple(map(float, r)) for r in before], dtype=float)
+                grouping0 = _grouping_count(scorer, P0)
+                violations0 = _violations_exact(scorer, P0)
+                hpwl0 = float(scorer._hpwl(P0))
+                bbox0 = _bbox_area(P0)
+                P1 = _np.asarray([tuple(map(float, r)) for r in bridged], dtype=float)
+                grouping1 = _grouping_count(scorer, P1)
+                violations1 = _violations_exact(scorer, P1)
+                hpwl1 = float(scorer._hpwl(P1))
+                bbox1 = _bbox_area(P1)
                 print(f"[gbridge] n={len(before)} ms={(time.perf_counter()-started)*1000:.3f} "
                       f"grouping={grouping0}->{grouping1} V={violations0}->{violations1} "
                       f"hpwl={hpwl0:.6f}->{hpwl1:.6f} bbox={bbox0:.6f}->{bbox1:.6f} "
                       f"committed={int(bridged != before)}", file=sys.stderr, flush=True)
-            return bridged
-        except Exception:
-            return current
+            except Exception:
+                pass
+        return bridged
 
     def _coord_polish(self, out, at, cons, tpos, b2b, p2b, pins):
         """Post-pass: order-preserving simultaneous-axis coordinate polish of

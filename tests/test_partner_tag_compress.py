@@ -154,10 +154,29 @@ def test_group_bridge_works_with_tag_compress_off(monkeypatch):
     monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
     monkeypatch.setattr(tc, "tag_compress",
                         lambda *a, **k: pytest.fail("tag pass called"))
+    seen = []
     monkeypatch.setattr("violation_killer.bridge_grouping_violations",
-                        lambda scorer, value, budget: value)
+                        lambda scorer, value, budget: seen.append((budget, value)) or value + [(9., 9., 1., 1.)])
     out = list(rects)
-    assert _opt()._tag_compress(out, at, cons, tpos, b2b, p2b, pins, None) is out
+    got = _opt()._tag_compress(out, at, cons, tpos, b2b, p2b, pins, None)
+    assert seen and seen[0][0] == pytest.approx(0.02)
+    assert got != out
+
+
+def test_tag_then_bridge_share_one_scorer(monkeypatch):
+    n, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_TAG_COMPRESS", "1")
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    sentinel = object()
+    made = []
+    events = []
+    monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: made.append(1) or sentinel)
+    monkeypatch.setattr(tc, "tag_compress", lambda scorer, value: events.append(("tag", scorer)) or value)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations",
+                        lambda scorer, value, budget: events.append(("bridge", scorer)) or value)
+    _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
+    assert made == [1]
+    assert events == [("tag", sentinel), ("bridge", sentinel)]
 
 
 def test_bridge_failure_preserves_tag_result(monkeypatch):
@@ -181,6 +200,19 @@ def test_group_bridge_debug_reports_self_paired_fields(monkeypatch, capsys):
     err = capsys.readouterr().err
     for field in ("ms=", "grouping=", "V=", "hpwl=", "bbox=", "committed="):
         assert field in err
+
+
+def test_bridge_debug_failure_preserves_bridge_result(monkeypatch):
+    n, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE_DEBUG", "1")
+    accepted = [(8.0, 8.0, 1.0, 1.0)] * len(rects)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations",
+                        lambda *a: accepted)
+    monkeypatch.setattr("violation_killer._grouping_count",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("diagnostic")))
+    out = list(rects)
+    assert _opt()._tag_compress(out, at, cons, tpos, b2b, p2b, pins, None) is accepted
 
 
 def test_warm_dependencies_is_idempotent():
