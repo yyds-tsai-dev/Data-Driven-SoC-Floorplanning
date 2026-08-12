@@ -398,13 +398,34 @@ timestamps or absolute paths. The production checkpoint expected SHA is
 exact bytes before deserialization and bind canonical config, key/shape/dtype,
 and selected EMA tensor identity. Missing EMA, mismatch, Shapely dependency,
 or scorer source SHA/version mismatch fails closed. Fixtures may use only a
-test-injected expected hash helper.
+test-injected trust policy; a public temporary-root invocation is rejected
+before any `torch.load`.
 
-Before model or G0 scoring, freeze scorer identity: `scripts/iccad2026_evaluate.py`
-SHA256 is `7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1`,
-with the declared scorer schema/version identifier, `SHAPELY_AVAILABLE=true`,
-and Shapely `2.0.5`. A legitimate source change requires a written
-specification amendment and new freeze; it is never auto-accepted.
+The implementation defines an unexported, frozen internal contract:
+`@dataclass(frozen=True) class TeacherTrustPolicy` with fields
+`canonical_root: Path`, `expected_checkpoint_sha256: str`,
+`allowed_model_identity: Mapping[str, str]`, `expected_scorer_sha256: str`,
+`scorer_contract: str`, and `shapely_version: str`.  The callable is
+`teacher_main(argv, *, _trust_policy: Optional[TeacherTrustPolicy] = None)`;
+`_trust_policy` is a Python-only keyword accepted exclusively by tests for
+fixture injection.  The command-line entry invokes `teacher_main(sys.argv[1:])`
+with `None`, which constructs production constants.  No CLI flag, environment
+variable, or config file can override canonical root, checkpoint, model, or
+scorer trust.  The fixture pseudocode therefore uses
+`data_root, checkpoint, trust = write_teacher_fixture(tmp_path)` and calls
+`teacher_main([...], _trust_policy=trust)`; the public temporary-root test
+continues to call `teacher_main([...])` and verifies rejection before load.
+
+Before model or G0 scoring, bind the literal project-owned scorer contract
+`iccad2026_evaluate_cost_no_runtime_v1` in the production trust policy and
+manifest.  It freezes `scripts/iccad2026_evaluate.py` SHA256
+`7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1`, verifies
+the exact `evaluate_solution` callable parameter signature,
+`SolutionMetrics.cost_no_runtime` presence, and `compute_total_score` weighting
+equivalence, requires `SHAPELY_AVAILABLE=true` with Shapely `2.0.5`, and always
+selects `.cost_no_runtime`.  This is a literal executable contract, not a
+placeholder declared identifier.  A legitimate source change requires a
+written specification amendment and new freeze; it is never auto-accepted.
 
 Persist a versioned manifest containing baseline commit/checkpoint identities,
 canonical model/EMA/keyset/config hashes, Flow identity, portfolio/environment

@@ -286,13 +286,13 @@ def test_group_contact_requires_exact_abutment_and_positive_overlap():
   it is test data, never a validation loader:
 ```python
 def test_teacher_cli_writes_split_evidence(tmp_path):
-    data_root, checkpoint = write_teacher_fixture(tmp_path)
+    data_root, checkpoint, trust = write_teacher_fixture(tmp_path)
     out = tmp_path / "out"
     rc = teacher_main([
         "--data-root", str(data_root), "--index-out", str(out / "training_index.json"),
         "--checkpoint", str(checkpoint), "--out-dir", str(out),
         "--seed", "20260813", "--heldout-mod", "2", "--n-min", "1",
-    ])
+    ], _trust_policy=trust)
     assert rc == 0
     assert {p.name for p in out.iterdir()} == {
         "train_corpus.jsonl", "heldout_corpus.jsonl", "train_labels.jsonl",
@@ -310,6 +310,29 @@ def test_teacher_rejects_validation_provenance_before_model_load(tmp_path,
         teacher_main(["--data-root", str(tmp_path / "validation"),
                       "--checkpoint", str(tmp_path / "x.pt"),
                       "--out-dir", str(tmp_path / "out")])
+
+
+# Internal test dependency injection is explicit and cannot be reached from
+# the command line.  The production entry point calls `teacher_main(sys.argv[1:])`
+# with `_trust_policy=None`; that path constructs immutable production constants.
+# Module-private (not exported in `__all__`) internal contract.
+@dataclass(frozen=True)
+class TeacherTrustPolicy:
+    canonical_root: Path
+    expected_checkpoint_sha256: str
+    allowed_model_identity: Mapping[str, str]
+    expected_scorer_sha256: str
+    scorer_contract: str
+    shapely_version: str
+
+
+def teacher_main(argv, *, _trust_policy: Optional[TeacherTrustPolicy] = None): ...
+
+
+# A public call with a temporary/noncanonical root is rejected before any
+# `torch.load`; only the fixture's internal `_trust_policy=trust` can bind its
+# test root/checkpoint/model/scorer identities.  No CLI flag, environment
+# variable, or config file can override those trust fields.
 
 
 def test_teacher_ast_forbids_validation_and_golden_reads():
@@ -362,10 +385,17 @@ config, state keys/shapes/dtypes, and selected EMA tensor identity; missing EMA
 or mismatch fails closed. Fixtures may inject an expected hash only through a
 test helper, never a permissive CLI bypass.
 
-Freeze scorer before model/G0 scoring: `scripts/iccad2026_evaluate.py` SHA256
-`7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1`, declared
-scorer schema/version, `SHAPELY_AVAILABLE=true`, and Shapely `2.0.5`. A
-legitimate source change requires a written spec amendment and new freeze.
+Freeze and bind the literal project-owned scorer contract
+`iccad2026_evaluate_cost_no_runtime_v1` in production trust and the manifest
+before model/G0 scoring. It verifies
+`scripts/iccad2026_evaluate.py` SHA256
+`7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1`, the exact
+`evaluate_solution` callable parameter signature,
+`SolutionMetrics.cost_no_runtime` presence, and `compute_total_score` weighting
+equivalence; it requires `SHAPELY_AVAILABLE=true` and Shapely `2.0.5`, and
+always selects `.cost_no_runtime`. This is a literal executable contract, not
+a placeholder declared identifier. A legitimate source change requires a
+written spec amendment and new freeze.
 
 Derive `tp` only from fixed/preplaced input geometry and retain only metric
 references, never golden coordinates. Every generated candidate envelope in
