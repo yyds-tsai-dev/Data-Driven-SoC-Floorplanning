@@ -79,11 +79,16 @@ def test_g0_probe_changed_candidate_requires_strict_deltas_and_gate_threshold(tm
     monkeypatch.setattr(probe, "EXPECTED_BASELINE_SHA256", hashlib.sha256(source.read_bytes()).hexdigest())
     monkeypatch.setattr(probe, "EXPECTED_BASELINE_SCORE", 1.0)
     def non_strict(solution, ctx):
-        return {"cost_no_runtime": .5, "is_feasible": True, "grouping_violations": 1, "total_soft_violations": 1}
+        changed = solution["positions"][0][0] != 0
+        return {"cost_no_runtime": .5 if changed else 1.0, "is_feasible": True,
+                "grouping_violations": 1, "total_soft_violations": 1}
     out, man = tmp_path / "o.json", tmp_path / "m.json"
     rc = probe.main(["replay", "--input", str(source), "--output", str(out), "--manifest", str(man)],
                     case_loader=_fixture_loader, bridge_fn=_fixture_bridge, evaluate_fn=non_strict)
-    assert rc == 1 and json.loads(man.read_text())["accepted"] is False
+    assert rc == 1
+    report = json.loads(man.read_text()); rows = json.loads(out.read_text())
+    assert report["errors"] == 0 and report["feasible"] == 2 and report["accepted"] is False
+    assert all(row["changed"] and not row["candidate_strict"] and not row["accepted"] for row in rows)
 
 
 def test_g0_probe_off_replay_binds_each_case_not_only_weighted_aggregate(tmp_path, monkeypatch):
@@ -107,7 +112,11 @@ def test_g0_probe_source_hygiene_reachable_ast_only(tmp_path):
     probe = _load_probe_module()
     source = Path("partner/violation_killer.py").read_text()
     assert probe._source_hygiene_text(source)
-    mutated = source.replace("def _dag_debug", "def _dag_debug_test_id", 1)
+    mutated = source.replace(
+        '    if os.environ.get("PARTNER_GROUP_DAG_BRIDGE_DEBUG") != "1":',
+        '    coord_polish.forbidden()\n    if os.environ.get("PARTNER_GROUP_DAG_BRIDGE_DEBUG") != "1":',
+        1,
+    )
     assert probe._source_hygiene_text(mutated) is False
 
 
@@ -126,9 +135,15 @@ def test_g0_probe_runtime_and_infeasibility_fail_the_gate(tmp_path, monkeypatch)
     assert probe.main(["replay", "--input", str(source), "--output", str(out), "--manifest", str(man)], case_loader=_fixture_loader, bridge_fn=_fixture_bridge, evaluate_fn=_fixture_evaluate, clock=lambda: next(ticks)) == 1
     assert json.loads(man.read_text())["causal_mean_ms"] > .75
     def infeasible(solution, ctx):
-        return {"cost_no_runtime": .5, "is_feasible": False, "grouping_violations": 0, "total_soft_violations": 0}
+        changed = solution["positions"][0][0] != 0
+        return {"cost_no_runtime": .5 if changed else 1.0,
+                "is_feasible": False if changed else True,
+                "grouping_violations": 0 if changed else 1,
+                "total_soft_violations": 0 if changed else 1}
     assert probe.main(["replay", "--input", str(source), "--output", str(out), "--manifest", str(man)], case_loader=_fixture_loader, bridge_fn=_fixture_bridge, evaluate_fn=infeasible) == 1
-    assert json.loads(man.read_text())["feasible"] == 0
+    report = json.loads(man.read_text()); rows = json.loads(out.read_text())
+    assert report["errors"] == 0 and report["feasible"] == 0 and report["accepted"] is False
+    assert all(row["changed"] and not row["candidate_strict"] for row in rows)
 
 
 def test_g0_probe_rejects_error_and_explicit_bad_schema(tmp_path, monkeypatch):
