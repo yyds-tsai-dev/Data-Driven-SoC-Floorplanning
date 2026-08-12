@@ -77,11 +77,60 @@ def test_schema_field_order_and_frozen_contract():
         SparseEdge(0, 1, 0, 1., "x", 1.).src = 2
 
 def test_five_column_constraints_are_retained_and_two_column_masks(tmp_path):
-    row = _case(cons=[[1, 1, 1, 0, 1], [0, 0, 1, 1, 0], [0, 1, 0, 1, 1]])
+    row = _case(cons=[[0, 0, 2, 7, 10], [0, 1, 2, 7, 5], [1, 0, 0, 0, 0]])
     save_sanitized_corpus(tmp_path / "five", [row])
     got = load_sanitized_corpus(tmp_path / "five")[0]
     assert got["cons"] == row["cons"]
-    assert got["tp"] == [[7., 8., 2., 2.], [-1., -1., -1., -1.], [5., 6., 5., 6.]]
+    assert got["tp"] == [[-1., -1., -1., -1.], [9., 9., 3., 4.], [-1., -1., 5., 6.]]
+
+@pytest.mark.parametrize("cons", [[[0, 0, -1, 0, 0]], [[0, 0, 1.5, 0, 0]], [[0, 0, 1, 0, 16]], [[0, 0, 1, -2, 0]]])
+def test_five_column_group_and_boundary_validation(tmp_path, cons):
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "bad", [_case(n=1, area=[1.], tp=[[1., 1., 1., 1.]], cons=cons)])
+
+def test_empty_case_is_valid(tmp_path):
+    row = _case(n=0, area=[], cons=[], tp=[], b2b=[], p2b=[], pins=[])
+    save_sanitized_corpus(tmp_path / "empty", [row])
+    assert load_sanitized_corpus(tmp_path / "empty")[0]["n"] == 0
+
+@pytest.mark.parametrize("root", [None, "/definitely/wrong", "wrong-relative", object()])
+def test_source_root_restrictions(tmp_path, root):
+    with pytest.raises(ValueError): save_sanitized_corpus(tmp_path / "x", [_case()], source_root=root)
+
+def test_explicit_canonical_source_root(tmp_path):
+    root = (tmp_path.parents[3] / "nashome/NVL4/vdalab/yyds-dev/Data-Driven-SoC-Floorplanning/FloorSet/floorset_lite")
+    # Use repository's canonical path through the implementation's accepted relative spelling.
+    import pathlib
+    canonical = pathlib.Path("FloorSet/floorset_lite").resolve()
+    save_sanitized_corpus(tmp_path / "x", [_case()], source_root=canonical)
+
+@pytest.mark.parametrize("row", [{"test_id": 1}, {"validation": True}, {"loader": {}}, {"provenance": {}}])
+def test_load_rejects_forbidden_rows(tmp_path, row):
+    p = tmp_path / "bad"; p.write_text(__import__("json").dumps(row) + "\n")
+    with pytest.raises(ValueError): load_sanitized_corpus(p)
+
+def test_canonical_order_and_recursive_provenance_no_partial(tmp_path):
+    p = tmp_path / "x"; canonical_jsonl(p, [{"z": 1, "a": [2]}]); before = p.read_bytes()
+    assert before == b'{"a":[2],"z":1}\n'
+    with pytest.raises(ValueError): canonical_jsonl(p, [{"nested": {"validation": 1}}])
+    assert p.read_bytes() == before
+
+def test_manifest_order_duplicate_and_no_partial(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"; a.write_bytes(b"a"); b.write_bytes(b"b")
+    out = tmp_path / "m"; result = write_sha256_manifest(out, [b, a]); assert list(result) == sorted(result)
+    before = out.read_bytes()
+    with pytest.raises(ValueError): write_sha256_manifest(out, [a, a])
+    assert out.read_bytes() == before
+
+def test_collate_exact_contact_values_and_effective_weights():
+    label = TopologyLabel("x", 3, 2, 2., 3., 4., (SparseEdge(0, 2, 1, 1.5, "pin", .5),), (ContactLabel(1, 2, 0, False, 2., .25),), ((0, 1, 2),))
+    batch = collate_labels([label], torch.device("cpu"), torch.float64)
+    assert batch.edge_src.tolist() == [0] and batch.edge_weight.tolist() == [2.]
+    assert batch.contact_a.tolist() == [1] and batch.contact_order.tolist() == [0] and batch.contact_weight.tolist() == [1.]
+    assert all(not t.requires_grad for t in batch.__dict__.values())
+
+@pytest.mark.parametrize("label", [TopologyLabel("", 1, 1, 1., 1., 1., (), (), ()), TopologyLabel("x", 1, 1, 1., 1., 0., (), (), ()), TopologyLabel("x", 1, True, 1., 1., 1., (), (), ())])
+def test_collate_rejects_label_scalars(label):
+    with pytest.raises(ValueError): collate_labels([label], torch.device("cpu"), torch.float32)
 
 @pytest.mark.parametrize("bad", ["abc", {"x": 1}, None, 4])
 def test_sequence_inputs_reject_non_sequences(tmp_path, bad):

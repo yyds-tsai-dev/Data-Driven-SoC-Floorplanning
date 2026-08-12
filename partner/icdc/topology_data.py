@@ -57,7 +57,11 @@ def _sanitize(case: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(case[key], (list, tuple)) or len(case[key]) != n: raise ValueError(key)
     if any(not _num(x, positive=True) for x in case["area"]): raise ValueError("area")
     widths = {len(r) for r in case["cons"] if isinstance(r, (list, tuple))}
-    if widths not in ({2}, {5}) or any(not isinstance(r, (list, tuple)) or len(r) not in (2, 5) or any(type(x) is not int or x not in (0, 1) for x in r) for r in case["cons"]): raise ValueError("cons")
+    if widths and widths not in ({2}, {5}): raise ValueError("cons")
+    for row in case["cons"]:
+        if not isinstance(row, (list, tuple)) or len(row) not in (2, 5): raise ValueError("cons")
+        if any(type(x) is not int for x in row[:2]) or any(x not in (0, 1) for x in row[:2]): raise ValueError("cons")
+        if len(row) == 5 and (any(type(x) is not int or x < 0 for x in row[2:4]) or type(row[4]) is not int or row[4] < 0 or row[4] & ~15): raise ValueError("cons")
     for r in case["tp"]:
         if not isinstance(r, (list, tuple)) or len(r) != 4 or any(not _num(x) for x in r): raise ValueError("tp")
     for key, width in (("b2b", 3), ("p2b", 3), ("pins", 2)):
