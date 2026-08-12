@@ -48,6 +48,28 @@ def test_topology_prior_extracts_margin_and_record_weight():
     assert label.record_weight == 3.
     assert label.edges[0].margin == 1.
 
+
+def test_topology_prior_separation_and_contact_gradients_are_directional():
+    rects = torch.tensor([[[0., 0., 1., 1.], [2., 0., 1., 1.]]], requires_grad=True)
+    batch = SparseTopologyBatch(
+        torch.tensor([0]), torch.tensor([0]), torch.tensor([1]), torch.tensor([0]),
+        torch.tensor([0.5]), torch.tensor([1.]), torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long), torch.empty(0), torch.empty(0),
+    )
+    out = topology_losses(rects, batch, torch.ones(1))
+    assert out["separation"].item() == 0
+    out["total"].backward()
+    assert rects.grad[0, 1, 0].item() == 0
+
+
+def test_extract_pin_paths_preserve_reduced_edges_and_ignore_forbidden_sources():
+    legal = torch.tensor([[0., 0., 1., 1.], [2., 0., 1., 1.], [4., 0., 1., 1.]], dtype=torch.float64)
+    case = {"n": 3, "cons": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 1, 0, 0, 0]]}
+    label = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    assert label.pin_paths == ((0, 1, 2),)
+    assert [(e.src, e.dst, e.kind) for e in label.edges].count((0, 1, "pin")) == 1
+
 CANONICAL_ROOT = Path("FloorSet/floorset_lite").resolve()
 
 
