@@ -226,31 +226,58 @@ def _pin_mask(cons: Sequence[Sequence[int]], tp: torch.Tensor) -> Tuple[bool, ..
     return tuple(index in _authorized_preplaced(cons, tp) for index in range(len(cons)))
 
 
-def _clearance(rects: torch.Tensor) -> float:
-    max_dimension = float(rects[:, 2:].max())
-    span_x = float(rects[:, 0].max() - rects[:, 0].min()) + max_dimension
-    span_y = float(rects[:, 1].max() - rects[:, 1].min()) + max_dimension
-    return max(max_dimension, span_x, span_y) + 1.0
-
-
 def _place_for_pair(rects: torch.Tensor, first: int, second: int,
                     axis: int, order: int, moved: int) -> torch.Tensor:
-    candidate = rects.clone()
     stationary = second if moved == first else first
-    other_axis = 1 - axis
-    target_gap = abs(_pair_gap(rects, moved, stationary, other_axis)) + _clearance(rects)
-    stationary_start = float(rects[stationary, axis])
-    stationary_end = stationary_start + float(rects[stationary, axis + 2])
-    moved_size = float(rects[moved, axis + 2])
-    if moved == first:
-        before = order == 1
-    else:
-        before = order == 0
-    if before:
-        candidate[moved, axis] = stationary_start - moved_size - target_gap
-    else:
-        candidate[moved, axis] = stationary_end + target_gap
-    return candidate
+    perp = 1 - axis
+    before = (moved == first) == bool(order)
+    m = rects[moved]
+    s = rects[stationary]
+    u_face = float(s[axis] - m[axis + 2]) if before else float(s[axis] + s[axis + 2])
+    sigma = -1.0 if before else 1.0
+    q0 = sigma * (float(m[axis]) - u_face)
+    lo = float(s[perp] - m[perp + 2])
+    hi = float(s[perp] + s[perp + 2])
+    t0 = float(m[perp])
+    qmin = max(0.0, t0 - hi, lo - t0)
+    candidates = []
+    if q0 >= qmin:
+        candidates.append((q0, t0))
+    clamp_t = min(max(t0, lo), hi)
+    candidates.append((0.0, clamp_t))
+    r = max(0.0, 0.5 * (q0 + t0 - hi))
+    candidates.append((r, hi + r))
+    r = max(0.0, 0.5 * (q0 - t0 + lo))
+    candidates.append((r, lo - r))
+    best = None
+    best_dist = None
+    for q, t in candidates:
+        trial = rects.clone()
+        trial[moved, axis] = u_face + sigma * q
+        trial[moved, perp] = t
+        if _pair_state(trial, first, second) != (axis, order):
+            continue
+        dist = (float(trial[moved, axis] - m[axis]) ** 2
+                + float(trial[moved, perp] - m[perp]) ** 2)
+        if best_dist is None or dist < best_dist:
+            best, best_dist = trial, dist
+    if best is None and axis == 1:
+        # Account for floating-point cancellation at a strict topology tie.
+        for q, t in candidates:
+            trial = rects.clone()
+            trial[moved, axis] = math.nextafter(u_face + sigma * q,
+                                                  math.inf if sigma > 0 else -math.inf)
+            trial[moved, perp] = t
+            if t < lo:
+                trial[moved, perp] = math.nextafter(t, hi)
+            elif t > hi:
+                trial[moved, perp] = math.nextafter(t, lo)
+            if _pair_state(trial, first, second) == (axis, order):
+                dist = (float(trial[moved, axis] - m[axis]) ** 2
+                        + float(trial[moved, perp] - m[perp]) ** 2)
+                if best_dist is None or dist < best_dist:
+                    best, best_dist = trial, dist
+    return best if best is not None else rects.clone()
 
 
 def _repair_preplaced(rects: torch.Tensor, cons: Sequence[Sequence[int]],
@@ -393,6 +420,9 @@ def generate_proposals(
             or not _rect_cpu(raw_rects, n, True)):
         raise ValueError("raw_rects")
     base = raw_rects.to(dtype=torch.float64).clone()
+    for index, row in enumerate(cons):
+        if row[0] != 0 or row[1] != 0:
+            base[index, 2:] = tp[index, 2:]
     if cfg.total_cap == 0:
         return
     seen = {_proposal_fingerprint(base, cons)}
@@ -401,7 +431,6 @@ def generate_proposals(
     yield "base", base.clone()
     total += 1
     pinned = _pin_mask(cons, tp)
-    clearance = _clearance(base)
 
     for first in range(n):
         for second in range(first + 1, n):
@@ -415,8 +444,8 @@ def generate_proposals(
             if not pinned[first] and not pinned[second]:
                 moved = second
             current_axis, current_order = _pair_state(base, first, second)
-            intents = ((current_axis, 1 - current_order),
-                       (1 - current_axis, 1 - current_order))
+            intents = tuple(sorted(((current_axis, 1 - current_order),
+                                    (1 - current_axis, 1 - current_order))))
             for axis, order in intents:
                 candidate = _place_for_pair(base, first, second, axis, order, moved)
                 actual_axis, actual_order = _pair_state(candidate, first, second)
@@ -434,23 +463,7 @@ def generate_proposals(
     pin_base = _repair_preplaced(base, cons, tp)
     preplaced = _authorized_preplaced(cons, tp)
     if preplaced:
-        mismatched = tuple(index for index in preplaced
-                           if not torch.equal(base[index, :2], tp[index, :2]))
-        if mismatched and cfg.pin_repair_cap > 0:
-            target = mismatched[0]
-            peer = next((index for index in range(n)
-                         if index != target and not pinned[index]), None)
-            if peer is not None:
-                axis, order = _pair_state(pin_base, target, peer)
-                name = f"pin:{target}:{peer}:{axis}:{order}"
-                emitted = _emit_candidate(name, pin_base.clone(), "pin",
-                                           cfg.pin_repair_cap, seen, names,
-                                           total, cfg.total_cap, cons)
-                if emitted is not None:
-                    yield emitted
-                    total += 1
-                    if total >= cfg.total_cap:
-                        return
+        pin_seen: set = set()
         for target in preplaced:
             for peer in range(n):
                 if peer == target or pinned[peer]:
@@ -465,7 +478,7 @@ def generate_proposals(
                     continue
                 name = f"pin:{target}:{peer}:{actual_axis}:{actual_order}"
                 emitted = _emit_candidate(name, candidate, "pin", cfg.pin_repair_cap,
-                                           seen, names, total, cfg.total_cap, cons)
+                                           pin_seen, names, total, cfg.total_cap, cons)
                 if emitted is not None:
                     yield emitted
                     total += 1
