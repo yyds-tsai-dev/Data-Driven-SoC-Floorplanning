@@ -5,7 +5,7 @@ import io
 import json
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
-from typing import get_args, get_origin, get_type_hints
+from typing import Dict, Iterator, Optional, get_args, get_origin, get_type_hints
 
 import pytest
 import torch
@@ -658,6 +658,85 @@ def test_shared_pin_path_root_deduplicates_root_pin_and_sep_edges():
 @pytest.mark.parametrize("cons", [[], [[0, 0]], [[0, 0, 1]], [[0, 0, 1, 0, 0]], [[0, 0, 1, 0, 16]]])
 def test_extractor_malformed_constraints_are_controlled(cons):
     with pytest.raises(ValueError): extract_sparse_label(torch.ones((2, 4), dtype=torch.float64), {"n": 2, "cons": cons}, "x", 1, 1., 2.)
+
+
+# Task 3 RED regressions: these deliberately pin the public proposal contract.
+def test_contact_predicate_reverse_gap_and_y_orientation_are_exact():
+    x_gap = torch.tensor([[3., 0., 1., 2.], [0., .5, 1., 2.]], dtype=torch.float64)
+    x_exact = torch.tensor([[3., 0., 1., 2.], [2., .5, 1., 2.]], dtype=torch.float64)
+    y_gap = torch.tensor([[0., 3., 2., 1.], [.5, 0., 2., 1.]], dtype=torch.float64)
+    y_exact = torch.tensor([[0., 3., 2., 1.], [.5, 2., 2., 1.]], dtype=torch.float64)
+    assert not has_exact_positive_contact(x_gap, 0, 1, 0, False, 1.)
+    assert has_exact_positive_contact(x_exact, 0, 1, 0, False, 1.)
+    assert not has_exact_positive_contact(y_gap, 0, 1, 1, False, 1.)
+    assert has_exact_positive_contact(y_exact, 0, 1, 1, False, 1.)
+
+
+def test_proposal_public_annotations_and_result_fields_are_exact():
+    hints = get_type_hints(ProposalResult)
+    assert hints == {"name": str, "rects": torch.Tensor, "legal": torch.Tensor,
+                     "drift": torch.Tensor, "hard_checks": Dict[str, bool],
+                     "cost": Optional[float], "label": Optional[TopologyLabel]}
+    for fn in (generate_proposals, pin_feasible_then_exact_tfdl):
+        fh = get_type_hints(fn)
+        assert fh
+    assert get_origin(get_type_hints(generate_proposals)["return"]) is Iterator
+    assert dataclasses.is_dataclass(ProposalResult) and ProposalResult.__dataclass_params__.frozen
+
+
+def _cap_case(raw, cons=None, tp=None):
+    n = raw.shape[0]
+    return {"instance_id": "caps", "n": n, "area": [float(r[2] * r[3]) for r in raw],
+            "cons": cons or [[0, 0, 0, 0, 0] for _ in range(n)],
+            "tp": tp or [[-1., -1., -1., -1.] for _ in range(n)]}
+
+
+def test_each_kind_cap_is_exact_when_supply_exists():
+    raw = torch.tensor([[float(i * 7), float((i % 3) * 7), 2., 2.] for i in range(9)], dtype=torch.float64)
+    cons = [[0, 0, 0, 11 if i < 6 else 0, 0] for i in range(9)]
+    out = list(generate_proposals(raw, _cap_case(raw, cons), ProposalConfig(2, 0, 2, 20)))
+    assert sum(n.startswith("axis:") for n, _ in out) == 2
+    assert sum(n.startswith("contact:") for n, _ in out) == 2
+    assert len(out) == 5
+
+
+def test_proposal_names_encode_pair_axis_order_and_contact_intent(proposal_fixture):
+    raw, case = proposal_fixture
+    names = [n for n, _ in generate_proposals(raw, case, ProposalConfig(8, 8, 8, 32))]
+    for name in names:
+        if name == "base":
+            continue
+        parts = name.split(":")
+        assert len(parts) == 5 and all(part.lstrip("-").isdigit() for part in parts[1:])
+        assert parts[0] in {"axis", "pin", "contact"}
+
+
+def test_generator_rejects_float32_and_malformed_case_before_any_seed(proposal_fixture):
+    raw, case = proposal_fixture
+    with pytest.raises((TypeError, ValueError)):
+        list(generate_proposals(raw.float(), case, ProposalConfig()))
+    for bad in (dict(case, area=[1.]), dict(case, tp=[[0., 0., 1., 1.]] * 3), dict(case, cons=[])):
+        with pytest.raises((TypeError, ValueError)):
+            list(generate_proposals(raw, bad, ProposalConfig()))
+
+
+def test_admission_rejects_displaced_preplaced_and_float32_without_tfdl(monkeypatch, proposal_fixture):
+    raw, case = proposal_fixture
+    calls = []
+    class Spy:
+        def tfdl(self, *args, **kwargs): calls.append(1); raise AssertionError("called")
+    monkeypatch.setattr(topology_prior, "T", Spy())
+    displaced = raw.clone(); displaced[0, 0] += 1
+    assert pin_feasible_then_exact_tfdl(displaced, case) is None
+    assert pin_feasible_then_exact_tfdl(raw.float(), case) is None
+    assert not calls
+
+
+def test_fingerprint_distinguishes_axis_and_contact_relations_independently():
+    cons = [[0, 0, 0, 7, 0]] * 2
+    a = torch.tensor([[0., 0., 2., 2.], [2., 1., 2., 2.]], dtype=torch.float64)
+    b = a.clone(); b[1, 1] = 2.
+    assert _topology_fingerprint(a, cons) != _topology_fingerprint(b, cons)
 
 CANONICAL_ROOT = Path("FloorSet/floorset_lite").resolve()
 
