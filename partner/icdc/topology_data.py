@@ -1,8 +1,15 @@
-"""Strict, leak-free data contracts for topology-prior training."""
+"""Strict, leak-free data contracts for topology-prior training.
+
+The canonical FloorSet directory is trusted read-only input.  Source receipts
+bind a case to exact bytes and a layout index; a later sealed manifest anchors
+those hashes.  Shards are tensor-only and loaded with ``weights_only=True`` so
+receipt verification does not execute arbitrary pickle objects.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -389,16 +396,17 @@ def _load_receipt_source(
     expected_sha = _validate_digest(receipt.file_sha256, "receipt hash")
     if resolved not in cache:
         try:
-            actual_sha = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            verified_bytes = resolved.read_bytes()
+            actual_sha = hashlib.sha256(verified_bytes).hexdigest()
         except OSError as exc:
             raise ValueError("cannot hash receipt source") from exc
         if actual_sha != expected_sha:
             raise ValueError("receipt hash mismatch")
         try:
             source = torch.load(
-                resolved,
+                io.BytesIO(verified_bytes),
                 map_location="cpu",
-                weights_only=False,
+                weights_only=True,
             )
         except Exception as exc:
             raise ValueError("cannot load receipt source") from exc
@@ -406,26 +414,48 @@ def _load_receipt_source(
     elif cache[resolved][0] != expected_sha:
         raise ValueError("receipt hash mismatch")
     source = cache[resolved][1]
-    if not isinstance(source, (list, tuple)) or len(source) < 7:
+    if not isinstance(source, (list, tuple)) or len(source) != 7:
         raise ValueError("malformed receipt source")
-    row_count: int | None = None
-    for array in source[:7]:
-        if isinstance(array, torch.Tensor):
-            if array.ndim == 0 or array.shape[0] <= 0:
-                raise ValueError("malformed receipt source")
-            count = int(array.shape[0])
-        elif isinstance(array, (list, tuple)):
-            if not array:
-                raise ValueError("malformed receipt source")
-            count = len(array)
-        else:
+    for array in source:
+        if not isinstance(array, torch.Tensor):
             raise ValueError("malformed receipt source")
-        if row_count is None:
-            row_count = count
-        elif count != row_count:
+        if array.device.type != "cpu" or array.requires_grad or array.ndim == 0:
+            raise ValueError("malformed receipt source")
+        if array.dtype == torch.bool or array.is_complex():
+            raise ValueError("malformed receipt source")
+        try:
+            finite = torch.isfinite(array).all().item()
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("malformed receipt source") from exc
+        if not finite or array.shape[0] <= 0:
+            raise ValueError("malformed receipt source")
+    batch_size = int(source[0].shape[0])
+    input_rows = source[0]
+    if input_rows.ndim != 3 or input_rows.shape[2] != 6 or input_rows.shape[1] < 1:
+        raise ValueError("malformed input batch")
+    expected_shapes = (
+        (1, 3),
+        (1, 3),
+        (1, 2),
+        (1, 3),
+        (1, 4),
+    )
+    for array, (rank, width) in zip(source[1:6], expected_shapes):
+        if array.ndim != 3 or array.shape[2] != width:
+            raise ValueError("malformed receipt source shape")
+        if int(array.shape[0]) != batch_size:
             raise ValueError("inconsistent receipt source batch lengths")
-        if receipt.layout_index >= count:
-            raise ValueError("receipt index range")
+    tree = source[4]
+    fp = source[5]
+    metrics = source[6]
+    if int(tree.shape[1]) != int(input_rows.shape[1]) - 1:
+        raise ValueError("malformed tree batch")
+    if int(fp.shape[1]) != int(input_rows.shape[1]):
+        raise ValueError("malformed fp batch")
+    if metrics.ndim != 2 or metrics.shape[0] != batch_size or metrics.shape[1] != 8:
+        raise ValueError("malformed metrics batch")
+    if receipt.layout_index >= batch_size:
+        raise ValueError("receipt index range")
     return source
 
 

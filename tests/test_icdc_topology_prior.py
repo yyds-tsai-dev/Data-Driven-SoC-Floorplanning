@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import io
 import json
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
@@ -62,6 +63,13 @@ def _save(path, cases, **kwargs):
         try:
             n = int(case["n"])
             cons = torch.as_tensor(case["cons"], dtype=torch.float64)
+            if cons.shape[0] != n:
+                raise ValueError("constraint row count")
+            if cons.shape[1] == 2:
+                source_cons = torch.zeros((n, 5), dtype=torch.float64)
+                source_cons[:, :2] = cons
+            else:
+                source_cons = cons
             area = torch.as_tensor(case["area"], dtype=torch.float64)
             tp = torch.as_tensor(case["tp"], dtype=torch.float64)
             fp = []
@@ -71,20 +79,29 @@ def _save(path, cases, **kwargs):
                 x = float(row[0]) if float(row[0]) >= 0 else 0.0
                 y = float(row[1]) if float(row[1]) >= 0 else 0.0
                 fp.append([width, height, x, y])
-            input_rows = torch.cat((area.reshape(n, 1), cons), dim=1)
+            input_rows = torch.cat((area.reshape(n, 1), source_cons), dim=1)
             shard = [
-                [input_rows],
-                [torch.as_tensor(case["b2b"], dtype=torch.float64).reshape(-1, 3)],
-                [torch.as_tensor(case["p2b"], dtype=torch.float64).reshape(-1, 3)],
-                [torch.as_tensor(case["pins"], dtype=torch.float64).reshape(-1, 2)],
-                [torch.zeros((n, 1), dtype=torch.float64)],
-                [torch.tensor(fp, dtype=torch.float64)],
-                [
-                    torch.tensor(
-                        [float(case["area_ref"]), 0.0, float(case["hpwl_ref"])],
-                        dtype=torch.float64,
-                    )
-                ],
+                input_rows.unsqueeze(0),
+                torch.as_tensor(case["b2b"], dtype=torch.float64).reshape(1, -1, 3),
+                torch.as_tensor(case["p2b"], dtype=torch.float64).reshape(1, -1, 3),
+                torch.as_tensor(case["pins"], dtype=torch.float64).reshape(1, -1, 2),
+                torch.zeros((1, max(n - 1, 0), 3), dtype=torch.float64),
+                torch.tensor(fp, dtype=torch.float64).unsqueeze(0),
+                torch.tensor(
+                    [
+                        [
+                            float(case["area_ref"]),
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            2.0,
+                            float(case["hpwl_ref"]) - 2.0,
+                        ]
+                    ],
+                    dtype=torch.float64,
+                ),
             ]
             relative = "worker_0/layouts.th"
             shard_path = root / relative
@@ -97,7 +114,13 @@ def _save(path, cases, **kwargs):
                 layout_index=0,
                 fingerprint="0" * 64,
             )
-            source_cases.append(dict(case, instance_id=source_instance_id(receipt)))
+            source_cases.append(
+                dict(
+                    case,
+                    instance_id=source_instance_id(receipt),
+                    cons=source_cons.tolist(),
+                )
+            )
             receipts.append(receipt)
         except Exception:
             source_cases.append(case)
@@ -145,13 +168,18 @@ def _fake_bound_source(tmp_path, monkeypatch, count=2):
         )
         raw_inputs.append(input_rows)
         raw_fps.append(fp)
-        metrics.append(torch.tensor([100.0 + index, 0.0, 5.0], dtype=torch.float64))
+        metrics.append(
+            torch.tensor(
+                [100.0 + index, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 3.0],
+                dtype=torch.float64,
+            )
+        )
     shard = [
         torch.stack(raw_inputs),
         torch.zeros((count, 0, 3), dtype=torch.float64),
         torch.zeros((count, 0, 3), dtype=torch.float64),
         torch.zeros((count, 0, 2), dtype=torch.float64),
-        torch.zeros((count, 2, 1), dtype=torch.float64),
+        torch.zeros((count, 1, 3), dtype=torch.float64),
         torch.stack(raw_fps),
         torch.stack(metrics),
     ]
@@ -410,6 +438,92 @@ def test_tensor_batch_scalar_and_mismatched_lengths_reject_without_partial(
     assert output.read_bytes() == b"before"
 
 
+def test_receipt_source_requires_exactly_seven_arrays(tmp_path, monkeypatch):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    shard_path = root / receipts[0].relative_path
+    source = torch.load(shard_path, map_location="cpu", weights_only=False)
+    source.append(torch.zeros((2, 1), dtype=torch.float64))
+    torch.save(source, shard_path)
+    altered = dataclasses.replace(
+        receipts[0],
+        file_sha256=hashlib.sha256(shard_path.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            tmp_path / "extra-array",
+            [cases[0]],
+            source_root=root,
+            source_receipts=[altered],
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_shape",
+    [
+        (0, (2, 2, 6)),
+        (1, (2, 1, 2)),
+        (2, (2, 1, 4)),
+        (3, (2, 1, 3)),
+        (4, (2, 2, 2)),
+        (5, (2, 2, 3)),
+        (6, (2, 3)),
+    ],
+)
+def test_receipt_source_requires_exact_real_shard_shapes(
+    tmp_path, monkeypatch, bad_shape
+):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    shard_path = root / receipts[0].relative_path
+    source = torch.load(shard_path, map_location="cpu", weights_only=False)
+    source[bad_shape[0]] = torch.zeros(bad_shape[1], dtype=torch.float64)
+    torch.save(source, shard_path)
+    altered = dataclasses.replace(
+        receipts[0],
+        file_sha256=hashlib.sha256(shard_path.read_bytes()).hexdigest(),
+    )
+    output = tmp_path / "bad-shape"
+    output.write_bytes(b"before")
+    with pytest.raises(ValueError):
+        save_sanitized_corpus(
+            output,
+            [cases[0]],
+            source_root=root,
+            source_receipts=[altered],
+        )
+    assert output.read_bytes() == b"before"
+
+
+def test_source_verification_loads_the_verified_bytes_once(tmp_path, monkeypatch):
+    root, cases, receipts = _fake_bound_source(tmp_path, monkeypatch)
+    shard_path = root / receipts[0].relative_path
+    original_bytes = shard_path.read_bytes()
+    replacement = torch.load(
+        io.BytesIO(original_bytes), map_location="cpu", weights_only=False
+    )
+    replacement[0] = replacement[0].clone()
+    replacement[0][0, 0, 0] = 9999.0
+    replacement_path = tmp_path / "replacement.th"
+    torch.save(replacement, replacement_path)
+    original_load = topology_data.torch.load
+
+    def load_wrapper(source, *args, **kwargs):
+        assert isinstance(source, io.BytesIO)
+        assert kwargs.get("weights_only") is True
+        shard_path.write_bytes(replacement_path.read_bytes())
+        return original_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(topology_data.torch, "load", load_wrapper)
+    output = tmp_path / "verified-bytes.jsonl"
+    save_sanitized_corpus(
+        output,
+        [cases[0]],
+        source_root=root,
+        source_receipts=[receipts[0]],
+    )
+    assert load_sanitized_corpus(output)[0]["area"][0] == 198.0
+    assert original_bytes != shard_path.read_bytes()
+
+
 @pytest.mark.skipif(
     not Path("FloorSet/floorset_lite/worker_26/layouts_5488.th").is_file(),
     reason="real training shard is unavailable",
@@ -609,10 +723,10 @@ def test_five_column_group_and_boundary_validation(tmp_path, cons):
         _save(tmp_path / "bad", [one_case])
 
 
-def test_empty_case_is_valid(tmp_path):
+def test_empty_case_cannot_be_bound_to_a_training_shard(tmp_path):
     row = _case(n=0, area=[], cons=[], tp=[], b2b=[], p2b=[], pins=[])
-    _save(tmp_path / "empty", [row])
-    assert load_sanitized_corpus(tmp_path / "empty")[0]["n"] == 0
+    with pytest.raises(ValueError):
+        _save(tmp_path / "empty", [row])
 
 
 @pytest.mark.parametrize(
