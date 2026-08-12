@@ -205,6 +205,35 @@ def test_teacher_checkpoint_identity_schema_and_ema_requirements():
             t._checkpoint_identity(bad)
 
 
+def test_checkpoint_identity_codec_has_canonical_vectors():
+    codec = importlib.import_module("icdc.checkpoint_identity")
+    assert codec.IDENTITY_SCHEMA == "icdc_canonical_state_v1"
+
+    logical = torch.arange(12, dtype=torch.float64).reshape(2, 6)[:, ::2]
+    assert not logical.is_contiguous()
+    reversed_state = {"z": torch.ones(1), "a": logical}
+    sorted_state = {"a": logical.contiguous(), "z": torch.ones(1)}
+    assert codec.canonical_keyset_sha256(reversed_state) == codec.canonical_keyset_sha256(sorted_state)
+    assert codec.canonical_state_sha256(reversed_state) == codec.canonical_state_sha256(sorted_state)
+
+    exact_header = b"w\0float32\0[2]\0"
+    assert codec.canonical_keyset_sha256({"w": torch.zeros(2)}) == hashlib.sha256(exact_header).hexdigest()
+    assert codec.canonical_keyset_sha256({"w": torch.zeros(2)}) != codec.canonical_keyset_sha256({"w": torch.zeros(1, 2)})
+    assert codec.canonical_config_sha256({"z": 1, "a": [2]}) == codec.canonical_config_sha256({"a": [2], "z": 1})
+    with pytest.raises((ValueError, TypeError)):
+        codec.canonical_config_sha256({"bad": float("nan")})
+
+    checkpoint = {"model_config": {"d": 1}, "model": sorted_state,
+                  "ema": {key: value.clone() for key, value in sorted_state.items()}}
+    identity = codec.canonical_checkpoint_identity(checkpoint)
+    assert tuple(identity) == (
+        "identity_schema", "model_config_sha256", "model_keyset_sha256",
+        "ema_keyset_sha256", "ema_state_sha256")
+    assert identity == codec.canonical_checkpoint_identity(checkpoint)
+    with pytest.raises((ValueError, TypeError)):
+        codec.canonical_checkpoint_identity({**checkpoint, "ema": {}})
+
+
 def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     path = Path("scripts/probes/icdc_topology_teacher.py")
     t = _teacher(); tree = ast.parse(path.read_text())
