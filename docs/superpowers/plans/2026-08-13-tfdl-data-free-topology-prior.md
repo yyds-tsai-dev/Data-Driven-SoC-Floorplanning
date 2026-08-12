@@ -29,6 +29,19 @@ Create only `partner/icdc/topology_data.py`, `partner/icdc/topology_prior.py`, `
 
 ### Task 1: Data schema, sanitized corpus, split, manifest
 
+The implemented corpus API is receipt-bound.  Callers must pass the immutable
+canonical `source_root=FloorSet/floorset_lite` and one
+`CorpusSourceReceipt(relative_path, file_sha256, layout_index, fingerprint)`
+per case; a bare `save_sanitized_corpus(path, cases)` call is invalid and must
+not appear in fixtures or documentation.  Verification hashes each exact
+source file, loads its bytes once from a `BytesIO` buffer using
+`weights_only=True`, validates the exact seven-tensor shard schema (input
+`(batch,n+1,6)`, then widths `3,3,2,3,4`, tree/fingerprint/metrics dimensions),
+and reconstructs canonical geometry by mapping raw `(w,h,x,y)` to `(x,y,w,h)`.
+The receipt's relative path, SHA256, layout index, and sanitized fingerprint
+are immutable provenance; `source_root` and receipts are required manifest
+fields and define the trust boundary.
+
 **Files:** Create `partner/icdc/topology_data.py`; create/modify `tests/test_icdc_topology_prior.py`.
 
 **Interfaces:** Frozen dataclasses exactly as specified:
@@ -55,7 +68,12 @@ def test_sanitize_excludes_golden_and_masks_non_input_geometry(tmp_path):
         "hpwl_ref": 10.0, "area_ref": 100.0,
         "golden": [[99., 99., 99., 99.]],
     }
-    save_sanitized_corpus(tmp_path / "c.jsonl", [case])
+    # Production call also requires the immutable source_root and receipts;
+    # this fixture must construct those explicitly (no unbound corpus API).
+    save_sanitized_corpus(
+        tmp_path / "c.jsonl", [case], source_root=source_root,
+        source_receipts=[receipt],
+    )
     row = load_sanitized_corpus(tmp_path / "c.jsonl")[0]
     assert set(row) == {
         "instance_id", "n", "area", "cons", "tp", "b2b", "p2b",

@@ -140,6 +140,29 @@ Reject a run that wins by collapsing all outputs to one topology.
 
 ## Data and validation hygiene
 
+### Task 1 source receipt contract (implemented)
+
+The sanitized corpus is admitted only from the immutable canonical source root
+`FloorSet/floorset_lite`.  Each row is bound to a `CorpusSourceReceipt` carrying
+`relative_path`, the source-file SHA256, `layout_index`, and the sanitized input
+`fingerprint`; the receipt-derived instance identity is
+`relative_path#layout_index`.  The source root and every receipt are required
+arguments to `save_sanitized_corpus`—there is no unbound corpus-writing API.
+
+Receipt verification hashes the exact source bytes first, then loads those
+bytes through a single in-memory buffer with `torch.load(...,
+weights_only=True, map_location="cpu")`.  Only the exact seven-tensor raw shard
+schema is accepted: input rows `(batch, n+1, 6)`, followed by tensors with
+widths `3, 3, 2, 3, 4`, a tree dimension of `n`, a fingerprint dimension of
+`n+1`, and metrics `(batch, 8)`.  All tensors must be finite CPU tensors with
+matching batch dimensions; no arbitrary pickle/object source is trusted.
+
+The source adapter maps raw `(w,h,x,y)` geometry to the canonical
+`(x,y,w,h)` representation and masks non-input coordinates before fingerprinting.
+Golden/validation fields are never serialized or read.  This exact immutable
+source boundary, including `source_root` plus the complete receipt list, is
+part of the corpus manifest and must be reverified on reload.
+
 Training and held-out data come from a non-validation instance pool. Validation
 cases are never used for proposal tuning, repeated feedback, threshold choice,
 or checkpoint selection. The checkpoint is selected solely by held-out gates.
