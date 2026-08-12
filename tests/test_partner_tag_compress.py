@@ -44,7 +44,8 @@ import tag_compress as tc                  # noqa: E402
 
 _ENV = ("PARTNER_TAG_COMPRESS", "PARTNER_TAG_COMPRESS_DEBUG",
         "PARTNER_GROUP_BRIDGE", "PARTNER_GROUP_BRIDGE_BUDGET",
-        "PARTNER_GROUP_BRIDGE_DEBUG")
+        "PARTNER_GROUP_BRIDGE_DEBUG", "PARTNER_GROUP_DAG_BRIDGE",
+        "PARTNER_GROUP_DAG_BRIDGE_BUDGET", "PARTNER_GROUP_DAG_BRIDGE_DEBUG")
 
 
 @pytest.fixture(autouse=True)
@@ -225,6 +226,56 @@ def test_bridge_debug_ms_covers_bridge_call(monkeypatch, capsys):
                         lambda *a: (clock.__setitem__(0, clock[0] + 0.25) or a[1]))
     _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
     assert "ms=250.000" in capsys.readouterr().err
+
+
+def test_dag_default_off_is_identity_and_does_not_construct_scorer(monkeypatch):
+    out = [(0.0, 0.0, 1.0, 1.0)]
+    monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: pytest.fail("scorer constructed"))
+    assert _opt()._tag_compress(out, torch.ones(1), torch.zeros((1, 5)), torch.full((1, 4), -1.0), torch.zeros((0, 3)), torch.zeros((0, 3)), torch.zeros((0, 2)), None) is out
+
+
+def test_dag_only_runs_local_then_dag_with_one_scorer(monkeypatch):
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    made, events, sentinel = [], [], object()
+    monkeypatch.setattr(co, "_ColumnOptimizer", lambda *a, **k: made.append(1) or sentinel)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda s, v, b: events.append(("local", s)) or v)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda s, v, b: events.append(("dag", s)) or v)
+    _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
+    assert made == [1] and events == [("local", sentinel), ("dag", sentinel)]
+
+
+def test_dag_literal_zero_is_disabled(monkeypatch):
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "0")
+    events = []
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: events.append("local") or a[1])
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: events.append("dag") or a[1])
+    _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
+    assert events == ["local"]
+
+
+def test_dag_exception_preserves_local_identity(monkeypatch):
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    local = [(3.0, 4.0, 1.0, 1.0)] * len(rects)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: local)
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda *a: (_ for _ in ()).throw(RuntimeError("dag")))
+    assert _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None) is local
+
+
+def test_dag_budget_fallback_and_debug_literal_one(monkeypatch, capsys):
+    _, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE_BUDGET", "bad")
+    monkeypatch.setenv("PARTNER_GROUP_DAG_BRIDGE_DEBUG", "true")
+    seen = []
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations", lambda *a: a[1])
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations_dag", lambda s, v, b: seen.append(b) or v)
+    _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
+    assert seen == [pytest.approx(0.003)]
+    assert "ms=" not in capsys.readouterr().err
 
 
 def test_warm_dependencies_is_idempotent():

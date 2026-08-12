@@ -263,7 +263,8 @@ class MyOptimizer(FloorplanOptimizer):
         preserves the production import path exactly.
         """
         if not (os.environ.get("PARTNER_TAG_COMPRESS")
-                or os.environ.get("PARTNER_GROUP_BRIDGE")):
+                or os.environ.get("PARTNER_GROUP_BRIDGE")
+                or os.environ.get("PARTNER_GROUP_DAG_BRIDGE") == "1"):
             return
         try:
             from tag_compress import warm_dependencies
@@ -725,7 +726,8 @@ class MyOptimizer(FloorplanOptimizer):
         byte-identical pipeline.  Contained: any failure returns `out`."""
         tag_on = bool(os.environ.get("PARTNER_TAG_COMPRESS"))
         bridge_on = bool(os.environ.get("PARTNER_GROUP_BRIDGE"))
-        if not (tag_on or bridge_on):
+        dag_on = os.environ.get("PARTNER_GROUP_DAG_BRIDGE") == "1"
+        if not (tag_on or bridge_on or dag_on):
             return out
         scorer = None
         try:
@@ -764,7 +766,7 @@ class MyOptimizer(FloorplanOptimizer):
                 print(f"[tcomp] n={len(out)} moved={nmoved} V={v0}->{v1} "
                       f"darea={(ar[1] / max(ar[0], 1e-9) - 1) * 100:.3f}%",
                       file=sys.stderr, flush=True)
-        if not bridge_on:
+        if not (bridge_on or dag_on):
             return current
         debug_bridge = os.environ.get("PARTNER_GROUP_BRIDGE_DEBUG") == "1"
         try:
@@ -800,7 +802,35 @@ class MyOptimizer(FloorplanOptimizer):
                       f"committed={int(bridged != before)}", file=sys.stderr, flush=True)
             except Exception:
                 pass
-        return bridged
+        if not dag_on:
+            return bridged
+
+        dag_debug = os.environ.get("PARTNER_GROUP_DAG_BRIDGE_DEBUG") == "1"
+        try:
+            try:
+                dag_budget = float(os.environ.get("PARTNER_GROUP_DAG_BRIDGE_BUDGET", "0.003"))
+            except (TypeError, ValueError):
+                dag_budget = 0.003
+            if not np.isfinite(dag_budget) or dag_budget <= 0.0:
+                dag_budget = 0.003
+            from violation_killer import bridge_grouping_violations_dag
+            dag_started = time.perf_counter() if dag_debug else None
+            dagged = bridge_grouping_violations_dag(scorer, bridged, dag_budget)
+            if dag_debug:
+                elapsed_ms = (time.perf_counter() - dag_started) * 1000.0
+                from violation_killer import _grouping_count, _violations_exact, _bbox_area
+                p0 = np.asarray([tuple(map(float, r)) for r in bridged], dtype=float)
+                p1 = np.asarray([tuple(map(float, r)) for r in dagged], dtype=float)
+                print(f"[gdag] n={len(bridged)} ms={elapsed_ms:.3f} "
+                      f"grouping={_grouping_count(scorer, p0)}->{_grouping_count(scorer, p1)} "
+                      f"V={_violations_exact(scorer, p0)}->{_violations_exact(scorer, p1)} "
+                      f"hpwl={float(scorer._hpwl(p0)):.6f}->{float(scorer._hpwl(p1)):.6f} "
+                      f"bbox={_bbox_area(p0):.6f}->{_bbox_area(p1):.6f} "
+                      f"committed={int(dagged is not bridged and dagged != bridged)}",
+                      file=sys.stderr, flush=True)
+            return dagged
+        except Exception:
+            return bridged
 
     def _coord_polish(self, out, at, cons, tpos, b2b, p2b, pins):
         """Post-pass: order-preserving simultaneous-axis coordinate polish of
