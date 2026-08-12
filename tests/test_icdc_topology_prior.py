@@ -32,6 +32,170 @@ from icdc.topology_data import (
 
 import icdc.topology_data as topology_data
 from icdc.topology_prior import topology_losses, extract_sparse_label
+from icdc.topology_prior import (
+    ProposalConfig, ProposalResult, generate_proposals,
+    pin_feasible_then_exact_tfdl, is_acyclic, matches_preplaced_origins,
+    has_exact_positive_contact,
+)
+
+
+@pytest.fixture
+def proposal_fixture():
+    """Small legal seed: one fixed block and a disconnected grouping pair."""
+    raw = torch.tensor([[0., 0., 2., 2.], [4., 0., 2., 2.],
+                        [0., 5., 2., 2.], [4., 5., 2., 2.]], dtype=torch.float32)
+    # cons columns are (group, preplaced); group 5 joins blocks 2 and 3.
+    case = {"n": 4, "cons": [[0, 1], [0, 0], [5, 0], [5, 0]],
+            "tp": [[0., 0.], [0., 0.], [0., 0.], [0., 0.]],
+            "boundary": [20., 20.]}
+    return raw, case
+
+
+def test_proposal_dataclasses_are_frozen_and_have_exact_defaults():
+    assert [f.name for f in fields(ProposalConfig)] == ["axis_exchange_cap", "pin_repair_cap", "group_contact_cap", "total_cap"]
+    assert ProposalConfig() == ProposalConfig(8, 8, 8, 32)
+    assert [f.name for f in fields(ProposalResult)] == ["name", "rects", "legal", "drift", "hard_checks", "cost", "label"]
+    with pytest.raises(FrozenInstanceError): ProposalConfig().total_cap = 1
+
+
+@pytest.mark.parametrize("kwargs", [{"axis_exchange_cap": -1}, {"pin_repair_cap": -1}, {"group_contact_cap": -1}, {"total_cap": -1}, {"total_cap": 1.5}])
+def test_proposal_config_rejects_bad_caps(kwargs):
+    with pytest.raises((TypeError, ValueError)): ProposalConfig(**kwargs)
+
+
+def test_proposals_are_deterministic_named_and_capped(proposal_fixture):
+    raw, case = proposal_fixture
+    cfg = ProposalConfig(1, 1, 1, 3)
+    first, second = list(generate_proposals(raw, case, cfg)), list(generate_proposals(raw.clone(), case, cfg))
+    assert [x[0] for x in first] == [x[0] for x in second]
+    assert [x[1].tolist() for x in first] == [x[1].tolist() for x in second]
+    assert len(first) <= 3 and len({x[0] for x in first}) == len(first)
+    assert all(n == "base" or n.startswith(("axis:", "pin:", "contact:")) for n, _ in first)
+
+
+def test_base_is_float64_clone_and_input_is_untouched(proposal_fixture):
+    raw, case = proposal_fixture; before = raw.clone()
+    got = list(generate_proposals(raw, case, ProposalConfig(0, 0, 0, 1)))
+    assert got[0][0] == "base" and got[0][1].dtype == torch.float64
+    assert not got[0][1].data_ptr() == raw.data_ptr() and torch.equal(raw, before)
+
+
+def test_zero_and_individual_caps_are_respected(proposal_fixture):
+    raw, case = proposal_fixture
+    assert list(generate_proposals(raw, case, ProposalConfig(total_cap=0))) == []
+    out = list(generate_proposals(raw, case, ProposalConfig(0, 0, 0, 32)))
+    assert [n for n, _ in out] == ["base"]
+
+
+def test_all_emitted_rects_are_finite_positive_and_sizes_preserved(proposal_fixture):
+    raw, case = proposal_fixture
+    for _, rects in generate_proposals(raw, case, ProposalConfig()):
+        assert rects.shape == raw.shape and torch.isfinite(rects).all() and (rects[:, 2:] > 0).all()
+        assert torch.equal(rects[:, 2:], raw[:, 2:].to(torch.float64))
+
+
+def test_axis_variant_changes_realized_pair_and_preserves_pin(proposal_fixture):
+    raw, case = proposal_fixture; out = list(generate_proposals(raw, case, ProposalConfig(8, 0, 0, 32)))
+    assert any(name.startswith("axis:") and not torch.equal(r[:, :2], raw[:, :2].to(torch.float64)) for name, r in out)
+    for _, r in out: assert torch.equal(r[0, :2], raw[0, :2].to(torch.float64))
+
+
+def test_pin_and_contact_predicates_cover_contract_edges():
+    assert is_acyclic(3, [(0, 1), (1, 2)]) and not is_acyclic(3, [(0, 1), (1, 2), (2, 0)])
+    exact = torch.tensor([[0., 0., 1., 2.], [1., .5, 1., 2.]], dtype=torch.float64)
+    assert has_exact_positive_contact(exact, 0, 1, 0, True, 1.)
+    corner = torch.tensor([[0., 0., 1., 1.], [1., 1., 1., 1.]], dtype=torch.float64)
+    assert not has_exact_positive_contact(corner, 0, 1, 0, True, .1)
+
+
+def test_matches_preplaced_accepts_batched_and_rejects_drift(proposal_fixture):
+    raw, case = proposal_fixture
+    assert matches_preplaced_origins(raw, case) and matches_preplaced_origins(raw.unsqueeze(0), case)
+    drift = raw.clone(); drift[0, 0] += 0.25
+    assert not matches_preplaced_origins(drift, case)
+
+
+def test_proposal_result_keeps_optional_cost_and_label_none():
+    r = ProposalResult("base", torch.zeros((1, 4)), torch.zeros((1, 4)), torch.zeros((1, 2)), {"ok": True}, None, None)
+    assert r.cost is None and r.label is None and isinstance(r.hard_checks, dict)
+
+
+def test_total_cap_limits_after_base(proposal_fixture):
+    raw, case = proposal_fixture
+    assert len(list(generate_proposals(raw, case, ProposalConfig(total_cap=1)))) == 1
+
+
+def test_generator_rejects_wrong_rank(proposal_fixture):
+    raw, case = proposal_fixture
+    with pytest.raises((TypeError, ValueError)): list(generate_proposals(raw.unsqueeze(0), case, ProposalConfig()))
+
+
+@pytest.mark.parametrize("bad", [torch.ones((4, 3)), torch.ones((3, 4)), torch.tensor([[0., 0., -1., 1.]] * 4)])
+def test_generator_rejects_malformed_or_nonpositive_raw(proposal_fixture, bad):
+    with pytest.raises((TypeError, ValueError)): list(generate_proposals(bad, proposal_fixture[1], ProposalConfig()))
+
+
+def test_generator_rejects_nonfinite_raw(proposal_fixture):
+    raw, case = proposal_fixture; raw[0, 0] = float("nan")
+    with pytest.raises((TypeError, ValueError)): list(generate_proposals(raw, case, ProposalConfig()))
+
+
+def test_generator_accepts_float32_and_casts_float64(proposal_fixture):
+    raw, case = proposal_fixture
+    assert all(r.dtype == torch.float64 for _, r in generate_proposals(raw, case, ProposalConfig(0, 0, 0, 1)))
+
+
+def test_acyclic_rejects_self_loop_and_bad_endpoints():
+    assert not is_acyclic(2, [(0, 0)]) and not is_acyclic(2, [(0, 3)])
+
+
+def test_acyclic_rejects_bad_n_or_edges():
+    assert not is_acyclic(0, [(0, 1)]) and not is_acyclic(2, [("x", 1)])
+
+
+def test_contact_rejects_gap_and_wrong_order():
+    exact = torch.tensor([[0., 0., 1., 2.], [1., .5, 1., 2.]], dtype=torch.float64)
+    gap = exact.clone(); gap[1, 0] += 1e-4
+    assert not has_exact_positive_contact(gap, 0, 1, 0, True, 1.)
+    assert not has_exact_positive_contact(exact, 0, 1, 0, False, 1.)
+
+
+def test_contact_rejects_malformed_rects():
+    assert not has_exact_positive_contact(torch.ones((2, 3)), 0, 1, 0, True, 1.)
+
+
+def test_matches_preplaced_rejects_one_ulp_drift(proposal_fixture):
+    raw, case = proposal_fixture; drift = raw.clone().to(torch.float64); drift[0, 0] = torch.nextafter(drift[0, 0], torch.tensor(1.))
+    assert not matches_preplaced_origins(drift, case)
+
+
+def test_matches_preplaced_rejects_malformed():
+    assert not matches_preplaced_origins(torch.ones((3, 4)), {"n": 4, "cons": [[0, 1]] * 4})
+
+
+def test_pin_admission_returns_optional_tuple_or_none(proposal_fixture):
+    raw, case = proposal_fixture
+    result = pin_feasible_then_exact_tfdl(raw.to(torch.float64), case)
+    assert result is None or (len(result) == 2 and result[0].shape[-1] == 4 and result[1].shape[-1] == 2)
+
+
+def test_contact_topology_not_collapsed_into_base(proposal_fixture):
+    raw, case = proposal_fixture
+    names = [n for n, _ in generate_proposals(raw, case, ProposalConfig(0, 0, 8, 32))]
+    assert names[0] == "base" and len(names) == len(set(names))
+
+
+def test_proposals_never_mutate_case_or_raw(proposal_fixture):
+    raw, case = proposal_fixture; snapshot = repr(case); before = raw.clone()
+    list(generate_proposals(raw, case, ProposalConfig()))
+    assert repr(case) == snapshot and torch.equal(raw, before)
+
+
+def test_proposal_names_have_stable_kind_order(proposal_fixture):
+    raw, case = proposal_fixture
+    names = [n for n, _ in generate_proposals(raw, case, ProposalConfig())]
+    kinds = [n.split(":", 1)[0] for n in names]
+    assert kinds == sorted(kinds, key=lambda k: {"base": 0, "axis": 1, "pin": 2, "contact": 3}[k])
 
 
 def test_topology_prior_loss_axis1_and_empty_backward():
