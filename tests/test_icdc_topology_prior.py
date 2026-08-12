@@ -239,6 +239,30 @@ def test_checkpoint_identity_codec_has_canonical_vectors():
         codec.canonical_checkpoint_identity({**checkpoint, "ema": {}})
 
 
+def test_checkpoint_identity_streams_tensor_bytes_incrementally(monkeypatch):
+    codec = importlib.import_module("icdc.checkpoint_identity")
+    real_sha256 = hashlib.sha256
+    updates = []
+
+    class RecordingHash:
+        def __init__(self, data=b""):
+            self._inner = real_sha256(data)
+
+        def update(self, data):
+            updates.append(len(data))
+            self._inner.update(data)
+
+        def hexdigest(self):
+            return self._inner.hexdigest()
+
+    monkeypatch.setattr(codec.hashlib, "sha256", RecordingHash)
+    state = {"a": torch.arange(64, dtype=torch.float64),
+             "b": torch.arange(96, dtype=torch.float32)}
+    codec.canonical_state_sha256(state)
+    assert len(updates) >= 4
+    assert max(updates) <= max(t.numel() * t.element_size() for t in state.values())
+
+
 def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     path = Path("scripts/probes/icdc_topology_teacher.py")
     t = _teacher(); tree = ast.parse(path.read_text())
@@ -301,10 +325,13 @@ def test_teacher_default_policy_binds_frozen_production_inputs():
     policy = t._production_trust_policy()
     assert policy.canonical_root == Path("FloorSet/floorset_lite").resolve()
     assert policy.expected_checkpoint_sha256 == "508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659"
-    assert set(policy.allowed_model_identity) == {
-        "identity_schema", "model_config_sha256", "model_keyset_sha256",
-        "ema_keyset_sha256", "ema_state_sha256"}
-    assert policy.allowed_model_identity["ema_state_sha256"] == "0efb3c706d627f6230e6f550d83e88741dc1f5a95e6c3450d7ed1e4a882a4d87"
+    assert policy.allowed_model_identity == {
+        "identity_schema": "icdc_canonical_state_v1",
+        "model_config_sha256": "4c6a1e19f0574af348efa81a758c05524522ad3501d46f18e839774fa933971b",
+        "model_keyset_sha256": "79a51975d9b9f583143259198d244554c8a4e97122fc5e5cf150ec64f4429ba7",
+        "ema_keyset_sha256": "79a51975d9b9f583143259198d244554c8a4e97122fc5e5cf150ec64f4429ba7",
+        "ema_state_sha256": "92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb",
+    }
     assert policy.expected_scorer_sha256 == "7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1"
     assert policy.scorer_contract == "iccad2026_evaluate_cost_no_runtime_v1"
     assert policy.shapely_version == "2.0.5"
