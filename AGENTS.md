@@ -27,16 +27,81 @@ Recent history uses concise Conventional-style subjects such as `docs: ...`, `re
 
 ## Agent-Specific Instructions
 
-### Subagent Model Routing
+### Model Orchestration (GPT-5.6)
 
-When the user selects Subagent-Driven execution, use the following routing policy:
+Activate this policy only when the user explicitly selects Subagent-Driven
+execution. Otherwise, keep normal single-agent behaviour and do not spawn
+subagents merely because the roles below are available. Project configuration
+in `.codex/config.toml` pins the root task to `gpt-5.6-sol` at `xhigh`; a newly
+started or reloaded Codex task is required for that setting and the custom-agent
+files to take effect.
 
-- `gpt-5.6-sol` is the root Scheduler/Integrator. It decomposes the request, manages dependencies, assigns the least expensive capable executor, integrates results, and performs final verification.
-- Use a Terra deep-reasoner role with high/xhigh reasoning for bounded architecture analysis, experiment design, integration reasoning, and non-mechanical debugging. Escalate highest-risk architecture, solver-policy, subtle root-cause work, and final whole-branch review to Sol high/xhigh.
-- Use `gpt-5.6-luna` as the fast-worker for well-specified, low-ambiguity mechanical work such as applying a decided edit, running scripts/tests and reporting, renames/moves, boilerplate, documentation synchronization, and fact gathering.
-- Always specify model and reasoning effort explicitly when dispatching. `deep-reasoner` and `fast-worker` are semantic prompt roles, not formal `agent_type` values; use an available formal type such as `worker` or `default`.
-- The fish Codex CLI on this host has been verified to run `gpt-5.6-luna`. If the active `spawn_agent` interface does not advertise or accept Luna, invoke the fast-worker through an ephemeral `codex exec -m gpt-5.6-luna` file-handoff workflow. Fall back to Terra low/medium only when the CLI workflow is unsuitable.
-- Follow the Subagent-Driven review loop: fresh implementer per task, task-scoped review, fix and re-review Important/Critical findings, then a broad final whole-branch review.
+#### Roles and routing
+
+- **Scheduler/Integrator — `gpt-5.6-sol` (`xhigh`).** The root task owns request
+  interpretation, dependency-aware decomposition, routing, integration,
+  conflict resolution, final verification, and acceptance. Keep the scheduler
+  context focused on requirements and decisions; delegate noisy exploration,
+  test output, and mechanical execution when delegation is worthwhile.
+- **Deep reasoner — `deep-reasoner`, `gpt-5.6-terra` (`xhigh`).** Use for
+  bounded architecture analysis, experiment design, integration reasoning,
+  subtle diagnosis, task-scoped review, and decisions that require trade-off
+  analysis. Terra returns evidence and a recommendation; Sol retains the final
+  decision for highest-risk architecture, solver policy, unresolved ambiguity,
+  and whole-branch acceptance. The project role is defined in
+  `.codex/agents/deep-reasoner.toml` with a read-only default sandbox.
+- **Fast worker — `fast-worker`, `gpt-5.6-luna` (`low`).** Use for
+  well-specified, low-ambiguity implementation, commands and tests, renames and
+  moves, boilerplate, documentation synchronization, and fact gathering. Luna
+  executes decided work and stops at material design ambiguity instead of
+  guessing. The project role is defined in `.codex/agents/fast-worker.toml`.
+
+Route decisions, diagnoses, and non-mechanical review to Terra; route already
+decided execution to Luna; keep cross-task integration, unresolved trade-offs,
+highest-risk work, and final acceptance with Sol. The scheduler may perform a
+trivial action directly when delegation overhead would exceed the work.
+
+#### Dispatch contract
+
+Every delegated task must state the objective, why the chosen role is
+appropriate, exact file or subsystem ownership, relevant constraints and
+already-made decisions, required output, and verification evidence. Always
+specify the model and reasoning effort explicitly at dispatch time even when a
+custom-agent file also pins them.
+
+All agents share the same worktree. Parallelize only independent tasks with
+disjoint write ownership; serialize dependencies and overlapping files. Tell
+every writer that it is not alone in the codebase, must preserve unrelated
+edits, and must not revert another agent's work.
+
+#### Execution and review loop
+
+1. Sol decomposes the request into bounded, dependency-aware tasks.
+2. Terra resolves any undecided architecture or behaviour questions before
+   implementation.
+3. A fresh Luna implementer receives one task with explicit ownership and
+   verification requirements.
+4. A separate Terra pass reviews the task requirements and actual diff.
+5. Important or Critical findings return for correction and re-review.
+6. Sol integrates accepted tasks, resolves cross-task inconsistencies, runs or
+   delegates final verification, and performs the broad final whole-branch
+   review at high or xhigh reasoning.
+
+Subagent reports are advisory until Sol checks the claimed files, evidence,
+and integration state. Never report success based only on a subagent summary.
+
+#### Fallbacks
+
+- If the active interface has not loaded the project custom-agent names, use a
+  built-in `default` or `worker` agent with the same explicit model, reasoning
+  effort, and role instructions.
+- If the active spawn interface rejects `gpt-5.6-luna`, invoke the verified
+  fast-worker path through an ephemeral
+  `codex exec -m gpt-5.6-luna` file-handoff workflow. Fall back to Terra at
+  low or medium effort only when that CLI workflow is unsuitable.
+- A failed subagent does not authorize discarding unrelated work or widening
+  scope. Retry with a corrected bounded prompt, use the documented fallback,
+  or report the blocker.
 
 ### graphify
 
