@@ -215,6 +215,18 @@ def test_bridge_debug_failure_preserves_bridge_result(monkeypatch):
     assert _opt()._tag_compress(out, at, cons, tpos, b2b, p2b, pins, None) is accepted
 
 
+def test_bridge_debug_ms_covers_bridge_call(monkeypatch, capsys):
+    n, at, cons, tpos, b2b, p2b, pins, rects = _single()
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE", "1")
+    monkeypatch.setenv("PARTNER_GROUP_BRIDGE_DEBUG", "1")
+    clock = iter((10.0, 10.25))
+    monkeypatch.setattr(co.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr("violation_killer.bridge_grouping_violations",
+                        lambda *a: a[1])
+    _opt()._tag_compress(list(rects), at, cons, tpos, b2b, p2b, pins, None)
+    assert "ms=250.000" in capsys.readouterr().err
+
+
 def test_warm_dependencies_is_idempotent():
     previous = tc._EXACT_VIOL_FN
     try:

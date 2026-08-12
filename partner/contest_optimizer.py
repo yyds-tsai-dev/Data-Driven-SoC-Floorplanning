@@ -766,20 +766,23 @@ class MyOptimizer(FloorplanOptimizer):
                       file=sys.stderr, flush=True)
         if not bridge_on:
             return current
+        debug_bridge = os.environ.get("PARTNER_GROUP_BRIDGE_DEBUG") == "1"
         try:
             try:
                 budget = float(os.environ.get("PARTNER_GROUP_BRIDGE_BUDGET", "0.02"))
             except (TypeError, ValueError):
                 budget = 0.02
             from violation_killer import bridge_grouping_violations
+            started = time.perf_counter() if debug_bridge else None
             bridged = bridge_grouping_violations(scorer, current, budget)
+            elapsed_ms = ((time.perf_counter() - started) * 1000
+                          if debug_bridge else None)
         except Exception:
             return current
-        if os.environ.get("PARTNER_GROUP_BRIDGE_DEBUG") == "1":
+        if debug_bridge:
             try:
                 from violation_killer import _grouping_count, _violations_exact, _bbox_area
                 import numpy as _np
-                started = time.perf_counter()
                 before = current
                 P0 = _np.asarray([tuple(map(float, r)) for r in before], dtype=float)
                 grouping0 = _grouping_count(scorer, P0)
@@ -791,7 +794,7 @@ class MyOptimizer(FloorplanOptimizer):
                 violations1 = _violations_exact(scorer, P1)
                 hpwl1 = float(scorer._hpwl(P1))
                 bbox1 = _bbox_area(P1)
-                print(f"[gbridge] n={len(before)} ms={(time.perf_counter()-started)*1000:.3f} "
+                print(f"[gbridge] n={len(before)} ms={elapsed_ms:.3f} "
                       f"grouping={grouping0}->{grouping1} V={violations0}->{violations1} "
                       f"hpwl={hpwl0:.6f}->{hpwl1:.6f} bbox={bbox0:.6f}->{bbox1:.6f} "
                       f"committed={int(bridged != before)}", file=sys.stderr, flush=True)
