@@ -261,7 +261,17 @@ Have a fresh Terra xhigh reviewer inspect the report/result JSON and return PASS
 
 - [ ] **Step 1: Run three reversed-order pairs**
 
-Source the repository `.env` for the promoted 0811d operating point and export the evidenced `PYTHONPATH`, `DIRECT_CKPT`, and `FLOW_CKPT` values. From `FloorSet/iccad2026contest`, for ON set `PARTNER_GROUP_BRIDGE=1`, `PARTNER_GROUP_BRIDGE_BUDGET=0.02`, and `PARTNER_GROUP_BRIDGE_DEBUG=1`; for OFF unset all three. Invoke `$ROOT/scripts/iccad2026_evaluate.py --data-path ../ --evaluate $ROOT/scripts/probes/tag_compress_warm_wrapper.py --output $ROOT/artifacts/partner_eval/gbridge_g1_pairN_arm.json` and capture each ON log.
+Source the repository `.env` for the promoted 0811d operating point and export the evidenced `PYTHONPATH`, `DIRECT_CKPT`, and `FLOW_CKPT` values. Execute from `FloorSet/iccad2026contest` using this explicit root and quoted command (define `ROOT` before changing directory):
+
+```bash
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT/FloorSet/iccad2026contest"
+uv run python "$ROOT/scripts/iccad2026_evaluate.py" --data-path ../ \
+  --evaluate "$ROOT/scripts/probes/tag_compress_warm_wrapper.py" \
+  --output "$ROOT/artifacts/partner_eval/gbridge_g1_pairN_arm.json"
+```
+
+For ON set `PARTNER_GROUP_BRIDGE=1`, `PARTNER_GROUP_BRIDGE_BUDGET=0.02`, and `PARTNER_GROUP_BRIDGE_DEBUG=1`; for OFF unset all three. Capture each ON log.
 
 - [ ] **Step 2: Summarize and adjudicate**
 
