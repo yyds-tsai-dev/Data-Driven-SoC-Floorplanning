@@ -5,6 +5,7 @@ import time
 import numpy as np
 import pytest
 import torch
+from dataclasses import replace
 
 sys.path.insert(0, "partner")
 import column_sa_legalizer as csl
@@ -109,3 +110,35 @@ def test_nonfinite_layout_is_identity():
     opt, out = _case()
     bad = list(out); bad[1] = (float("nan"), 0., 1., 1.)
     assert vk.bridge_grouping_violations(opt, bad, .02) is bad
+
+
+def test_axis_solver_rejects_bad_equality_cycle_pin_and_bounds():
+    base = vk._AxisProblem(np.array([0., 2.]), np.ones(2),
+                           np.array([-10., -10.]), np.array([10., 10.]),
+                           np.array([False, False]), (), ())
+    assert vk._solve_axis_dag(replace(base, equalities=(
+        vk._AxisEquality(0, 1, 0.), vk._AxisEquality(1, 0, 1.)))) is None
+    assert vk._solve_axis_dag(replace(base, edges=(vk._AxisEdge(0, 0, 1.),))) is None
+    pinned = replace(base, pinned=np.array([True, True]),
+                     equalities=(vk._AxisEquality(0, 1, 3.),))
+    assert vk._solve_axis_dag(pinned) is None
+    cycle = replace(base, edges=(vk._AxisEdge(0, 1, 1.), vk._AxisEdge(1, 0, 1.)))
+    assert vk._solve_axis_dag(cycle) is None
+    bounded = replace(base, lower=np.array([0., 0.]), upper=np.array([0., 1.]),
+                      edges=(vk._AxisEdge(0, 1, 2.),))
+    assert vk._solve_axis_dag(bounded) is None
+
+
+def test_axis_solver_preserves_pin_satisfies_edges_and_is_repeatable():
+    problem = vk._AxisProblem(
+        coords=np.array([0., 7., 11.]), sizes=np.array([2., 2., 1.]),
+        lower=np.array([0., 0., 0.]), upper=np.array([0., 20., 20.]),
+        pinned=np.array([True, False, False]),
+        equalities=(vk._AxisEquality(1, 2, 4.),),
+        edges=(vk._AxisEdge(0, 1, 3.),),)
+    first = vk._solve_axis_dag(problem)
+    second = vk._solve_axis_dag(problem)
+    assert first is not None and np.array_equal(first, second)
+    assert first[0] == 0.
+    assert first[1] >= first[0] + 3.
+    assert first[2] == pytest.approx(first[1] + 4., abs=1e-9)

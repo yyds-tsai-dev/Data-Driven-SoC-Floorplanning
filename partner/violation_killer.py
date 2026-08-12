@@ -27,6 +27,7 @@ import math
 import os
 import time
 import traceback
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -50,6 +51,158 @@ MAX_ASPECT = 10.0     # cap for reshape slivers
 HP_SAFETY = 1.25      # deflate apparent HPWL rewards / inflate HPWL costs
 MEMBER_CAP = 10       # attach targets per grouping fix
 SWAP_CAP = 12         # wall-swap partners per boundary fix
+
+
+@dataclass(frozen=True)
+class _AxisEquality:
+    left: int
+    right: int
+    delta: float
+
+
+@dataclass(frozen=True)
+class _AxisEdge:
+    before: int
+    after: int
+    gap: float
+
+
+@dataclass(frozen=True)
+class _AxisProblem:
+    coords: np.ndarray
+    sizes: np.ndarray
+    lower: np.ndarray
+    upper: np.ndarray
+    pinned: np.ndarray
+    equalities: Tuple[_AxisEquality, ...]
+    edges: Tuple[_AxisEdge, ...]
+
+
+def _axis_problem_shapes_ok(problem: _AxisProblem, n: int) -> bool:
+    arrays = (problem.coords, problem.sizes, problem.lower, problem.upper,
+              problem.pinned)
+    return (all(np.asarray(a).shape == (n,) for a in arrays)
+            and np.issubdtype(np.asarray(problem.pinned).dtype, np.bool_)
+            and np.all(np.isfinite(problem.coords))
+            and np.all(np.isfinite(problem.sizes))
+            and np.all(np.isfinite(problem.lower))
+            and np.all(np.isfinite(problem.upper))
+            and np.all(problem.sizes >= 0)
+            and np.all(problem.lower <= problem.upper))
+
+
+def _topological_order(n: int, edges: Tuple[Tuple[int, int], ...]) -> Optional[List[int]]:
+    outgoing = [[] for _ in range(n)]
+    indegree = [0] * n
+    for u, v in edges:
+        outgoing[u].append(v)
+        indegree[v] += 1
+    ready = [i for i, degree in enumerate(indegree) if degree == 0]
+    order = []
+    while ready:
+        u = ready.pop(0)
+        order.append(u)
+        for v in outgoing[u]:
+            indegree[v] -= 1
+            if indegree[v] == 0:
+                ready.append(v)
+    return order if len(order) == n else None
+
+
+def _incoming_edges(order: List[int], edges: Dict[Tuple[int, int], float]):
+    incoming = [[] for _ in order]
+    for (u, v), gap in edges.items():
+        incoming[v].append((u, gap))
+    return incoming
+
+
+def _outgoing_edges(order: List[int], edges: Dict[Tuple[int, int], float]):
+    outgoing = [[] for _ in order]
+    for (u, v), gap in edges.items():
+        outgoing[u].append((v, gap))
+    return outgoing
+
+
+def _axis_solution_ok(problem: _AxisProblem, result: np.ndarray) -> bool:
+    if result.shape != problem.coords.shape or not np.all(np.isfinite(result)):
+        return False
+    if np.any(result < problem.lower - 1e-9) or np.any(result > problem.upper + 1e-9):
+        return False
+    for i, pinned in enumerate(problem.pinned):
+        if pinned and not np.isclose(result[i], problem.coords[i], atol=1e-9, rtol=0.0):
+            return False
+    for eq in problem.equalities:
+        if not np.isclose(result[eq.right], result[eq.left] + eq.delta,
+                          atol=1e-9, rtol=0.0):
+            return False
+    return all(result[e.after] >= result[e.before] + e.gap - 1e-9
+               for e in problem.edges)
+
+
+def _solve_axis_dag(problem: _AxisProblem) -> Optional[np.ndarray]:
+    n = len(problem.coords)
+    if not _axis_problem_shapes_ok(problem, n):
+        return None
+    parent = np.arange(n, dtype=np.int64)
+    offset = np.zeros(n, dtype=np.float64)
+
+    def find(i: int) -> Tuple[int, float]:
+        if parent[i] != i:
+            root, delta = find(int(parent[i]))
+            offset[i] += delta
+            parent[i] = root
+        return int(parent[i]), float(offset[i])
+
+    for eq in problem.equalities:
+        if not (0 <= eq.left < n and 0 <= eq.right < n and np.isfinite(eq.delta)):
+            return None
+        ra, da = find(eq.left); rb, db = find(eq.right)
+        if ra == rb:
+            if not np.isclose(db - da, eq.delta, atol=1e-9, rtol=0.0): return None
+        else:
+            parent[rb] = ra; offset[rb] = da + eq.delta - db
+    roots = sorted({find(i)[0] for i in range(n)})
+    root_index = {root: k for k, root in enumerate(roots)}
+    root_lo = np.full(len(roots), -np.inf); root_hi = np.full(len(roots), np.inf)
+    targets: List[List[float]] = [[] for _ in roots]; pin_value: Dict[int, float] = {}
+    for i in range(n):
+        root, delta = find(i); k = root_index[root]
+        root_lo[k] = max(root_lo[k], problem.lower[i] - delta); root_hi[k] = min(root_hi[k], problem.upper[i] - delta)
+        targets[k].append(problem.coords[i] - delta)
+        if problem.pinned[i]:
+            value = float(problem.coords[i] - delta)
+            if k in pin_value and not np.isclose(pin_value[k], value, atol=1e-9, rtol=0.0): return None
+            pin_value[k] = value
+    for k, value in pin_value.items(): root_lo[k] = root_hi[k] = value
+    reduced: Dict[Tuple[int, int], float] = {}
+    for edge in problem.edges:
+        if not (0 <= edge.before < n and 0 <= edge.after < n and np.isfinite(edge.gap)): return None
+        ra, da = find(edge.before); rb, db = find(edge.after); gap = da + edge.gap - db
+        if ra == rb:
+            if gap > 1e-9: return None
+        else:
+            key = (root_index[ra], root_index[rb]); reduced[key] = max(reduced.get(key, -np.inf), gap)
+    order = _topological_order(len(roots), tuple(reduced))
+    if order is None: return None
+    incoming = _incoming_edges(order, reduced); outgoing = _outgoing_edges(order, reduced)
+    for v in order:
+        for u, gap in incoming[v]: root_lo[v] = max(root_lo[v], root_lo[u] + gap)
+    for u in reversed(order):
+        for v, gap in outgoing[u]: root_hi[u] = min(root_hi[u], root_hi[v] - gap)
+    if np.any(root_lo > root_hi + 1e-9): return None
+    target = np.array([np.median(values) for values in targets]); x = np.clip(target, root_lo, root_hi)
+    for _ in range(2):
+        for v in order:
+            if incoming[v]: x[v] = max(x[v], max(x[u] + gap for u, gap in incoming[v]))
+            x[v] = min(x[v], root_hi[v])
+        for u in reversed(order):
+            cap = root_hi[u]
+            if outgoing[u]: cap = min(cap, min(x[v] - gap for v, gap in outgoing[u]))
+            x[u] = max(root_lo[u], min(cap, max(x[u], target[u])))
+    result = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        root, delta = find(i); result[i] = x[root_index[root]] + delta
+    return result if _axis_solution_ok(problem, result) else None
 
 
 def kill_violations(out, area_targets, constraints, target_positions,
