@@ -149,17 +149,27 @@ def test_contact_loss_respects_order_and_is_zero_at_exact_positive_contact():
 - [ ] Run `uv run pytest tests/test_icdc_topology_prior.py -k topology_losses -q`; expect RED.
 - [ ] Implement sparse gathers. For axis `0`, signed separation is
   `x_dst-(x_src+w_src)`; for axis `1`, it is `y_dst-(y_src+h_src)`. Apply
-  `relu((margin-signed_separation)/scale[edge_batch])`. For each contact use
-  `s=scale[contact_batch].clamp_min(1e-6)`. Contact order defines signed
-  abutment gap; compute `abs(gap)/s + relu((perp_margin-overlap)/s)`, without
-  clamping a negative overlap. Reduce with detached contact weights as
-  `sum(weight*term)/sum(weight).clamp_min(1e-12)`. During label
-  extraction, expand every adjacent edge on a pin-support path into `edges`
-  with `kind="pin"`; `pin_paths` remains audit metadata, so the fixed batch
-  schema needs no hidden path tensors. Transitive-reduce separation edges and
-  retain grouping contacts as spanning forests. In `collate_labels`, multiply
-  each edge/contact weight by that record's detached `record_weight`; detach
-  weights only, never `rects`. No energy import/call is allowed in this module.
+  `relu((margin-signed_separation)/scale[edge_batch])`. Separation and contact
+  are global detached-effective-weight normalized means; contact itself is the
+  sum (not average) of normalized `abs(face_gap)` and overlap-deficit terms,
+  with `total = separation + contact`. Empty classes return differentiable
+  zero. The finite, nonnegative `[B]` scale is clamped with `clamp_min(1e-6)`.
+  Contact order defines signed abutment gap. Exact teacher contacts require
+  bit-equal face abutment and strictly positive perpendicular overlap; extract
+  the grouping forest from observed teacher contacts using deterministic
+  maximum-overlap Kruskal. Margin is the nonnegative physical face gap.
+  Transitive-reduce separation edges before expanding pin edges. For each axis,
+  `pin_paths` is audit-only incoming critical support chains terminating at
+  each preplaced block (never p2b); recursively choose the incoming
+  predecessor by greatest physical end, tie-breaking by lower block ID.
+  Expand every adjacent path edge into `edges` with `kind="pin"`, retaining
+  duplicate sep+pin edges so their weights intentionally add; the fixed batch
+  schema has no separate pin loss. In `collate_labels`, multiply each
+  edge/contact weight by detached `record_weight`, with frozen
+  `record_weight = base_cost / teacher_cost` (finite positive; reject
+  `teacher_cost > base_cost`). Proposal identity remains the teacher JSONL
+  envelope/manifest keyed by `(instance_id, sample_seed)`, not TopologyLabel
+  fields. Detach weights only, never `rects`; no energy import/call is allowed.
 - [ ] Run focused tests; expect PASS; run `graphify update .` without staging graph dirt.
 - [ ] Commit `git add partner/icdc/topology_prior.py tests/test_icdc_topology_prior.py && git commit -m "feat: add sparse topology labels and losses"`.
 

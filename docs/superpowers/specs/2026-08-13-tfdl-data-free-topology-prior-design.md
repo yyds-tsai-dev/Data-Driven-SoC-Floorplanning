@@ -115,6 +115,33 @@ Student outputs remain coordinates and aspect variables. No golden coordinates
 are teacher targets. The teacher explains topology constraints, rather than
 providing dense labels or exact-coordinate imitation.
 
+#### Frozen sparse-label and loss contract
+
+Topology separation and contact losses are global, detached-effective-weight
+normalized means. Separation uses the normalized hinge on every retained edge.
+The contact term is a sum (not an average) of normalized absolute face-gap and
+normalized overlap-deficit terms; `total = separation + contact`. An empty edge
+or contact class contributes a differentiable zero. The loss scale accepts a
+finite, nonnegative `[B]` tensor and uses `clamp_min(1e-6)` where it is a
+denominator.
+
+Exact contacts require bit-equal face abutment and strictly positive overlap on
+the perpendicular axis. The extracted grouping forest consists of observed
+teacher contacts selected deterministically by maximum-overlap Kruskal. Margin
+is the nonnegative physical face gap. Transitive reduction precedes pin-edge
+expansion.
+
+`pin_paths` is audit-only metadata: for each axis it stores incoming critical
+support chains terminating at each preplaced block, never p2b. The incoming
+predecessor is chosen recursively by greatest physical end, breaking ties by
+lower block ID. Duplicate separation and pin edges intentionally remain and
+therefore add weight. The fixed batch schema has no separate pin loss.
+
+Record weight is frozen as `base_cost / teacher_cost`, finite and positive;
+extraction rejects `teacher_cost > base_cost`. Proposal identity remains the
+teacher JSONL envelope/manifest keyed by `instance_id` and `sample_seed`, not
+frozen `TopologyLabel` fields.
+
 Run three samples from the production-aligned differentiable two-step sampler
 before computing the student losses. The student objective is a weighted sum
 of:
