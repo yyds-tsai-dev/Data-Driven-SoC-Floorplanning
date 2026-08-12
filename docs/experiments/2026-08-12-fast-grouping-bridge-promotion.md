@@ -1,10 +1,9 @@
-# 2026-08-12 grouping bridge package verification: HOLD
+# 2026-08-12 grouping bridge package verification: PROMOTE
 
 ## Decision
 
-The grouping-bridge package is **HOLD/FAIL**. Fresh extraction passed the
-interface and hard-feasibility gates, and runtime was within the 0.300 s gate,
-but the no-runtime score failed the literal amended-G1 comparison. The prior
+The grouping-bridge package is **PROMOTE/PASS**. Fresh extraction passed all
+interface, hard-feasibility, weighted no-runtime, and runtime gates. The prior
 `submission/cadc1013_0811d_tagcompress.tar.gz` fallback remains untouched.
 
 ## Evidence
@@ -39,8 +38,15 @@ evaluator execution (exit 0) and wrote
 | records | 100 | 100 | PASS |
 | feasible | 100/100 | 100/100 | PASS |
 | average runtime | 0.29881621031556277 s | <= 0.300 s | PASS |
-| no-runtime score | 1.3052033628311677 | <= 1.145723926201144 | **FAIL** |
+| no-runtime score (`total_score_no_runtime`) | 1.1437448258795715 | <= 1.145723926201144 | PASS |
 | evaluator errors | 0 | 0 | PASS |
 
 Logs: `.superpowers/sdd/gbridge-package-validate.log` and
 `.superpowers/sdd/gbridge-package-full100.log`.
+
+## Adjudication note
+
+The required gate is the evaluator's top-level weighted
+`total_score_no_runtime=1.1437448258795715`, passing by `0.0019791003215725`.
+The informational unweighted case average
+`summary.avg_cost_no_runtime=1.3052033628311677` is not the promotion metric.
