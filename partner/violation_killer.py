@@ -78,6 +78,104 @@ class _AxisProblem:
     equalities: Tuple[_AxisEquality, ...]
     edges: Tuple[_AxisEdge, ...]
 
+@dataclass(frozen=True)
+class _ContactChoice:
+    group_id: int; a: int; b: int; axis: int; a_before_b: bool; perp_delta: float
+
+@dataclass(frozen=True)
+class _SoftProfile:
+    boundary_satisfied: frozenset
+    grouping_connected: frozenset
+    mib_equal: frozenset
+
+def _positive_shared_edge(P, c):
+    a,b,axis = c.a,c.b,c.axis; p=1-axis
+    abut = abs((P[a,axis]+P[a,2+axis])-P[b,axis]) <= 1e-9 if c.a_before_b else abs((P[b,axis]+P[b,2+axis])-P[a,axis]) <= 1e-9
+    overlap = min(P[a,p]+P[a,2+p], P[b,p]+P[b,2+p])-max(P[a,p],P[b,p])
+    return bool(abut and overlap > 0.0)
+
+def _contact_forest(P, members):
+    comps=_components(P,np.asarray(sorted(members),dtype=np.int64)); out=[]
+    for k, comp in enumerate(comps):
+        root=min(comp); reached={root}
+        while len(reached)<len(comp):
+            candidates=[]
+            for u in sorted(reached):
+                for v in sorted(set(comp)-reached):
+                    if _positive_shared_edge(P,_ContactChoice(0,u,v,0,True,0.)) or _positive_shared_edge(P,_ContactChoice(0,u,v,1,True,0.)):
+                        candidates.append((u,v))
+            if not candidates: return tuple(out)
+            u,v=min(candidates); out.append((k,u,v)); reached.add(v)
+    return tuple(out)
+
+def _forest_equalities(P, forest):
+    x=[]; y=[]
+    for _,u,v in forest:
+        x.append(_AxisEquality(u,v,float(P[u,0]-P[v,0])) if False else _AxisEquality(u,v,float(P[v,0]-P[u,0])))
+        y.append(_AxisEquality(u,v,float(P[v,1]-P[u,1])))
+    return tuple(x),tuple(y)
+
+def _separation_edges(P, axis):
+    out=[]; n=len(P)
+    for a in range(n):
+        for b in range(a+1,n):
+            candidates=[]
+            for ax in (0,1):
+                ae=P[a,ax]+P[a,2+ax]; be=P[b,ax]+P[b,2+ax]
+                if ae<=P[b,ax]: candidates.append((ax,P[b,ax]-ae,a,b))
+                elif be<=P[a,ax]: candidates.append((ax,P[a,ax]-be,b,a))
+            if not candidates: continue
+            best=max(candidates,key=lambda z:(z[1]/max(P[z[2],2+z[0]]+P[z[3],2+z[0]],1e-12),-z[0]))
+            if best[0]==axis: out.append(_AxisEdge(best[2],best[3],float(P[best[2],2+axis]+best[1])))
+    return tuple(out)
+
+def _make_axis_problem(P, axis, equalities, edges, kind):
+    span=float(np.sum(P[:,2+axis])); lo=float(np.min(P[:,axis])-span); hi=float(np.max(P[:,axis]+P[:,2+axis])+span)
+    return _AxisProblem(P[:,axis].copy(),P[:,2+axis].copy(),np.full(len(P),lo),np.full(len(P),hi),np.asarray(kind,dtype=np.int64)==2,tuple(equalities),tuple(edges))
+
+def _enumerate_contact_choices(opt,P,max_contacts=4):
+    out=[]
+    for gid, members in sorted(opt.cluster_groups.items()):
+        comps=_components(P,np.asarray(sorted(members),dtype=np.int64))
+        for i,left in enumerate(comps):
+            for right in comps[i+1:]:
+                for a in sorted(left):
+                    for b in sorted(right):
+                        for axis in (0,1):
+                            if P[a,axis]+P[a,2+axis] <= P[b,axis]: before=True
+                            elif P[b,axis]+P[b,2+axis] <= P[a,axis]: before=False
+                            else: continue
+                            p=1-axis; lo=-P[b,2+p]+JOIN; hi=P[a,2+p]-JOIN; d=float(np.clip(P[b,p]-P[a,p],lo,hi))
+                            c=_ContactChoice(int(gid),a,b,axis,before,d)
+                            if not _positive_shared_edge(P,c): out.append(c)
+                            else: out.append(c)
+                            if len(out)>=max_contacts:return out
+    return out
+
+def _project_changed_contact(opt,P,choice,budget_s=.003):
+    forest=[]
+    for gid,m in sorted(opt.cluster_groups.items()): forest.extend(_contact_forest(P,m))
+    xe,ye=_forest_equalities(P,forest); before=choice.a if choice.a_before_b else choice.b; after=choice.b if choice.a_before_b else choice.a
+    comps=_components(P,np.asarray(sorted(opt.cluster_groups[choice.group_id]))); ml=next(set(c) for c in comps if choice.a in c); mr=next(set(c) for c in comps if choice.b in c)
+    def stale(e): return (e.before in ml and e.after in mr) or (e.before in mr and e.after in ml)
+    ce=_AxisEquality(before,after,float(P[before,2+choice.axis])); pe=_AxisEquality(choice.a,choice.b,choice.perp_delta)
+    qx=_solve_axis_dag(_make_axis_problem(P,choice.axis,xe+(ce,),tuple(e for e in _separation_edges(P,choice.axis) if not stale(e)),opt.kind)); qy=_solve_axis_dag(_make_axis_problem(P,1-choice.axis,ye+(pe,),tuple(e for e in _separation_edges(P,1-choice.axis) if not stale(e)),opt.kind))
+    if qx is None or qy is None:return None
+    Q=P.copy(); Q[:,choice.axis]=qx; Q[:,1-choice.axis]=qy
+    return Q if _positive_shared_edge(Q,choice) else None
+
+def bridge_grouping_violations_dag(opt,out,budget_s=.003):
+    try:
+        P=np.asarray(out,dtype=float); grouping=_grouping_count(opt,P)
+        if grouping<=0 or not np.isfinite(P).all(): return out
+        ctx=_Ctx(opt,P); s0,v0=ctx.score(P)
+        for c in _enumerate_contact_choices(opt,P):
+            Q=_project_changed_contact(opt,P,c,budget_s)
+            if Q is not None and _grouping_count(opt,Q)<grouping and ctx.score(Q)[1]<v0 and ctx.score(Q)[0]<s0 and _final_guards_ok(opt,P,Q,list(opt.kind),list(opt.areas)):
+                return [tuple(map(float,r)) for r in Q]
+        return out
+    except Exception:return out
+
 
 def _axis_problem_shapes_ok(problem: _AxisProblem, n: int) -> bool:
     try:

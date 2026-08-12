@@ -1,6 +1,7 @@
 import math
 import sys
 import time
+import types
 
 import numpy as np
 import pytest
@@ -10,6 +11,73 @@ from dataclasses import replace
 sys.path.insert(0, "partner")
 import column_sa_legalizer as csl
 import violation_killer as vk
+
+
+def _coordinated_chain_case():
+    out = [(0., 0., 1., 1.), (1., 0., 1., 1.), (1., 2., 1., 1.), (2., 2., 1., 1.)]
+    n = 4
+    areas = torch.ones(n)
+    constraints = torch.zeros((n, 5)); constraints[:, 0] = 1.; constraints[:, 3] = 1.
+    targets = torch.full((n, 4), -1.); targets[:, 2:] = 1.
+    b2b = torch.zeros((0, 3))
+    pins = torch.tensor([(0.5, 0.5), (4.5, -1.5), (2.0, 2.5), (2.0, 2.5)])
+    p2b = torch.tensor([(0., 0., 16.), (1., 1., 0.25), (2., 2., 16.), (3., 3., 1.)])
+    opt = csl._ColumnOptimizer(out, areas, constraints, targets, b2b, p2b, pins,
+                               time.time() + 60., seed=0)
+    return opt, out
+
+
+def test_dag_bridge_creates_positive_shared_edge_and_reduces_grouping():
+    opt, out = _coordinated_chain_case(); P = np.asarray(out, float)
+    assert vk.bridge_grouping_violations(opt, out, 0.2) is out
+    assert len(vk._components(P, np.asarray(opt.cluster_groups[1]))) == 2
+    before = vk._grouping_count(opt, P)
+    got = vk.bridge_grouping_violations_dag(opt, out, 0.2); Q = np.asarray(got, float)
+    assert vk._grouping_count(opt, Q) < before
+    assert vk._violations_exact(opt, Q) < vk._violations_exact(opt, P)
+    assert vk._Ctx(opt, P).score(Q)[0] < vk._Ctx(opt, P).score(P)[0]
+    assert np.array_equal(Q[:, 2:], P[:, 2:])
+
+
+def test_positive_shared_edge_rejects_corner_only_touch():
+    choice = vk._ContactChoice(1, 0, 1, 0, True, 0.)
+    assert vk._positive_shared_edge(np.asarray([(0.,0.,2.,2.), (2.,1.,2.,2.)]), choice)
+    assert not vk._positive_shared_edge(np.asarray([(0.,0.,2.,2.), (2.,2.,2.,2.)]), choice)
+
+
+def test_impossible_dag_bridge_is_exact_identity(monkeypatch):
+    opt, out = _coordinated_chain_case(); monkeypatch.setattr(vk, '_solve_axis_dag', lambda p: None)
+    assert vk.bridge_grouping_violations_dag(opt, out, .2) is out
+
+
+def test_dag_bridge_is_repeatable_and_preserves_hard_geometry():
+    opt, out = _coordinated_chain_case(); one = vk.bridge_grouping_violations_dag(opt, list(out), .2)
+    two = vk.bridge_grouping_violations_dag(opt, list(out), .2)
+    assert one == two and np.array_equal(np.asarray(one)[:,2:], np.asarray(out)[:,2:])
+
+
+def test_dag_mechanism_never_calls_legacy_grouping_or_coord_polish(monkeypatch):
+    opt, out = _coordinated_chain_case()
+    monkeypatch.setattr(vk, '_fix_grouping', lambda *a, **k: pytest.fail('legacy grouping called'))
+    got = vk.bridge_grouping_violations_dag(opt, out, .2)
+    assert vk._grouping_count(opt, np.asarray(got)) < vk._grouping_count(opt, np.asarray(out))
+
+
+def test_contact_forest_spans_each_component_without_closing_a_cycle():
+    opt, out = _coordinated_chain_case(); P = np.asarray(out)
+    forest = vk._contact_forest(P, opt.cluster_groups[1])
+    assert forest == ((0, 0, 1), (1, 2, 3))
+
+
+def test_contact_choice_clips_signed_perpendicular_delta_inside_join_bounds():
+    opt, out = _coordinated_chain_case()
+    chosen = next(c for c in vk._enumerate_contact_choices(opt, np.asarray(out), 4) if (c.a,c.b,c.axis,c.a_before_b)==(0,2,0,True))
+    assert chosen.perp_delta == pytest.approx(1. - vk.JOIN, abs=0.)
+
+
+def test_separation_edges_assign_once_with_coordinate_deltas():
+    opt, out = _coordinated_chain_case(); P = np.asarray(out)
+    assert vk._separation_edges(P, 0) == (vk._AxisEdge(0,1,1.), vk._AxisEdge(0,3,2.), vk._AxisEdge(2,3,1.))
 
 
 def _case(preplaced=False):
