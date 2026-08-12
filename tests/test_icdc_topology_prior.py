@@ -274,6 +274,72 @@ def test_cluster_contact_requires_literal_positive_overlap_and_face_contact():
     with pytest.raises(ValueError): extract_sparse_label(corner, base, "x", 1, 1., 2.)
 
 
+def test_cluster_contact_square_kruskal_is_deterministic_and_canonical():
+    legal = torch.tensor([[0., 0., 2., 2.], [2., 0., 2., 2.], [0., 2., 2., 2.], [2., 2., 2., 2.]], dtype=torch.float64)
+    case = {"n": 4, "cons": [[0, 0, 0, 9, 0]] * 4}
+    a = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    b = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    assert a == b
+    assert {(c.a, c.b, c.axis) for c in a.contacts} == {(0, 1, 0), (2, 3, 0), (0, 2, 1)}
+    reversed_ids = torch.tensor([[2., 0., 2., 2.], [0., 0., 2., 2.]], dtype=torch.float64)
+    contact = extract_sparse_label(reversed_ids, {"n": 2, "cons": [[0, 0, 0, 9, 0]] * 2}, "x", 1, 1., 2.).contacts[0]
+    assert (contact.a, contact.b, contact.axis, contact.a_before_b) == (0, 1, 0, False)
+
+
+def test_pin_path_uses_greatest_end_predecessor_on_x():
+    legal = torch.tensor([[0., 0., 2., 2.], [1., 10., 2., 2.], [6., 6., 2., 2.]], dtype=torch.float64)
+    case = {"n": 3, "cons": [[0, 0], [0, 0], [0, 1]]}
+    label = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    incoming = {(e.src, e.dst) for e in label.edges if e.kind == "sep" and e.axis == 0}
+    assert {(0, 2), (1, 2)} <= incoming
+    assert label.pin_paths == ((1, 2),)
+
+
+def test_pin_path_x_tie_uses_lower_id_predecessor():
+    legal = torch.tensor([[0., 0., 3., 2.], [1., 10., 2., 2.], [7., 6., 2., 2.]], dtype=torch.float64)
+    case = {"n": 3, "cons": [[0, 0], [0, 0], [0, 1]]}
+    label = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    incoming = {(e.src, e.dst) for e in label.edges if e.kind == "sep" and e.axis == 0}
+    assert {(0, 2), (1, 2)} <= incoming
+    assert label.pin_paths == ((0, 2),)
+
+
+def test_pin_path_uses_greatest_end_predecessor_on_y():
+    legal = torch.tensor([[0., 0., 2., 2.], [10., 1., 2., 2.], [6., 7., 2., 2.]], dtype=torch.float64)
+    case = {"n": 3, "cons": [[0, 0], [0, 0], [0, 1]]}
+    label = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    assert label.pin_paths == ((1, 2),)
+
+
+def test_collate_preserves_sep_and_pin_duplicates_with_record_weight():
+    legal = torch.tensor([[0., 0., 1., 1.], [2., 0., 1., 1.], [4., 0., 1., 1.]], dtype=torch.float64)
+    case = {"n": 3, "cons": [[0, 0], [0, 0], [0, 1]]}
+    label = extract_sparse_label(legal, case, "x", 1, 1., 2.)
+    batch = collate_labels([label], torch.device("cpu"), torch.float64)
+    matches = [(s.item(), d.item(), ax.item(), w.item()) for s, d, ax, w in zip(batch.edge_src, batch.edge_dst, batch.edge_axis, batch.edge_weight) if (s.item(), d.item(), ax.item()) == (0, 1, 0)]
+    assert len(matches) == 2 and all(weight == 2. for *_rest, weight in matches)
+
+
+@pytest.mark.parametrize("legal,case", [
+    (torch.ones((1, 3, 4), dtype=torch.float64), {"n": 3, "cons": [[0, 0]] * 3}),
+    (torch.tensor([[0., 0., float("nan"), 1.]], dtype=torch.float64), {"n": 1, "cons": [[0, 0]]}),
+])
+def test_extractor_rejects_exact_legal_shape_and_value_gaps(legal, case):
+    with pytest.raises(ValueError): extract_sparse_label(legal, case, "x", 1, 1., 2.)
+
+
+@pytest.mark.parametrize("teacher,base", [(float("nan"), 2.), (1., float("inf")), (0., 2.), (-1., 2.), (2., 0.)])
+def test_extractor_rejects_nonfinite_and_nonpositive_costs(teacher, base):
+    with pytest.raises(ValueError): extract_sparse_label(torch.ones((1, 4), dtype=torch.float64), {"n": 1, "cons": [[0, 0]]}, "x", 1, teacher, base)
+
+
+@pytest.mark.parametrize("cons", [
+    [[0, 0, -1, 1, 0]], [[0, 0, 0, -1, 0]], [[0, 0, 0, 1, 16]], [[2, 0, 0, 1, 0]], [[0, 2, 0, 1, 0]],
+])
+def test_extractor_rejects_invalid_fixed_preplaced_cluster_metadata(cons):
+    with pytest.raises(ValueError): extract_sparse_label(torch.ones((1, 4), dtype=torch.float64), {"n": 1, "cons": cons}, "x", 1, 1., 2.)
+
+
 def test_extractor_rejects_float32_nonfinite_nonpositive_and_metadata():
     base = {"n": 1, "cons": [[0, 0]]}
     for legal in (torch.ones((1, 4), dtype=torch.float32), torch.tensor([[0., 0., 0., 1.]], dtype=torch.float64), torch.tensor([[0., 0., float('nan'), 1.]], dtype=torch.float64)):
