@@ -11,12 +11,15 @@ import column_sa_legalizer as csl
 import violation_killer as vk
 
 
-def _case():
+def _case(preplaced=False):
     n = 3
     areas = torch.ones(n)
     constraints = torch.zeros((n, 5))
     constraints[:, 3] = 1
     targets = torch.full((n, 4), -1.0)
+    if preplaced:
+        constraints[0, 1] = 1
+        targets[0] = torch.tensor([0., 0., 1., 1.])
     empty3 = torch.zeros((0, 3))
     pins = torch.zeros((0, 2))
     rects = [(0., 0., 1., 1.), (2., 0., 1., 1.), (0., 2., 1., 1.)]
@@ -53,20 +56,23 @@ def test_disconnected_movable_group_is_bridged_and_strictly_improves():
 
 
 def test_preplaced_component_is_never_moved():
-    opt, out = _case()
-    opt.preplaced[0] = True
-    opt.kind[0] = 2
+    opt, out = _case(preplaced=True)
     q = vk.bridge_grouping_violations(opt, out, .5)
+    p, qn = np.asarray(out, float), np.asarray(q, float)
+    assert q != out
+    assert vk._grouping_count(opt, qn) < vk._grouping_count(opt, p)
+    assert vk._violations_exact(opt, qn) < vk._violations_exact(opt, p)
+    assert vk._Ctx(opt, p).score(qn)[0] < vk._Ctx(opt, p).score(p)[0]
+    assert vk._final_guards_ok(opt, p, qn, list(opt.kind), list(opt.areas))
     assert np.array_equal(np.asarray(q)[0], np.asarray(out)[0])
 
 
-@pytest.mark.parametrize("gate", ["proxy", "grouping", "guards"])
-def test_proxy_non_improvement_rolls_back(monkeypatch, gate):
+def _rollback_case(monkeypatch, gate):
     opt, out = _case()
     candidate = np.asarray([(0., 0., 1., 1.), (1., 0., 1., 1.),
                             (2., 0., 1., 1.)])
     if gate == "proxy":
-        monkeypatch.setattr(vk._Ctx, "score", lambda self, p: (1., 0))
+        monkeypatch.setattr(vk._Ctx, "score", lambda self, p: (2., 0) if np.array_equal(p, candidate) else (2., 2))
     elif gate == "grouping":
         monkeypatch.setattr(vk, "_grouping_count", lambda o, p: 2)
     else:
@@ -76,12 +82,16 @@ def test_proxy_non_improvement_rolls_back(monkeypatch, gate):
     assert vk.bridge_grouping_violations(opt, out, .02) is out
 
 
+def test_proxy_non_improvement_rolls_back(monkeypatch):
+    _rollback_case(monkeypatch, "proxy")
+
+
 def test_grouping_non_improvement_rolls_back(monkeypatch):
-    test_proxy_non_improvement_rolls_back(monkeypatch, "grouping")
+    _rollback_case(monkeypatch, "grouping")
 
 
 def test_final_guard_failure_rolls_back(monkeypatch):
-    test_proxy_non_improvement_rolls_back(monkeypatch, "guards")
+    _rollback_case(monkeypatch, "guards")
 
 
 def test_exception_is_contained(monkeypatch):
