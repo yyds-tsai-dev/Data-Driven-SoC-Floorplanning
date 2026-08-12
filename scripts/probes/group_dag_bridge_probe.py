@@ -12,6 +12,7 @@ import statistics
 import sys
 import time
 import torch
+import numpy as np
 from pathlib import Path
 from typing import Any, Callable
 
@@ -55,6 +56,20 @@ def _default_loader(test_id: int, row: dict[str, Any]):
     return load_test_cases(ev, data_path=str(root / "FloorSet"))[test_id]
 
 
+def _default_cases():
+    root = Path(__file__).resolve().parents[2]
+    ev = _load_evaluator()
+    from partner.icdc.data import load_test_cases
+    cases = load_test_cases(ev, data_path=str(root / "FloorSet"))
+    from partner.column_sa_legalizer import _ColumnOptimizer
+    out = []
+    for case in cases:
+        c = dict(case)
+        c["optimizer"] = _ColumnOptimizer(c["rects"], c["area"], c["cons"], c["tp"], c["b2b"], c["p2b"], c["pins"], time.time() + 60., seed=0)
+        out.append(c)
+    return out
+
+
 def _default_evaluate(solution: dict[str, Any], case: Any):
     ev = _load_evaluator()
     if isinstance(case, dict) and "cons" in case:
@@ -71,17 +86,6 @@ def _metric(value: Any, name: str, default: float = 0.0) -> float:
     else:
         value = getattr(value, name, default)
     return float(value)
-
-
-def _call(fn: Callable, *args):
-    """Permit compact fixture callbacks while keeping the production signatures explicit."""
-    for n in range(len(args), 0, -1):
-        try:
-            return fn(*args[:n])
-        except TypeError:
-            if n == 1:
-                raise
-    return fn()
 
 
 def _source_hygiene() -> bool:
@@ -114,7 +118,10 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
             return 2
     except Exception:
         return 2
-    if bridge_fn is None:
+    production_mode = bridge_fn is None and case_loader is _default_loader and evaluate_fn is _default_evaluate
+    cached_cases = None
+    if production_mode:
+        cached_cases = _default_cases()
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "partner"))
         from violation_killer import bridge_grouping_violations_dag
         bridge_fn = lambda context, positions, budget: bridge_grouping_violations_dag(context["optimizer"], positions, budget)
@@ -130,17 +137,19 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
         tid = int(row["test_id"])
         before = row["positions"]
         try:
-            scorer = _call(case_loader, tid, row)
-            if bridge_fn is None:
+            scorer = (cached_cases[tid] if production_mode else case_loader(tid, row))
+            if production_mode:
                 from partner.column_sa_legalizer import _ColumnOptimizer
                 scorer = dict(scorer)
                 scorer["optimizer"] = _ColumnOptimizer(row["positions"], torch.as_tensor(scorer["area"]), torch.as_tensor(scorer["cons"]), torch.as_tensor(scorer["tp"]), torch.as_tensor(scorer["b2b"]), torch.as_tensor(scorer["p2b"]), torch.as_tensor(scorer["pins"]), time.time() + 60., seed=0)
             started = clock()
-            after = _call(bridge_fn, scorer, before, 0.003)
+            after = bridge_fn(scorer, before, 0.003)
             elapsed = (clock() - started) * 1000
             timings.append(elapsed)
-            off = _call(evaluate_fn, {"positions": before}, scorer)
-            on = _call(evaluate_fn, {"positions": after}, scorer)
+            before_arr = np.asarray(before, dtype=float); after_arr = np.asarray(after, dtype=float)
+            if before_arr.shape != after_arr.shape or not np.isfinite(after_arr).all(): raise ValueError("invalid candidate")
+            off = evaluate_fn({"positions": before_arr.tolist(), "runtime": 1.0}, scorer)
+            on = evaluate_fn({"positions": after_arr.tolist(), "runtime": 1.0}, scorer)
             off_cost = _metric(off, "cost_no_runtime", _metric(off, "cost"))
             on_cost = _metric(on, "cost_no_runtime", _metric(on, "cost"))
             off_costs.append(off_cost); on_costs.append(on_cost); counts.append(int(row["block_count"]))
@@ -150,7 +159,7 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
             grouping_after = _metric(on, "grouping_violations", grouping_before)
             v_before = _metric(off, "total_soft_violations", row.get("total_soft_violations", 0))
             v_after = _metric(on, "total_soft_violations", v_before)
-            changed = after != before
+            after = after_arr.tolist(); changed = not np.array_equal(after_arr, before_arr)
             strict = (not changed) or (ok and grouping_after < grouping_before and v_after < v_before)
             accepted = changed and strict
             cases.append({"test_id": tid, "block_count": int(row["block_count"]), "positions": after,
