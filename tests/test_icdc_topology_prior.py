@@ -830,8 +830,32 @@ def test_hard_sizes_are_normalized_only_in_emitted_proposals():
     case = _topology_case(raw, [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0]], tp)
     out = list(generate_proposals(raw, case, ProposalConfig(8, 0, 0, 32)))
     assert torch.equal(raw[:, 2:], torch.tensor([[9., 8.], [7., 6.]], dtype=torch.float64))
-    proposals = [(name, rects) for name, rects in out if name != "base"]
-    assert proposals and all(torch.equal(rects[0, 2:], torch.tensor([2., 3.])) for _, rects in proposals)
+    assert out
+    assert all(torch.equal(rects[0, 2:], torch.tensor([2., 3.])) for _, rects in out)
+    assert all(torch.equal(rects[1, 2:], torch.tensor([7., 6.])) for _, rects in out)
+
+
+def test_mismatched_preplaced_pin_repairs_peer_and_reverses_repaired_pair_state():
+    raw = torch.tensor([[20., 0., 2., 2.], [0., 0., 2., 2.]], dtype=torch.float64)
+    case = _topology_case(raw, [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0]],
+                          [[0., 0., 2., 2.], [-1., -1., -1., -1.]])
+    out = [(name, rects) for name, rects in
+           generate_proposals(raw, case, ProposalConfig(0, 8, 0, 32))
+           if name.startswith("pin:")]
+    assert out
+    pin_base = raw.clone()
+    pin_base[0, :2] = torch.tensor([0., 0.])
+    repaired_state = topology_prior._pair_state(pin_base, 0, 1)
+    for name, rects in out:
+        _, p, peer, axis, order = name.split(":")
+        p, peer, axis, order = map(int, (p, peer, axis, order))
+        assert (p, peer) == (0, 1)
+        assert torch.equal(rects[0, :2], torch.tensor([0., 0.]))
+        assert not torch.equal(rects[1, :2], pin_base[1, :2])
+        assert topology_prior._proposal_fingerprint(rects, case["cons"])[0] == (
+            "pair", 0, 1, axis, order
+        )
+        assert (axis, order) == (repaired_state[0], 1 - repaired_state[1])
 
 
 def test_tfdl_public_function_does_not_call_shelf_fallback():
