@@ -215,11 +215,12 @@ def test_source_root_restrictions(tmp_path, root):
         save_sanitized_corpus(tmp_path / "x", [_case()], source_root=root)
 
 
-def test_explicit_canonical_source_root(tmp_path):
+@pytest.mark.parametrize("root", [Path("FloorSet/floorset_lite"), CANONICAL_ROOT])
+def test_explicit_canonical_source_root(tmp_path, root):
     save_sanitized_corpus(
         tmp_path / "x",
         [_case()],
-        source_root=CANONICAL_ROOT,
+        source_root=root,
     )
 
 
