@@ -102,11 +102,37 @@ def _contact_forest(P, members):
             candidates=[]
             for u in sorted(reached):
                 for v in sorted(set(comp)-reached):
-                    if _positive_shared_edge(P,_ContactChoice(0,u,v,0,True,0.)) or _positive_shared_edge(P,_ContactChoice(0,u,v,1,True,0.)):
-                        candidates.append((u,v))
-            if not candidates: return tuple(out)
+                    for axis in (0, 1):
+                        for before in (True, False):
+                            if _positive_shared_edge(P, _ContactChoice(0, u, v, axis, before, 0.)):
+                                candidates.append((u, v)); break
+                        if candidates and candidates[-1] == (u, v): break
+            if not candidates: return None
             u,v=min(candidates); out.append((k,u,v)); reached.add(v)
     return tuple(out)
+
+def _soft_profile(opt, P):
+    boundary = frozenset((int(i), int(code)) for i, code in _boundary_violators(opt, P) for code in range(1, 9) if not (code & int(code)))
+    # Store satisfied boundary bits; evaluator codes are powers of two.
+    boundary = frozenset((i, bit) for i in range(len(P)) for bit in (1,2,4,8,16,32,64,128)
+                         if (i, bit) not in {(int(j), int(c)) for j, c in _boundary_violators(opt, P)})
+    grouping = set()
+    for gid, members in opt.cluster_groups.items():
+        for comp in _components(P, np.asarray(sorted(members), dtype=np.int64)):
+            for i, a in enumerate(sorted(comp)):
+                for b in sorted(comp)[i+1:]: grouping.add((int(gid), a, b))
+    mib = set()
+    for gid, members in enumerate(opt._mib_arrays):
+        for i, a in enumerate(sorted(members)):
+            for b in sorted(members)[i+1:]:
+                if (round(float(P[a,2]),4),round(float(P[a,3]),4)) == (round(float(P[b,2]),4),round(float(P[b,3]),4)):
+                    mib.add((gid, a, b))
+    return _SoftProfile(boundary, frozenset(grouping), frozenset(mib))
+
+def _profile_nonregressing(before, after):
+    return (before.boundary_satisfied <= after.boundary_satisfied
+            and before.grouping_connected <= after.grouping_connected
+            and before.mib_equal <= after.mib_equal)
 
 def _forest_equalities(P, forest):
     x=[]; y=[]
@@ -153,25 +179,44 @@ def _enumerate_contact_choices(opt,P,max_contacts=4):
     return out
 
 def _project_changed_contact(opt,P,choice,budget_s=.003):
+    deadline = time.perf_counter() + float(budget_s)
+    if not math.isfinite(float(budget_s)) or budget_s <= 0 or time.perf_counter() >= deadline:
+        return None
     forest=[]
-    for gid,m in sorted(opt.cluster_groups.items()): forest.extend(_contact_forest(P,m))
+    for gid,m in sorted(opt.cluster_groups.items()):
+        if time.perf_counter() >= deadline: return None
+        part = _contact_forest(P,m)
+        if part is None: return None
+        forest.extend(part)
     xe,ye=_forest_equalities(P,forest); before=choice.a if choice.a_before_b else choice.b; after=choice.b if choice.a_before_b else choice.a
     comps=_components(P,np.asarray(sorted(opt.cluster_groups[choice.group_id]))); ml=next(set(c) for c in comps if choice.a in c); mr=next(set(c) for c in comps if choice.b in c)
     def stale(e): return (e.before in ml and e.after in mr) or (e.before in mr and e.after in ml)
     ce=_AxisEquality(before,after,float(P[before,2+choice.axis])); pe=_AxisEquality(choice.a,choice.b,choice.perp_delta)
-    qx=_solve_axis_dag(_make_axis_problem(P,choice.axis,xe+(ce,),tuple(e for e in _separation_edges(P,choice.axis) if not stale(e)),opt.kind)); qy=_solve_axis_dag(_make_axis_problem(P,1-choice.axis,ye+(pe,),tuple(e for e in _separation_edges(P,1-choice.axis) if not stale(e)),opt.kind))
+    axis_edges = tuple(e for e in _separation_edges(P, choice.axis) if not stale(e))
+    perp_edges = tuple(e for e in _separation_edges(P, 1-choice.axis) if not stale(e))
+    if len(axis_edges) > 8192 or len(perp_edges) > 8192 or time.perf_counter() >= deadline:
+        return None
+    qx=_solve_axis_dag(_make_axis_problem(P,choice.axis,xe+(ce,),axis_edges,opt.kind))
+    if qx is None or time.perf_counter() >= deadline: return None
+    qy=_solve_axis_dag(_make_axis_problem(P,1-choice.axis,ye+(pe,),perp_edges,opt.kind))
     if qx is None or qy is None:return None
     Q=P.copy(); Q[:,choice.axis]=qx; Q[:,1-choice.axis]=qy
     return Q if _positive_shared_edge(Q,choice) else None
 
 def bridge_grouping_violations_dag(opt,out,budget_s=.003):
     try:
+        budget=float(budget_s)
+        if not math.isfinite(budget) or budget<=0: return out
+        deadline=time.perf_counter()+budget
         P=np.asarray(out,dtype=float); grouping=_grouping_count(opt,P)
-        if grouping<=0 or not np.isfinite(P).all(): return out
-        ctx=_Ctx(opt,P); s0,v0=ctx.score(P)
+        if grouping<=0 or P.shape != (int(opt.n),4) or not np.isfinite(P).all(): return out
+        if any(len(_components(P,np.asarray(sorted(m),dtype=np.int64))) > 12 for m in opt.cluster_groups.values()): return out
+        ctx=_Ctx(opt,P); s0,v0=ctx.score(P); profile0=_soft_profile(opt,P)
+        if time.perf_counter() >= deadline: return out
         for c in _enumerate_contact_choices(opt,P):
-            Q=_project_changed_contact(opt,P,c,budget_s)
-            if Q is not None and _grouping_count(opt,Q)<grouping and ctx.score(Q)[1]<v0 and ctx.score(Q)[0]<s0 and _final_guards_ok(opt,P,Q,list(opt.kind),list(opt.areas)):
+            if time.perf_counter() >= deadline: return out
+            Q=_project_changed_contact(opt,P,c,max(0.0,deadline-time.perf_counter()))
+            if Q is not None and _grouping_count(opt,Q)<grouping and ctx.score(Q)[1]<v0 and ctx.score(Q)[0]<s0 and _profile_nonregressing(profile0,_soft_profile(opt,Q)) and _final_guards_ok(opt,P,Q,list(opt.kind),list(opt.areas)):
                 return [tuple(map(float,r)) for r in Q]
         return out
     except Exception:return out

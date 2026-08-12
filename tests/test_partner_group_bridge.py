@@ -79,6 +79,39 @@ def test_separation_edges_assign_once_with_coordinate_deltas():
     opt, out = _coordinated_chain_case(); P = np.asarray(out)
     assert vk._separation_edges(P, 0) == (vk._AxisEdge(0,1,1.), vk._AxisEdge(0,3,2.), vk._AxisEdge(2,3,1.))
 
+def test_dag_invalid_budget_is_exact_identity():
+    opt, out = _coordinated_chain_case()
+    for budget in (0, -1, float("nan"), float("inf")):
+        assert vk.bridge_grouping_violations_dag(opt, out, budget) is out
+
+def test_dag_reversed_id_forest_and_equalities():
+    opt, out = _coordinated_chain_case()
+    P = np.asarray([(1., 0., 1., 1.), (0., 0., 1., 1.),
+                    (2., 2., 1., 1.), (1., 2., 1., 1.)])
+    forest = vk._contact_forest(P, opt.cluster_groups[1])
+    assert len(forest) == 2
+    xe, ye = vk._forest_equalities(P, forest)
+    assert len(xe) == len(ye) == 2
+
+def test_dag_pinned_conflict_is_identity():
+    opt, out = _coordinated_chain_case(); P = np.asarray(out, float)
+    problem = vk._make_axis_problem(P, 0, (vk._AxisEquality(0, 2, 0.),), (), [2, 1, 1, 1])
+    problem = replace(problem, pinned=np.array([True, False, True, False]))
+    assert vk._solve_axis_dag(problem) is None
+
+def test_soft_profile_regression_rejects_lost_relations():
+    opt, out = _coordinated_chain_case(); P = np.asarray(out, float)
+    before = vk._soft_profile(opt, P)
+    changed = P.copy(); changed[1, 0] += .25
+    assert not vk._profile_nonregressing(before, vk._soft_profile(opt, changed))
+
+def test_dag_component_cap_skips_solver(monkeypatch):
+    opt, out = _coordinated_chain_case()
+    opt.cluster_groups[1] = list(range(14))
+    called = False
+    monkeypatch.setattr(vk, "_solve_axis_dag", lambda p: pytest.fail("solver called"))
+    assert vk.bridge_grouping_violations_dag(opt, out, .2) is out
+
 
 def _case(preplaced=False):
     n = 3
