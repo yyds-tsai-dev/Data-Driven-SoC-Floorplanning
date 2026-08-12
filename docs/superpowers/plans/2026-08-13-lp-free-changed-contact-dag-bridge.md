@@ -359,8 +359,10 @@ as a rigid contact-spanning tree: `_forest_equalities` emits the current x and
 y offsets of every forest edge, without closing an equality cycle. Assign each
 currently non-overlapping pair to exactly one deterministic separating axis
 (largest normalized gap, then x on ties); `_separation_edges(P, axis)` returns
-only pairs assigned to that axis. Remove only the selected pair's old
-separator, enforce exact contact-axis equality, choose the deterministic
+only pairs assigned to that axis. After the contact merges the two selected
+pre-contact components, remove every stale raw block separator crossing that
+component pair, not merely the selected blocks' separator; retain internal and
+unrelated-component separators. Enforce exact contact-axis equality, choose the deterministic
 perpendicular delta in `[-size_b+JOIN, size_a-JOIN]`, and return identity on any
 exception, deadline, non-finite value, pin conflict, cycle, corner contact, or
 guard failure.

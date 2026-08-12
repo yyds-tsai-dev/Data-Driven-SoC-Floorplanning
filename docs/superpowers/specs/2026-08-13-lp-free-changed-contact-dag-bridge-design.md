@@ -44,7 +44,12 @@ only when that path leaves a disconnected grouping.
    on the contact axis, and impose a bounded positive-overlap relation on the
    perpendicular axis. Corner touch is invalid; shared-edge overlap must be
    strictly positive.
-6. Rebuild the reduced component separation DAG after the contact choice.
+6. Rebuild the reduced component separation DAG after the contact choice. The
+   two selected pre-contact components are now one rigid component: discard
+   every stale original separator whose endpoints cross that component pair,
+   not only the separator of the selected blocks. Preserve all internal and
+   unrelated-component separators, then rely on the final exact overlap guard
+   to validate the changed topology.
 7. Apply global forward and reverse longest-path/slack projection on the
    reduced DAG, with dimensions fixed and preplaced origins fixed.
 8. Recount evaluator-semantics grouping and all soft/hard constraints. On any
