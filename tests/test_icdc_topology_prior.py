@@ -2660,6 +2660,19 @@ def test_population_abort_does_not_unlink_foreign_replacement(tmp_path):
         db_path.unlink(missing_ok=True)
 
 
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_population_abort_preserves_replaced_captured_sidecar(tmp_path, suffix):
+    t = _teacher(); acc = t._PopulationAccumulator(); sidecar = Path(f"{acc._db_path}{suffix}")
+    sidecar.write_bytes(b"owned-sidecar"); owned = sidecar.stat()
+    sidecar.unlink(); sidecar.write_bytes(b"foreign-sidecar")
+    try:
+        acc.abort()
+        assert sidecar.exists() and sidecar.stat().st_ino != owned.st_ino
+        assert sidecar.read_bytes() == b"foreign-sidecar"
+    finally:
+        sidecar.unlink(missing_ok=True)
+
+
 def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
     t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
     lease = t._new_staging_lease(owned); moved = tmp_path / "moved-owned"
@@ -2667,6 +2680,26 @@ def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
     owned.rename(moved); owned.symlink_to(sentinel, target_is_directory=True)
     assert t._cleanup_owned_staging(lease) is False
     assert owned.is_symlink() and moved.exists() and (sentinel / "keep").exists()
+
+
+def test_cleanup_owned_staging_rechecks_identity_after_first_lstat(tmp_path, monkeypatch):
+    t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
+    lease = t._new_staging_lease(owned); moved = tmp_path / "moved-owned"
+    foreign = tmp_path / "foreign"; foreign.mkdir(); (foreign / "keep").write_text("keep")
+    real_match = t._path_matches_lease; checked = {"count": 0}
+
+    def race(path, held_lease):
+        result = real_match(path, held_lease)
+        checked["count"] += 1
+        if checked["count"] == 1:
+            Path(path).rename(moved)
+            Path(path).symlink_to(foreign, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(t, "_path_matches_lease", race)
+    assert t._cleanup_owned_staging(lease) is False
+    assert checked["count"] >= 2 and moved.exists() and owned.is_symlink()
+    assert (foreign / "keep").exists()
 
 
 def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monkeypatch):
@@ -2683,9 +2716,9 @@ def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monk
 
     def process(case_input):
         identity, _ = _task4_private_case_spool(stages[-1])
-        spool = identity[0]; spool.rename(moved); spool.write_bytes(b"owned-spool")
-        spool.write_bytes(b"foreign-spool")
-        attacked["path"] = spool
+        spool = identity[0]; original_bytes = spool.read_bytes()
+        spool.rename(moved); spool.write_bytes(b"foreign-spool")
+        attacked["path"] = spool; attacked["original"] = original_bytes
         raise marker
 
     monkeypatch.setattr(t, "_runtime_hooks",
@@ -2693,7 +2726,7 @@ def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monk
     with pytest.raises(RuntimeError) as exc:
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert exc.value is marker and not out.exists()
-    assert moved.read_bytes().startswith(_TASK4_SQLITE_MAGIC)
+    assert moved.read_bytes() == attacked["original"]
     replacement = Path(attacked["path"])
     assert replacement.exists() and replacement.read_bytes() == b"foreign-spool"
 
