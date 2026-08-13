@@ -97,6 +97,57 @@ class CorpusSourceReceipt:
     fingerprint: str
 
 
+@dataclass(frozen=True)
+class VerifiedTrainingFpRow:
+    receipt: CorpusSourceReceipt
+    instance_id: str
+    input_fingerprint: str
+    case: Mapping[str, object]
+    fp_xywh: torch.Tensor
+
+
+def validate_raw_source(source: Sequence[torch.Tensor]) -> tuple[int, int]:
+    if not isinstance(source, (list, tuple)) or len(source) != 7:
+        raise ValueError("source schema")
+    expected = ((3, 6), (3, 3), (3, 3), (3, 2), (3, 3), (3, 4), (2, 8))
+    for tensor, (rank, width) in zip(source, expected):
+        if (not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu"
+                or tensor.requires_grad or not tensor.is_floating_point()
+                or tensor.ndim != rank or tensor.shape[-1] != width
+                or not bool(torch.isfinite(tensor).all())):
+            raise ValueError("source tensors")
+    batch, n = int(source[0].shape[0]), int(source[0].shape[1])
+    if batch < 1 or n < 1 or int(source[4].shape[1]) != n - 1:
+        raise ValueError("source shape")
+    if any(int(t.shape[0]) != batch for t in source[1:]):
+        raise ValueError("source batch")
+    if int(source[5].shape[1]) != n:
+        raise ValueError("source fp shape")
+    return batch, n
+
+
+def verified_training_fp_row(
+    source: Sequence[torch.Tensor], receipt: CorpusSourceReceipt
+) -> VerifiedTrainingFpRow:
+    _, n = validate_raw_source(source)
+    if type(receipt) is not CorpusSourceReceipt:
+        raise ValueError("receipt type")
+    if receipt.layout_index < 0 or receipt.layout_index >= int(source[0].shape[0]):
+        raise ValueError("receipt index")
+    from .data import BandFileSampler
+    try:
+        raw_case = BandFileSampler._instance(source, receipt.layout_index)
+        case = _sanitize(dict(raw_case))
+    except Exception as exc:
+        raise ValueError("source case") from exc
+    instance_id = source_instance_id(receipt)
+    case["instance_id"] = instance_id
+    case = _sanitize(case)
+    raw = source[5][receipt.layout_index, :n].to(dtype=torch.float64, device="cpu")
+    fp_xywh = torch.stack((raw[:, 2], raw[:, 3], raw[:, 0], raw[:, 1]), dim=1).contiguous()
+    return VerifiedTrainingFpRow(receipt, instance_id, fingerprint_case(case), case, fp_xywh)
+
+
 def _path(value: str | Path) -> Path:
     try:
         return Path(value)
