@@ -1250,9 +1250,19 @@ def _task4_install_public_removal_attack(
 
 def _task4_install_private_claim_removal_failure(
         t, monkeypatch, *, target, directory):
-    """Fail only removal of the original inode after it leaves its public path."""
+    """Fail exactly one private removal of the original claimed inode.
+
+    Both ``os`` and ``Path`` removal entry points are wrapped.  This stays
+    independent of quarantine naming: a marker is emitted only after the
+    expected inode has moved away from its public location.  A cleanup backend
+    that uses another disposal primitive must expose an equivalent observable
+    fault point; silently avoiding the marker is not a successful test path.
+    """
     real_unlink = t.os.unlink
+    real_remove = t.os.remove
     real_rmdir = t.os.rmdir
+    real_path_unlink = Path.unlink
+    real_path_rmdir = Path.rmdir
     expected_info = target.lstat()
     expected = (expected_info.st_dev, expected_info.st_ino)
     attack = {}
@@ -1278,20 +1288,37 @@ def _task4_install_private_claim_removal_failure(
         if (observed.st_dev, observed.st_ino) != expected:
             return
         marker = OSError(errno.EIO, "injected private-claim removal failure")
-        attack.update(path=candidate, identity=expected, marker=marker)
+        attack.update(path=candidate, identity=expected, marker=marker, count=1)
         raise marker
 
     def unlink(path, *args, **kwargs):
         fail_private_claim(path, kwargs)
         return real_unlink(path, *args, **kwargs)
 
+    def remove(path, *args, **kwargs):
+        fail_private_claim(path, kwargs)
+        return real_remove(path, *args, **kwargs)
+
     def rmdir(path, *args, **kwargs):
         fail_private_claim(path, kwargs)
         return real_rmdir(path, *args, **kwargs)
 
-    monkeypatch.setattr(t.os, "rmdir" if directory else "unlink",
-                        rmdir if directory else unlink)
-    return attack, real_unlink, real_rmdir
+    def path_unlink(path, *args, **kwargs):
+        fail_private_claim(path, kwargs)
+        return real_path_unlink(path, *args, **kwargs)
+
+    def path_rmdir(path, *args, **kwargs):
+        fail_private_claim(path, kwargs)
+        return real_path_rmdir(path, *args, **kwargs)
+
+    if directory:
+        monkeypatch.setattr(t.os, "rmdir", rmdir)
+        monkeypatch.setattr(Path, "rmdir", path_rmdir)
+    else:
+        monkeypatch.setattr(t.os, "unlink", unlink)
+        monkeypatch.setattr(t.os, "remove", remove)
+        monkeypatch.setattr(Path, "unlink", path_unlink)
+    return attack, real_unlink, real_remove, real_rmdir
 
 
 def _task4_assert_closed_sqlite_connection(module, connection):
@@ -3089,67 +3116,51 @@ def test_population_sidecar_private_claim_failure_restores_owned_journal(
     acc.register({"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
                   "instance_id": "complete-before-finalize", "n": 1})
     acc.record_winner("complete-before-finalize", 5.0, 4.0)
+    db.execute("BEGIN IMMEDIATE")
+    acc.register({"relative_path": "worker_2/layouts_0.th", "layout_index": 1,
+                  "instance_id": "active-journal-owner", "n": 1})
+    assert journal.is_file(), "the active SQLite transaction must own a journal"
+    capture = getattr(acc, "_capture_sidecars", None)
+    if callable(capture):
+        capture()
+    owned_info = journal.stat()
+    owned_bytes = journal.read_bytes()
     missing_target = tmp_path / "missing-foreign-population-wal"
     real_unlink = t.os.unlink; real_rmdir = t.os.rmdir; installed = {}
-
-    class FinalizationConnectionProxy:
-        def __init__(self, connection):
-            self._connection = connection
-
-        def __getattr__(self, name):
-            return getattr(self._connection, name)
-
-        def execute(self, *args, **kwargs):
-            result = self._connection.execute(*args, **kwargs)
-            if not installed:
-                # Arm this only during the public finish lifecycle: SQLite has
-                # completed its work for this query before the foreign state is
-                # introduced, and the following close must finalize it safely.
-                journal.write_bytes(b"owned-population-journal")
-                capture = getattr(acc, "_capture_sidecars", None)
-                if callable(capture):
-                    capture()
-                owned_info = journal.stat()
-                wal.symlink_to(missing_target)
-                foreign_info = wal.lstat()
-                attack, _unused_unlink, _unused_rmdir = (
-                    _task4_install_private_claim_removal_failure(
-                        t, monkeypatch, target=journal, directory=False))
-                installed.update(
-                    attack=attack,
-                    owned_identity=(owned_info.st_dev, owned_info.st_ino),
-                    foreign_identity=(foreign_info.st_dev, foreign_info.st_ino),
-                )
-            return result
-
-    acc._db = FinalizationConnectionProxy(db)
+    wal.unlink(missing_ok=True)
+    wal.symlink_to(missing_target)
+    foreign_info = wal.lstat()
+    attack, _unused_unlink, _unused_remove, _unused_rmdir = (
+        _task4_install_private_claim_removal_failure(
+            t, monkeypatch, target=journal, directory=False))
+    installed.update(
+        attack=attack,
+        owned_identity=(owned_info.st_dev, owned_info.st_ino),
+        owned_bytes=owned_bytes,
+        foreign_identity=(foreign_info.st_dev, foreign_info.st_ino),
+    )
     error = None
     try:
         acc.finish()
     except BaseException as exc:
         error = exc
     try:
-        attack = installed["attack"]
         _task4_assert_closed_sqlite_connection(t, db)
         assert acc._db is None
         assert _task4_lifecycle_registry_sizes(t) == baseline
         assert wal.is_symlink() and os.readlink(wal) == str(missing_target)
         assert (wal.lstat().st_dev, wal.lstat().st_ino) == installed["foreign_identity"]
-        if attack:
-            assert error is attack["marker"]
-            assert main.exists() and (main.stat().st_dev, main.stat().st_ino) == main_identity
-            assert journal.read_bytes() == b"owned-population-journal"
-            assert (journal.stat().st_dev, journal.stat().st_ino) == installed["owned_identity"]
-            assert not Path(attack["path"]).exists()
-            # A failed finalizer cannot leave a cached successful population
-            # result that makes a later finish call appear complete.
-            with pytest.raises(RuntimeError):
-                acc.finish()
-        else:
-            # An implementation may classify no disk sidecar as owned or use
-            # a lower-level removal boundary.  It must still preserve foreign
-            # state and complete the detached connection lifecycle.
-            assert error is None
+        # Firing proves this exact pre-captured inode was recognized as owned;
+        # it is not merely a matching conventional sidecar name.
+        assert attack["count"] == 1 and error is attack["marker"]
+        assert main.exists() and (main.stat().st_dev, main.stat().st_ino) == main_identity
+        assert journal.read_bytes() == installed["owned_bytes"]
+        assert (journal.stat().st_dev, journal.stat().st_ino) == installed["owned_identity"]
+        assert not Path(attack["path"]).exists()
+        # A failed finalizer cannot leave a cached successful population
+        # result that makes a later finish call appear complete.
+        with pytest.raises(RuntimeError):
+            acc.finish()
         assert not _task4_path_fd_targets(main)
         assert not _task4_path_fd_targets(journal)
         assert not _task4_path_fd_targets(wal)
@@ -3337,23 +3348,19 @@ def test_cleanup_owned_staging_restores_private_claim_after_removal_failure(
     target_info = target.lstat()
     expected = (target_info.st_dev, target_info.st_ino)
     lease = t._new_staging_lease(stage)
-    attack, _real_unlink, _real_rmdir = _task4_install_private_claim_removal_failure(
+    attack, _real_unlink, _real_remove, _real_rmdir = (
+        _task4_install_private_claim_removal_failure(
         t, monkeypatch, target=target, directory=kind != "leaf",
-    )
+    ))
     result = t._cleanup_owned_staging(lease)
-    if attack:
-        assert result is False
-        assert target.exists() and (target.lstat().st_dev, target.lstat().st_ino) == expected
-        if kind == "leaf":
-            assert target.read_bytes() == b"owned-leaf-data"
-        # The path observed by the fault is the claimed private name itself;
-        # it must not remain in the quarantine after failure handling.
-        assert not Path(attack["path"]).exists()
-        assert not _task4_stage_fd_targets(stage)
-    else:
-        # Implementations may remove claimed names below a different boundary;
-        # the public-path race contracts cover a direct public removal.
-        assert result is True and not stage.exists()
+    assert attack["count"] == 1 and result is False
+    assert target.exists() and (target.lstat().st_dev, target.lstat().st_ino) == expected
+    if kind == "leaf":
+        assert target.read_bytes() == b"owned-leaf-data"
+    # The path observed by the fault is the claimed private name itself;
+    # it must not remain in the quarantine after failure handling.
+    assert not Path(attack["path"]).exists()
+    assert not _task4_stage_fd_targets(stage)
 
 
 def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monkeypatch):
@@ -3518,9 +3525,10 @@ def test_teacher_case_spool_public_removal_never_deletes_replacement(
         assert not public_spool.exists()
 
 
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
 @pytest.mark.parametrize("sidecar_kind", ["regular", "dangling_symlink"])
 def test_teacher_case_spool_close_rejects_residual_foreign_sidecar_before_publish(
-        tmp_path, monkeypatch, sidecar_kind):
+        tmp_path, monkeypatch, suffix, sidecar_kind):
     """A sidecar created after close is foreign evidence, never publishable output."""
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
     out = tmp_path / "out"; stages = []; published = []; created = {}
@@ -3542,14 +3550,16 @@ def test_teacher_case_spool_close_rejects_residual_foreign_sidecar_before_publis
         def close(self):
             result = self._connection.close()
             if not created:
-                sidecar = Path(f"{self._path}-journal")
+                sidecar = Path(f"{self._path}{suffix}")
+                sidecar.unlink(missing_ok=True)
                 if sidecar_kind == "regular":
-                    sidecar.write_bytes(b"foreign-case-spool-sidecar")
+                    payload = f"foreign-case-spool-sidecar:{suffix}".encode()
+                    sidecar.write_bytes(payload)
                     info = sidecar.stat()
                     created.update(path=sidecar, mode="regular",
-                                   identity=(info.st_dev, info.st_ino))
+                                   payload=payload, identity=(info.st_dev, info.st_ino))
                 else:
-                    missing = tmp_path / "missing-case-spool-sidecar-target"
+                    missing = tmp_path / f"missing-case-spool-sidecar-target{suffix}"
                     sidecar.symlink_to(missing)
                     info = sidecar.lstat()
                     created.update(path=sidecar, mode="symlink",
@@ -3578,7 +3588,7 @@ def test_teacher_case_spool_close_rejects_residual_foreign_sidecar_before_publis
     sidecar = Path(created["path"])
     assert (sidecar.lstat().st_dev, sidecar.lstat().st_ino) == created["identity"]
     if created["mode"] == "regular":
-        assert sidecar.read_bytes() == b"foreign-case-spool-sidecar"
+        assert sidecar.read_bytes() == created["payload"]
     else:
         assert sidecar.is_symlink() and os.readlink(sidecar) == created["target"]
     assert not _task4_path_fd_targets(sidecar)
@@ -3607,12 +3617,13 @@ def test_teacher_case_spool_restores_private_claim_after_removal_failure(
         def close(self):
             result = self._connection.close()
             if not installed:
-                attack, _real_unlink, _real_rmdir = (
+                attack, _real_unlink, _real_remove, _real_rmdir = (
                     _task4_install_private_claim_removal_failure(
                         t, monkeypatch, target=self._path, directory=False))
                 installed.update(attack=attack, path=self._path,
                                  identity=(self._path.stat().st_dev,
-                                           self._path.stat().st_ino))
+                                           self._path.stat().st_ino),
+                                 payload=self._path.read_bytes())
             return result
 
     def connect(database, *args, **kwargs):
@@ -3632,17 +3643,14 @@ def test_teacher_case_spool_restores_private_claim_after_removal_failure(
         result = None
     attack = installed["attack"]
     spool = Path(installed["path"])
-    if attack:
-        assert error is attack["marker"] and result is None
-        assert not published and not out.exists()
-        assert spool.exists()
-        assert (spool.stat().st_dev, spool.stat().st_ino) == installed["identity"]
-        assert spool.read_bytes().startswith(_TASK4_SQLITE_MAGIC)
-        assert not Path(attack["path"]).exists()
-        assert not _task4_path_fd_targets(spool)
-    else:
-        assert error is None and result in {0, 1} and len(published) == 1
-        assert not spool.exists()
+    assert attack["count"] == 1 and error is attack["marker"] and result is None
+    assert not published and not out.exists()
+    assert spool.exists()
+    assert (spool.stat().st_dev, spool.stat().st_ino) == installed["identity"]
+    assert spool.read_bytes() == installed["payload"]
+    assert spool.read_bytes().startswith(_TASK4_SQLITE_MAGIC)
+    assert not Path(attack["path"]).exists()
+    assert not _task4_path_fd_targets(spool)
 
 
 @pytest.mark.parametrize("suffix", ["", "-journal", "-wal", "-shm"])
