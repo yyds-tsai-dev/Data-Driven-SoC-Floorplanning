@@ -19,7 +19,7 @@ import sys
 import tempfile
 import inspect
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Optional
@@ -57,7 +57,9 @@ import torch
 from direct_diffusion_model import DirectDenoiser, DirectModelConfig, sample_direct_dpmpp
 from diffusion_model import DiffusionSchedule
 import icdc.engine as _ENGINE
+import icdc.energy as _ENERGY
 from icdc.energy import decode_rects
+from icdc.topology_prior import ProposalConfig, generate_proposals, pin_feasible_then_exact_tfdl
 from icdc.topology_data import CorpusSourceReceipt, fingerprint_case, split_for_id
 from icdc.topology_data import _sanitize as _sanitize_case
 
@@ -71,6 +73,39 @@ __all__ = ["teacher_main"]
 
 _SAMPLE_DIRECT_DPM = sample_direct_dpmpp
 _DECODE_RECTS = decode_rects
+_GENERATE_PROPOSALS = generate_proposals
+
+def _admit_proposal(proposal, case, _admit=pin_feasible_then_exact_tfdl):
+    return _admit(proposal, case)
+
+_ADMIT_PROPOSAL = _admit_proposal
+
+def _verify_hard_legal(rects, case):
+    n, cons, tp = _validate_case(case)
+    area = torch.as_tensor(case["area"], dtype=torch.float64, device="cpu")
+    result = _ENGINE.verify_hard_legal(rects.numpy(), area.numpy(), torch.as_tensor(cons, dtype=torch.int64).numpy(), tp.numpy())
+    if not isinstance(result, Mapping) or not result or any(not isinstance(k, str) or not k for k in result) or any(type(v) is not bool for v in result.values()):
+        raise ValueError("hard audit")
+    return dict(result)
+
+_VERIFY_HARD_LEGAL = _verify_hard_legal
+
+def _diagnostic_energy(rects, case):
+    n, cons, tp = _validate_case(case)
+    area = torch.as_tensor(case["area"], dtype=torch.float64).unsqueeze(0)
+    cons_t = torch.as_tensor(cons, dtype=torch.int64).unsqueeze(0)
+    batch = {"area": area, "cons": cons_t,
+             "b2b": torch.as_tensor(case["b2b"], dtype=torch.float64).reshape(1, -1, 3),
+             "p2b": torch.as_tensor(case["p2b"], dtype=torch.float64).reshape(1, -1, 3),
+             "pins": torch.as_tensor(case["pins"], dtype=torch.float64).reshape(1, -1, 2),
+             "hpwl_ref": torch.tensor([case["hpwl_ref"]], dtype=torch.float64),
+             "area_ref": torch.tensor([case["area_ref"]], dtype=torch.float64),
+             "n_soft": _ENERGY.n_soft(cons_t, area), "tau_sharp": torch.tensor(0.01, dtype=torch.float64),
+             "tau_soft": torch.tensor(0.1, dtype=torch.float64)}
+    result = _ENERGY.energy(rects.unsqueeze(0), batch)
+    return result["E"][0].item()
+
+_DIAGNOSTIC_ENERGY = _diagnostic_energy
 
 @dataclass(frozen=True)
 class _TeacherModelState:
@@ -629,6 +664,100 @@ def _select_official_winner(rows: Sequence[Mapping[str, Any]]) -> int:
             normalized[index][0],
         ),
     )
+
+@dataclass(frozen=True)
+class _CandidateRecord:
+    ordinal: int; name: str; original: torch.Tensor; legal: Optional[torch.Tensor]
+    drift: Mapping[str, float]; hard: Mapping[str, bool]; official_cost: Optional[float]
+    diagnostic_energy: Optional[float]; energy_status: str; rejection_reason: Optional[str]
+
+@dataclass(frozen=True)
+class _CandidateLifecycle:
+    candidates: tuple[_CandidateRecord, ...]; winner_ordinal: Optional[int]
+    base_cost: Optional[float]; teacher_cost: Optional[float]
+
+def _run_candidate_lifecycle(raw_rects, case, *, scorer, cfg=ProposalConfig()):
+    if not hasattr(scorer, "evaluate_solution") or not callable(scorer.evaluate_solution):
+        raise TypeError("scorer")
+    if type(cfg) is not ProposalConfig:
+        raise TypeError("cfg")
+    n, normalized_cons, normalized_tp = _validate_case(case)
+    if not isinstance(raw_rects, torch.Tensor) or raw_rects.device.type != "cpu" or raw_rects.dtype is not torch.float64 or raw_rects.shape != (n, 4) or not bool(torch.isfinite(raw_rects).all()) or not bool((raw_rects[:, 2:] > 0).all()):
+        raise ValueError("raw rects")
+    area = torch.as_tensor(case["area"], dtype=torch.float64)
+    cons = torch.as_tensor(normalized_cons, dtype=torch.int64)
+    tensors = {name: torch.as_tensor(case[name], dtype=torch.float64) for name in ("b2b", "p2b", "pins")}
+    shapes = {"b2b": (None, 3), "p2b": (None, 3), "pins": (None, 2)}
+    for name, value in tensors.items():
+        if value.ndim != 2 or value.shape[1] != shapes[name][1] or not bool(torch.isfinite(value).all()): raise ValueError(name)
+    if area.shape != (n,) or cons.shape != (n, 5) or not bool(torch.isfinite(area).all()) or not bool((area > 0).all()) or not all(math.isfinite(float(case[k])) and float(case[k]) > 0 for k in ("hpwl_ref", "area_ref")): raise ValueError("adapter")
+    generated = []
+    try:
+        for item in _GENERATE_PROPOSALS(raw_rects, case, cfg): generated.append(item)
+    except Exception as exc: raise RuntimeError("proposal generation") from exc
+    if not generated or not isinstance(generated[0], (tuple, list)) or len(generated[0]) != 2 or generated[0][0] != "base": raise ValueError("base proposal")
+    phase = {"base": 0, "axis": 1, "pin": 2, "contact": 3}; seen_names = set(); last_phase = -1
+    for item in generated:
+        if not isinstance(item, (tuple, list)) or len(item) != 2 or not isinstance(item[0], str) or item[0] in seen_names: raise ValueError("proposal")
+        name = item[0]; kind = name.split(":")[0]
+        if kind not in {"base", "axis", "pin", "contact"} or (kind == "base" and name != "base") or (kind != "base" and len(name.split(":")) != (6 if kind == "contact" else 5)): raise ValueError("proposal name")
+        if kind != "base":
+            parts = name.split(":")
+            try: vals = [int(x) for x in parts[1:]]
+            except Exception as exc: raise ValueError("proposal name") from exc
+            if any(x == "" or str(v) != x for x, v in zip(parts[1:], vals)): raise ValueError("proposal name")
+        if phase[kind] < last_phase: raise ValueError("proposal phase")
+        last_phase = phase[kind]; seen_names.add(name)
+        candidate = item[1]
+        if not isinstance(candidate, torch.Tensor) or candidate.device.type != "cpu" or candidate.dtype is not torch.float64 or candidate.shape != (n, 4) or not bool(torch.isfinite(candidate).all()) or not bool((candidate[:, 2:] > 0).all()): raise ValueError("proposal rects")
+    names = set(); records = []
+    for ordinal, item in enumerate(generated):
+        if not isinstance(item, (tuple, list)) or len(item) != 2: raise ValueError("proposal")
+        name, candidate = item
+        if not isinstance(name, str) or not name or name in names or "\0" in name: raise ValueError("proposal name")
+        tokens = name.split(":"); kind = tokens[0]
+        if kind not in phase or (kind == "base" and (name != "base" or ordinal != 0)) or (kind != "base" and len(tokens) != (6 if kind == "contact" else 5)): raise ValueError("proposal name")
+        if kind != "base":
+            try: vals = [int(x) for x in tokens[1:]]
+            except Exception as exc: raise ValueError("proposal name") from exc
+            if any(x == "" or str(v) != x for x, v in zip(tokens[1:], vals)): raise ValueError("proposal name")
+        if records and phase[kind] < phase[records[-1].name.split(":")[0]]: raise ValueError("proposal phase")
+        if not isinstance(candidate, torch.Tensor) or candidate.device.type != "cpu" or candidate.dtype is not torch.float64 or candidate.shape != (n, 4) or not bool(torch.isfinite(candidate).all()) or not bool((candidate[:, 2:] > 0).all()): raise ValueError("proposal rects")
+        names.add(name); original = candidate.clone(); legal = None; drift = {}; hard = {}; cost = energy_value = None; energy_status = "not_reached"; reason = None
+        stage = "admission"
+        try:
+            admitted = _ADMIT_PROPOSAL(candidate.clone(), case)
+            if not isinstance(admitted, (tuple, list)) or len(admitted) != 2: raise ValueError
+            legal, drift_tensor = admitted
+            if not isinstance(legal, torch.Tensor) or legal.device.type != "cpu" or legal.dtype is not torch.float64 or legal.shape != (n, 4) or not bool(torch.isfinite(legal).all()) or not bool((legal[:, 2:] > 0).all()) or not isinstance(drift_tensor, torch.Tensor) or drift_tensor.device.type != "cpu" or drift_tensor.dtype is not torch.float64 or drift_tensor.shape != (n, 2) or not bool(torch.isfinite(drift_tensor).all()) or not bool(torch.count_nonzero(drift_tensor) == 0): raise ValueError
+            legal = legal.clone(); drift = {"max_abs": 0.0}; stage = "hard"; hard = _VERIFY_HARD_LEGAL(legal.clone(), case)
+            if not hard or any(type(v) is not bool or not v for v in hard.values()): raise ValueError
+            stage = "intent"
+            if _proposal_intent_holds(name, legal.clone(), case) is not True: raise ValueError
+            stage = "official"
+            result = scorer.evaluate_solution({"positions": [[float(v) for v in row] for row in legal.tolist()], "runtime": 1.0}, {"hpwl_baseline": float(case["hpwl_ref"]), "area_baseline": float(case["area_ref"])}, cons, tensors["b2b"], tensors["p2b"], tensors["pins"], area, normalized_tp.tolist(), median_runtime=1.0)
+            feasible = result.is_feasible; cost_value = result.cost_no_runtime
+            if type(feasible) is not bool: raise ValueError("feasible")
+            if not feasible: reason = "official_infeasible"
+            elif not isinstance(cost_value, numbers.Real) or isinstance(cost_value, bool) or not math.isfinite(float(cost_value)) or float(cost_value) <= 0: reason = "official_invalid_cost"
+            else: cost = float(cost_value)
+        except Exception:
+            if reason is None: reason = {"admission": "admission_failed", "hard": "hard_audit_failed", "intent": "intent_not_survived", "official": "official_evaluator_error"}[stage]
+        if legal is not None and hard and cost is not None:
+            try:
+                value = _DIAGNOSTIC_ENERGY(legal.clone(), case)
+                if isinstance(value, numbers.Real) and not isinstance(value, bool) and math.isfinite(float(value)): energy_value = float(value); energy_status = "recorded"
+                else: energy_status = "unavailable"
+            except Exception: energy_status = "unavailable"
+            reason = None
+        records.append(_CandidateRecord(ordinal, name, original, legal, drift, hard, cost, energy_value, energy_status, reason))
+    base = next((r for r in records if r.name == "base" and r.official_cost is not None and r.rejection_reason is None), None)
+    if base is None:
+        records = [replace(r, rejection_reason=(r.rejection_reason or "base_unavailable")) for r in records]
+        return _CandidateLifecycle(tuple(records), None, None, None)
+    winner = min((r for r in records if r.official_cost is not None and r.rejection_reason is None), key=lambda r: (r.official_cost, r.ordinal, r.name))
+    records = [replace(r, rejection_reason=(None if r is winner else ("not_selected" if r.rejection_reason is None else r.rejection_reason))) for r in records]
+    return _CandidateLifecycle(tuple(records), winner.ordinal, base.official_cost, winner.official_cost)
 
 
 def _canonical_relative_path(value: Any) -> str:
