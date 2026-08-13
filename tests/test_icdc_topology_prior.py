@@ -1319,6 +1319,96 @@ def test_teacher_streaming_b1_durability_failure_is_transactional(tmp_path, monk
     assert staging_paths and not staging_paths[-1].exists()
 
 
+def test_teacher_streaming_b1_review_population_is_bounded_exact_and_ordered():
+    t = _teacher()
+    rows = [
+        {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "worker_2/layouts_0.th#0", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25},
+        {"relative_path": "worker_10/layouts_0.th", "layout_index": 0, "instance_id": "worker_10/layouts_0.th#0", "n": 12, "base_cost": 3.5, "teacher_cost": 2.25},
+    ]
+    expected = t._weighted_population(rows)
+    acc = t._PopulationAccumulator()
+    for row in rows:
+        acc.add(row)
+    assert acc.finish() == expected
+    reversed_acc = t._PopulationAccumulator()
+    for row in reversed(rows):
+        reversed_acc.add(row)
+    assert reversed_acc.finish() == expected
+    assert not any(isinstance(v, (list, tuple, dict)) and any(x is row for x in v for row in rows) for v in acc.__dict__.values())
+    assert all(row["relative_path"] not in repr(value) and row["instance_id"] not in repr(value)
+               for value in acc.__dict__.values() for row in rows)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda r: {**r, "extra": 1}, lambda r: {k: v for k, v in r.items() if k != "n"},
+    lambda r: {**r, "layout_index": -1}, lambda r: {**r, "layout_index": True},
+    lambda r: {**r, "instance_id": ""}, lambda r: {**r, "instance_id": "bad/../id"},
+    lambda r: {**r, "n": -1}, lambda r: {**r, "n": True},
+    lambda r: {**r, "base_cost": float("nan")}, lambda r: {**r, "base_cost": float("inf")},
+    lambda r: {**r, "n": 10000}, lambda r: {**r, "base_cost": 1e308, "n": 10000},
+])
+def test_teacher_streaming_b1_review_population_rejects_malformed_rows(mutate):
+    t = _teacher()
+    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "worker_2/layouts_0.th#0", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25}
+    with pytest.raises(ValueError):
+        t._PopulationAccumulator().add(mutate(row))
+
+
+def test_teacher_streaming_b1_review_writer_init_is_transactional(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root, relative_path="worker_0/layouts_0.th"); _task4_fake_runtime(t, monkeypatch)
+    stages = []; real_stage = t._new_staging
+    monkeypatch.setattr(t, "_new_staging", lambda destination: (stages.append(real_stage(destination)) or stages[-1]))
+    import builtins
+    real_open = builtins.open; handles = []; sentinel = RuntimeError("third staging open")
+    def flaky_open(path, mode="r", *args, **kwargs):
+        if len(handles) >= 2 and str(path).endswith(".jsonl"):
+            raise sentinel
+        handle = real_open(path, mode, *args, **kwargs); handles.append(handle); return handle
+    monkeypatch.setattr(t, "open", flaky_open, raising=False)
+    with pytest.raises(RuntimeError) as exc:
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert exc.value is sentinel and not out.exists() and stages and not Path(stages[0]).exists()
+    assert all(handle.closed for handle in handles)
+
+
+def test_teacher_streaming_b1_review_writer_close_preserves_primary_and_closes_all(monkeypatch):
+    t = _teacher(); writer = t._JsonlWriter.__new__(t._JsonlWriter)
+    class Fake:
+        closed = False
+        def __init__(self, primary=False): self.primary = primary; self.calls = 0
+        def flush(self):
+            if self.primary: raise primary_error
+        def fileno(self): return 0
+        def close(self):
+            self.calls += 1; self.closed = True
+            if self.primary: raise cleanup
+    primary_error = RuntimeError("primary"); primary = primary_error; cleanup = RuntimeError("cleanup")
+    files = [Fake(i == 0) for i in range(6)]; writer._files = dict(zip(t._TASK4_JSONL, files))
+    monkeypatch.setattr(t.os, "fsync", lambda fd: None)
+    with pytest.raises(RuntimeError) as exc: writer.close()
+    assert exc.value is primary and [f.calls for f in files] == [1] * 6
+
+
+def test_teacher_streaming_b1_review_directory_fd_closes_on_fsync_error(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root, relative_path="worker_0/layouts_0.th"); _task4_fake_runtime(t, monkeypatch)
+    stages = []; real_stage = t._new_staging
+    monkeypatch.setattr(t, "_new_staging", lambda destination: (stages.append(Path(real_stage(destination))) or stages[-1]))
+    real_open, real_close, real_fsync = t.os.open, t.os.close, t.os.fsync; owned = []; sentinel = OSError("directory fsync")
+    def spy_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if Path(path).resolve() == stages[-1].resolve(): owned.append(fd)
+        return fd
+    closed = []
+    monkeypatch.setattr(t.os, "open", spy_open); monkeypatch.setattr(t.os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
+    failed = []
+    monkeypatch.setattr(t.os, "fsync", lambda fd: (failed.append(fd), (_ for _ in ()).throw(sentinel))[1] if fd in owned else real_fsync(fd))
+    published = []; monkeypatch.setattr(t, "_publish_staging", lambda *a: published.append(a))
+    with pytest.raises(OSError) as exc: t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert exc.value is sentinel and failed and failed[0] in closed and not out.exists() and not stages[-1].exists() and published == []
+
+
 def test_teacher_excluded_rows_publish_empty_non_authorizing_terminal_evidence(tmp_path, monkeypatch):
     preflight_calls = []
     policy = _policy_for(tmp_path / "floorset_lite")
