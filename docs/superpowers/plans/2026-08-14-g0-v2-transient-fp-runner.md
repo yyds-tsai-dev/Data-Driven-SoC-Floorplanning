@@ -97,7 +97,7 @@ The injected call trace must prove both layouts use official `cost_no_runtime`, 
 
 - [ ] **Step 5: Implement minimal two-slot evaluation and sparse extraction**
 
-Use `pin_feasible_then_exact_tfdl`, `engine.verify_hard_legal`, and `extract_sparse_label`. Hard-audit the raw production winner unchanged; only a failing raw base gets one exact-TFDL repair and second hard audit before scoring. A failed repair kills coverage. Score the teacher only if independently admitted and hard legal. Select by `(cost_no_runtime, ordinal, name)`. Convert results immediately to scalar audit data plus `TopologyLabel`, then delete local dense tensors before returning.
+Use `pin_feasible_then_exact_tfdl`, `engine.verify_hard_legal`, and `extract_sparse_label`. Hard-audit the raw production winner unchanged; only a failing raw base gets one deterministic repair and second hard audit before scoring. The repair restores exact target area by changing height only for violating non-fixed/non-preplaced blocks, then runs exact TFDL. A failed repair kills coverage. Score the teacher only if independently admitted and hard legal. Select by `(cost_no_runtime, ordinal, name)`. Convert results immediately to scalar audit data plus `TopologyLabel`, then delete local dense tensors before returning.
 
 - [ ] **Step 6: Add RED population accounting tests**
 
@@ -183,7 +183,7 @@ labels.write(canonical_sparse_label(result.sparse_label))
 population.add(result)
 ```
 
-The real implementation must normalize exact tensor shapes/dtypes, verify the optimizer portfolio trace, accept a raw hard-legal production winner unchanged, and use deterministic pin-feasible exact-TFDL only to repair a raw base that fails the first hard audit.
+The real implementation must normalize exact tensor shapes/dtypes, verify the optimizer portfolio trace, accept a raw hard-legal production winner unchanged, and use the bounded soft-area normalization plus deterministic pin-feasible exact-TFDL only to repair a raw base that fails the first hard audit.
 
 - [ ] **Step 6: Implement atomic evidence publication and gate exit codes**
 

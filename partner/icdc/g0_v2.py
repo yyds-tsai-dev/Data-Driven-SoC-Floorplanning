@@ -153,6 +153,21 @@ def _hard_audit(
     return dict(raw)
 
 
+def _normalize_soft_area(
+    rects: torch.Tensor, area: torch.Tensor, cons: torch.Tensor
+) -> torch.Tensor:
+    """Restore exact target area only for violating resizable blocks."""
+    repaired = rects.clone()
+    soft = (cons[:, 0] == 0) & (cons[:, 1] == 0)
+    relative_error = torch.abs(
+        repaired[:, 2] * repaired[:, 3] - area
+    ) / torch.clamp_min(area, 1e-9)
+    violating = soft & (relative_error > 0.01)
+    if bool(violating.any()):
+        repaired[violating, 3] = area[violating] / repaired[violating, 2]
+    return repaired
+
+
 def _official_cost(
     scorer: Any,
     rects: torch.Tensor,
@@ -241,7 +256,12 @@ def evaluate_case(
     base_legal = base_rects
     base_hard = _hard_audit(base_legal, area, cons, tp)
     if not all(base_hard.values()):
-        admitted_base = exact_admit(base_rects, "base legal")
+        repair_seed = (
+            _normalize_soft_area(base_rects, area, cons)
+            if not base_hard.get("area", False)
+            else base_rects
+        )
+        admitted_base = exact_admit(repair_seed, "base legal")
         if admitted_base is None:
             raise ValueError("base admission")
         base_legal = admitted_base

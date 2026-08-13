@@ -236,6 +236,32 @@ def test_failed_production_base_admission_fails_closed_before_scoring():
     assert scorer.calls == []
 
 
+def test_soft_mib_area_failure_is_normalized_before_exact_base_repair():
+    case = _case()
+    case["area"] = [8.0, 4.0]
+    case["area_ref"] = 12.0
+    case["cons"] = [[0, 0, 7, 0, 0], [0, 0, 7, 0, 0]]
+    calls = []
+
+    def admit(proposal, _case):
+        calls.append(proposal.clone())
+        if len(calls) == 1:
+            return proposal.clone(), torch.zeros((2, 2), dtype=torch.float64)
+        return None
+
+    out = evaluate_case(
+        _rects(1.0), _rects(), case, _Scorer([1.2]), sample_seed=17,
+        admit=admit,
+    )
+    assert len(calls) == 2
+    assert calls[0].tolist() == [
+        [0.0, 0.0, 2.0, 4.0],
+        [3.0, 0.0, 2.0, 2.0],
+    ]
+    assert all(out.base_hard_audit.values())
+    assert out.winner == "production-base"
+
+
 def test_case_result_and_canonical_json_contain_no_dense_coordinates():
     out = evaluate_case(
         _rects(1.0),

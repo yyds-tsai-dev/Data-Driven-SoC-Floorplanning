@@ -151,8 +151,11 @@ unchanged.
   `1=transient-fp-exact-tfdl`. The historical 25 blind axis/pin/contact
   mutations are excluded. The raw frozen production winner is first hard
   audited unchanged; only a failing raw winner receives one deterministic
-  pin-feasible exact-TFDL repair and zero-drift check before a second hard
-  audit. The transient-fp seed always receives that exact admission. A base
+  repair before a second hard audit: any non-fixed/non-preplaced block outside
+  the official 1% area tolerance first has its height set to `area/width`, then
+  the seed receives pin-feasible exact TFDL and a zero-drift check. Fixed and
+  preplaced dimensions/origins are never normalized. The transient-fp seed
+  always receives exact admission without this production-only normalization. A base
   repair failure kills coverage; no alternate candidate may substitute for it.
   Each eligible case retains the hard-legal production base when the fp
   candidate is rejected, unavailable, or does not improve official
@@ -467,8 +470,10 @@ authority; only the target permits Task 5.  G1 remains the sole causal
 transfer proof.
 
 Hard-audit the raw production winner unchanged. If it fails, pass it through
-deterministic pin-feasible exact-TFDL once, require zero drift and a successful
-second hard audit, then score the resulting hard-legal production base exactly
+deterministic repair once: restore exact target area for only violating
+non-fixed/non-preplaced blocks, pass the repaired seed through pin-feasible
+exact TFDL, require zero drift and a successful second hard audit, then score
+the resulting hard-legal production base exactly
 once. Score the transient-fp slot
 exactly once only after exact admission and hard audit, using the SHA-pinned
 provided/local contest evaluator:
