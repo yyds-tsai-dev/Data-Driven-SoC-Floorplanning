@@ -1,12 +1,14 @@
 import dataclasses
 import ast
 import collections.abc
+import gc
 import hashlib
 import io
 import importlib
 import importlib.util
 import os
 import sys
+import weakref
 import json
 import math
 from dataclasses import FrozenInstanceError, fields
@@ -1157,8 +1159,9 @@ def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destina
     inspected = {}
 
     def fail_publish(staging, destination):
-        assert destination == out and staging.is_dir()
-        _task4_assert_success_artifacts(t, root, staging, calls, policy, preflight_calls)
+        stage_path = getattr(staging, "path", staging)
+        assert destination == out and stage_path.is_dir()
+        _task4_assert_success_artifacts(t, root, stage_path, calls, policy, preflight_calls)
         inspected["ok"] = True
         raise _Task4PublishFailure("publish failure")
 
@@ -1171,10 +1174,16 @@ def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destina
 def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path, monkeypatch):
     """The six support streams must be append-only and numerically ordered."""
     t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
-    _task4_shard(root, relative_path="worker_0/layouts_0.th")
-    _task4_shard(root, relative_path="worker_0/layouts_2.th", metric_delta=2)
-    _task4_shard(root, relative_path="worker_0/layouts_10.th", metric_delta=10)
-    _task4_fake_runtime(t, monkeypatch)
+    _task4_shard(root, relative_path="worker_2/layouts_0.th")
+    _task4_shard(root, relative_path="worker_2/layouts_2.th", metric_delta=2)
+    _task4_shard(root, relative_path="worker_2/layouts_10.th", metric_delta=10)
+    calls = []; _task4_fake_runtime(t, monkeypatch, calls=calls)
+    runtime = t._runtime_hooks()
+    original_process = runtime.process_case
+    def process(case_input):
+        outcome = original_process(case_input)
+        return dataclasses.replace(outcome, rejection_rows=({"reason": "not_selected"},))
+    monkeypatch.setattr(t, "_runtime_hooks", lambda: dataclasses.replace(runtime, process_case=process))
     created = []; reads = 0
     real_new_staging = t._new_staging
 
@@ -1195,8 +1204,31 @@ def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path,
 
     monkeypatch.setattr(t, "_new_staging", new_staging)
     monkeypatch.setattr(t, "_read_verified_shard", read)
-    with pytest.raises(AssertionError, match="staging must exist"):
-        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert reads == 3
+    for name in _TASK4_JSONL:
+        rows = _task4_jsonl(out / name)
+        assert (out / name).read_bytes() == b"".join(_task4_canonical_json(row) + b"\n" for row in rows)
+    assert sum(len(_task4_jsonl(out / "proposals.jsonl")) for _ in [0]) == len(calls)
+    assert sum(len(_task4_jsonl(out / "rejections.jsonl")) for _ in [0]) == len(calls)
+
+
+def test_teacher_streaming_b1_releases_prior_source_before_next_shard(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root, relative_path="worker_2/layouts_0.th")
+    _task4_shard(root, relative_path="worker_2/layouts_2.th")
+    _task4_fake_runtime(t, monkeypatch)
+    refs = []; reads = 0; real_read = t._read_verified_shard
+    def read(*args):
+        nonlocal reads
+        if reads:
+            gc.collect()
+            assert refs[-1]() is None
+        raw, source = real_read(*args)
+        refs.append(weakref.ref(source[0])); reads += 1
+        return raw, source
+    monkeypatch.setattr(t, "_read_verified_shard", read)
+    t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
 
 
 def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
