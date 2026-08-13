@@ -7,6 +7,7 @@ import io
 import importlib
 import importlib.util
 import os
+import stat
 import sys
 import weakref
 import json
@@ -1211,6 +1212,17 @@ def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path,
         assert (out / name).read_bytes() == b"".join(_task4_canonical_json(row) + b"\n" for row in rows)
     assert sum(len(_task4_jsonl(out / "proposals.jsonl")) for _ in [0]) == len(calls)
     assert sum(len(_task4_jsonl(out / "rejections.jsonl")) for _ in [0]) == len(calls)
+    expected_all = [c.case["instance_id"] for c in calls]
+    train_ids = [c.case["instance_id"] for c in calls if c.partition == "train"]
+    held_ids = [c.case["instance_id"] for c in calls if c.partition == "heldout"]
+    assert [r["instance_id"] for r in _task4_jsonl(out / "train_corpus.jsonl")] == train_ids
+    assert [r["instance_id"] for r in _task4_jsonl(out / "heldout_corpus.jsonl")] == held_ids
+    assert [r["instance_id"] for r in _task4_jsonl(out / "train_labels.jsonl")] == train_ids
+    assert [r["instance_id"] for r in _task4_jsonl(out / "heldout_labels.jsonl")] == held_ids
+    assert [r["instance_id"] for r in _task4_jsonl(out / "proposals.jsonl")] == expected_all
+    assert [r["instance_id"] for r in _task4_jsonl(out / "rejections.jsonl")] == expected_all
+    assert len(_task4_jsonl(out / "proposals.jsonl")) == len(calls)
+    assert len(_task4_jsonl(out / "rejections.jsonl")) == len(calls)
 
 
 def test_teacher_streaming_b1_releases_prior_source_before_next_shard(tmp_path, monkeypatch):
@@ -1243,18 +1255,62 @@ def test_teacher_streaming_b1_durability_precedes_publish(tmp_path, monkeypatch)
     t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
     _task4_shard(root, relative_path="worker_0/layouts_0.th")
     _task4_fake_runtime(t, monkeypatch)
-    fsync_paths = []; published = []
+    staging_paths = []
+    real_new_staging = t._new_staging
+    def new_staging(destination):
+        stage = real_new_staging(destination); staging_paths.append(Path(getattr(stage, "path", stage))); return stage
+    monkeypatch.setattr(t, "_new_staging", new_staging)
+    events = []; published = []
     real_fsync = t.os.fsync
-
     def fsync(fd):
-        fsync_paths.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        mode = t.os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            manifest_exists = (path / "g0_manifest.json").exists()
+            events.append(("dir", manifest_exists))
+        else:
+            events.append(path.name)
         return real_fsync(fd)
-
     monkeypatch.setattr(t.os, "fsync", fsync)
-    monkeypatch.setattr(t, "_publish_staging", lambda *args: published.append(args))
+    def publish(staging, destination):
+        stage = Path(getattr(staging, "path", staging))
+        manifest = json.loads((stage / "g0_manifest.json").read_text())
+        assert manifest["support_hashes"] == {
+            name: hashlib.sha256((stage / name).read_bytes()).hexdigest()
+            for name in _TASK4_FILES if name != "g0_manifest.json"}
+        assert manifest["self_sha256"] == t._manifest_self_sha256(manifest)
+        published.append((stage, destination)); events.append("publish")
+    monkeypatch.setattr(t, "_publish_staging", publish)
     t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
-    assert len(fsync_paths) >= len(_TASK4_JSONL) + 3
-    assert published
+    assert staging_paths
+    assert events == [*_TASK4_JSONL, "training_index.json", ("dir", False),
+                      "g0_manifest.json", ("dir", True), "publish"]
+
+
+@pytest.mark.parametrize("fail_target", ["train_corpus.jsonl", "training_index.json",
+                                           "dir_pre", "g0_manifest.json", "dir_post"])
+def test_teacher_streaming_b1_durability_failure_is_transactional(tmp_path, monkeypatch, fail_target):
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root, relative_path="worker_0/layouts_0.th")
+    _task4_fake_runtime(t, monkeypatch)
+    staging_paths = []; real_new_staging = t._new_staging
+    def new_staging(destination):
+        stage = real_new_staging(destination); staging_paths.append(Path(getattr(stage, "path", stage))); return stage
+    monkeypatch.setattr(t, "_new_staging", new_staging)
+    sentinel = OSError("durability sentinel"); real_fsync = t.os.fsync
+    def fsync(fd):
+        path = Path(os.readlink(f"/proc/self/fd/{fd}")); mode = t.os.fstat(fd).st_mode
+        target = ("dir_pre" if stat.S_ISDIR(mode) and not (path / "g0_manifest.json").exists()
+                  else "dir_post" if stat.S_ISDIR(mode) else path.name)
+        if target == fail_target: raise sentinel
+        return real_fsync(fd)
+    monkeypatch.setattr(t.os, "fsync", fsync)
+    published = []; monkeypatch.setattr(t, "_publish_staging", lambda *args: published.append(args))
+    with pytest.raises(OSError) as exc:
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert exc.value is sentinel
+    assert published == [] and not out.exists()
+    assert staging_paths and not staging_paths[-1].exists()
 
 
 def test_teacher_excluded_rows_publish_empty_non_authorizing_terminal_evidence(tmp_path, monkeypatch):
