@@ -595,6 +595,9 @@ def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
     assert differing
     assert all(torch.equal(state.model.state_dict()[k], payload["ema"][k]) for k in payload["ema"])
     assert all(p.dtype == torch.float32 for p in state.model.parameters())
+    cpu_before = torch.get_rng_state()
+    t._materialize_teacher_model(payload, torch.device("cpu"))
+    assert torch.equal(cpu_before, torch.get_rng_state())
 
 
 @pytest.mark.parametrize("kind", ["nonmapping", "missing_config", "config_nonmapping", "config_incomplete",
@@ -602,7 +605,7 @@ def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
     "missing_model", "model_nonmapping", "model_empty",
     "missing_ema", "ema_nonmapping", "ema_empty", "key_mismatch", "extra_ema", "shape",
     "nontensor", "inf", "zdim", "zrepr", "unknown", "model_shape", "model_dtype",
-    "timesteps_zero", "timesteps_bool", "dropout_nan", "dropout_negative"])
+    "timesteps_zero", "timesteps_bool", "dropout_nan", "dropout_negative", "config_reversed"])
 def test_task4_materializer_rejects_malformed_payload(kind):
     bad = _task4_teacher_payload()
     if kind == "nonmapping": bad = []
@@ -643,14 +646,22 @@ def test_task4_materializer_rejects_malformed_payload(kind):
     elif kind == "timesteps_bool": bad["model_config"]["timesteps"] = True
     elif kind == "dropout_nan": bad["model_config"]["dropout"] = float("nan")
     elif kind == "dropout_negative": bad["model_config"]["dropout"] = -0.1
+    elif kind == "config_reversed": bad["model_config"] = dict(reversed(list(bad["model_config"].items())))
     with pytest.raises(ValueError):
         _teacher()._materialize_teacher_model(bad, torch.device("cpu"))
 
 
+def test_task4_materializer_rejects_unsupported_device_before_construction(monkeypatch):
+    t = _teacher()
+    monkeypatch.setattr(t, "DirectDenoiser", lambda *args, **kwargs: pytest.fail("constructed"))
+    with pytest.raises(ValueError):
+        t._materialize_teacher_model(_task4_teacher_payload(), torch.device("meta"))
+
+
 def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
-    t = _teacher(); case = _task4_anchored_case_input(t).case
+    t = _teacher(); payload = _task4_teacher_payload(); state = t._materialize_teacher_model(payload, torch.device("cpu")); case = _task4_anchored_case_input(t).case
     case = t._sanitize_case(case, artifact=True)
-    direct, diagnostic = t._build_teacher_batches(case, torch.device("cpu"))
+    direct, diagnostic = t._build_teacher_batches(case, torch.device("cpu"), state.cfg)
     assert direct["area"].shape == (1, 3) and direct["tp"].shape == (1, 3, 4)
     assert direct["cons"].shape == (1, 3, 5) and direct["scale"].shape == (1,)
     for key in ("area", "tp", "b2b", "p2b", "pins", "scale"):
@@ -678,8 +689,44 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
     f64_scale = torch.sqrt(torch.tensor(case["area"], dtype=torch.float64).sum())
     assert diagnostic["scale"].item() != f64_scale.item()
     tiny = t._sanitize_case(dict(_task4_case_input(t).case, area=[0.1, 0.2, 0.3]), artifact=True)
-    tiny_direct, tiny_diag = t._build_teacher_batches(tiny, torch.device("cpu"))
+    tiny_direct, tiny_diag = t._build_teacher_batches(tiny, torch.device("cpu"), state.cfg)
     assert tiny_direct["scale"].item() == 1.0 and tiny_diag["scale"].item() == 1.0
+    assert direct["cons"].data_ptr() != diagnostic["cons"].data_ptr()
+    direct["cons"][0, 0, 0] = 0
+    assert diagnostic["cons"][0, 0, 0].item() == case["cons"][0][0]
+
+
+def test_task4_teacher_batch_adapter_accepts_empty_relation_tails():
+    t = _teacher(); state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
+    case = dict(_task4_case_input(t).case, b2b=[], p2b=[], pins=[])
+    case = t._sanitize_case(case, artifact=True)
+    direct, diagnostic = t._build_teacher_batches(case, torch.device("cpu"), state.cfg)
+    assert direct["b2b"].shape == diagnostic["b2b"].shape == (1, 0, 3)
+    assert direct["p2b"].shape == diagnostic["p2b"].shape == (1, 0, 3)
+    assert direct["pins"].shape == diagnostic["pins"].shape == (1, 0, 2)
+    assert direct["b2b"].dtype is torch.float32 and diagnostic["b2b"].dtype is torch.float64
+    assert direct["p2b"].dtype is torch.float32 and diagnostic["p2b"].dtype is torch.float64
+    assert direct["pins"].dtype is torch.float32 and diagnostic["pins"].dtype is torch.float64
+    assert direct["node_feat"].shape[-1] == state.cfg.node_feat_dim
+
+
+def test_task4_sample_uses_materialized_cfg_condition_once(monkeypatch):
+    t = _teacher(); state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
+    case = t._sanitize_case(_task4_case_input(t).case, artifact=True)
+    import icdc.engine as engine
+    original = engine.build_cond; calls = []
+    def spy(batch, cfg):
+        calls.append((batch, cfg))
+        return original(batch, cfg)
+    monkeypatch.setattr(engine, "build_cond", spy)
+    monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", lambda model, cond, schedule, **kwargs: torch.zeros((1, 3, 4), dtype=torch.float32), raising=False)
+    def decoder(raw, area, cons, tp, scale):
+        out = raw.detach().to(torch.float64).clone()
+        out[..., 2:] = 1.0
+        return out
+    monkeypatch.setattr(t, "_DECODE_RECTS", decoder, raising=False)
+    t._sample_direct_once(state, case, 7)
+    assert len(calls) == 1 and calls[0][1] is state.cfg
 
 
 def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch):
@@ -722,7 +769,7 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
         assert kwargs["z_known"].shape == (1, 3, 4) and kwargs["known_mask"].shape == (1, 3, 4)
         assert kwargs["z_known"].dtype == torch.float32 and kwargs["z_known"].device.type == "cpu"
         assert kwargs["known_mask"].dtype == torch.bool and kwargs["known_mask"].device.type == "cpu"
-        direct, _ = t._build_teacher_batches(case, torch.device("cpu"))
+        direct, _ = t._build_teacher_batches(case, torch.device("cpu"), state.cfg)
         import icdc.engine as engine
         expected_cond = engine.build_cond(direct, state.cfg)
         assert set(cond) == set(expected_cond)
@@ -2321,11 +2368,7 @@ def _policy_for(root):
 
 def _task4_verified_checkpoint(t, root):
     """Create the smallest canonical checkpoint and bind policy to its bytes."""
-    checkpoint = {
-        "model": {"weight": torch.tensor([1.0])},
-        "ema": {"weight": torch.tensor([1.0])},
-        "model_config": {"hidden": 1},
-    }
+    checkpoint = _task4_teacher_payload()
     path = root / "unused.th"
     torch.save(checkpoint, path)
     identity = t._checkpoint_identity(checkpoint)
