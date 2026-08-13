@@ -2314,6 +2314,7 @@ def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destina
 def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path, monkeypatch):
     """P1-C globally registers before replaying one spooled case at a time."""
     t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    heldout_mod = 2
     _task4_shard(root, relative_path="worker_2/layouts_0.th")
     _task4_shard(root, relative_path="worker_2/layouts_2.th", metric_delta=2)
     _task4_shard(root, relative_path="worker_2/layouts_10.th", metric_delta=10)
@@ -2358,14 +2359,24 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
     monkeypatch.setattr(torch, "load", load)
     monkeypatch.setattr(t._PopulationAccumulator, "register", register)
     monkeypatch.setattr(t._JsonlWriter, "write", write)
-    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert t.teacher_main(
+        _task4_args(root, out, heldout_mod=heldout_mod), _trust_policy=_policy_for(root)
+    ) == 0
 
     expected_paths = ["worker_2/layouts_0.th", "worker_2/layouts_2.th",
                       "worker_2/layouts_10.th"]
     assert reader_calls == [(2, 0), (2, 2), (2, 10)]
     assert [event[1] for event in events if event[0] == "load"] == [
         (root / relative_path).read_bytes() for relative_path in expected_paths]
-    heldout_ids = [f"{relative_path}#1" for relative_path in expected_paths]
+    expected_all = [
+        f"{relative_path}#{index}"
+        for relative_path in expected_paths
+        for index in range(2)
+    ]
+    heldout_ids = [
+        instance_id for instance_id in expected_all
+        if split_for_id(instance_id, heldout_mod) == "heldout"
+    ]
     assert [event[1] for event in events if event[0] == "register"] == heldout_ids
     first_process = next(index for index, event in enumerate(events) if event[0] == "process")
     assert all(index < first_process for index, event in enumerate(events)
@@ -2373,11 +2384,6 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
     first_write = next(index for index, event in enumerate(events) if event[0] == "write")
     assert first_process < first_write
 
-    expected_all = [
-        f"{relative_path}#{index}"
-        for relative_path in expected_paths
-        for index in range(2)
-    ]
     assert [case.case["instance_id"] for case in calls] == expected_all
     assert len(calls) == len(expected_all) == len({case.case["instance_id"] for case in calls})
     assert {case.case["instance_id"] for case in calls} == set(expected_all)
