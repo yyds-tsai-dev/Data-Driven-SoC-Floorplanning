@@ -50,6 +50,7 @@ import icdc.topology_prior as topology_prior
 def test_teacher_publish_b2_atomic_success_uses_one_noreplace_attempt(tmp_path, monkeypatch):
     t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"
     stage.mkdir(); (stage / "sentinel").write_text("owned")
+    lease = t._new_staging_lease(stage)
     original_inode = stage.stat().st_ino; calls = []
 
     def rename_once(source, dest):
@@ -57,21 +58,21 @@ def test_teacher_publish_b2_atomic_success_uses_one_noreplace_attempt(tmp_path, 
         os.rename(source, dest)
 
     monkeypatch.setattr(t, "_renameat2_noreplace", rename_once, raising=False)
-    t._publish_staging(stage, destination)
+    t._publish_staging(lease, destination)
     assert len(calls) == 1 and not stage.exists()
     assert destination.stat().st_ino == original_inode
 
 
 @pytest.mark.parametrize("err", [errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL, errno.EXDEV])
 def test_teacher_publish_b2_platform_errors_propagate_without_fallback(tmp_path, monkeypatch, err):
-    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir()
+    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir(); lease = t._new_staging_lease(stage)
     calls = []
     def fail_once(source, dest):
         calls.append((source, dest)); raise OSError(err, os.strerror(err))
     monkeypatch.setattr(t, "_renameat2_noreplace", fail_once, raising=False)
     monkeypatch.setattr(os, "rename", lambda *a: pytest.fail("fallback rename"))
     monkeypatch.setattr(os, "replace", lambda *a: pytest.fail("fallback replace"))
-    with pytest.raises(OSError) as exc: t._publish_staging(stage, destination)
+    with pytest.raises(OSError) as exc: t._publish_staging(lease, destination)
     assert exc.value.errno == err and len(calls) == 1
     assert stage.exists() and not destination.exists()
 
@@ -79,50 +80,89 @@ def test_teacher_publish_b2_platform_errors_propagate_without_fallback(tmp_path,
 @pytest.mark.parametrize("err", [errno.EEXIST, errno.ENOTEMPTY])
 def test_teacher_publish_b2_existing_destination_is_untouched(tmp_path, monkeypatch, err):
     t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"
-    stage.mkdir(); destination.mkdir(); (destination / "sentinel").write_text("foreign")
+    stage.mkdir(); lease = t._new_staging_lease(stage); destination.mkdir(); (destination / "sentinel").write_text("foreign")
     inode = destination.stat().st_ino
-    monkeypatch.setattr(t, "_renameat2_noreplace", lambda *a: (_ for _ in ()).throw(OSError(err, "busy")), raising=False)
-    with pytest.raises(ValueError, match="existing output"): t._publish_staging(stage, destination)
+    calls = []
+    def fail_once(*args): calls.append(args); raise OSError(err, "busy")
+    monkeypatch.setattr(t, "_renameat2_noreplace", fail_once, raising=False)
+    with pytest.raises(ValueError, match="existing output"): t._publish_staging(lease, destination)
+    assert len(calls) == 1
     assert destination.stat().st_ino == inode and (destination / "sentinel").read_text() == "foreign"
 
 
 def test_teacher_publish_b2_eintr_precommit_is_not_retried(tmp_path, monkeypatch):
-    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir()
+    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir(); lease = t._new_staging_lease(stage)
     inode = stage.stat().st_ino; calls = []
     def interrupted(*args):
         calls.append(args); raise InterruptedError(errno.EINTR, "interrupted")
     monkeypatch.setattr(t, "_renameat2_noreplace", interrupted, raising=False)
-    with pytest.raises(InterruptedError): t._publish_staging(stage, destination)
+    with pytest.raises(InterruptedError): t._publish_staging(lease, destination)
     assert len(calls) == 1 and stage.stat().st_ino == inode and not destination.exists()
 
 
 def test_teacher_publish_b2_eintr_postcommit_accepts_exact_lease(tmp_path, monkeypatch):
-    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir()
+    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir(); lease = t._new_staging_lease(stage)
     inode = stage.stat().st_ino
     def moved_then_interrupted(source, dest):
         os.rename(source, dest); raise InterruptedError(errno.EINTR, "interrupted")
     monkeypatch.setattr(t, "_renameat2_noreplace", moved_then_interrupted, raising=False)
-    t._publish_staging(stage, destination)
+    t._publish_staging(lease, destination)
     assert not stage.exists() and destination.stat().st_ino == inode
 
 
-def test_teacher_publish_b2_lease_cleanup_refuses_replacement(tmp_path):
-    t = _teacher(); stage = tmp_path / "stage"; sentinel = tmp_path / "sentinel"; stage.mkdir(); sentinel.mkdir()
-    lease = getattr(t, "_new_staging_lease", lambda p: p)(stage)
-    path = Path(getattr(lease, "path", lease)); path.rmdir(); path.symlink_to(sentinel, target_is_directory=True)
-    cleanup = getattr(t, "_cleanup_owned_staging")
-    cleanup(lease)
-    assert sentinel.exists() and path.is_symlink()
+def test_teacher_publish_b2_lease_cleanup_requires_exact_identity(tmp_path):
+    t = _teacher(); cleanup = t._cleanup_owned_staging
+    exact = tmp_path / "exact"; exact.mkdir(); lease = t._new_staging_lease(exact)
+    assert cleanup(lease) is True and not exact.exists()
+    for kind in ("symlink", "foreign"):
+        stage = tmp_path / kind; stage.mkdir(); lease = t._new_staging_lease(stage)
+        sentinel = tmp_path / (kind + "-sentinel"); sentinel.mkdir(); (sentinel / "keep").write_text("keep")
+        stage.rmdir()
+        if kind == "symlink": stage.symlink_to(sentinel, target_is_directory=True)
+        else: stage.mkdir(); (stage / "keep").write_text("keep")
+        assert cleanup(lease) is False and stage.exists() and (sentinel / "keep").exists()
 
 
 def test_teacher_publish_b2_ambiguous_eintr_never_deletes_foreign_destination(tmp_path, monkeypatch):
-    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir()
+    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir(); lease = t._new_staging_lease(stage)
+    moved = tmp_path / "moved-owned"
     def ambiguous(source, dest):
-        os.rename(source, dest); (dest / "foreign").write_text("foreign"); raise InterruptedError(errno.EINTR, "interrupted")
+        os.rename(source, moved); Path(dest).mkdir(); (Path(dest) / "foreign").write_text("foreign"); raise InterruptedError(errno.EINTR, "interrupted")
     monkeypatch.setattr(t, "_renameat2_noreplace", ambiguous, raising=False)
     with pytest.raises(RuntimeError, match="ambiguous"):
-        t._publish_staging(stage, destination)
-    assert destination.exists() and (destination / "foreign").read_text() == "foreign"
+        t._publish_staging(lease, destination)
+    assert destination.exists() and (destination / "foreign").read_text() == "foreign" and moved.exists()
+
+
+def test_teacher_publish_b2_eintr_ambiguous_source_replacement_is_untouched(tmp_path, monkeypatch):
+    t = _teacher(); stage = tmp_path / "stage"; destination = tmp_path / "out"; stage.mkdir(); lease = t._new_staging_lease(stage)
+    moved = tmp_path / "moved-owned"
+    def ambiguous(source, dest):
+        os.rename(source, moved); Path(source).mkdir(); (Path(source) / "foreign").write_text("foreign"); raise InterruptedError(errno.EINTR, "interrupted")
+    monkeypatch.setattr(t, "_renameat2_noreplace", ambiguous, raising=False)
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        t._publish_staging(lease, destination)
+    assert not destination.exists() and (stage / "foreign").read_text() == "foreign" and moved.exists()
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "foreign"])
+def test_teacher_publish_b2_transaction_cleanup_refuses_replacement(tmp_path, monkeypatch, replacement):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    _task4_fake_runtime(t, monkeypatch); stages = []
+    real_new = t._new_staging
+    def new_staging(destination):
+        stage = real_new(destination); stages.append(Path(getattr(stage, "path", stage))); return stage
+    monkeypatch.setattr(t, "_new_staging", new_staging)
+    moved = tmp_path / "moved-owned"; sentinel = tmp_path / "sentinel"; sentinel.mkdir(); (sentinel / "keep").write_text("keep")
+    marker = RuntimeError("publish sentinel")
+    def publish(stage, destination):
+        path = Path(getattr(stage, "path", stage)); os.rename(path, moved)
+        if replacement == "symlink": path.symlink_to(sentinel, target_is_directory=True)
+        else: path.mkdir(); (path / "foreign").write_text("foreign")
+        raise marker
+    monkeypatch.setattr(t, "_publish_staging", publish)
+    with pytest.raises(RuntimeError, match="publish sentinel") as exc: t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert exc.value is marker and not out.exists() and moved.exists() and sentinel.exists()
 
 
 # ---------------------------------------------------------------------------
