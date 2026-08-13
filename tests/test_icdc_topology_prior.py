@@ -1268,12 +1268,13 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
     assert events == expected_events
 
 
-def test_teacher_canonical_ascii_discovery_binds_paths_and_ignores_unicode_decoys(tmp_path, monkeypatch):
+def test_teacher_evidence_a_canonical_ascii_discovery_binds_paths_and_ignores_unicode_decoys(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
     # These names must not become valid after parse-to-int/path reconstruction.
     _task4_single_shard(root, "worker_02/layouts_00.th", metric_delta=9)
     _task4_single_shard(root, "worker_²/layouts_⁰.th", metric_delta=8)
     _task4_single_shard(root, "worker_2/layouts_０.th", metric_delta=7)
+    _task4_single_shard(root, "worker_١/layouts_١.th", metric_delta=6)
     calls = []; _task4_fake_runtime(t, monkeypatch, calls=calls)
     out = tmp_path / "out"
     assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
@@ -1283,14 +1284,14 @@ def test_teacher_canonical_ascii_discovery_binds_paths_and_ignores_unicode_decoy
     assert all("02" not in c.receipt.relative_path for c in calls)
 
 
-def test_teacher_validate_source_shard_uses_bounded_finite_checks(monkeypatch):
+def test_teacher_evidence_a_validate_source_shard_uses_bounded_finite_checks(monkeypatch):
     t = _teacher(); source = _task4_padded_tensors()
     monkeypatch.setattr(torch, "cat", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("validation concatenated source tensors")))
-    assert t._validate_source_shard(source) == (2, 3)
+    assert t._validate_source_shard(source) == (2, 4)
 
 
-def test_teacher_json_serialization_always_disables_nan(tmp_path, monkeypatch):
+def test_teacher_evidence_a_json_serialization_always_disables_nan(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
     _task4_fake_runtime(t, monkeypatch); out = tmp_path / "out"
     real_dumps = t.json.dumps; seen = []
@@ -1313,7 +1314,7 @@ def test_teacher_json_serialization_always_disables_nan(tmp_path, monkeypatch):
     ("hard", {}, "hard"), ("hard", {1: True}, "hard"),
     ("hard", {"legal": 1}, "hard"), ("hard", {"legal": False}, "hard"),
 ])
-def test_teacher_diagnostic_evidence_schema_is_semantically_rejected(
+def test_teacher_evidence_a_diagnostic_evidence_schema_is_semantically_rejected(
         tmp_path, monkeypatch, field, value, match):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
     out = tmp_path / "out"; calls, _ = _task4_install_custom_runtime(
