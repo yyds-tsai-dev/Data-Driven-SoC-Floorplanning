@@ -1960,6 +1960,101 @@ def test_teacher_runtime_preflight_binds_verified_checkpoint_and_literal_scorer_
         runtime.process_case(None)
 
 
+def test_teacher_scorer_source_file_seam_rejects_symlink_and_is_static(tmp_path, monkeypatch):
+    t = _teacher()
+    scorer_path = (t._REPO / "scripts" / "iccad2026_evaluate.py").absolute()
+    assert t._SCORER_PATH == scorer_path
+    t._verify_scorer_source_file(scorer_path, t._SCORER_SHA256)
+    symlink = tmp_path / "iccad2026_evaluate.py"
+    symlink.symlink_to(scorer_path)
+    with pytest.raises(ValueError, match="scorer_sha256"):
+        t._verify_scorer_source_file(symlink, t._SCORER_SHA256)
+
+    monkeypatch.setattr(t, "_SCORER_PATH", symlink)
+    root = tmp_path / "canonical"; root.mkdir()
+    checkpoint, policy = _task4_verified_checkpoint(t, root)
+    with pytest.raises(ValueError, match="scorer_sha256"):
+        t._runtime_hooks().preflight(policy, checkpoint)
+
+
+def test_teacher_scorer_source_seam_is_frozen_before_static_evaluator_import():
+    path = Path("scripts/probes/icdc_topology_teacher.py")
+    tree = ast.parse(path.read_text())
+    evaluator_imports = [
+        node for node in tree.body
+        if isinstance(node, ast.Import)
+        and any(alias.name == "iccad2026_evaluate" and alias.asname == "_EVALUATOR"
+                for alias in node.names)
+    ]
+    assert len(evaluator_imports) == 1
+    evaluator_line = evaluator_imports[0].lineno
+    assignments = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id in {"_SCORER_SHA256", "_SCORER_PATH"}:
+                assignments[target.id] = node.lineno
+    assert set(assignments) == {"_SCORER_SHA256", "_SCORER_PATH"}
+    helper_defs = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_verify_scorer_source_file"
+    ]
+    assert len(helper_defs) == 1
+    helper_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "_verify_scorer_source_file"
+    ]
+    assert helper_calls
+    assert all(line < evaluator_line for line in (*assignments.values(), helper_defs[0].lineno,
+                                                    *(node.lineno for node in helper_calls)))
+    dynamic_imports = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ((isinstance(node.func, ast.Name) and node.func.id == "__import__")
+             or (isinstance(node.func, ast.Attribute) and node.func.attr == "import_module"))
+    ]
+    assert not dynamic_imports
+
+
+def test_teacher_runtime_preflight_rejects_boolean_median_runtime_signature(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
+    checkpoint, policy = _task4_verified_checkpoint(t, root)
+    evaluator = t._EVALUATOR
+
+    def bad_evaluate_solution(
+        solution, baseline_metrics, target_constraints, b2b_connectivity,
+        p2b_connectivity, pins_pos, target_areas, target_positions=None,
+        median_runtime=True,
+    ):
+        return None
+
+    monkeypatch.setattr(evaluator, "evaluate_solution", bad_evaluate_solution)
+    with pytest.raises(ValueError, match="evaluate_solution_signature"):
+        t._runtime_hooks().preflight(policy, checkpoint)
+
+
+def test_teacher_runtime_preflight_failure_clears_trusted_process_state(tmp_path):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
+    checkpoint, policy = _task4_verified_checkpoint(t, root)
+    runtime = t._runtime_hooks()
+    assert runtime.preflight(policy, checkpoint) == _task4_expected_trust(policy)
+    bad_policy = dataclasses.replace(policy, expected_scorer_sha256="0" * 64)
+    with pytest.raises(ValueError, match="scorer_sha256"):
+        runtime.preflight(bad_policy, checkpoint)
+    with pytest.raises(RuntimeError, match="before trusted preflight"):
+        runtime.process_case(None)
+
+
+def test_teacher_runtime_preflight_rejects_non_dataclass_metrics(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
+    checkpoint, policy = _task4_verified_checkpoint(t, root)
+    monkeypatch.setattr(t._EVALUATOR, "SolutionMetrics", object)
+    with pytest.raises(ValueError, match="cost_no_runtime"):
+        t._runtime_hooks().preflight(policy, checkpoint)
+
+
 @pytest.mark.parametrize("broken, expected_label", [
     ("scorer_sha256", "scorer_sha256"),
     ("shapely_available", "shapely_available"),
