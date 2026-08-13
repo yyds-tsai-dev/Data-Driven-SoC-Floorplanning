@@ -870,15 +870,22 @@ class _PopulationAccumulator:
 
     def _close_spool(self) -> None:
         db, self._db = self._db, None
+        primary: Optional[BaseException] = None
         if db is not None:
             try:
                 db.close()
-            finally:
-                for path in (self._db_path, Path(str(self._db_path) + "-journal")):
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
+            except BaseException as exc:
+                primary = exc
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            try:
+                Path(f"{self._db_path}{suffix}").unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+        if primary is not None:
+            raise primary
 
     def abort(self) -> None:
         try:
@@ -1052,7 +1059,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         _fsync_dir()
         _publish_staging(staging, destination)
         return 0 if authorized else 1
-    except Exception:
+    except BaseException:
         if population is not None:
             population.abort()
         if writer is not None:
