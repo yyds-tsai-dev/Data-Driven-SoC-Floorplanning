@@ -25,10 +25,31 @@ from types import MappingProxyType
 from typing import Any, Callable, Optional
 
 _REPO = Path(__file__).resolve().parents[2]
+_SCORER_SHA256 = "7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1"
+_SCORER_PATH = (_REPO / "scripts" / "iccad2026_evaluate.py").absolute()
+
+
+def _verify_scorer_source_file(path: Path, expected_sha: str) -> str:
+    try:
+        if (not isinstance(path, Path)
+                or any(component.is_symlink() for component in (path, *path.parents))
+                or not path.is_file()):
+            raise ValueError
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise ValueError
+        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_sha != expected_sha:
+            raise ValueError
+        return actual_sha
+    except Exception as exc:
+        raise ValueError("scorer_sha256") from exc
+
+
 for _path in (_REPO / "FloorSet" / "iccad2026contest", _REPO / "FloorSet", _REPO / "scripts", _REPO / "partner"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+_verify_scorer_source_file(_SCORER_PATH, _SCORER_SHA256)
 import shapely
 import iccad2026_evaluate as _EVALUATOR
 
@@ -68,50 +89,73 @@ class _TeacherRuntime:
     authorizing: bool
 
 def _runtime_hooks() -> _TeacherRuntime:
-    trusted: dict[str, Any] = {}
+    trusted: Optional[Mapping[str, Any]] = None
 
     def preflight(policy: TeacherTrustPolicy, checkpoint: Path) -> Mapping[str, Any]:
+        nonlocal trusted
+        trusted = None
         verified_scorer = _verify_frozen_scorer_contract(policy)
         payload, identity = _load_verified_checkpoint_bytes(checkpoint, policy)
+        model_identity = {
+            key: value for key, value in identity.items() if key != "checkpoint_sha256"
+        }
         value = {"trust_ok": True, "input_ok": True, "scorer_ok": True,
                  "checkpoint_sha256": identity["checkpoint_sha256"],
-                 "model_identity": dict(policy.allowed_model_identity),
+                 "model_identity": model_identity,
                  "scorer_sha256": verified_scorer["scorer_sha256"],
                  "scorer_contract": verified_scorer["scorer_contract"],
                  "shapely_version": verified_scorer["shapely_version"]}
-        trusted.update({"payload": payload, "scorer": _EVALUATOR, "trust": value})
+        trusted = {"payload": payload, "scorer": _EVALUATOR, "trust": value}
         return value
 
     def process_case(_case: _CaseInput) -> _CaseOutcome:
-        if not trusted:
-            raise RuntimeError("teacher process runtime not implemented")
+        if trusted is None:
+            raise RuntimeError("teacher process before trusted preflight")
         raise RuntimeError("teacher process runtime not implemented")
 
     return _TeacherRuntime(preflight, process_case, False)
 
 
 def _verify_frozen_scorer_contract(policy: TeacherTrustPolicy) -> Mapping[str, str]:
-    scorer_path = (_REPO / "scripts" / "iccad2026_evaluate.py").resolve()
-    origin = Path(getattr(_EVALUATOR, "__file__", "")).resolve()
-    if origin != scorer_path or not scorer_path.is_file() or scorer_path.is_symlink():
-        raise ValueError("scorer_sha256")
-    actual = hashlib.sha256(scorer_path.read_bytes()).hexdigest()
-    if actual != policy.expected_scorer_sha256 or actual != _SCORER_SHA256:
+    try:
+        actual = _verify_scorer_source_file(_SCORER_PATH, policy.expected_scorer_sha256)
+        origin = Path(_EVALUATOR.__file__).absolute()
+        if origin != _SCORER_PATH or origin.is_symlink():
+            raise ValueError
+    except Exception as exc:
+        raise ValueError("scorer_sha256") from exc
+    if actual != _SCORER_SHA256:
         raise ValueError("scorer_sha256")
     if policy.scorer_contract != "iccad2026_evaluate_cost_no_runtime_v1":
         raise ValueError("scorer_contract")
-    if getattr(_EVALUATOR, "SHAPELY_AVAILABLE", None) is not True:
+    try:
+        shapely_available = _EVALUATOR.SHAPELY_AVAILABLE
+    except Exception as exc:
+        raise ValueError("shapely_available") from exc
+    if shapely_available is not True:
         raise ValueError("shapely_available")
-    if getattr(shapely, "__version__", None) != policy.shapely_version:
+    try:
+        shapely_version = shapely.__version__
+    except Exception as exc:
+        raise ValueError("shapely_version") from exc
+    if shapely_version != policy.shapely_version:
         raise ValueError("shapely_version")
     expected = ["solution", "baseline_metrics", "target_constraints", "b2b_connectivity", "p2b_connectivity", "pins_pos", "target_areas", "target_positions", "median_runtime"]
     try:
         params = list(inspect.signature(_EVALUATOR.evaluate_solution).parameters.values())
-        if len(params) != 9 or [p.name for p in params] != expected or any(p.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params) or any(p.default is not inspect.Parameter.empty for p in params[:7]) or params[7].default is not None or params[8].default != 1.0:
+        if (len(params) != 9 or [p.name for p in params] != expected
+                or any(p.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
+                or any(p.default is not inspect.Parameter.empty for p in params[:7])
+                or params[7].default is not None
+                or type(params[8].default) is not float or params[8].default != 1.0):
             raise ValueError
     except Exception as exc:
         raise ValueError("evaluate_solution_signature") from exc
-    if not any(f.name == "cost_no_runtime" for f in fields(_EVALUATOR.SolutionMetrics)):
+    try:
+        metric_fields = fields(_EVALUATOR.SolutionMetrics)
+    except Exception as exc:
+        raise ValueError("cost_no_runtime") from exc
+    if not any(f.name == "cost_no_runtime" for f in metric_fields):
         raise ValueError("cost_no_runtime")
     counts = [7, 19, 43]
     costs = [1.25, 2.5, 4.75]
@@ -126,7 +170,6 @@ def _verify_frozen_scorer_contract(policy: TeacherTrustPolicy) -> Mapping[str, s
     return {"scorer_sha256": actual, "scorer_contract": policy.scorer_contract, "shapely_version": policy.shapely_version}
 
 _CHECKPOINT_SHA256 = "508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659"
-_SCORER_SHA256 = "7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1"
 _MODEL_IDENTITY = MappingProxyType({
     "identity_schema": IDENTITY_SCHEMA,
     "model_config_sha256": "4c6a1e19f0574af348efa81a758c05524522ad3501d46f18e839774fa933971b",
