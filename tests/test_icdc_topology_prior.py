@@ -333,9 +333,9 @@ def _task4_tensors(*, soft_delta=0, metric_delta=0):
     )
     if soft_delta:
         fp[0, 0, 2:] += soft_delta
-        fp[0, 1, :2] += soft_delta
+        fp[0, 1, 2:] += soft_delta
         fp[1, 0, 2:] += soft_delta
-        fp[1, 1, :2] += soft_delta
+        fp[1, 1, 2:] += soft_delta
     metrics = torch.tensor(
         [[100 + metric_delta, 0, 0, 0, 0, 0, 2, 3],
          [200 + metric_delta, 0, 0, 0, 0, 0, 5, 7]],
@@ -386,10 +386,27 @@ def _task4_expected_case(index):
     }
 
 
-def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None):
+def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None,
+                        preflight_calls=None, events=None):
     calls = [] if calls is None else calls
+    preflight_calls = [] if preflight_calls is None else preflight_calls
+    events = [] if events is None else events
+    case_input_type = getattr(t, "_CaseInput", _Task4CaseInput)
+    case_outcome_type = getattr(t, "_CaseOutcome", _Task4CaseOutcome)
+    runtime_type = getattr(t, "_TeacherRuntime", _Task4Runtime)
+    if case_input_type is not _Task4CaseInput:
+        assert [field.name for field in dataclasses.fields(case_input_type)] == [
+            "case", "receipt", "partition", "sample_seed"]
+    if case_outcome_type is not _Task4CaseOutcome:
+        assert [field.name for field in dataclasses.fields(case_outcome_type)] == [
+            "label_row", "proposal_rows", "rejection_rows", "base_cost",
+            "teacher_cost", "legal", "covered"]
+    if runtime_type is not _Task4Runtime:
+        assert [field.name for field in dataclasses.fields(runtime_type)] == [
+            "preflight", "process_case", "authorizing"]
 
     def preflight(policy, checkpoint):
+        preflight_calls.append((policy, checkpoint))
         return {
             "trust_ok": True, "input_ok": True, "scorer_ok": True,
             "checkpoint_sha256": policy.expected_checkpoint_sha256,
@@ -401,9 +418,11 @@ def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None):
 
     def process_case(case_input):
         calls.append(case_input)
+        events.append(("process", case_input.receipt.relative_path,
+                       case_input.receipt.layout_index))
         if fail_at is not None and len(calls) - 1 == fail_at:
             raise _Task4ProcessFailure(f"process failure at {fail_at}")
-        return _Task4CaseOutcome(
+        return case_outcome_type(
             label_row={"edges": [], "contacts": [], "pin_paths": []},
             proposal_rows=({
                 "ordinal": 0, "name": "base", "intended_intent": "base",
@@ -417,7 +436,7 @@ def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None):
         )
 
     monkeypatch.setattr(
-        t, "_runtime_hooks", lambda: _Task4Runtime(preflight, process_case, True),
+        t, "_runtime_hooks", lambda: runtime_type(preflight, process_case, True),
         raising=False,
     )
     return calls
@@ -434,15 +453,18 @@ def _task4_args(root, out, *, n_min=1, heldout_mod=2, max_files=None):
 
 
 def _task4_run(tmp_path, monkeypatch, *, n_min=1, max_files=None,
-               soft_delta=0, relative_path="worker_2/layouts_0.th", fail_at=None):
+               soft_delta=0, relative_path="worker_2/layouts_0.th", fail_at=None,
+               preflight_calls=None, events=None, policy=None):
     t = _teacher()
     root = tmp_path / "floorset_lite"
     _task4_shard(root, soft_delta=soft_delta, relative_path=relative_path)
     out = tmp_path / "out"
-    calls = _task4_fake_runtime(t, monkeypatch, fail_at=fail_at)
+    calls = _task4_fake_runtime(t, monkeypatch, fail_at=fail_at,
+                                preflight_calls=preflight_calls, events=events)
+    policy = _policy_for(root) if policy is None else policy
     result = t.teacher_main(
         _task4_args(root, out, n_min=n_min, max_files=max_files),
-        _trust_policy=_policy_for(root),
+        _trust_policy=policy,
     )
     return t, root, out, calls, result
 
@@ -473,18 +495,28 @@ def _task4_envelope(case, receipt, partition, sample_seed):
             "partition": partition, "sample_seed": sample_seed, "n": case["n"]}
 
 
-def _task4_normalize(value, *, manifest=False):
-    if isinstance(value, dict):
-        value = {key: _task4_normalize(item, manifest=manifest)
-                 for key, item in value.items()}
-        if "file_sha256" in value:
-            value["file_sha256"] = "SOURCE_SHA_SENTINEL"
-        if manifest:
-            value.pop("support_hashes", None)
-            value.pop("self_sha256", None)
+def _task4_normalize_known_hashes(value, *, kind):
+    """Normalize only receipt hashes and root manifest hashes for soft-fp comparison."""
+    if kind == "index":
+        normalized = dict(value)
+        rows = normalized["rows"]
+        normalized["rows"] = _task4_normalize_known_hashes(rows, kind="label")
+        return normalized
+    if kind in {"label", "proposal"}:
+        rows = value if isinstance(value, list) else [value]
+        normalized = []
+        for row in rows:
+            row = dict(row)
+            receipt = dict(row["receipt"])
+            receipt["file_sha256"] = "SOURCE_SHA_SENTINEL"
+            row["receipt"] = receipt
+            normalized.append(row)
+        return normalized if isinstance(value, list) else normalized[0]
+    if kind == "manifest":
+        value = dict(value)
+        value.pop("support_hashes", None)
+        value.pop("self_sha256", None)
         return value
-    if isinstance(value, list):
-        return [_task4_normalize(item, manifest=manifest) for item in value]
     return value
 
 
@@ -493,78 +525,140 @@ def _task4_artifact_projection(out):
     for name in _TASK4_FILES:
         path = out / name
         if name in _TASK4_JSONL:
-            projection[name] = _task4_normalize(_task4_jsonl(path))
+            kind = "label" if "labels" in name else "proposal" if name == "proposals.jsonl" else "corpus"
+            projection[name] = _task4_normalize_known_hashes(_task4_jsonl(path), kind=kind)
+        elif name == "training_index.json":
+            projection[name] = _task4_normalize_known_hashes(
+                json.loads(path.read_text()), kind="index"
+            )
         else:
-            projection[name] = _task4_normalize(
-                json.loads(path.read_text()), manifest=name == "g0_manifest.json"
+            projection[name] = _task4_normalize_known_hashes(
+                json.loads(path.read_text()), kind="manifest"
             )
     return projection
 
 
-def test_teacher_source_transaction_publishes_exact_sanitized_evidence(tmp_path, monkeypatch):
-    t, root, out, calls, result = _task4_run(tmp_path, monkeypatch)
-    assert result == 0
+def _task4_expected_trust(policy):
+    return {
+        "trust_ok": True, "input_ok": True, "scorer_ok": True,
+        "checkpoint_sha256": policy.expected_checkpoint_sha256,
+        "model_identity": dict(policy.allowed_model_identity),
+        "scorer_sha256": policy.expected_scorer_sha256,
+        "scorer_contract": policy.scorer_contract,
+        "shapely_version": policy.shapely_version,
+    }
+
+
+def _task4_assert_success_artifacts(t, root, out, calls, policy,
+                                    preflight_calls, *, bounded=False,
+                                    training_authorized=True,
+                                    state="TARGET_GAIN_MET"):
     assert sorted(path.name for path in out.iterdir()) == sorted(_TASK4_FILES)
-    assert [item.receipt.relative_path for item in calls] == ["worker_2/layouts_0.th"] * 2
-    assert [source_instance_id(item.receipt) for item in calls] == [
-        "worker_2/layouts_0.th#0", "worker_2/layouts_0.th#1"]
-    assert [item.partition for item in calls] == ["train", "heldout"]
-    assert all(item.sample_seed == t._sample_seed(20260813, source_instance_id(item.receipt), 0)
-               for item in calls)
-
     expected_cases = [_task4_expected_case(0), _task4_expected_case(1)]
-    train_rows = _task4_jsonl(out / "train_corpus.jsonl")
-    heldout_rows = _task4_jsonl(out / "heldout_corpus.jsonl")
-    assert train_rows == [expected_cases[0]]
-    assert heldout_rows == [expected_cases[1]]
-    assert (out / "train_corpus.jsonl").read_bytes() == _task4_canonical_json(train_rows[0]) + b"\n"
-    assert (out / "heldout_corpus.jsonl").read_bytes() == _task4_canonical_json(heldout_rows[0]) + b"\n"
-
     expected_receipts = [_task4_receipt(root / "worker_2/layouts_0.th", i, expected_cases[i])
                          for i in range(2)]
+    assert [item.case for item in calls] == expected_cases
+    assert [source_instance_id(item.receipt) for item in calls] == [case["instance_id"] for case in expected_cases]
+    assert [item.partition for item in calls] == ["train", "heldout"]
+    assert [item.sample_seed for item in calls] == [
+        t._sample_seed(20260813, case["instance_id"], 0) for case in expected_cases]
+    assert len(preflight_calls) == 1
+    assert preflight_calls[0] == (policy, root / "unused.th")
+
+    train_rows = _task4_jsonl(out / "train_corpus.jsonl")
+    heldout_rows = _task4_jsonl(out / "heldout_corpus.jsonl")
+    assert train_rows == [expected_cases[0]] and heldout_rows == [expected_cases[1]]
+    env = lambda i, partition: _task4_envelope(
+        expected_cases[i], expected_receipts[i], partition,
+        t._sample_seed(20260813, expected_cases[i]["instance_id"], 0),
+    )
+    expected_labels = [
+        {**env(0, "train"), "proposal_ordinal": 0, "proposal_name": "base",
+         "base_cost": 1.1, "teacher_cost": 1.0, "record_weight": 1.1,
+         "edges": [], "contacts": [], "pin_paths": []},
+        {**env(1, "heldout"), "proposal_ordinal": 0, "proposal_name": "base",
+         "base_cost": 1.1, "teacher_cost": 1.0, "record_weight": 1.1,
+         "edges": [], "contacts": [], "pin_paths": []},
+    ]
+    fake_fields = {
+        "ordinal": 0, "name": "base", "intended_intent": "base",
+        "admission_status": "admitted", "admission_reason": "fixture",
+        "drift": {"max_abs": 0.0}, "hard": {"legal": True},
+        "diagnostic_energy": 0.0, "official_cost": 1.0,
+        "feasible": True, "winner": True, "status": "winner",
+    }
+    expected_proposals = [{**env(0, "train"), **fake_fields},
+                          {**env(1, "heldout"), **fake_fields}]
+    assert _task4_jsonl(out / "train_labels.jsonl") == [expected_labels[0]]
+    assert _task4_jsonl(out / "heldout_labels.jsonl") == [expected_labels[1]]
+    assert _task4_jsonl(out / "proposals.jsonl") == expected_proposals
+    assert (out / "rejections.jsonl").read_bytes() == b""
+
     index = json.loads((out / "training_index.json").read_text())
     assert index["schema"] == "icdc_topology_training_index_v1"
     assert index["rows"] == [
         {"receipt": expected_receipts[i], "instance_id": expected_cases[i]["instance_id"],
-         "source_row_count": 2, "block_count": 3, "partition": ("train" if i == 0 else "heldout"),
-         "sample_ordinal": 0,
+         "source_row_count": 2, "block_count": 3,
+         "partition": ("train" if i == 0 else "heldout"), "sample_ordinal": 0,
          "sample_seed": t._sample_seed(20260813, expected_cases[i]["instance_id"], 0),
          "status": "processed"}
         for i in range(2)]
-    for partition, index in (("train", 0), ("heldout", 1)):
-        label_rows = _task4_jsonl(out / f"{partition}_labels.jsonl")
-        proposal_rows = _task4_jsonl(out / "proposals.jsonl")
-        assert len(label_rows) == 1
-        assert label_rows[0] == {
-            **_task4_envelope(expected_cases[index], expected_receipts[index], partition,
-                              t._sample_seed(20260813, expected_cases[index]["instance_id"], 0)),
-            "proposal_ordinal": 0, "proposal_name": "base", "base_cost": 1.1,
-            "teacher_cost": 1.0, "record_weight": 1.1,
-            "edges": [], "contacts": [], "pin_paths": [],
-        }
-        assert any(row["instance_id"] == expected_cases[index]["instance_id"] for row in proposal_rows)
-    assert _task4_jsonl(out / "rejections.jsonl") == []
 
+    expected_population = t._weighted_population([{
+        "relative_path": "worker_2/layouts_0.th", "layout_index": 1,
+        "instance_id": expected_cases[1]["instance_id"], "n": 3,
+        "base_cost": 1.1, "teacher_cost": 1.0,
+    }])
     manifest = json.loads((out / "g0_manifest.json").read_text())
+    assert set(manifest) == {"schema", "status", "state", "secondary_reasons",
+                             "training_authorized", "bounded_max_files", "trust",
+                             "population", "coverage", "support_hashes", "self_sha256"}
     assert manifest["schema"] == "icdc_topology_teacher_g0_v1"
     assert manifest["status"] == "complete"
-    assert manifest["state"] == "TARGET_GAIN_MET"
-    assert manifest["training_authorized"] is True
-    assert manifest["bounded_max_files"] is False
-    assert set(manifest["support_hashes"]) == set(_TASK4_FILES) - {"g0_manifest.json"}
+    assert manifest["state"] == state
+    assert manifest["secondary_reasons"] == []
+    assert manifest["training_authorized"] is training_authorized
+    assert manifest["bounded_max_files"] is bounded
+    assert manifest["trust"] == _task4_expected_trust(policy)
+    assert manifest["population"] == expected_population
+    assert manifest["coverage"] == {
+        "eligible_train": 1, "eligible_heldout": 1, "heldout_winners": 1,
+        "legal": True, "covered": True,
+    }
     assert manifest["support_hashes"] == {
         name: hashlib.sha256((out / name).read_bytes()).hexdigest()
         for name in _TASK4_FILES if name != "g0_manifest.json"
     }
     assert manifest["self_sha256"] == t._manifest_self_sha256(manifest)
+
+    for name in _TASK4_JSONL:
+        rows = _task4_jsonl(out / name)
+        expected_bytes = b"".join(_task4_canonical_json(row) + b"\n" for row in rows)
+        assert (out / name).read_bytes() == expected_bytes
+    for name in ("training_index.json", "g0_manifest.json"):
+        parsed = json.loads((out / name).read_text())
+        assert (out / name).read_bytes() == _task4_canonical_json(parsed) + b"\n"
     blobs = b"".join((out / name).read_bytes() for name in _TASK4_FILES)
     assert not any(str(secret).encode() in blobs for secret in (701, 703, 401, 403, 709, 719, 809, 811))
     assert b"timestamp" not in blobs and str(root).encode() not in blobs
+    return manifest
+
+
+def test_teacher_source_transaction_publishes_exact_sanitized_evidence(tmp_path, monkeypatch):
+    preflight_calls = []
+    policy = _policy_for(tmp_path / "floorset_lite")
+    t, root, out, calls, result = _task4_run(tmp_path, monkeypatch,
+                                             preflight_calls=preflight_calls,
+                                             policy=policy)
+    assert result == 0
+    _task4_assert_success_artifacts(t, root, out, calls, policy, preflight_calls)
 
 
 def test_teacher_source_reads_each_file_once_from_same_bytesio_under_path_swap(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; path = _task4_shard(root)
-    out = tmp_path / "out"; calls = _task4_fake_runtime(t, monkeypatch)
+    out = tmp_path / "out"; calls = []
+    preflight_calls = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls, preflight_calls=preflight_calls)
     original_bytes = path.read_bytes(); seen = []
     real_load = torch.load
 
@@ -576,11 +670,13 @@ def test_teacher_source_reads_each_file_once_from_same_bytesio_under_path_swap(t
         return real_load(source, **kwargs)
 
     monkeypatch.setattr(torch, "load", load_from_verified_bytes)
-    result = t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    policy = _policy_for(root)
+    result = t.teacher_main(_task4_args(root, out), _trust_policy=policy)
     assert result == 0 and seen == [original_bytes] and len(calls) == 2
     expected_sha = hashlib.sha256(original_bytes).hexdigest()
     index = json.loads((out / "training_index.json").read_text())
     assert {row["receipt"]["file_sha256"] for row in index["rows"]} == {expected_sha}
+    _task4_assert_success_artifacts(t, root, out, calls, policy, preflight_calls)
 
 
 @pytest.mark.parametrize("soft_delta", [1000, 2000])
@@ -605,10 +701,15 @@ def test_teacher_soft_fp_variants_only_change_narrow_source_hashes(tmp_path, mon
 def test_teacher_fresh_outputs_are_byte_identical_and_existing_output_is_untouched(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
     first, second = tmp_path / "first", tmp_path / "second"
-    _task4_fake_runtime(t, monkeypatch)
-    assert t.teacher_main(_task4_args(root, first), _trust_policy=_policy_for(root)) == 0
-    _task4_fake_runtime(t, monkeypatch)
-    assert t.teacher_main(_task4_args(root, second), _trust_policy=_policy_for(root)) == 0
+    policy = _policy_for(root)
+    calls_first = []; preflight_first = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls_first, preflight_calls=preflight_first)
+    assert t.teacher_main(_task4_args(root, first), _trust_policy=policy) == 0
+    _task4_assert_success_artifacts(t, root, first, calls_first, policy, preflight_first)
+    calls_second = []; preflight_second = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls_second, preflight_calls=preflight_second)
+    assert t.teacher_main(_task4_args(root, second), _trust_policy=policy) == 0
+    _task4_assert_success_artifacts(t, root, second, calls_second, policy, preflight_second)
     assert {name: (first / name).read_bytes() for name in _TASK4_FILES} == {
         name: (second / name).read_bytes() for name in _TASK4_FILES}
     before = {name: hashlib.sha256((first / name).read_bytes()).hexdigest() for name in _TASK4_FILES}
@@ -630,14 +731,13 @@ def test_teacher_process_failure_is_transactional_for_each_eligible_row(tmp_path
 
 def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
-    _task4_fake_runtime(t, monkeypatch)
+    policy = _policy_for(root); calls = []; preflight_calls = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls, preflight_calls=preflight_calls)
     inspected = {}
 
     def fail_publish(staging, destination):
         assert destination == out and staging.is_dir()
-        assert sorted(path.name for path in staging.iterdir()) == sorted(_TASK4_FILES)
-        manifest = json.loads((staging / "g0_manifest.json").read_text())
-        assert manifest["status"] == "complete"
+        _task4_assert_success_artifacts(t, root, staging, calls, policy, preflight_calls)
         inspected["ok"] = True
         raise _Task4PublishFailure("publish failure")
 
@@ -648,28 +748,63 @@ def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destina
 
 
 def test_teacher_excluded_rows_publish_empty_non_authorizing_terminal_evidence(tmp_path, monkeypatch):
-    t, root, out, calls, result = _task4_run(tmp_path, monkeypatch, n_min=4)
+    preflight_calls = []
+    policy = _policy_for(tmp_path / "floorset_lite")
+    t, root, out, calls, result = _task4_run(
+        tmp_path, monkeypatch, n_min=4, preflight_calls=preflight_calls, policy=policy)
     assert result != 0 and calls == []
     assert sorted(path.name for path in out.iterdir()) == sorted(_TASK4_FILES)
+    assert preflight_calls == [(policy, root / "unused.th")]
+    expected_cases = [_task4_expected_case(0), _task4_expected_case(1)]
+    expected_receipts = [_task4_receipt(root / "worker_2/layouts_0.th", i, expected_cases[i])
+                         for i in range(2)]
     index = json.loads((out / "training_index.json").read_text())
-    assert [row["instance_id"] for row in index["rows"]] == [
-        "worker_2/layouts_0.th#0", "worker_2/layouts_0.th#1"]
-    assert all(row["status"] == "excluded_n_min" for row in index["rows"])
-    assert all(row["partition"] is None and row["sample_ordinal"] is None and row["sample_seed"] is None
-               for row in index["rows"])
+    assert index["schema"] == "icdc_topology_training_index_v1"
+    assert index["rows"] == [
+        {"receipt": expected_receipts[i], "instance_id": expected_cases[i]["instance_id"],
+         "source_row_count": 2, "block_count": 3, "partition": None,
+         "sample_ordinal": None, "sample_seed": None, "status": "excluded_n_min"}
+        for i in range(2)]
     assert all((out / name).read_bytes() == b"" for name in _TASK4_JSONL)
     manifest = json.loads((out / "g0_manifest.json").read_text())
+    assert set(manifest) == {"schema", "status", "state", "secondary_reasons",
+                             "training_authorized", "bounded_max_files", "trust",
+                             "population", "coverage", "support_hashes", "self_sha256"}
     assert manifest["status"] == "complete"
     assert manifest["state"] == "KILLED_LEGALITY_OR_COVERAGE"
+    assert manifest["secondary_reasons"] == []
     assert manifest["training_authorized"] is False
+    assert manifest["bounded_max_files"] is False
+    assert manifest["trust"] == _task4_expected_trust(policy)
+    assert manifest["coverage"]["eligible_train"] == 0
+    assert manifest["coverage"]["eligible_heldout"] == 0
+    assert manifest["coverage"]["heldout_winners"] == 0
+    assert manifest["coverage"]["legal"] is True
+    assert manifest["coverage"]["covered"] is False
+    assert manifest["support_hashes"] == {
+        name: hashlib.sha256((out / name).read_bytes()).hexdigest()
+        for name in _TASK4_FILES if name != "g0_manifest.json"
+    }
+    assert manifest["self_sha256"] == t._manifest_self_sha256(manifest)
+    assert (out / "training_index.json").read_bytes() == _task4_canonical_json(index) + b"\n"
+    assert (out / "g0_manifest.json").read_bytes() == _task4_canonical_json(manifest) + b"\n"
 
 
 def test_teacher_bounded_max_files_is_non_authorizing_even_with_positive_fake_gain(tmp_path, monkeypatch):
-    t, root, out, calls, result = _task4_run(tmp_path, monkeypatch, max_files=1)
+    preflight_calls = []
+    policy = _policy_for(tmp_path / "floorset_lite")
+    t, root, out, calls, result = _task4_run(
+        tmp_path, monkeypatch, max_files=1, preflight_calls=preflight_calls, policy=policy)
     assert result != 0
-    manifest = json.loads((out / "g0_manifest.json").read_text())
-    assert manifest["bounded_max_files"] is True
-    assert manifest["training_authorized"] is False
+    manifest = _task4_assert_success_artifacts(
+        t, root, out, calls, policy, preflight_calls,
+        bounded=True, training_authorized=False)
+    assert len(calls) == 2
+    assert manifest["state"] == "TARGET_GAIN_MET"
+    assert manifest["coverage"] == {
+        "eligible_train": 1, "eligible_heldout": 1, "heldout_winners": 1,
+        "legal": True, "covered": True,
+    }
 
 
 def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, monkeypatch):
@@ -680,12 +815,16 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
     _task4_single_shard(root, "worker_10/layouts_0.th", metric_delta=4)
     decoy_a = root / "worker_2" / "layouts_bad.th"; decoy_a.write_bytes(b"bad")
     decoy_b = root / "worker_bad" / "layouts_0.th"; decoy_b.parent.mkdir(); decoy_b.write_bytes(b"bad")
-    calls = _task4_fake_runtime(t, monkeypatch)
+    calls = []; events = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls, events=events)
     loaded = []
     real_load = torch.load
 
     def count_load(source, **kwargs):
+        assert isinstance(source, io.BytesIO)
+        assert kwargs == {"weights_only": True, "map_location": "cpu"}
         loaded.append(source.getvalue())
+        events.append(("load", source.getvalue(), kwargs.copy()))
         return real_load(source, **kwargs)
 
     monkeypatch.setattr(torch, "load", count_load)
@@ -696,24 +835,29 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
         "worker_2/layouts_2.th", "worker_2/layouts_10.th",
         "worker_10/layouts_0.th"]
     assert len(loaded) == 4
+    expected_paths = ["worker_2/layouts_0.th", "worker_2/layouts_2.th",
+                      "worker_2/layouts_10.th", "worker_10/layouts_0.th"]
+    expected_events = []
+    for relative_path in expected_paths:
+        expected_events.append(("load", (root / relative_path).read_bytes(),
+                                {"weights_only": True, "map_location": "cpu"}))
+        expected_events.extend(
+            ("process", relative_path, index)
+            for index in ([0, 1] if relative_path == "worker_2/layouts_0.th" else [0])
+        )
+    assert events == expected_events
 
 
 def test_teacher_ast_guard_resolves_imports_aliases_and_bytesio_source_load_contract():
     tree = ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())
     aliases = {}
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for item in node.names:
                 aliases[item.asname or item.name.split(".")[0]] = item.name
         elif isinstance(node, ast.ImportFrom) and node.module:
             for item in node.names:
                 aliases[item.asname or item.name] = f"{node.module}.{item.name}"
-        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            value = node.value
-            if isinstance(value, ast.Name) and value.id in aliases:
-                aliases[node.targets[0].id] = aliases[value.id]
-            elif isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id in aliases:
-                aliases[node.targets[0].id] = f"{aliases[value.value.id]}.{value.attr}"
 
     def resolve(node):
         if isinstance(node, ast.Name):
@@ -723,28 +867,56 @@ def test_teacher_ast_guard_resolves_imports_aliases_and_bytesio_source_load_cont
             return f"{base}.{node.attr}"
         return ""
 
+    # Resolve ordinary one-level assignment aliases after imports, including
+    # aliases nested in a function body.
+    for _ in range(2):
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            value = node.value
+            resolved = resolve(value)
+            if resolved and resolved != target.id and (isinstance(value, (ast.Name, ast.Attribute))):
+                aliases[target.id] = resolved
+
     loads = []
     banned = ("load_test_cases", "FloorplanDatasetLiteTest", "BandFileSampler._instance",
               "golden", "validation")
     dynamic = {"__import__", "importlib.import_module", "getattr", "eval", "exec"}
     for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imported = [item.name for item in node.names]
+            assert not any(any(symbol == bad or symbol.endswith("." + bad)
+                               for bad in banned + ("_instance",)) for symbol in imported)
+        if isinstance(node, ast.Attribute):
+            assert node.attr not in {"golden", "_instance"}
+        if isinstance(node, ast.Subscript):
+            literal = node.slice.value if isinstance(node.slice, ast.Constant) else None
+            assert literal != "golden"
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         name = resolve(node.func)
-        assert name not in dynamic
+        assert name not in dynamic and not any(name.endswith("." + item) for item in dynamic)
         assert not any(name == item or name.endswith("." + item) for item in banned)
+        assert not any(keyword.arg is None for keyword in node.keywords)
+        assert name != "torch.serialization.load"
         if name == "torch.load":
             loads.append(node)
             assert len(node.args) == 1
             source = node.args[0]
             assert isinstance(source, ast.Call) and resolve(source.func) == "io.BytesIO"
             assert len(source.args) == 1
+            assert isinstance(source.args[0], ast.Name) and not source.keywords
             keyword_values = {
                 keyword.arg: keyword.value.value
                 for keyword in node.keywords
                 if keyword.arg is not None and isinstance(keyword.value, ast.Constant)
             }
             assert keyword_values == {"weights_only": True, "map_location": "cpu"}
+            assert len(keyword_values) == len(node.keywords) == 2
     assert loads
 
 
