@@ -241,6 +241,13 @@ def _axis_solve(c0: torch.Tensor, size: torch.Tensor, adj: torch.Tensor,
     if exact:
         seq = _exact_pass(lo.detach(), size.detach(), adj)
         mn = mn + (seq - mn).detach()          # straight-through
+        # Sequential exact abutment can move a mathematically fixed pin by a
+        # handful of ulps because it rebuilds coordinates through a different
+        # addition chain.  Snap only sub-contract residuals back to the
+        # authorized origin; a genuinely infeasible pin remains displaced and
+        # is still rejected by the drift/hard-legality gates.
+        near_pin = pinned & ((mn - pin_val).abs() <= PIN_TOL)
+        mn = torch.where(near_pin, pin_val, mn)
     drift = torch.where(pinned, mn - pin_val, torch.zeros_like(mn))
     if seat0 is not None and bool((seat0 > 0).any()):
         m = mask if mask is not None else torch.ones_like(pinned)

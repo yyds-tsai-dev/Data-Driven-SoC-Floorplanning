@@ -128,6 +128,30 @@ def test_pinned_blocks_stay_exact_when_drift_is_zero():
                                       torch.zeros_like(moved)), drift)
 
 
+def test_exact_pass_snaps_sub_tolerance_pin_roundoff_bit_exact(monkeypatch):
+    rects = torch.tensor(
+        [[[0.0, 0.0, 1.0, 1.0], [2.0, 2.0, 1.0, 1.0]]],
+        dtype=torch.float64,
+    )
+    mask = torch.ones((1, 2), dtype=torch.bool)
+    pinned = torch.tensor([[True, False]])
+    pin_xy = rects[..., :2].clone()
+    original = T._exact_pass
+
+    def one_ulp(lo, size, adj):
+        out = original(lo, size, adj)
+        out[:, 0] = torch.nextafter(out[:, 0], torch.full_like(out[:, 0], float("inf")))
+        return out
+
+    monkeypatch.setattr(T, "_exact_pass", one_ulp)
+    legal, drift = T.tfdl(
+        rects, mask, pinned, pin_xy=pin_xy, exact=True,
+    )
+
+    assert torch.equal(legal[0, 0, :2], pin_xy[0, 0])
+    assert torch.equal(drift, torch.zeros_like(drift))
+
+
 def test_padded_blocks_are_ignored():
     rects, area = _random_layout(B=2, N=16, seed=3)
     mask = area > 0

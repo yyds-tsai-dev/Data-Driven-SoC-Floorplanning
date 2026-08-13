@@ -101,7 +101,7 @@ def sample_bank(model, schedule, batch: Dict[str, torch.Tensor], cfg,
 # contract check against rung-(-1)
 # ---------------------------------------------------------------------------
 def verify_hard_legal(P: np.ndarray, area: np.ndarray, cons: np.ndarray,
-                      tp: np.ndarray, area_tol: float = 0.005,
+                      tp: np.ndarray, area_tol: float = 0.01,
                       dim_tol: float = 1e-5) -> Dict[str, bool]:
     """Same predicates as `layout_refiner._guard_hard_ok`, on raw arrays.
 

@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 import torch
+import numpy as np
 
+from icdc.engine import verify_hard_legal
 from icdc.qa_contract import (
     QA_RELATIVE_PATH,
     SCORER_RELATIVE_PATH,
@@ -198,6 +200,13 @@ def test_qa_preflight_and_official_a4_a5_a6_semantics(tmp_path):
         assert score_provided_local_no_runtime(
             _qa_area_case(), rect, evidence
         ).feasible is feasible
+        hard = verify_hard_legal(
+            rect.numpy(), np.asarray([100.0]),
+            np.asarray([[0, 0, 0, 0, 0]]),
+            np.asarray([[-1.0, -1.0, -1.0, -1.0]]),
+        )
+        assert hard["area"] is feasible
+        assert hard["ok"] is feasible
 
     copied_qa = tmp_path / QA_RELATIVE_PATH
     copied_scorer = tmp_path / SCORER_RELATIVE_PATH
