@@ -54,6 +54,10 @@ import shapely
 import iccad2026_evaluate as _EVALUATOR
 
 import torch
+from direct_diffusion_model import DirectDenoiser, DirectModelConfig, sample_direct_dpmpp
+from diffusion_model import DiffusionSchedule
+import icdc.engine as _ENGINE
+from icdc.energy import decode_rects
 from icdc.topology_data import CorpusSourceReceipt, fingerprint_case, split_for_id
 from icdc.topology_data import _sanitize as _sanitize_case
 
@@ -64,6 +68,77 @@ from icdc.checkpoint_identity import (  # noqa: E402
 
 
 __all__ = ["teacher_main"]
+
+_SAMPLE_DIRECT_DPM = sample_direct_dpmpp
+_DECODE_RECTS = lambda *args, **kwargs: decode_rects(*args, **kwargs)
+
+@dataclass(frozen=True)
+class _TeacherModelState:
+    model: Any
+    schedule: Any
+    cfg: Any
+    device: torch.device
+
+def _select_teacher_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def _materialize_teacher_model(payload: Mapping[str, Any], device: torch.device) -> _TeacherModelState:
+    try:
+        if not isinstance(payload, Mapping) or not isinstance(device, torch.device): raise ValueError("payload")
+        cfg_data = payload.get("model_config")
+        if not isinstance(cfg_data, Mapping) or set(cfg_data) != {f.name for f in fields(DirectModelConfig)}: raise ValueError("config")
+        ints = {"node_feat_dim", "relation_feat_dim", "z_dim", "d_model", "layers", "heads", "timesteps"}
+        for k in ints:
+            v = cfg_data[k]
+            if type(v) is not int or v <= 0: raise ValueError("config")
+        if cfg_data["z_dim"] != 4 or cfg_data["d_model"] % cfg_data["heads"]: raise ValueError("config")
+        if cfg_data["z_repr"] != "xyaspect" or type(cfg_data["self_conditioning"]) is not bool: raise ValueError("config")
+        if type(cfg_data["dropout"]) not in (int, float) or not math.isfinite(float(cfg_data["dropout"])) or not 0 <= float(cfg_data["dropout"]) < 1: raise ValueError("config")
+        model_weights, ema = payload.get("model"), payload.get("ema")
+        if not isinstance(model_weights, Mapping) or not model_weights or not isinstance(ema, Mapping) or not ema: raise ValueError("weights")
+        cfg = DirectModelConfig(**dict(cfg_data)); model = DirectDenoiser(cfg)
+        expected = list(model.state_dict())
+        if list(model_weights) != expected or list(ema) != expected: raise ValueError("keys")
+        reference = model.state_dict()
+        for values in (model_weights, ema):
+            for key in expected:
+                value = values[key]; want = reference[key]
+                if not isinstance(value, torch.Tensor) or value.device.type != "cpu" or value.shape != want.shape or value.dtype != want.dtype: raise ValueError("tensor")
+                if value.is_floating_point() and not bool(torch.isfinite(value).all()): raise ValueError("finite")
+        model.load_state_dict(ema, strict=True)
+        model.to(device=device, dtype=torch.float32).eval()
+        for parameter in model.parameters(): parameter.requires_grad_(False)
+        return _TeacherModelState(model, DiffusionSchedule(cfg.timesteps, device=device), cfg, device)
+    except ValueError: raise
+    except Exception as exc: raise ValueError("materialize") from exc
+
+def _build_teacher_batches(case: Mapping[str, Any], device: torch.device):
+    try:
+        n, _cons, _tp = _validate_case(case)
+        keys = ("area", "tp", "b2b", "p2b", "pins", "cons")
+        direct = {}
+        for key in keys:
+            dtype = torch.int64 if key == "cons" else torch.float32
+            value = torch.as_tensor(case[key], dtype=dtype, device=device).unsqueeze(0)
+            direct[key] = value
+        area = direct["area"]; direct["scale"] = torch.sqrt(area[area > 0].sum()).clamp_min(1.0).reshape(1)
+        direct.update(_ENGINE.build_cond(direct, DirectModelConfig(node_feat_dim=26, relation_feat_dim=9, z_dim=4, d_model=8, layers=1, heads=1, dropout=0.0, timesteps=8, self_conditioning=True)))
+        diagnostic = {k: (torch.as_tensor(case[k], dtype=torch.float64, device="cpu").unsqueeze(0) if k != "cons" else direct[k].detach().to("cpu")) for k in keys}
+        diagnostic["scale"] = direct["scale"].detach().to("cpu", dtype=torch.float64)
+        diagnostic["hpwl_ref"] = torch.tensor([case["hpwl_ref"]], dtype=torch.float64); diagnostic["area_ref"] = torch.tensor([case["area_ref"]], dtype=torch.float64)
+        return direct, diagnostic
+    except Exception as exc: raise ValueError("teacher batches") from exc
+
+def _sample_direct_once(state: _TeacherModelState, case: Mapping[str, Any], seed: int) -> torch.Tensor:
+    direct, diagnostic = _build_teacher_batches(case, state.device)
+    cond = _ENGINE.build_cond(direct, state.cfg); z_known, known_mask = _ENGINE.known_channels(direct)
+    generator = torch.Generator(device=state.device); generator.manual_seed(seed)
+    raw = _SAMPLE_DIRECT_DPM(state.model, cond, state.schedule, steps=2, generator=generator, z_known=z_known, known_mask=known_mask)
+    n = direct["area"].shape[1]
+    if not isinstance(raw, torch.Tensor) or tuple(raw.shape) != (1, n, 4) or raw.device != state.device or raw.dtype != torch.float32 or not bool(torch.isfinite(raw).all()): raise ValueError("sample")
+    decoded = _DECODE_RECTS(raw.detach().to("cpu", dtype=torch.float64), diagnostic["area"], diagnostic["cons"], diagnostic["tp"], diagnostic["scale"])
+    if not isinstance(decoded, torch.Tensor) or tuple(decoded.shape) != (1, n, 4) or decoded.device.type != "cpu" or decoded.dtype != torch.float64 or not bool(torch.isfinite(decoded).all()) or not bool((decoded[...,2:] > 0).all()): raise ValueError("decoded")
+    return decoded[0]
 
 @dataclass(frozen=True)
 class _CaseInput:
@@ -90,10 +165,12 @@ class _TeacherRuntime:
 
 def _runtime_hooks() -> _TeacherRuntime:
     trusted: Optional[Mapping[str, Any]] = None
+    cached: Optional[_TeacherModelState] = None
 
     def preflight(policy: TeacherTrustPolicy, checkpoint: Path) -> Mapping[str, Any]:
-        nonlocal trusted
+        nonlocal trusted, cached
         trusted = None
+        cached = None
         verified_scorer = _verify_frozen_scorer_contract(policy)
         payload, identity = _load_verified_checkpoint_bytes(checkpoint, policy)
         model_identity = {
@@ -109,9 +186,17 @@ def _runtime_hooks() -> _TeacherRuntime:
         return value
 
     def process_case(_case: _CaseInput) -> _CaseOutcome:
+        nonlocal cached
         if trusted is None:
             raise RuntimeError("teacher process before trusted preflight")
-        raise RuntimeError("teacher process runtime not implemented")
+        if _case is None:
+            raise RuntimeError("teacher process runtime not implemented")
+        if not isinstance(_case, _CaseInput):
+            raise ValueError("case input")
+        if cached is None:
+            cached = _materialize_teacher_model(trusted["payload"], _select_teacher_device())
+        _sample_direct_once(cached, _case.case, _case.sample_seed)
+        raise RuntimeError("teacher process candidate lifecycle not implemented")
 
     return _TeacherRuntime(preflight, process_case, False)
 
