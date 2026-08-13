@@ -5645,6 +5645,74 @@ def test_task4_p1b_base_late_failure_keeps_mutation_evidence_without_winner(
     _p1b_assert_accounting(out)
 
 
+# P1-B review RED contracts: production energy plumbing must use the complete
+# collate schema, sanitized zero-edge cases must remain evaluable, and the
+# lifecycle must reject malformed/over-cap generator streams before sinks.
+def test_task4_p1b_energy_batch_is_exact_scaled_cpu_f64(monkeypatch):
+    t = _teacher()
+    case = _p1b_case() | {
+        "area": [4.0, 5.0], "hpwl_ref": 7.0, "area_ref": 9.0,
+    }
+    seen = {}
+
+    def energy(rects, batch):
+        seen["rects"] = rects
+        seen["batch"] = batch
+        return {"E": torch.tensor([1.25], dtype=torch.float64)}
+
+    monkeypatch.setattr(t._ENERGY, "energy", energy)
+    assert t._DIAGNOSTIC_ENERGY(_p1b_raw(), case) == 1.25
+    assert seen["rects"].shape == (1, 2, 4)
+    assert seen["rects"].device.type == "cpu" and seen["rects"].dtype == torch.float64
+    expected = {"area", "cons", "b2b", "p2b", "pins", "hpwl_ref", "area_ref",
+                "scale", "n_soft", "tau_sharp", "tau_soft"}
+    assert set(seen["batch"]) == expected
+    batch = seen["batch"]
+    assert batch["scale"].tolist() == [3.0]
+    assert batch["tau_sharp"].tolist() == [3e-5]
+    assert batch["tau_soft"].tolist() == [3e-2]
+    assert torch.equal(batch["n_soft"], t._ENERGY.n_soft(batch["cons"], batch["area"]))
+    for key in ("area", "cons", "b2b", "p2b", "pins", "hpwl_ref", "area_ref",
+                "scale", "n_soft", "tau_sharp", "tau_soft"):
+        assert batch[key].device.type == "cpu" and batch[key].dtype == torch.float64
+
+
+def test_task4_p1b_sanitized_empty_edges_reaches_official_and_energy(monkeypatch):
+    case = _p1b_case() | {
+        "b2b": torch.empty((0, 3), dtype=torch.float64),
+        "p2b": torch.empty((0, 3), dtype=torch.float64),
+        "pins": torch.empty((0, 2), dtype=torch.float64),
+        "hpwl_ref": 0.0, "area_ref": 2.0,
+    }
+    assert torch.as_tensor(case["b2b"], dtype=torch.float64).reshape(0, 3).shape == (0, 3)
+    assert torch.as_tensor(case["p2b"], dtype=torch.float64).reshape(0, 3).shape == (0, 3)
+    assert torch.as_tensor(case["pins"], dtype=torch.float64).reshape(0, 2).shape == (0, 2)
+    scorer = _P1BScorer((True, 2.0))
+    out, trace = _p1b_run(monkeypatch, scorer, case=case, stream=[("base", _p1b_raw())], energy_results=[4.0])
+    assert out.winner_ordinal == 0 and out.candidates[0].official_cost == 2.0
+    assert out.candidates[0].diagnostic_energy == 4.0
+    args, _kwargs = scorer.calls[0]
+    assert args[1] == {"hpwl_baseline": 0.0, "area_baseline": 2.0}
+    assert args[3].shape == (0, 3) and args[4].shape == (0, 3) and args[5].shape == (0, 2)
+    assert all(x.device.type == "cpu" and x.dtype == torch.float64 for x in args[3:7])
+    assert len(trace["admit"]) == len(trace["hard"]) == len(trace["intent"]) == len(trace["energy"]) == 1
+
+
+@pytest.mark.parametrize("stream,cfg", [
+    (["base", "axis:0:1:0:0"], topology_prior.ProposalConfig(total_cap=1)),
+    (["base", "axis:0:1:0:0"], topology_prior.ProposalConfig(axis_exchange_cap=0)),
+    (["base", "pin:0:1:0:1"], topology_prior.ProposalConfig(pin_repair_cap=0)),
+    (["base", "contact:1:0:1:0:1"], topology_prior.ProposalConfig(group_contact_cap=0)),
+])
+def test_task4_p1b_caps_and_names_fail_closed_before_candidate_sinks(monkeypatch, stream, cfg):
+    t = _teacher(); scorer = _P1BScorer(); trace = {}
+    templates = [(name, _p1b_raw()) for name in stream]
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        _p1b_run(monkeypatch, scorer, stream=templates, cfg=cfg, trace_out=trace)
+    assert scorer.calls == []
+    assert trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
+
+
 def _p1b_reachable_forbidden(source):
     tree = ast.parse(source)
     functions = {
