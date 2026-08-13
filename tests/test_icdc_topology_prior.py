@@ -5081,3 +5081,96 @@ def test_collate_rejects_bad_labels_container(bad):
 def test_collate_rejects_wrong_label_instance_type():
     with pytest.raises(ValueError):
         collate_labels([object()], torch.device("cpu"), torch.float32)
+
+
+# P1-B RED: frozen lifecycle contract exercised with opaque admission/scorer spies.
+def _p1b_case():
+    return {"n": 2, "area": [1.0, 1.0], "cons": [[0, 0, 0, 0, 0]] * 2,
+            "b2b": [], "p2b": [], "pins": [], "tp": [[-1.0] * 4] * 2,
+            "hpwl_ref": 1.0, "area_ref": 1.0}
+
+
+def _p1b_rects():
+    return [[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 1.0, 1.0]]
+
+
+def _p1b_lifecycle(*args, **kwargs):
+    # Keep missing production symbols as the intentional RED signal.
+    return topology_prior._run_candidate_lifecycle(*args, **kwargs)
+
+
+def test_task4_p1b_ordered_originals_immutable_and_base_contract():
+    originals = [(_p1b_rects(), "base"), (_p1b_rects(), "mutation")]
+    frozen = repr(originals)
+    _p1b_lifecycle(originals, _p1b_case(), scorer=lambda **k: {}, cfg=topology_prior.ProposalConfig())
+    assert repr(originals) == frozen and originals[0][1] == "base"
+
+
+def test_task4_p1b_opaque_admission_hard_reject_continue(monkeypatch):
+    seen = []
+    monkeypatch.setattr(topology_prior, "pin_feasible_then_exact_tfdl",
+                        lambda proposal, case: seen.append(proposal) or proposal, raising=False)
+    out = _p1b_lifecycle([(_p1b_rects(), "base"), (_p1b_rects(), "mutation")], _p1b_case(),
+                         scorer=lambda **k: {"cost_no_runtime": 1.0, "is_feasible": True},
+                         cfg=topology_prior.ProposalConfig())
+    assert len(seen) == 2 and len(out) == 2
+
+
+def test_task4_p1b_intent_lost_is_not_scored(monkeypatch):
+    scored = []
+    monkeypatch.setattr(topology_prior, "_proposal_intent_holds", lambda *a: False, raising=False)
+    out = _p1b_lifecycle([(_p1b_rects(), "base")], _p1b_case(),
+                         scorer=lambda **k: scored.append(k), cfg=topology_prior.ProposalConfig())
+    assert not scored and out[0]["status"] == "intent_not_survived"
+
+
+def test_task4_p1b_exact_official_adapter_and_fixed_runtime():
+    calls = []
+    def scorer(**kwargs):
+        calls.append(kwargs); return {"cost_no_runtime": 2.0, "is_feasible": True}
+    _p1b_lifecycle([(_p1b_rects(), "base")], _p1b_case(), scorer=scorer,
+                    cfg=topology_prior.ProposalConfig())
+    assert calls[0]["runtime"] == 1.0 and calls[0]["median_runtime"] == 1.0
+    assert calls[0]["target_positions"] == _p1b_case()["tp"]
+
+
+def test_task4_p1b_official_beats_energy_and_ties_keep_base(monkeypatch):
+    monkeypatch.setattr(topology_prior, "_energy", lambda *a: -99.0, raising=False)
+    out = _p1b_lifecycle([(_p1b_rects(), "base"), (_p1b_rects(), "mutation")], _p1b_case(),
+                         scorer=lambda **k: {"cost_no_runtime": 3.0, "is_feasible": True},
+                         cfg=topology_prior.ProposalConfig())
+    assert out[0]["winner"] == "base"
+
+
+@pytest.mark.parametrize("result,status", [({}, "official_evaluator_error"),
+    ({"cost_no_runtime": 1.0, "is_feasible": False}, "official_infeasible"),
+    ({"cost_no_runtime": float("nan"), "is_feasible": True}, "official_invalid_cost")])
+def test_task4_p1b_official_exception_infeasible_invalid_cost(result, status):
+    out = _p1b_lifecycle([(_p1b_rects(), "base")], _p1b_case(), scorer=lambda **k: result,
+                         cfg=topology_prior.ProposalConfig())
+    assert out[0]["status"] == status
+
+
+def test_task4_p1b_energy_unavailable_still_wins(monkeypatch):
+    monkeypatch.setattr(topology_prior, "_energy", lambda *a: float("nan"), raising=False)
+    out = _p1b_lifecycle([(_p1b_rects(), "base")], _p1b_case(),
+                         scorer=lambda **k: {"cost_no_runtime": 1.0, "is_feasible": True},
+                         cfg=topology_prior.ProposalConfig())
+    assert out[0]["winner"] == "base" and out[0]["energy"] is None
+
+
+def test_task4_p1b_base_unavailable_complete_accounting(monkeypatch):
+    monkeypatch.setattr(topology_prior, "pin_feasible_then_exact_tfdl", lambda *a: None, raising=False)
+    out = _p1b_lifecycle([(_p1b_rects(), "base"), (_p1b_rects(), "mutation")], _p1b_case(),
+                         scorer=lambda **k: {"cost_no_runtime": 1.0, "is_feasible": True},
+                         cfg=topology_prior.ProposalConfig())
+    assert out[0]["winner"] is None and out[0]["base_cost"] is None
+    assert out[1]["status"] == "base_unavailable"
+
+
+def test_task4_p1b_scope_static_boundary_has_no_label_writer_g0():
+    # P1-B lifecycle must be a pure test seam; publication/label/G0 ownership
+    # remains guarded by the existing exact-load static checker.
+    assert hasattr(topology_prior, "_run_candidate_lifecycle")
+    assert _task4_static_forbidden(Path("scripts/probes/icdc_topology_teacher.py").read_text(),
+                                   require_exact_loads=True)
