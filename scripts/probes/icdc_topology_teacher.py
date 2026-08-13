@@ -171,9 +171,45 @@ def _build_teacher_batches(case: Mapping[str, Any], device: torch.device, cfg: D
         direct = {"area": area.unsqueeze(0), "tp": tp.unsqueeze(0), "b2b": b2b,
                   "p2b": p2b, "pins": pins, "cons": cons.unsqueeze(0)}
         direct["scale"] = torch.sqrt(direct["area"][direct["area"] > 0].sum()).clamp_min(1.0).reshape(1)
+        raw_shapes = {
+            "area": (1, n), "tp": (1, n, 4), "b2b": tuple(b2b.shape),
+            "p2b": tuple(p2b.shape), "pins": tuple(pins.shape), "scale": (1,),
+        }
+        for key, shape in raw_shapes.items():
+            value = direct[key]
+            if (not isinstance(value, torch.Tensor) or tuple(value.shape) != shape
+                    or value.device != device or value.dtype != torch.float32
+                    or not bool(torch.isfinite(value).all())):
+                raise ValueError("teacher direct tensor")
+        if not bool((direct["area"] > 0).all()):
+            raise ValueError("teacher area")
+        if (not isinstance(direct["cons"], torch.Tensor)
+                or tuple(direct["cons"].shape) != (1, n, 5)
+                or direct["cons"].device != device
+                or direct["cons"].dtype != torch.int64):
+            raise ValueError("teacher constraints")
         condition = _ENGINE.build_cond(direct, cfg)
-        if not isinstance(condition, Mapping):
-            raise ValueError("teacher condition")
+        expected_condition_keys = {"node_feat", "adj", "mask", "scale", "rel_feat"}
+        if not isinstance(condition, Mapping) or set(condition) != expected_condition_keys:
+            raise ValueError("teacher condition keys")
+        condition_shapes = {
+            "node_feat": (1, n, cfg.node_feat_dim),
+            "adj": (1, n, n),
+            "mask": (1, n),
+            "scale": (1,),
+            "rel_feat": (1, n, n, cfg.relation_feat_dim),
+        }
+        for key, shape in condition_shapes.items():
+            value = condition[key]
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape or value.device != device:
+                raise ValueError("teacher condition tensor")
+            if key == "mask":
+                if value.dtype != torch.bool:
+                    raise ValueError("teacher condition mask")
+            elif value.dtype != torch.float32 or not bool(torch.isfinite(value).all()):
+                raise ValueError("teacher condition float")
+        if not torch.equal(condition["scale"], direct["scale"]):
+            raise ValueError("teacher condition scale")
         direct.update(condition)
         diagnostic = {
             "area": torch.as_tensor(case["area"], dtype=torch.float64).unsqueeze(0),
@@ -191,10 +227,20 @@ def _build_teacher_batches(case: Mapping[str, Any], device: torch.device, cfg: D
 
 def _sample_direct_once(state: _TeacherModelState, case: Mapping[str, Any], seed: int) -> torch.Tensor:
     direct, diagnostic, cond = _build_teacher_batches(case, state.device, state.cfg)
-    z_known, known_mask = _ENGINE.known_channels(direct)
+    known = _ENGINE.known_channels(direct)
+    if type(known) is not tuple or len(known) != 2:
+        raise ValueError("teacher known channels")
+    z_known, known_mask = known
+    n = direct["area"].shape[1]
+    if (not isinstance(z_known, torch.Tensor) or tuple(z_known.shape) != (1, n, 4)
+            or z_known.device != state.device or z_known.dtype != torch.float32
+            or not bool(torch.isfinite(z_known).all())):
+        raise ValueError("teacher known z")
+    if (not isinstance(known_mask, torch.Tensor) or tuple(known_mask.shape) != (1, n, 4)
+            or known_mask.device != state.device or known_mask.dtype != torch.bool):
+        raise ValueError("teacher known mask")
     generator = torch.Generator(device=state.device); generator.manual_seed(seed)
     raw = _SAMPLE_DIRECT_DPM(state.model, cond, state.schedule, steps=2, generator=generator, z_known=z_known, known_mask=known_mask)
-    n = direct["area"].shape[1]
     if not isinstance(raw, torch.Tensor) or tuple(raw.shape) != (1, n, 4) or raw.device != state.device or raw.dtype != torch.float32 or not bool(torch.isfinite(raw).all()): raise ValueError("sample")
     decoded = _DECODE_RECTS(raw.detach().to("cpu", dtype=torch.float64), diagnostic["area"], diagnostic["cons"], diagnostic["tp"], diagnostic["scale"])
     if not isinstance(decoded, torch.Tensor) or tuple(decoded.shape) != (1, n, 4) or decoded.device.type != "cpu" or decoded.dtype != torch.float64 or not bool(torch.isfinite(decoded).all()) or not bool((decoded[...,2:] > 0).all()): raise ValueError("decoded")
