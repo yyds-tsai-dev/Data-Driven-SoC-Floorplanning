@@ -92,18 +92,65 @@ _VERIFY_HARD_LEGAL = _verify_hard_legal
 
 def _diagnostic_energy(rects, case):
     n, cons, tp = _validate_case(case)
-    area = torch.as_tensor(case["area"], dtype=torch.float64).unsqueeze(0)
-    cons_t = torch.as_tensor(cons, dtype=torch.int64).unsqueeze(0)
-    batch = {"area": area, "cons": cons_t,
-             "b2b": torch.as_tensor(case["b2b"], dtype=torch.float64).reshape(1, -1, 3),
-             "p2b": torch.as_tensor(case["p2b"], dtype=torch.float64).reshape(1, -1, 3),
-             "pins": torch.as_tensor(case["pins"], dtype=torch.float64).reshape(1, -1, 2),
-             "hpwl_ref": torch.tensor([case["hpwl_ref"]], dtype=torch.float64),
-             "area_ref": torch.tensor([case["area_ref"]], dtype=torch.float64),
-             "n_soft": _ENERGY.n_soft(cons_t, area), "tau_sharp": torch.tensor(0.01, dtype=torch.float64),
-             "tau_soft": torch.tensor(0.1, dtype=torch.float64)}
+    if (not isinstance(rects, torch.Tensor) or rects.device.type != "cpu"
+            or rects.dtype is not torch.float64 or tuple(rects.shape) != (n, 4)
+            or not bool(torch.isfinite(rects).all())
+            or not bool((rects[:, 2:] > 0).all())):
+        raise ValueError("energy rects")
+    try:
+        area = torch.as_tensor(case["area"], dtype=torch.float64, device="cpu")
+        cons_t = torch.as_tensor(cons, dtype=torch.float64, device="cpu")
+        hpwl_ref = torch.as_tensor(case["hpwl_ref"], dtype=torch.float64, device="cpu").reshape(1)
+        area_ref = torch.as_tensor(case["area_ref"], dtype=torch.float64, device="cpu").reshape(1)
+    except Exception as exc:
+        raise ValueError("energy references") from exc
+    if (not isinstance(case.get("hpwl_ref"), numbers.Real)
+            or isinstance(case.get("hpwl_ref"), bool)
+            or not isinstance(case.get("area_ref"), numbers.Real)
+            or isinstance(case.get("area_ref"), bool)
+            or tuple(area.shape) != (n,) or not bool(torch.isfinite(area).all())
+            or not bool((area > 0).all()) or tuple(cons_t.shape) != (n, 5)
+            or not bool(torch.isfinite(cons_t).all())
+            or tuple(hpwl_ref.shape) != (1,) or not bool(torch.isfinite(hpwl_ref).all())
+            or bool((hpwl_ref < 0).any()) or tuple(area_ref.shape) != (1,)
+            or not bool(torch.isfinite(area_ref).all()) or bool((area_ref <= 0).any())):
+        raise ValueError("energy references")
+
+    def relation_tensor(name: str, width: int) -> torch.Tensor:
+        try:
+            value = torch.as_tensor(case[name], dtype=torch.float64, device="cpu")
+        except Exception as exc:
+            raise ValueError(name) from exc
+        if value.numel() == 0:
+            return torch.empty((1, 0, width), dtype=torch.float64, device="cpu")
+        if (value.ndim != 2 or tuple(value.shape[-1:]) != (width,)
+                or not bool(torch.isfinite(value).all())):
+            raise ValueError(name)
+        return value.reshape(1, -1, width)
+
+    area = area.unsqueeze(0)
+    cons_t = cons_t.unsqueeze(0)
+    scale = torch.sqrt(area.clamp_min(0).sum()).clamp_min(1).reshape(1)
+    batch = {
+        "area": area,
+        "cons": cons_t,
+        "b2b": relation_tensor("b2b", 3),
+        "p2b": relation_tensor("p2b", 3),
+        "pins": relation_tensor("pins", 2),
+        "hpwl_ref": hpwl_ref,
+        "area_ref": area_ref,
+        "scale": scale,
+        "n_soft": _ENERGY.n_soft(cons_t, area).to(dtype=torch.float64, device="cpu"),
+        "tau_sharp": 1e-5 * scale,
+        "tau_soft": 1e-2 * scale,
+    }
     result = _ENERGY.energy(rects.unsqueeze(0), batch)
-    return result["E"][0].item()
+    if (not isinstance(result, Mapping) or "E" not in result
+            or not isinstance(result["E"], torch.Tensor)
+            or result["E"].device.type != "cpu" or result["E"].dtype is not torch.float64
+            or tuple(result["E"].shape) != (1,) or not bool(torch.isfinite(result["E"]).all())):
+        raise ValueError("energy result")
+    return float(result["E"][0].item())
 
 _DIAGNOSTIC_ENERGY = _diagnostic_energy
 
@@ -684,32 +731,122 @@ def _run_candidate_lifecycle(raw_rects, case, *, scorer, cfg=ProposalConfig()):
     n, normalized_cons, normalized_tp = _validate_case(case)
     if not isinstance(raw_rects, torch.Tensor) or raw_rects.device.type != "cpu" or raw_rects.dtype is not torch.float64 or raw_rects.shape != (n, 4) or not bool(torch.isfinite(raw_rects).all()) or not bool((raw_rects[:, 2:] > 0).all()):
         raise ValueError("raw rects")
-    area = torch.as_tensor(case["area"], dtype=torch.float64)
-    cons = torch.as_tensor(normalized_cons, dtype=torch.int64)
-    tensors = {name: torch.as_tensor(case[name], dtype=torch.float64) for name in ("b2b", "p2b", "pins")}
-    shapes = {"b2b": (None, 3), "p2b": (None, 3), "pins": (None, 2)}
-    for name, value in tensors.items():
-        if value.ndim != 2 or value.shape[1] != shapes[name][1] or not bool(torch.isfinite(value).all()): raise ValueError(name)
-    if area.shape != (n,) or cons.shape != (n, 5) or not bool(torch.isfinite(area).all()) or not bool((area > 0).all()) or not all(math.isfinite(float(case[k])) and float(case[k]) > 0 for k in ("hpwl_ref", "area_ref")): raise ValueError("adapter")
-    generated = []
     try:
-        for item in _GENERATE_PROPOSALS(raw_rects, case, cfg): generated.append(item)
-    except Exception as exc: raise RuntimeError("proposal generation") from exc
-    if not generated or not isinstance(generated[0], (tuple, list)) or len(generated[0]) != 2 or generated[0][0] != "base": raise ValueError("base proposal")
-    phase = {"base": 0, "axis": 1, "pin": 2, "contact": 3}; seen_names = set(); last_phase = -1
-    for item in generated:
-        if not isinstance(item, (tuple, list)) or len(item) != 2 or not isinstance(item[0], str) or item[0] in seen_names: raise ValueError("proposal")
-        name = item[0]; kind = name.split(":")[0]
-        if kind not in {"base", "axis", "pin", "contact"} or (kind == "base" and name != "base") or (kind != "base" and len(name.split(":")) != (6 if kind == "contact" else 5)): raise ValueError("proposal name")
-        if kind != "base":
-            parts = name.split(":")
-            try: vals = [int(x) for x in parts[1:]]
-            except Exception as exc: raise ValueError("proposal name") from exc
-            if any(x == "" or str(v) != x for x, v in zip(parts[1:], vals)): raise ValueError("proposal name")
-        if phase[kind] < last_phase: raise ValueError("proposal phase")
-        last_phase = phase[kind]; seen_names.add(name)
-        candidate = item[1]
-        if not isinstance(candidate, torch.Tensor) or candidate.device.type != "cpu" or candidate.dtype is not torch.float64 or candidate.shape != (n, 4) or not bool(torch.isfinite(candidate).all()) or not bool((candidate[:, 2:] > 0).all()): raise ValueError("proposal rects")
+        area = torch.as_tensor(case["area"], dtype=torch.float64, device="cpu")
+        cons = torch.as_tensor(normalized_cons, dtype=torch.int64, device="cpu")
+    except Exception as exc:
+        raise ValueError("adapter") from exc
+    if (not isinstance(case.get("hpwl_ref"), numbers.Real)
+            or isinstance(case.get("hpwl_ref"), bool)
+            or not isinstance(case.get("area_ref"), numbers.Real)
+            or isinstance(case.get("area_ref"), bool)
+            or area.shape != (n,) or not bool(torch.isfinite(area).all())
+            or not bool((area > 0).all())
+            or not math.isfinite(float(case["hpwl_ref"]))
+            or float(case["hpwl_ref"]) < 0
+            or not math.isfinite(float(case["area_ref"]))
+            or float(case["area_ref"]) <= 0):
+        raise ValueError("adapter")
+
+    def relation_tensor(name: str, width: int) -> torch.Tensor:
+        try:
+            value = torch.as_tensor(case[name], dtype=torch.float64, device="cpu")
+        except Exception as exc:
+            raise ValueError(name) from exc
+        if value.numel() == 0:
+            return torch.empty((0, width), dtype=torch.float64, device="cpu")
+        if (value.ndim != 2 or tuple(value.shape[-1:]) != (width,)
+                or not bool(torch.isfinite(value).all())):
+            raise ValueError(name)
+        return value
+
+    tensors = {
+        "b2b": relation_tensor("b2b", 3),
+        "p2b": relation_tensor("p2b", 3),
+        "pins": relation_tensor("pins", 2),
+    }
+
+    generated = []
+    phase = {"base": 0, "axis": 1, "pin": 2, "contact": 3}
+    counts = {"axis": 0, "pin": 0, "contact": 0}
+    seen_names: set[str] = set()
+    last_phase = -1
+    try:
+        proposals = iter(_GENERATE_PROPOSALS(raw_rects, case, cfg))
+        for ordinal in range(cfg.total_cap + 1):
+            try:
+                item = next(proposals)
+            except StopIteration:
+                break
+            if ordinal >= cfg.total_cap:
+                raise ValueError("proposal total cap")
+            if (not isinstance(item, (tuple, list)) or len(item) != 2
+                    or not isinstance(item[0], str)):
+                raise ValueError("proposal")
+            name, candidate = item
+            if not name or "\0" in name or name in seen_names:
+                raise ValueError("proposal name")
+            tokens = name.split(":")
+            kind = tokens[0]
+            if kind not in phase:
+                raise ValueError("proposal name")
+            if kind == "base":
+                if name != "base" or ordinal != 0:
+                    raise ValueError("base proposal")
+                values = []
+            else:
+                expected_len = 6 if kind == "contact" else 5
+                if len(tokens) != expected_len:
+                    raise ValueError("proposal name")
+                try:
+                    values = [int(token) for token in tokens[1:]]
+                except Exception as exc:
+                    raise ValueError("proposal name") from exc
+                if any(token == "" or str(value) != token for token, value in zip(tokens[1:], values)):
+                    raise ValueError("proposal name")
+                if kind == "axis":
+                    first, second, axis, order = values
+                    if (not first < second or not 0 <= first < n or not 0 <= second < n
+                            or axis not in (0, 1) or order not in (0, 1)):
+                        raise ValueError("axis proposal")
+                elif kind == "pin":
+                    target, peer, axis, order = values
+                    authorized = (0 <= target < n and 0 <= peer < n and target != peer
+                                  and normalized_cons[target][1] != 0
+                                  and bool((normalized_tp[target, :2] >= 0).all()))
+                    if not authorized or axis not in (0, 1) or order not in (0, 1):
+                        raise ValueError("pin proposal")
+                else:
+                    gid, first, second, axis, order = values
+                    if (gid <= 0 or not first < second or not 0 <= first < n
+                            or not 0 <= second < n or axis not in (0, 1)
+                            or order not in (0, 1)
+                            or normalized_cons[first][3] != gid
+                            or normalized_cons[second][3] != gid):
+                        raise ValueError("contact proposal")
+                counts[kind] += 1
+                cap = {"axis": cfg.axis_exchange_cap, "pin": cfg.pin_repair_cap,
+                       "contact": cfg.group_contact_cap}[kind]
+                if counts[kind] > cap:
+                    raise ValueError("proposal kind cap")
+            if phase[kind] < last_phase:
+                raise ValueError("proposal phase")
+            last_phase = phase[kind]
+            if (not isinstance(candidate, torch.Tensor) or candidate.device.type != "cpu"
+                    or candidate.dtype is not torch.float64 or tuple(candidate.shape) != (n, 4)
+                    or not bool(torch.isfinite(candidate).all())
+                    or not bool((candidate[:, 2:] > 0).all())):
+                raise ValueError("proposal rects")
+            seen_names.add(name)
+            generated.append((name, candidate.clone()))
+    except StopIteration:
+        pass
+    except (ValueError, TypeError):
+        raise
+    except Exception as exc:
+        raise RuntimeError("proposal generation") from exc
+    if not generated or generated[0][0] != "base":
+        raise ValueError("base proposal")
     names = set(); records = []
     for ordinal, item in enumerate(generated):
         if not isinstance(item, (tuple, list)) or len(item) != 2: raise ValueError("proposal")
