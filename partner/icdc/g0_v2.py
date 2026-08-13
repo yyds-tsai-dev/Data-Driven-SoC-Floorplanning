@@ -171,7 +171,7 @@ def _official_cost(
                 "hpwl_baseline": float(case["hpwl_ref"]),
                 "area_baseline": float(case["area_ref"]),
             },
-            cons.tolist(),
+            cons,
             b2b,
             p2b,
             pins,
@@ -288,6 +288,7 @@ def evaluate_case(
         sample_seed,
         teacher_cost,
         base_cost,
+        require_connected_clusters=False,
     )
     return G0CaseResult(
         instance_id=instance_id,

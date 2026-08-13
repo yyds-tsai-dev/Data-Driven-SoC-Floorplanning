@@ -724,19 +724,52 @@ def _separation_edges(r: list[list[float]], n: int) -> list[SparseEdge]:
                 ci = r[i][axis] + r[i][axis + 2] / 2; cj = r[j][axis] + r[j][axis + 2] / 2
                 src, dst = (i, j) if (ci, i) <= (cj, j) else (j, i)
                 candidates.append((src, dst, max(0.0, r[dst][axis] - r[src][axis] - r[src][axis + 2])))
+        # Direction is strictly increasing in ``(centre, block_id)``, so the
+        # candidate graph is a DAG.  Compute transitive reachability once with
+        # Python-int bitsets, then retain an outgoing edge only when earlier
+        # successors do not already reach its destination.  This is exactly
+        # the legacy per-edge BFS reduction, without its O(E*(V+E)) rescans.
+        order = sorted(
+            range(n),
+            key=lambda block: (
+                r[block][axis] + r[block][axis + 2] / 2,
+                block,
+            ),
+        )
+        rank = {block: index for index, block in enumerate(order)}
+        outgoing: list[list[int]] = [[] for _ in range(n)]
+        for src, dst, _ in candidates:
+            outgoing[src].append(dst)
+        reachable_bits = [0] * n
+        for src in reversed(order):
+            bits = 0
+            for dst in outgoing[src]:
+                bits |= (1 << dst) | reachable_bits[dst]
+            reachable_bits[src] = bits
+        retained: set[tuple[int, int]] = set()
+        for src in order:
+            covered = 0
+            for dst in sorted(outgoing[src], key=rank.__getitem__):
+                bit = 1 << dst
+                if not covered & bit:
+                    retained.add((src, dst))
+                covered |= bit | reachable_bits[dst]
         for src, dst, margin in candidates:
-            reachable = set()
-            frontier = [v for u, v, _ in candidates if u == src and v != dst]
-            while frontier:
-                node = frontier.pop()
-                if node in reachable: continue
-                reachable.add(node); frontier.extend(v for u, v, _ in candidates if u == node)
-            if dst not in reachable:
+            if (src, dst) in retained:
                 edges.append(SparseEdge(src, dst, axis, margin, "sep", 1.0))
     return edges
 
 
-def extract_sparse_label(legal: torch.Tensor, case: Mapping[str, Any], instance_id: str, sample_seed: int, teacher_cost: float, base_cost: float) -> TopologyLabel:
+def extract_sparse_label(
+    legal: torch.Tensor,
+    case: Mapping[str, Any],
+    instance_id: str,
+    sample_seed: int,
+    teacher_cost: float,
+    base_cost: float,
+    *,
+    require_connected_clusters: bool = True,
+) -> TopologyLabel:
     if not isinstance(case, Mapping): raise ValueError("case")
     if not isinstance(legal, torch.Tensor) or legal.device.type != "cpu" or legal.dtype != torch.float64 or legal.ndim != 2 or legal.shape[1] != 4: raise ValueError("legal")
     n = case.get("n")
@@ -765,7 +798,8 @@ def extract_sparse_label(legal: torch.Tensor, case: Mapping[str, Any], instance_
             return i
         for _, axis, a, b, order, overlap in sorted(cand):
             if find(a) != find(b): parent[find(a)] = find(b); contacts.append(ContactLabel(a, b, axis, bool(order), overlap, 1.0))
-        if len({find(i) for i in members}) != 1: raise ValueError("disconnected cluster")
+        if require_connected_clusters and len({find(i) for i in members}) != 1:
+            raise ValueError("disconnected cluster")
     incoming = {(e.axis, e.dst): [] for e in edges}
     for e in edges: incoming.setdefault((e.axis, e.dst), []).append(e.src)
     paths = []; pin_edges = []
