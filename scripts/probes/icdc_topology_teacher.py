@@ -336,6 +336,71 @@ class _CaseInput:
     sample_seed: int
 
 @dataclass(frozen=True)
+class _VerifiedShardSummary:
+    worker: int
+    layout: int
+    relative_path: str
+    file_sha256: str
+    source_row_count: int
+
+def _verified_shard_summary(raw: bytes, source: Any, worker: int, layout: int) -> _VerifiedShardSummary:
+    if type(worker) is not int or worker < 0 or type(layout) is not int or layout < 0:
+        raise ValueError("shard identity")
+    if not isinstance(raw, bytes):
+        raise ValueError("shard bytes")
+    count, _ = _validate_source_shard(source)
+    return _VerifiedShardSummary(worker, layout, f"worker_{worker}/layouts_{layout}.th",
+                                 hashlib.sha256(raw).hexdigest(), count)
+
+def _validate_spooled_case_row(record: Any, shard_summary: Any) -> tuple[Mapping[str, Any], CorpusSourceReceipt]:
+    if not isinstance(record, Mapping) or not isinstance(shard_summary, Mapping) and not dataclass_is_instance(shard_summary):
+        raise ValueError("spool record")
+    if isinstance(shard_summary, Mapping):
+        expected = {k: shard_summary[k] for k in ("worker", "layout", "relative_path", "file_sha256", "source_row_count")}
+    else:
+        expected = {"worker": shard_summary.worker, "layout": shard_summary.layout,
+                    "relative_path": shard_summary.relative_path,
+                    "file_sha256": shard_summary.file_sha256,
+                    "source_row_count": shard_summary.source_row_count}
+    keys = {"worker", "layout", "relative_path", "file_sha256", "source_row_count", "source_row_index", "instance_id", "case_json", "case", "fingerprint", "receipt"}
+    if set(record) != keys:
+        raise ValueError("spool record keys")
+    if any(record[k] != expected[k] for k in ("worker", "layout", "relative_path", "file_sha256", "source_row_count")):
+        raise ValueError("spool binding")
+    digest = record["file_sha256"]
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("spool digest")
+    index = record["source_row_index"]
+    if type(index) is not int or not 0 <= index < expected["source_row_count"]:
+        raise ValueError("spool index")
+    iid = f'{expected["relative_path"]}#{index}'
+    if record["instance_id"] != iid:
+        raise ValueError("spool instance")
+    text = record["case_json"]
+    if not isinstance(text, str) or any(ord(c) > 127 for c in text) or text != text.strip() or "\n" in text or "\r" in text:
+        raise ValueError("spool json")
+    try:
+        decoded = json.loads(text)
+    except Exception as exc:
+        raise ValueError("spool json") from exc
+    if not isinstance(decoded, Mapping) or decoded != record["case"]:
+        raise ValueError("spool case")
+    case = _sanitize_case(decoded)
+    canonical = json.dumps(case, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    if text != canonical or case.get("instance_id") != iid:
+        raise ValueError("spool canonical case")
+    fp = fingerprint_case(case)
+    if record["fingerprint"] != fp:
+        raise ValueError("spool fingerprint")
+    receipt = record["receipt"]
+    if type(receipt) is not CorpusSourceReceipt or (receipt.relative_path, receipt.file_sha256, receipt.layout_index, receipt.fingerprint) != (expected["relative_path"], digest, index, fp):
+        raise ValueError("spool receipt")
+    return case, receipt
+
+def dataclass_is_instance(value: Any) -> bool:
+    return hasattr(value, "__dataclass_fields__") and not isinstance(value, type)
+
+@dataclass(frozen=True)
 class _CaseOutcome:
     label_row: Mapping[str, Any]
     proposal_rows: Sequence[Mapping[str, Any]]
@@ -1389,7 +1454,7 @@ class _PopulationAccumulator:
                 "CREATE TABLE population ("
                 "relative_path TEXT NOT NULL, layout_index INTEGER NOT NULL, "
                 "instance_id TEXT NOT NULL, n INTEGER NOT NULL, base_cost REAL, "
-                "teacher_cost REAL, weight REAL NOT NULL, "
+                "teacher_cost REAL, weight REAL, "
                 "UNIQUE(relative_path, layout_index), UNIQUE(instance_id))"
             )
             self._db.commit()
@@ -1413,7 +1478,7 @@ class _PopulationAccumulator:
         try: weight = math.exp(row["n"] / 12)
         except (OverflowError, ValueError): weight = None
         try:
-            self._db.execute("INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) VALUES (?,?,?,?,NULL,NULL,?)", (rel,row["layout_index"],iid,row["n"],weight)); self._db.commit()
+            self._db.execute("INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) VALUES (?,?,?,?,NULL,NULL,?)", (rel,row["layout_index"],iid,row["n"],weight))
         except sqlite3.IntegrityError as exc: raise ValueError("duplicate population identity") from exc
         self.count += 1
 
@@ -1475,13 +1540,21 @@ class _PopulationAccumulator:
         if self._db is None:
             raise RuntimeError("population spool closed")
         try:
-            rows = list(self._db.execute("SELECT relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight FROM population ORDER BY relative_path,layout_index"))
-            enc = b"[" + b",".join(json.dumps({"relative_path":r[0],"layout_index":r[1],"instance_id":r[2],"n":r[3],"weight":r[6]},sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode() for r in rows) + b"]"
-            rows = [(r[0],int(r[1]),r[2],int(r[3]),r[4],r[5], (r[6] if r[6] is not None else math.exp(int(r[3])/12))) for r in rows]
-            denominator = sum(r[6] for r in rows); scored = [r for r in rows if r[4] is not None and r[5] is not None]
-            sden = sum(r[6] for r in scored); base_total = sum(r[6]*r[4] for r in scored); teacher_total = sum(r[6]*r[5] for r in scored)
-            complete = bool(rows) and len(scored) == len(rows) and denominator > 0
-            result = {"eligible_count":len(rows),"scored_winner_count":len(scored),"denominator":denominator,"scored_denominator":sden,"B_H":base_total/denominator if complete else None,"T_H":teacher_total/denominator if complete else None,"Delta_H":(base_total/denominator-teacher_total/denominator) if complete else None,"population_sha256":hashlib.sha256(enc).hexdigest()}
+            hasher = hashlib.sha256(); hasher.update(b"[")
+            total = scored = 0; denominator = sden = base_total = teacher_total = 0.0
+            first = True
+            for r in self._db.execute("SELECT relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight FROM population ORDER BY relative_path,layout_index"):
+                weight = r[6] if r[6] is not None else math.exp(int(r[3]) / 12)
+                if not math.isfinite(weight): raise ValueError("weight")
+                payload = json.dumps({"relative_path":r[0],"layout_index":r[1],"instance_id":r[2],"n":r[3],"weight":weight}, sort_keys=True, separators=(",",":"), ensure_ascii=True, allow_nan=False).encode()
+                if not first: hasher.update(b",")
+                hasher.update(payload); first = False
+                total += 1; denominator += weight
+                if r[4] is not None and r[5] is not None:
+                    scored += 1; sden += weight; base_total += weight * r[4]; teacher_total += weight * r[5]
+            hasher.update(b"]")
+            complete = total > 0 and scored == total and denominator > 0
+            result = {"eligible_count":total,"scored_winner_count":scored,"denominator":denominator,"scored_denominator":sden,"B_H":base_total/denominator if complete else None,"T_H":teacher_total/denominator if complete else None,"Delta_H":(base_total/denominator-teacher_total/denominator) if complete else None,"population_sha256":hasher.hexdigest()}
             self._finished = result
             self.denominator = denominator; self.base_total = base_total; self.teacher_total = teacher_total
             return dict(result)
@@ -1716,6 +1789,8 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     lease: Optional[_StagingLease] = None
     writer: Optional[_JsonlWriter] = None
     population: Optional[_PopulationAccumulator] = None
+    spool: Optional[sqlite3.Connection] = None
+    index_fd: Optional[Any] = None
     try:
         staging = _new_staging(destination)
         try:
@@ -1728,6 +1803,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         spool.execute("PRAGMA cache_size=-64")
         spool.execute("PRAGMA temp_store=FILE")
         spool.execute("PRAGMA mmap_size=0")
+        spool.execute("CREATE TABLE shards(worker INTEGER,layout INTEGER,summary_json TEXT,PRIMARY KEY(worker,layout))")
         spool.execute("CREATE TABLE cases(worker INTEGER,layout INTEGER,source_row_index INTEGER,relative_path TEXT,file_sha256 TEXT,source_row_count INTEGER,instance_id TEXT,case_json TEXT,fingerprint TEXT,PRIMARY KEY(worker,layout,source_row_index))")
         spool.commit()
         population = _PopulationAccumulator()
@@ -1738,9 +1814,17 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         # Registration is a global pre-pass: every eligible heldout identity is
         # known before either train or heldout runtime call.
         for _worker, _layout, path in files:
-            raw, source = _read_verified_shard(root, _worker, _layout); digest = hashlib.sha256(raw).hexdigest()
-            count, _blocks = _validate_source_shard(source)
-            rel = path.relative_to(root).as_posix()
+            raw, source = _read_verified_shard(root, _worker, _layout)
+            summary = _verified_shard_summary(raw, source, _worker, _layout)
+            try:
+                spool.execute("INSERT INTO shards VALUES (?,?,?)", (_worker, _layout, json.dumps(
+                    [summary.worker, summary.layout, summary.relative_path,
+                     summary.file_sha256, summary.source_row_count],
+                    ensure_ascii=True, separators=(",", ":"), allow_nan=False)))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("duplicate shard identity") from exc
+            source_count, _ = _validate_source_shard(source)
+            digest, count, rel = summary.file_sha256, source_count, summary.relative_path
             for index in range(count):
                 iid = f"{rel}#{index}"
                 case = _source_case_from_shard(source, index, iid)
@@ -1762,9 +1846,15 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
             "official_evaluator_error", "base_unavailable")}
         index_fd = open(lease.path / "training_index.json", "wb")
         index_fd.write(b'{"rows":['); first_index = True
-        for _worker, _layout, index, rel, digest, count, iid, case_text, fp in spool.execute("SELECT worker,layout,source_row_index,relative_path,file_sha256,source_row_count,instance_id,case_json,fingerprint FROM cases ORDER BY worker,layout,source_row_index"):
+        for _worker, _layout, index, rel, digest, count, iid, case_text, fp, summary_text in spool.execute("SELECT c.worker,c.layout,c.source_row_index,c.relative_path,c.file_sha256,c.source_row_count,c.instance_id,c.case_json,c.fingerprint,s.summary_json FROM cases c JOIN shards s ON s.worker=c.worker AND s.layout=c.layout ORDER BY c.worker,c.layout,c.source_row_index"):
                 case = json.loads(case_text)
-                receipt = CorpusSourceReceipt(rel, digest, index, fingerprint_case(case))
+                summary = _VerifiedShardSummary(*json.loads(summary_text))
+                record = {"worker": _worker, "layout": _layout, "relative_path": rel,
+                          "file_sha256": digest, "source_row_count": count,
+                          "source_row_index": index, "instance_id": iid,
+                          "case_json": case_text, "case": case, "fingerprint": fp,
+                          "receipt": CorpusSourceReceipt(rel, digest, index, fp)}
+                case, receipt = _validate_spooled_case_row(record, summary)
                 entry = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "source_row_count": count, "block_count": case["n"]}
                 if case["n"] < args.n_min:
                     row_index = {**entry, "partition": None, "sample_ordinal": None, "sample_seed": None, "status": "excluded_n_min"}
@@ -1803,8 +1893,9 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 row_index = {**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": outcome.case_status}
                 if not first_index: index_fd.write(b",")
                 index_fd.write(json.dumps(row_index,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()); index_fd.flush(); first_index=False
+        writer.close()
         index_fd.write(b'],"schema":"icdc_topology_training_index_v1"}\n'); index_fd.flush(); os.fsync(index_fd.fileno()); index_fd.close()
-        spool.close(); spool_path.unlink()
+        spool.close(); spool = None; spool_path.unlink()
         pop = population.finish()
         coverage = {"eligible_train": train_count, "eligible_heldout": held_count, "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_count) and bool(held_count) and heldout_winners == held_count,
                     "mutation_proposals": mutation_proposals, "mutation_admitted": mutation_admitted,
@@ -1837,6 +1928,17 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         _publish_staging(lease, destination)
         return 0 if authorized else 1
     except BaseException:
+        for handle in (index_fd,):
+            try:
+                if handle is not None and not handle.closed:
+                    handle.close()
+            except BaseException:
+                pass
+        try:
+            if spool is not None:
+                spool.close()
+        except BaseException:
+            pass
         if population is not None:
             population.abort()
         if writer is not None:
