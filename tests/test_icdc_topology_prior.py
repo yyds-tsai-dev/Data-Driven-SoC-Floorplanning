@@ -117,7 +117,8 @@ def test_teacher_publish_b2_lease_cleanup_requires_exact_identity(tmp_path):
     for kind in ("symlink", "foreign"):
         stage = tmp_path / kind; stage.mkdir(); lease = t._new_staging_lease(stage)
         sentinel = tmp_path / (kind + "-sentinel"); sentinel.mkdir(); (sentinel / "keep").write_text("keep")
-        stage.rmdir()
+        moved = tmp_path / (kind + "-moved-owned")
+        stage.rename(moved)
         if kind == "symlink": stage.symlink_to(sentinel, target_is_directory=True)
         else: stage.mkdir(); (stage / "keep").write_text("keep")
         assert cleanup(lease) is False and (sentinel / "keep").exists()
@@ -125,6 +126,27 @@ def test_teacher_publish_b2_lease_cleanup_requires_exact_identity(tmp_path):
             assert stage.is_symlink()
         else:
             assert stage.is_dir() and (stage / "keep").read_text() == "keep"
+        assert moved.exists()
+
+
+def test_teacher_publish_b2_lease_creation_failure_preserves_replacements(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"; _task4_fake_runtime(t, monkeypatch)
+    real_new = t._new_staging; real_lease = t._new_staging_lease; moved = tmp_path / "moved-owned"; marker = RuntimeError("lease marker")
+    observed = {}
+    def attack(stage):
+        observed["stage"] = stage
+        Path(stage).rename(moved); Path(stage).mkdir(); (Path(stage) / "foreign").write_text("foreign")
+        raise marker
+    monkeypatch.setattr(t, "_new_staging_lease", attack)
+    cleanup_calls = []
+    monkeypatch.setattr(t, "_cleanup_owned_staging", lambda lease: cleanup_calls.append(lease) or True)
+    with pytest.raises(RuntimeError) as exc:
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert exc.value is marker
+    assert not cleanup_calls
+    assert out.exists() is False and moved.exists()
+    assert (Path(observed["stage"]) / "foreign").read_text() == "foreign"
 
 
 def test_teacher_publish_b2_ambiguous_eintr_never_deletes_foreign_destination(tmp_path, monkeypatch):
