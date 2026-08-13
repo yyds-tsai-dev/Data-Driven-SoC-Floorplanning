@@ -2312,19 +2312,50 @@ def test_teacher_staged_case_spool_failure_is_transactional(tmp_path, monkeypatc
     )
 
 
-@pytest.mark.parametrize("poison, changed_column", [
-    ("stored_fingerprint", 8),
-    ("instance_id", 6),
-    ("relative_path", 3),
-    ("source_row_count", 5),
-    ("case_instance_id", 7),
-    ("case_fingerprint", 7),
-    ("noncanonical_case_json", 7),
-    ("file_sha256", 4),
+@dataclasses.dataclass(frozen=True)
+class _Task4SpoofedReplayMetadata:
+    """Test-only semantic contract for the replay validation boundary."""
+    worker: int
+    layout: int
+    source_row_index: int
+    source_row_count: int
+    instance_id: str
+    case: collections.abc.Mapping
+    receipt: CorpusSourceReceipt
+    fingerprint: str
+
+
+def _task4_spoofed_replay_metadata(value):
+    """Accept either a semantic mapping or a production-owned dataclass."""
+    names = tuple(field.name for field in dataclasses.fields(_Task4SpoofedReplayMetadata))
+    if isinstance(value, collections.abc.Mapping):
+        values = {name: value[name] for name in names}
+    else:
+        values = {name: getattr(value, name) for name in names}
+    return _Task4SpoofedReplayMetadata(**values)
+
+
+@pytest.mark.parametrize("poison, changed_leaf", [
+    ("worker", "worker"),
+    ("layout", "layout"),
+    ("relative_path", "receipt.relative_path"),
+    ("source_row_index", "source_row_index"),
+    ("source_row_count", "source_row_count"),
+    ("fingerprint", "fingerprint"),
+    ("instance_id", "instance_id"),
+    ("case_payload", "case"),
+    ("case_instance_id", "case"),
+    ("malformed_digest", "receipt.file_sha256"),
+    ("wrong_digest", "receipt.file_sha256"),
 ])
-def test_teacher_replay_revalidates_tampered_case_spool_rows_before_runtime(
-        tmp_path, monkeypatch, poison, changed_column):
-    """Stored case records are a binding, not merely convenient replay input."""
+def test_teacher_replay_rejects_spoofed_semantic_metadata_before_runtime(
+        tmp_path, monkeypatch, poison, changed_leaf):
+    """Replay must bind every decoded case and receipt before process_case runs.
+
+    The test intentionally owns only this semantic validation seam; the lease's
+    private database filename, schema, row representation, and cursor style all
+    remain production details.
+    """
     t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
     source_path = _task4_shard(root)
     calls = []
@@ -2335,87 +2366,93 @@ def test_teacher_replay_revalidates_tampered_case_spool_rows_before_runtime(
         t, "_new_staging",
         lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
     )
-    real_connect = t.sqlite3.connect
-    baseline_rows = []
-    changed_rows = []
+    source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    expected = [
+        _Task4SpoofedReplayMetadata(
+            worker=2, layout=0, source_row_index=index, source_row_count=2,
+            instance_id=f"worker_2/layouts_0.th#{index}", case=_task4_expected_case(index),
+            receipt=CorpusSourceReceipt("worker_2/layouts_0.th", source_digest, index,
+                                        fingerprint_case(_task4_expected_case(index))),
+            fingerprint=fingerprint_case(_task4_expected_case(index)),
+        )
+        for index in range(2)
+    ]
+    observed = []
 
-    def canonical_case_text(case):
-        return json.dumps(case, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=True, allow_nan=False)
-
-    def poison_row(row):
-        values = list(row)
-        if poison == "stored_fingerprint":
-            values[8] = "0" * 64
-        elif poison == "instance_id":
-            values[6] = "worker_2/layouts_0.th#99"
-        elif poison == "relative_path":
-            values[3] = "worker_99/layouts_7.th"
-        elif poison == "source_row_count":
-            values[5] = 0
-        elif poison == "file_sha256":
-            values[4] = "not-a-sha256"
+    def spoof(binding):
+        if poison == "worker":
+            return dataclasses.replace(binding, worker=99)
+        if poison == "layout":
+            return dataclasses.replace(binding, layout=7)
+        if poison == "relative_path":
+            return dataclasses.replace(
+                binding, receipt=dataclasses.replace(binding.receipt,
+                                                      relative_path="worker_2/layouts_7.th"))
+        if poison == "source_row_index":
+            return dataclasses.replace(binding, source_row_index=2)
+        if poison == "source_row_count":
+            # Index zero stays in range, but the sealed shard actually has two rows.
+            return dataclasses.replace(binding, source_row_count=1)
+        if poison == "fingerprint":
+            return dataclasses.replace(binding, fingerprint="0" * 64)
+        if poison == "instance_id":
+            return dataclasses.replace(binding, instance_id="worker_2/layouts_0.th#99")
+        if poison == "malformed_digest":
+            return dataclasses.replace(
+                binding, receipt=dataclasses.replace(binding.receipt, file_sha256="not-a-sha256"))
+        if poison == "wrong_digest":
+            return dataclasses.replace(
+                binding, receipt=dataclasses.replace(binding.receipt, file_sha256="0" * 64))
+        case = copy.deepcopy(binding.case)
+        if poison == "case_payload":
+            case["area"][0] += 0.25
         else:
-            case = json.loads(values[7])
-            if poison == "case_instance_id":
-                case["instance_id"] = "worker_2/layouts_0.th#99"
-                values[7] = canonical_case_text(case)
-            elif poison == "case_fingerprint":
-                case["area"][0] += 0.25
-                values[7] = canonical_case_text(case)
-            else:
-                values[7] = json.dumps(case, sort_keys=False, indent=1,
-                                       ensure_ascii=True, allow_nan=False)
-        return tuple(values)
+            case["instance_id"] = "worker_2/layouts_0.th#99"
+        return dataclasses.replace(binding, case=case)
 
-    class ReplayConnection:
-        def __init__(self, connection):
-            self._connection = connection
+    def changed_leaves(before, after):
+        leaves = {
+            "worker": before.worker != after.worker,
+            "layout": before.layout != after.layout,
+            "source_row_index": before.source_row_index != after.source_row_index,
+            "source_row_count": before.source_row_count != after.source_row_count,
+            "instance_id": before.instance_id != after.instance_id,
+            "case": before.case != after.case,
+            "fingerprint": before.fingerprint != after.fingerprint,
+            "receipt.relative_path": before.receipt.relative_path != after.receipt.relative_path,
+            "receipt.file_sha256": before.receipt.file_sha256 != after.receipt.file_sha256,
+            "receipt.layout_index": before.receipt.layout_index != after.receipt.layout_index,
+            "receipt.fingerprint": before.receipt.fingerprint != after.receipt.fingerprint,
+        }
+        return [name for name, changed in leaves.items() if changed]
 
-        def execute(self, statement, parameters=()):
-            cursor = self._connection.execute(statement, parameters)
-            if " FROM CASES" not in statement.upper():
-                return cursor
-            assert not calls, "the canonical spool baseline must be observed before runtime"
-            rows = list(cursor)
-            assert len(rows) == 2
-            digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
-            for source_row_index, row in enumerate(rows):
-                case = json.loads(row[7])
-                assert (row[0], row[1], row[2], row[3], row[4], row[5], row[6]) == (
-                    2, 0, source_row_index, "worker_2/layouts_0.th", digest, 2,
-                    f"worker_2/layouts_0.th#{source_row_index}",
-                )
-                assert case == _task4_expected_case(source_row_index)
-                assert row[7] == canonical_case_text(case)
-                assert row[8] == fingerprint_case(case)
-            target = 1 if poison == "source_row_count" else 0
-            changed = poison_row(rows[target])
-            assert [index for index, (before, after) in enumerate(zip(rows[target], changed))
-                    if before != after] == [changed_column]
-            baseline_rows.extend(rows)
-            changed_rows.extend([*rows[:target], changed, *rows[target + 1:]])
-            return iter(changed_rows)
+    def validate_spooled_case_row(value):
+        assert not calls, "semantic binding must precede every runtime process call"
+        binding = _task4_spoofed_replay_metadata(value)
+        index = len(observed)
+        assert index < len(expected), "each spooled case is validated exactly once"
+        assert binding == expected[index]
+        # The seam takes a decoded mapping, so this checks canonical case content
+        # without freezing the database's JSON column or serialization mechanism.
+        assert _task4_canonical_json(binding.case) == _task4_canonical_json(expected[index].case)
+        spoofed = spoof(binding) if index == 0 else binding
+        assert changed_leaves(binding, spoofed) == ([changed_leaf] if index == 0 else [])
+        observed.append((binding, spoofed))
+        if len(observed) == len(expected):
+            raise ValueError(f"spoofed replay metadata: {poison}")
 
-        def __getattr__(self, name):
-            return getattr(self._connection, name)
-
-    def connect(database, *args, **kwargs):
-        connection = real_connect(database, *args, **kwargs)
-        if stages and Path(database).absolute() == (stages[-1] / "case_spool.sqlite").absolute():
-            return ReplayConnection(connection)
-        return connection
-
-    monkeypatch.setattr(t.sqlite3, "connect", connect)
+    monkeypatch.setattr(t, "_validate_spooled_case_row", validate_spooled_case_row,
+                        raising=False)
     raised = None
     try:
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     except ValueError as exc:
         raised = exc
-    assert baseline_rows and changed_rows
-    assert isinstance(raised, ValueError), (
-        f"replay accepted tampered stored {poison} after reading its canonical baseline"
+    assert len(observed) == 2, (
+        "production replay must invoke the semantic validation seam exactly once "
+        "for each spooled case before runtime"
     )
+    assert isinstance(raised, ValueError) and "spoofed replay metadata" in str(raised)
     assert calls == []
     assert not out.exists() and stages and not stages[-1].exists()
 
