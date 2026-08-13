@@ -1696,6 +1696,26 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         legal = covered = True; processed = 0
         files = _iter_approved_shards(root)
         if args.max_files is not None: files = files[:args.max_files]
+        # Registration is a global pre-pass: every eligible heldout identity is
+        # known before either train or heldout runtime call.
+        for _worker, _layout, path in files:
+            raw, source = _read_verified_shard(root, _worker, _layout)
+            count, _blocks = _validate_source_shard(source)
+            rel = path.relative_to(root).as_posix()
+            for index in range(count):
+                iid = f"{rel}#{index}"
+                case = _source_case_from_shard(source, index, iid)
+                if case["n"] >= args.n_min and split_for_id(iid, args.heldout_mod) == "heldout":
+                    population.register({"relative_path": rel, "layout_index": index,
+                                         "instance_id": iid, "n": case["n"]})
+            del source, raw
+        mutation_proposals = mutation_admitted = mutation_intent_survived = 0
+        positive_gain_heldout = 0
+        positive_gain_heldout_weight = 0.0
+        eligible_heldout_weight = 0.0
+        rejection_counts = {k: 0 for k in ("admission_failed", "hard_audit_failed",
+            "intent_not_survived", "official_infeasible", "official_invalid_cost",
+            "official_evaluator_error", "base_unavailable")}
         for _worker, _layout, path in files:
             raw, source = _read_verified_shard(root, _worker, _layout); digest = hashlib.sha256(raw).hexdigest()
             count, blocks = _validate_source_shard(source)
@@ -1716,18 +1736,39 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 for r in sorted(outcome.rejection_rows, key=lambda x: (x.get("ordinal", 0), x.get("name", ""))): writer.write("rejections.jsonl", {**env, **dict(r)})
                 if partition == "train": train_count += 1
                 else:
-                    held_count += 1; heldout_winners += 1
-                    population.register({"relative_path": rel, "layout_index": index, "instance_id": iid, "n": case["n"]})
-                    if outcome.base_cost is not None: population.record_winner(iid, outcome.base_cost, outcome.teacher_cost)
+                    held_count += 1
+                    eligible_heldout_weight += math.exp(case["n"] / 12)
+                    if outcome.base_cost is not None:
+                        heldout_winners += 1
+                        population.record_winner(iid, outcome.base_cost, outcome.teacher_cost)
+                        if outcome.teacher_cost < outcome.base_cost:
+                            positive_gain_heldout += 1
+                            positive_gain_heldout_weight += math.exp(case["n"] / 12)
+                for rejection in outcome.rejection_rows:
+                    reason = rejection.get("reason")
+                    if reason in rejection_counts:
+                        rejection_counts[reason] += 1
+                if outcome.case_status == "base_unavailable" and not any(
+                        r.get("reason") == "base_unavailable" for r in outcome.rejection_rows):
+                    rejection_counts["base_unavailable"] += 1
+                mutation_rows = [p for p in outcome.proposal_rows if p.get("name") != "base"]
+                mutation_proposals += len(mutation_rows)
+                mutation_admitted += sum(p.get("admission_status") == "admitted" for p in mutation_rows)
+                mutation_intent_survived += sum(p.get("intent_status") == "passed" for p in mutation_rows)
                 legal = legal and outcome.legal; covered = covered and outcome.covered
-                rows.append({**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": "processed"})
+                rows.append({**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": outcome.case_status})
             del source, raw
         pop = population.finish()
-        coverage = {"eligible_train": train_count, "eligible_heldout": held_count, "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_count) and bool(held_count) and heldout_winners == held_count}
+        coverage = {"eligible_train": train_count, "eligible_heldout": held_count, "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_count) and bool(held_count) and heldout_winners == held_count,
+                    "mutation_proposals": mutation_proposals, "mutation_admitted": mutation_admitted,
+                    "mutation_intent_survived": mutation_intent_survived, "positive_gain_heldout": positive_gain_heldout,
+                    "eligible_heldout_weight": eligible_heldout_weight, "positive_gain_heldout_weight": positive_gain_heldout_weight,
+                    "rejection_counts": rejection_counts}
         state = _g0_state({**trust, "legal": legal, "coverage": coverage["covered"], "teacher_mean": pop["T_H"], "delta": pop["Delta_H"]})
         authorized = runtime.authorizing and state == "TARGET_GAIN_MET" and args.max_files is None
         if not processed: state = "KILLED_LEGALITY_OR_COVERAGE"; authorized = False
-        manifest = {"schema":"icdc_topology_teacher_g0_v1","status":"complete","state":state,"secondary_reasons":[],"training_authorized":authorized,"bounded_max_files":args.max_files is not None,"trust":trust,"population":pop,"coverage":coverage}
+        secondary_reasons = ["base_unavailable"] if rejection_counts["base_unavailable"] else []
+        manifest = {"schema":"icdc_topology_teacher_g0_v1","status":"complete","state":state,"secondary_reasons":secondary_reasons,"training_authorized":authorized,"bounded_max_files":args.max_files is not None,"trust":trust,"population":pop,"coverage":coverage}
         writer.close()
         with open(lease.path / "training_index.json", "wb") as fd:
             fd.write(json.dumps({"schema":"icdc_topology_training_index_v1","rows":rows}, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n"); fd.flush(); os.fsync(fd.fileno())
