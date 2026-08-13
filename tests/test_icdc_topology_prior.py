@@ -1174,7 +1174,7 @@ def _task4_expected_case(index):
 
 
 def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None,
-                        preflight_calls=None, events=None):
+                        preflight_calls=None, events=None, outcome_factory=None):
     calls = [] if calls is None else calls
     preflight_calls = [] if preflight_calls is None else preflight_calls
     events = [] if events is None else events
@@ -1208,7 +1208,8 @@ def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None,
                        case_input.receipt.layout_index))
         if fail_at is not None and len(calls) - 1 == fail_at:
             raise _Task4ProcessFailure(f"process failure at {fail_at}")
-        return _task4_good_outcome(case_outcome_type)
+        return (outcome_factory(t, case_input) if outcome_factory else
+                _task4_good_outcome(t, case_input))
 
     monkeypatch.setattr(
         t, "_CaseOutcome", case_outcome_type,
@@ -1232,13 +1233,14 @@ def _task4_args(root, out, *, n_min=1, heldout_mod=2, max_files=None):
 
 def _task4_run(tmp_path, monkeypatch, *, n_min=1, max_files=None,
                soft_delta=0, relative_path="worker_2/layouts_0.th", fail_at=None,
-               preflight_calls=None, events=None, policy=None):
+               preflight_calls=None, events=None, policy=None, outcome_factory=None):
     t = _teacher()
     root = tmp_path / "floorset_lite"
     _task4_shard(root, soft_delta=soft_delta, relative_path=relative_path)
     out = tmp_path / "out"
     calls = _task4_fake_runtime(t, monkeypatch, fail_at=fail_at,
-                                preflight_calls=preflight_calls, events=events)
+                                preflight_calls=preflight_calls, events=events,
+                                outcome_factory=outcome_factory)
     policy = _policy_for(root) if policy is None else policy
     result = t.teacher_main(
         _task4_args(root, out, n_min=n_min, max_files=max_files),
@@ -1397,46 +1399,31 @@ _TASK4_P1C_PROPOSAL_KEYS = {
 }
 
 
-def _task4_good_label(*, proposal_ordinal=0, proposal_name="base",
-                      base_cost=1.1, teacher_cost=1.0):
-    return {
-        "edges": [], "contacts": [], "pin_paths": [],
-        "proposal_ordinal": proposal_ordinal, "proposal_name": proposal_name,
-        "base_cost": base_cost, "teacher_cost": teacher_cost,
-        "record_weight": base_cost / teacher_cost,
-    }
+def _task4_good_label(case_input, *, base_cost=1.1, teacher_cost=1.1):
+    """A valid base-winner label, derived from this exact corpus case."""
+    raw = _task4_p1c_raw(case_input.case)
+    return _task4_p1c_label(
+        case_input, raw, 0, "base", base_cost, teacher_cost,
+    )
 
 
-def _task4_good_proposal(cost=1.0, *, winner=True, ordinal=0, name="base"):
-    return {
-        "ordinal": ordinal, "name": name,
-        "intended_intent": name if name != "base" else "base",
-        "raw_topology_fingerprint": "0" * 64,
-        "intended_topology_fingerprint": "0" * 64,
-        "realized_topology_fingerprint": "0" * 64,
-        "admission_status": "admitted", "admission_reason": None,
-        "drift": {"max_abs": 0.0}, "hard": {"hard_audit": True},
-        "hard_status": "passed", "intent_status": "passed",
-        "diagnostic_energy": 0.0, "energy_status": "recorded",
-        "official_cost": cost, "feasible": True, "official_status": "scored",
-        "winner": winner,
-        "status": "winner_base_no_improvement" if winner and name == "base" else "not_selected",
-    }
+def _task4_good_proposal(t, case_input, *, cost=1.1):
+    """A valid base-no-improvement proposal with real topology SHA evidence."""
+    raw = _task4_p1c_raw(case_input.case)
+    base = _task4_p1c_record(
+        t, 0, "base", raw, raw, cost=cost, energy=None,
+        energy_status="unavailable", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    lifecycle = t._CandidateLifecycle((base,), 0, cost, cost)
+    return _task4_p1c_expected_row(case_input, raw, base, lifecycle)
 
 
-def _task4_good_outcome(t, *, base_cost=1.1, teacher_cost=1.0,
-                        label_row=None, proposal_rows=None, rejection_rows=(),
-                        legal=True, covered=True,
-                        case_status="winner_base_no_improvement"):
-    outcome_type = t if isinstance(t, type) else t._CaseOutcome
-    return outcome_type(
-        label_row=(label_row if label_row is not None else
-                   _task4_good_label(base_cost=base_cost, teacher_cost=teacher_cost)),
-        proposal_rows=(tuple(proposal_rows) if proposal_rows is not None else
-                       (_task4_good_proposal(teacher_cost),)),
-        rejection_rows=tuple(rejection_rows), base_cost=base_cost,
-        teacher_cost=teacher_cost, legal=legal, covered=covered,
-        case_status=case_status,
+def _task4_good_outcome(t, case_input, *, cost=1.1):
+    """The shared default fixture is logically valid base-no-improvement."""
+    return t._CaseOutcome(
+        _task4_good_label(case_input, base_cost=cost, teacher_cost=cost),
+        (_task4_good_proposal(t, case_input, cost=cost),), (),
+        cost, cost, True, True, "winner_base_no_improvement",
     )
 
 
@@ -1454,7 +1441,7 @@ def _task4_install_custom_runtime(t, monkeypatch, *, preflight_factory=None,
     def process(case_input):
         process_calls.append(case_input)
         return (outcome_factory(t, case_input) if outcome_factory else
-                _task4_good_outcome(t._CaseOutcome))
+                _task4_good_outcome(t, case_input))
 
     monkeypatch.setattr(t, "_CaseOutcome", _Task4CaseOutcome)
     monkeypatch.setattr(
@@ -1490,7 +1477,8 @@ def test_teacher_evidence_a_cli_help_exposes_data_root():
 
 def test_teacher_evidence_a_padded_connectivity_transaction(tmp_path, monkeypatch):
     t, _root, out, calls, _preflight, _policy, result = _task4_execute_tensors(
-        tmp_path, monkeypatch, _task4_padded_tensors()
+        tmp_path, monkeypatch, _task4_padded_tensors(),
+        outcome_factory=_task4_p1c_mutation_outcome,
     )
     assert result == 0 and len(calls) == 2
     expected_connections = (
@@ -1648,10 +1636,11 @@ _TASK4_BAD_OUTCOME_KINDS = (
 )
 
 
-def _task4_bad_outcome(t, kind):
-    label = _task4_good_label(base_cost=1.0, teacher_cost=1.0)
-    proposal = _task4_good_proposal(1.0); proposals = [proposal]
-    rejections = []; base_cost = teacher_cost = 1.0; legal = covered = True
+def _task4_bad_outcome(t, case_input, kind):
+    valid = _task4_good_outcome(t, case_input)
+    label = dict(valid.label_row)
+    proposal = dict(valid.proposal_rows[0]); proposals = [proposal]
+    rejections = []; base_cost = teacher_cost = 1.1; legal = covered = True
     if kind.startswith("base_"):
         base_cost = {"base_nan": float("nan"), "base_inf": float("inf"),
                      "base_zero": 0.0, "base_negative": -1.0}[kind]
@@ -1698,7 +1687,9 @@ def _task4_bad_outcome(t, kind):
 def test_teacher_evidence_a_outcome_transaction(tmp_path, monkeypatch, kind):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
     calls, _ = _task4_install_custom_runtime(
-        t, monkeypatch, outcome_factory=lambda module, _case: _task4_bad_outcome(module, kind)
+        t, monkeypatch, outcome_factory=lambda module, case_input: _task4_bad_outcome(
+            module, case_input, kind,
+        )
     )
     with pytest.raises(ValueError):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
@@ -1709,9 +1700,9 @@ def test_teacher_evidence_a_ratio_transaction(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
     calls, _ = _task4_install_custom_runtime(
         t, monkeypatch,
-        outcome_factory=lambda module, _case: _task4_good_outcome(
-            module, base_cost=2.5, teacher_cost=1.25,
-            proposal_rows=(_task4_good_proposal(1.25),)),
+        outcome_factory=lambda module, case_input: _task4_p1c_mutation_outcome(
+            module, case_input, base_cost=2.5, teacher_cost=1.25,
+        ),
     )
     result = t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert result == 0 and len(calls) == 2
@@ -1743,7 +1734,9 @@ def test_teacher_evidence_a_nonnumeric_symlink_decoys_are_ignored(tmp_path, monk
     external = tmp_path / "external"; _task4_shard(external)
     (root / "worker_bad").symlink_to(external / "worker_2", target_is_directory=True)
     (root / "worker_2" / "layouts_bad.th").symlink_to(external / "worker_2" / "layouts_0.th")
-    out = tmp_path / "out"; calls, _ = _task4_install_custom_runtime(t, monkeypatch)
+    out = tmp_path / "out"; calls, _ = _task4_install_custom_runtime(
+        t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome,
+    )
     assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
     assert len(calls) == 2
 
@@ -1776,10 +1769,61 @@ def test_teacher_evidence_a_one_sided_split_is_coverage_kill(
     }
 
 
+def _task4_p1c_coverage(calls, outcomes):
+    reasons = (
+        "admission_failed", "hard_audit_failed", "intent_not_survived",
+        "official_infeasible", "official_invalid_cost", "official_evaluator_error",
+        "base_unavailable",
+    )
+    heldout = [(case_input, outcome) for case_input, outcome in zip(calls, outcomes)
+               if case_input.partition == "heldout"]
+    return {
+        "eligible_train": sum(case_input.partition == "train" for case_input in calls),
+        "eligible_heldout": len(heldout),
+        "heldout_winners": sum(outcome.case_status != "base_unavailable"
+                                for _, outcome in heldout),
+        "legal": all(outcome.legal for outcome in outcomes),
+        "covered": (all(outcome.covered for outcome in outcomes)
+                    and any(case_input.partition == "train" for case_input in calls)
+                    and bool(heldout)
+                    and all(outcome.case_status != "base_unavailable" for _, outcome in heldout)),
+        "mutation_proposals": sum(
+            row["ordinal"] != 0
+            for outcome in outcomes for row in outcome.proposal_rows
+        ),
+        "mutation_admitted": sum(
+            row["ordinal"] != 0 and row["admission_status"] == "admitted"
+            for outcome in outcomes for row in outcome.proposal_rows
+        ),
+        "mutation_intent_survived": sum(
+            row["ordinal"] != 0 and row["intent_status"] == "passed"
+            for outcome in outcomes for row in outcome.proposal_rows
+        ),
+        "positive_gain_heldout": sum(
+            outcome.covered and outcome.teacher_cost < outcome.base_cost
+            for _, outcome in heldout
+        ),
+        "eligible_heldout_weight": sum(
+            math.exp(case_input.case["n"] / 12) for case_input, _ in heldout
+        ),
+        "positive_gain_heldout_weight": sum(
+            math.exp(case_input.case["n"] / 12)
+            for case_input, outcome in heldout
+            if outcome.covered and outcome.teacher_cost < outcome.base_cost
+        ),
+        "rejection_counts": {
+            reason: sum(row["reason"] == reason
+                        for outcome in outcomes for row in outcome.rejection_rows)
+            for reason in reasons
+        },
+    }
+
+
 def _task4_assert_success_artifacts(t, root, out, calls, policy,
                                     preflight_calls, *, bounded=False,
-                                    training_authorized=True,
-                                    state="TARGET_GAIN_MET", source_bytes=None):
+                                    training_authorized=False,
+                                    state="STOP_HARD_GAIN_MISSED", source_bytes=None,
+                                    outcome_factory=_task4_good_outcome):
     assert sorted(path.name for path in out.iterdir()) == sorted(_TASK4_FILES)
     expected_cases = [_task4_expected_case(0), _task4_expected_case(1)]
     if source_bytes is None:
@@ -1801,15 +1845,25 @@ def _task4_assert_success_artifacts(t, root, out, calls, policy,
         expected_cases[i], expected_receipts[i], partition,
         t._sample_seed(20260813, expected_cases[i]["instance_id"], 0),
     )
-    expected_labels = [{**env(index, partition), **_task4_good_label()}
-                       for index, partition in ((0, "train"), (1, "heldout"))]
-    fake_fields = _task4_good_proposal()
-    expected_proposals = [{**env(0, "train"), **fake_fields},
-                          {**env(1, "heldout"), **fake_fields}]
+    expected_outcomes = [outcome_factory(t, case_input) for case_input in calls]
+    expected_labels = [
+        {**env(index, partition), **dict(outcome.label_row)}
+        for (index, partition), outcome in zip(((0, "train"), (1, "heldout")), expected_outcomes)
+    ]
+    expected_proposals = [
+        {**env(index, partition), **dict(row)}
+        for (index, partition), outcome in zip(((0, "train"), (1, "heldout")), expected_outcomes)
+        for row in outcome.proposal_rows
+    ]
+    expected_rejections = [
+        {**env(index, partition), **dict(row)}
+        for (index, partition), outcome in zip(((0, "train"), (1, "heldout")), expected_outcomes)
+        for row in outcome.rejection_rows
+    ]
     assert _task4_jsonl(out / "train_labels.jsonl") == [expected_labels[0]]
     assert _task4_jsonl(out / "heldout_labels.jsonl") == [expected_labels[1]]
     assert _task4_jsonl(out / "proposals.jsonl") == expected_proposals
-    assert (out / "rejections.jsonl").read_bytes() == b""
+    assert _task4_jsonl(out / "rejections.jsonl") == expected_rejections
 
     index = json.loads((out / "training_index.json").read_text())
     assert index["schema"] == "icdc_topology_training_index_v1"
@@ -1818,14 +1872,15 @@ def _task4_assert_success_artifacts(t, root, out, calls, policy,
          "source_row_count": 2, "block_count": 3,
          "partition": ("train" if i == 0 else "heldout"), "sample_ordinal": 0,
          "sample_seed": t._sample_seed(20260813, expected_cases[i]["instance_id"], 0),
-         "status": "winner_base_no_improvement"}
+         "status": expected_outcomes[i].case_status}
         for i in range(2)]
 
-    expected_population = _task4_p1c_canonical_population([{
-        "relative_path": "worker_2/layouts_0.th", "layout_index": 1,
-        "instance_id": expected_cases[1]["instance_id"], "n": 3,
-        "base_cost": 1.1, "teacher_cost": 1.0,
-    }])
+    expected_population = _task4_p1c_canonical_population([
+        {"relative_path": item.receipt.relative_path, "layout_index": item.receipt.layout_index,
+         "instance_id": item.case["instance_id"], "n": item.case["n"],
+         "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost}
+        for item, outcome in zip(calls, expected_outcomes) if item.partition == "heldout"
+    ])
     manifest = json.loads((out / "g0_manifest.json").read_text())
     assert set(manifest) == {"schema", "status", "state", "secondary_reasons",
                              "training_authorized", "bounded_max_files", "trust",
@@ -1838,20 +1893,7 @@ def _task4_assert_success_artifacts(t, root, out, calls, policy,
     assert manifest["bounded_max_files"] is bounded
     assert manifest["trust"] == _task4_expected_trust(policy)
     assert manifest["population"] == expected_population
-    assert manifest["coverage"] == {
-        "eligible_train": 1, "eligible_heldout": 1, "heldout_winners": 1,
-        "legal": True, "covered": True,
-        "mutation_proposals": 0, "mutation_admitted": 0,
-        "mutation_intent_survived": 0, "positive_gain_heldout": 0,
-        "eligible_heldout_weight": math.exp(3 / 12),
-        "positive_gain_heldout_weight": 0.0,
-        "rejection_counts": {
-            "admission_failed": 0, "hard_audit_failed": 0,
-            "intent_not_survived": 0, "official_infeasible": 0,
-            "official_invalid_cost": 0, "official_evaluator_error": 0,
-            "base_unavailable": 0,
-        },
-    }
+    assert manifest["coverage"] == _task4_p1c_coverage(calls, expected_outcomes)
     assert manifest["support_hashes"] == {
         name: hashlib.sha256((out / name).read_bytes()).hexdigest()
         for name in _TASK4_FILES if name != "g0_manifest.json"
@@ -1882,16 +1924,24 @@ def test_teacher_source_transaction_publishes_exact_sanitized_evidence(tmp_path,
     policy = _policy_for(tmp_path / "floorset_lite")
     t, root, out, calls, result = _task4_run(tmp_path, monkeypatch,
                                              preflight_calls=preflight_calls,
-                                             policy=policy)
+                                             policy=policy,
+                                             outcome_factory=_task4_p1c_mutation_outcome)
     assert result == 0
-    _task4_assert_success_artifacts(t, root, out, calls, policy, preflight_calls)
+    _task4_assert_success_artifacts(
+        t, root, out, calls, policy, preflight_calls,
+        training_authorized=True, state="TARGET_GAIN_MET",
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
 
 
 def test_teacher_source_reads_each_file_once_from_same_bytesio_under_path_swap(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; path = _task4_shard(root)
     out = tmp_path / "out"; calls = []
     preflight_calls = []
-    _task4_fake_runtime(t, monkeypatch, calls=calls, preflight_calls=preflight_calls)
+    _task4_fake_runtime(
+        t, monkeypatch, calls=calls, preflight_calls=preflight_calls,
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
     original_bytes = path.read_bytes(); seen = []
     real_load = torch.load
 
@@ -1909,8 +1959,11 @@ def test_teacher_source_reads_each_file_once_from_same_bytesio_under_path_swap(t
     expected_sha = hashlib.sha256(original_bytes).hexdigest()
     index = json.loads((out / "training_index.json").read_text())
     assert {row["receipt"]["file_sha256"] for row in index["rows"]} == {expected_sha}
-    _task4_assert_success_artifacts(t, root, out, calls, policy, preflight_calls,
-                                    source_bytes=original_bytes)
+    _task4_assert_success_artifacts(
+        t, root, out, calls, policy, preflight_calls,
+        training_authorized=True, state="TARGET_GAIN_MET",
+        source_bytes=original_bytes, outcome_factory=_task4_p1c_mutation_outcome,
+    )
 
 
 @pytest.mark.parametrize("soft_delta", [1000, 2000])
@@ -1920,9 +1973,9 @@ def test_teacher_soft_fp_variants_only_change_narrow_source_hashes(tmp_path, mon
     base_path = _task4_shard(base_root); soft_path = _task4_shard(soft_root, soft_delta=soft_delta)
     assert hashlib.sha256(base_path.read_bytes()).hexdigest() != hashlib.sha256(soft_path.read_bytes()).hexdigest()
     t = _teacher(); base_out = base_dir / "out"; soft_out = soft_dir / "out"
-    _task4_fake_runtime(t, monkeypatch)
+    _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
     assert t.teacher_main(_task4_args(base_root, base_out), _trust_policy=_policy_for(base_root)) == 0
-    _task4_fake_runtime(t, monkeypatch)
+    _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
     assert t.teacher_main(_task4_args(soft_root, soft_out), _trust_policy=_policy_for(soft_root)) == 0
     assert _task4_artifact_projection(base_out) == _task4_artifact_projection(soft_out)
     changed = (701 + soft_delta, 703 + soft_delta, 401 + soft_delta,
@@ -1941,13 +1994,27 @@ def test_teacher_fresh_outputs_are_byte_identical_and_existing_output_is_untouch
     first, second = tmp_path / "first", tmp_path / "second"
     policy = _policy_for(root)
     calls_first = []; preflight_first = []
-    _task4_fake_runtime(t, monkeypatch, calls=calls_first, preflight_calls=preflight_first)
+    _task4_fake_runtime(
+        t, monkeypatch, calls=calls_first, preflight_calls=preflight_first,
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
     assert t.teacher_main(_task4_args(root, first), _trust_policy=policy) == 0
-    _task4_assert_success_artifacts(t, root, first, calls_first, policy, preflight_first)
+    _task4_assert_success_artifacts(
+        t, root, first, calls_first, policy, preflight_first,
+        training_authorized=True, state="TARGET_GAIN_MET",
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
     calls_second = []; preflight_second = []
-    _task4_fake_runtime(t, monkeypatch, calls=calls_second, preflight_calls=preflight_second)
+    _task4_fake_runtime(
+        t, monkeypatch, calls=calls_second, preflight_calls=preflight_second,
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
     assert t.teacher_main(_task4_args(root, second), _trust_policy=policy) == 0
-    _task4_assert_success_artifacts(t, root, second, calls_second, policy, preflight_second)
+    _task4_assert_success_artifacts(
+        t, root, second, calls_second, policy, preflight_second,
+        training_authorized=True, state="TARGET_GAIN_MET",
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
     assert {name: (first / name).read_bytes() for name in _TASK4_FILES} == {
         name: (second / name).read_bytes() for name in _TASK4_FILES}
     before = {name: hashlib.sha256((first / name).read_bytes()).hexdigest() for name in _TASK4_FILES}
@@ -2032,7 +2099,7 @@ def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path,
 
     monkeypatch.setattr(t, "_new_staging", new_staging)
     monkeypatch.setattr(t, "_read_verified_shard", read)
-    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 1
     assert reads == 3
     for name in _TASK4_JSONL:
         rows = _task4_jsonl(out / name)
@@ -2374,20 +2441,24 @@ def test_teacher_bounded_max_files_is_non_authorizing_even_with_positive_fake_ga
     preflight_calls = []
     policy = _policy_for(tmp_path / "floorset_lite")
     t, root, out, calls, result = _task4_run(
-        tmp_path, monkeypatch, max_files=1, preflight_calls=preflight_calls, policy=policy)
-    assert result != 0
+        tmp_path, monkeypatch, max_files=1, preflight_calls=preflight_calls, policy=policy,
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
+    assert result == 1
     manifest = _task4_assert_success_artifacts(
         t, root, out, calls, policy, preflight_calls,
-        bounded=True, training_authorized=False)
+        bounded=True, training_authorized=False, state="TARGET_GAIN_MET",
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
     assert len(calls) == 2
     assert manifest["state"] == "TARGET_GAIN_MET"
     assert manifest["coverage"] == {
         "eligible_train": 1, "eligible_heldout": 1, "heldout_winners": 1,
         "legal": True, "covered": True,
-        "mutation_proposals": 0, "mutation_admitted": 0,
-        "mutation_intent_survived": 0, "positive_gain_heldout": 0,
+        "mutation_proposals": 2, "mutation_admitted": 2,
+        "mutation_intent_survived": 2, "positive_gain_heldout": 1,
         "eligible_heldout_weight": math.exp(3 / 12),
-        "positive_gain_heldout_weight": 0.0,
+        "positive_gain_heldout_weight": math.exp(3 / 12),
         "rejection_counts": {
             "admission_failed": 0, "hard_audit_failed": 0,
             "intent_not_survived": 0, "official_infeasible": 0,
@@ -2406,7 +2477,10 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
     decoy_a = root / "worker_2" / "layouts_bad.th"; decoy_a.write_bytes(b"bad")
     decoy_b = root / "worker_bad" / "layouts_0.th"; decoy_b.parent.mkdir(); decoy_b.write_bytes(b"bad")
     calls = []; events = []
-    _task4_fake_runtime(t, monkeypatch, calls=calls, events=events)
+    _task4_fake_runtime(
+        t, monkeypatch, calls=calls, events=events,
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
     loaded = []
     real_load = torch.load
 
@@ -2445,7 +2519,9 @@ def test_teacher_evidence_a_canonical_ascii_discovery_binds_paths_and_ignores_un
     _task4_single_shard(root, "worker_²/layouts_⁰.th", metric_delta=8)
     _task4_single_shard(root, "worker_2/layouts_０.th", metric_delta=7)
     _task4_single_shard(root, "worker_١/layouts_١.th", metric_delta=6)
-    calls = []; _task4_fake_runtime(t, monkeypatch, calls=calls)
+    calls = []; _task4_fake_runtime(
+        t, monkeypatch, calls=calls, outcome_factory=_task4_p1c_mutation_outcome,
+    )
     out = tmp_path / "out"
     assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
     assert [c.receipt.relative_path for c in calls] == [
@@ -2463,7 +2539,9 @@ def test_teacher_evidence_a_validate_source_shard_uses_bounded_finite_checks(mon
 
 def test_teacher_evidence_a_json_serialization_always_disables_nan(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
-    _task4_fake_runtime(t, monkeypatch); out = tmp_path / "out"
+    _task4_fake_runtime(
+        t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome,
+    ); out = tmp_path / "out"
     real_dumps = t.json.dumps; seen = []
     def spy(value, *args, **kwargs):
         seen.append(kwargs.get("allow_nan", "missing"))
@@ -2487,12 +2565,17 @@ def test_teacher_evidence_a_json_serialization_always_disables_nan(tmp_path, mon
 def test_teacher_evidence_a_diagnostic_evidence_schema_is_semantically_rejected(
         tmp_path, monkeypatch, field, value, match):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    def malformed(module, case_input):
+        valid = _task4_good_outcome(module, case_input)
+        return module._CaseOutcome(
+            valid.label_row,
+            (dict(valid.proposal_rows[0], **{field: value}),), (),
+            valid.base_cost, valid.teacher_cost, valid.legal, valid.covered,
+            valid.case_status,
+        )
     out = tmp_path / "out"; calls, _ = _task4_install_custom_runtime(
-        t, monkeypatch,
-        outcome_factory=lambda module, _case: module._CaseOutcome(
-            _task4_good_label(),
-            (dict(_task4_good_proposal(), **{field: value}),), (), 1.1, 1.0,
-            True, True, "winner_base_no_improvement"))
+        t, monkeypatch, outcome_factory=malformed,
+    )
     with pytest.raises(ValueError, match=match):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert len(calls) == 1 and not out.exists()
@@ -2797,7 +2880,7 @@ def test_teacher_valid_canonical_root_runs_the_authorizing_bridge_without_claimi
     _task4_shard(root); _checkpoint, policy = _task4_verified_checkpoint(t, root)
     args = _task4_args(root, out)
     _task4_fake_runtime(t, monkeypatch)
-    assert t.teacher_main(args, _trust_policy=policy) in (0, 1)
+    assert t.teacher_main(args, _trust_policy=policy) == 1
     assert out.exists()
 
 
@@ -6055,6 +6138,30 @@ def _task4_p1c_unavailable_outcome(t, case_input, *, base_reason="official_inval
     )
 
 
+def _task4_p1c_rejection_outcome(t, case_input, reason):
+    """A valid lifecycle fact for one terminal rejection reason."""
+    if reason == "base_unavailable":
+        return _task4_p1c_unavailable_outcome(t, case_input)
+    raw = _task4_p1c_raw(case_input.case); mutation = _task4_p1c_mutation(raw)
+    base = _task4_p1c_record(
+        t, 0, "base", raw, raw, cost=1.1, energy=None,
+        energy_status="unavailable", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    legal = None if reason == "admission_failed" else mutation
+    hard = ({} if legal is None else
+            {"hard_audit": False} if reason == "hard_audit_failed" else
+            {"hard_audit": True})
+    candidate = _task4_p1c_record(
+        t, 1, "axis:0:1:0:0", mutation, legal,
+        cost=None,
+        energy_status="not_reached", reason=reason, hard=hard,
+        drift={} if legal is None else {"max_abs": 0.0},
+    )
+    return _task4_p1c_outcome(
+        case_input, raw, t._CandidateLifecycle((base, candidate), 0, 1.1, 1.1)
+    )
+
+
 def _task4_p1c_canonical_population(rows):
     ordered = sorted(rows, key=lambda row: (row["relative_path"], row["layout_index"]))
     encoded = b"[" + b",".join(
@@ -6331,7 +6438,7 @@ def test_task4_p1c_teacher_main_registers_every_heldout_identity_before_process_
     monkeypatch.setattr(t, "_PopulationAccumulator", PopulationSpy)
     monkeypatch.setattr(t, "_CaseOutcome", _Task4CaseOutcome)
     monkeypatch.setattr(t, "_runtime_hooks", lambda: _Task4Runtime(preflight, process, True))
-    assert t.teacher_main(_task4_args(root, out), _trust_policy=policy) in (0, 1)
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=policy) == 0
     heldout = [event for event in events if event[1:] == ("worker_2/layouts_0.th#1",)]
     assert heldout[:3] == [
         ("register", "worker_2/layouts_0.th#1"),
@@ -6369,7 +6476,7 @@ def test_task4_p1c_teacher_main_artifacts_preserve_dynamic_winner_label_and_rece
         outcome_factory(module, case_input),
     )
     result = t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
-    assert result in (0, 1)  # P1-C must not hard-code a G0 success result.
+    assert result == (0 if mode == "mutation" else 1)
     rows = _task4_p1c_artifact_rows(out)
     corpus = rows["train_corpus.jsonl"] + rows["heldout_corpus.jsonl"]
     labels = rows["train_labels.jsonl"] + rows["heldout_labels.jsonl"]
@@ -6378,19 +6485,33 @@ def test_task4_p1c_teacher_main_artifacts_preserve_dynamic_winner_label_and_rece
         iid = case_input.case["instance_id"]
         index_row = next(row for row in rows["index"]["rows"] if row["instance_id"] == iid)
         label = next(row for row in labels if row["instance_id"] == iid)
-        assert index_row["receipt"] == dataclasses.asdict(case_input.receipt)
-        assert index_row["status"] == expected_status
+        envelope = _task4_envelope(
+            case_input.case, dataclasses.asdict(case_input.receipt),
+            case_input.partition, case_input.sample_seed,
+        )
+        expected = outcome_factory(t, case_input)
+        assert next(row for row in corpus if row["instance_id"] == iid) == case_input.case
         assert fingerprint_case(next(row for row in corpus if row["instance_id"] == iid)) == case_input.receipt.fingerprint
+        assert index_row == {
+            "receipt": dataclasses.asdict(case_input.receipt), "instance_id": iid,
+            "source_row_count": 2, "block_count": case_input.case["n"],
+            "partition": case_input.partition, "sample_ordinal": 0,
+            "sample_seed": case_input.sample_seed, "status": expected_status,
+        }
         proposals = [row for row in rows["proposals.jsonl"] if row["instance_id"] == iid]
+        rejections = [row for row in rows["rejections.jsonl"] if row["instance_id"] == iid]
         assert len(proposals) == expected_proposal_count
+        assert rejections == []
+        assert {key: value for key, value in label.items() if key not in envelope} == expected.label_row
+        assert [{key: value for key, value in row.items() if key not in envelope}
+                for row in proposals] == list(expected.proposal_rows)
+        assert [{key: value for key, value in row.items() if key not in envelope}
+                for row in rejections] == list(expected.rejection_rows)
         for row in (label, *proposals):
-            assert row["receipt"] == dataclasses.asdict(case_input.receipt)
-            assert row["partition"] == case_input.partition and row["sample_seed"] == case_input.sample_seed
-            if "ordinal" in row:
-                assert set(row) == _TASK4_P1C_PROPOSAL_KEYS | {
-                    "receipt", "instance_id", "partition", "sample_seed", "n",
-                }
-                assert type(row["intended_intent"]) is str and row["intended_intent"] == row["name"]
+            assert {key: row[key] for key in envelope} == envelope
+        assert all(set(row) == _TASK4_P1C_PROPOSAL_KEYS | set(envelope) for row in proposals)
+        assert all(type(row["intended_intent"]) is str and row["intended_intent"] == row["name"]
+                   for row in proposals)
         winner = next(row for row in proposals if row["winner"])
         assert label["proposal_ordinal"] == expected_ordinal and label["proposal_name"] == expected_name
         assert label["base_cost"] == 1.1 and label["teacher_cost"] == expected_teacher_cost
@@ -6443,7 +6564,12 @@ def test_task4_p1c_teacher_main_base_unavailable_retains_corpus_and_rejections_b
                                    case_input.partition, case_input.sample_seed)
         assert fingerprint_case(next(row for row in corpus if row["instance_id"] == iid)) == case_input.receipt.fingerprint
         index_row = next(row for row in rows["index"]["rows"] if row["instance_id"] == iid)
-        assert index_row["receipt"] == dataclasses.asdict(case_input.receipt)
+        assert index_row == {
+            "receipt": dataclasses.asdict(case_input.receipt), "instance_id": iid,
+            "source_row_count": 2, "block_count": case_input.case["n"],
+            "partition": case_input.partition, "sample_ordinal": 0,
+            "sample_seed": case_input.sample_seed, "status": "base_unavailable",
+        }
         expected = _task4_p1c_unavailable_outcome(t, case_input)
         proposals = [row for row in rows["proposals.jsonl"] if row["instance_id"] == iid]
         rejections = [row for row in rows["rejections.jsonl"] if row["instance_id"] == iid]
@@ -6479,6 +6605,58 @@ def test_task4_p1c_teacher_main_base_unavailable_retains_corpus_and_rejections_b
     }
 
 
+@pytest.mark.parametrize("reason", [
+    "admission_failed", "hard_audit_failed", "intent_not_survived",
+    "official_infeasible", "official_invalid_cost", "official_evaluator_error",
+    "base_unavailable",
+])
+def test_task4_p1c_teacher_main_rejection_reason_coverage_matrix_is_exact(
+        tmp_path, monkeypatch, reason):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    factory = lambda module, case_input: _task4_p1c_rejection_outcome(
+        module, case_input, reason,
+    )
+    calls, _ = _task4_install_custom_runtime(t, monkeypatch, outcome_factory=factory)
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 1
+    rows = _task4_p1c_artifact_rows(out)
+    outcomes = [factory(t, case_input) for case_input in calls]
+    assert rows["manifest"]["coverage"] == _task4_p1c_coverage(calls, outcomes)
+    counts = rows["manifest"]["coverage"]["rejection_counts"]
+    expected_counts = {
+        "admission_failed": 0, "hard_audit_failed": 0,
+        "intent_not_survived": 0, "official_infeasible": 0,
+        "official_invalid_cost": 0, "official_evaluator_error": 0,
+        "base_unavailable": 0,
+    }
+    expected_counts[reason] = 2
+    if reason == "base_unavailable":
+        # The missing base itself retains its truthful official terminal fact.
+        expected_counts["official_invalid_cost"] = 2
+    assert counts == expected_counts
+    assert all(type(value) is int for value in counts.values())
+    coverage = rows["manifest"]["coverage"]
+    assert coverage["mutation_proposals"] == 2
+    assert coverage["mutation_admitted"] == (0 if reason == "admission_failed" else 2)
+    assert coverage["mutation_intent_survived"] == (
+        2 if reason in {"official_infeasible", "official_invalid_cost",
+                         "official_evaluator_error", "base_unavailable"} else 0
+    )
+    assert coverage["positive_gain_heldout"] == 0
+    assert coverage["positive_gain_heldout_weight"] == 0.0
+    assert coverage["eligible_heldout_weight"] == math.exp(3 / 12)
+    if reason == "base_unavailable":
+        assert rows["manifest"]["state"] == "KILLED_LEGALITY_OR_COVERAGE"
+        assert rows["manifest"]["secondary_reasons"].count("base_unavailable") == 1
+        assert {row["status"] for row in rows["index"]["rows"]} == {"base_unavailable"}
+    else:
+        assert rows["manifest"]["state"] == "STOP_HARD_GAIN_MISSED"
+        assert rows["manifest"]["secondary_reasons"] == []
+        assert {row["status"] for row in rows["index"]["rows"]} == {
+            "winner_base_no_improvement"
+        }
+    assert rows["manifest"]["training_authorized"] is False
+
+
 @pytest.mark.parametrize("invalid", ["tampered_intent", "nonstring_intent", "two_winners",
                                      "baseless_winner", "stage_null", "duplicate_rejection",
                                      "label_mismatch"])
@@ -6505,6 +6683,82 @@ def test_task4_p1c_invalid_runtime_outcome_aborts_transaction_before_destination
         "baseless_winner": "base", "stage_null": "stage",
         "duplicate_rejection": "rejection", "label_mismatch": "label mismatch",
     }[invalid]
+    with pytest.raises(ValueError, match=expected_error):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("invalid,expected_error", [
+    ("case_status_unknown", "case_status"),
+    ("case_status_mismatch", "case_status"),
+    ("covered_legal_mismatch", "runtime flags"),
+    ("covered_flag_mismatch", "runtime flags"),
+    ("covered_null_cost", "runtime costs"),
+    ("covered_null_label", "label"),
+    ("unavailable_flags", "runtime flags"),
+    ("unavailable_label", "base_unavailable"),
+    ("unavailable_cost", "base_unavailable"),
+    ("topology_digest", "topology fingerprint"),
+    ("label_sparse_payload", "label sparse payload"),
+    ("label_base_cost", "label costs"),
+    ("label_teacher_cost", "label costs"),
+    ("label_record_weight", "label record_weight"),
+])
+def test_task4_p1c_validator_semantic_mismatches_abort_before_destination(
+        tmp_path, monkeypatch, invalid, expected_error):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+
+    def outcome(module, case_input):
+        if invalid.startswith("unavailable_"):
+            value = _task4_p1c_unavailable_outcome(module, case_input)
+        else:
+            value = _task4_p1c_mutation_outcome(module, case_input)
+        label = None if value.label_row is None else dict(value.label_row)
+        proposals = [dict(row) for row in value.proposal_rows]
+        base_cost, teacher_cost = value.base_cost, value.teacher_cost
+        legal, covered, case_status = value.legal, value.covered, value.case_status
+        if invalid == "case_status_unknown":
+            case_status = "winner_unknown"
+        elif invalid == "case_status_mismatch":
+            case_status = "winner_base_no_improvement"
+        elif invalid == "covered_legal_mismatch":
+            legal = False
+        elif invalid == "covered_flag_mismatch":
+            covered = False
+        elif invalid == "covered_null_cost":
+            base_cost = None
+        elif invalid == "covered_null_label":
+            label = None
+        elif invalid == "unavailable_label":
+            label = _task4_good_label(case_input)
+        elif invalid == "unavailable_flags":
+            legal = True
+        elif invalid == "unavailable_cost":
+            base_cost = teacher_cost = 1.1
+        elif invalid == "topology_digest":
+            proposals[1]["realized_topology_fingerprint"] = "1" * 64
+        elif invalid == "label_sparse_payload":
+            if label["edges"]:
+                label["edges"][0] = {**label["edges"][0], "weight": 2.0}
+            else:
+                label["edges"] = [{
+                    "src": 0, "dst": 1, "axis": 0, "margin": 0.0,
+                    "kind": "sep", "weight": 1.0,
+                }]
+        elif invalid == "label_base_cost":
+            label["base_cost"] = 1.2
+        elif invalid == "label_teacher_cost":
+            label["teacher_cost"] = 0.9
+        elif invalid == "label_record_weight":
+            label["record_weight"] = 1.0
+        else:
+            raise AssertionError(invalid)
+        return _Task4CaseOutcome(
+            label, tuple(proposals), value.rejection_rows, base_cost, teacher_cost,
+            legal, covered, case_status,
+        )
+
+    _task4_install_custom_runtime(t, monkeypatch, outcome_factory=outcome)
     with pytest.raises(ValueError, match=expected_error):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert not out.exists()
@@ -6544,9 +6798,9 @@ def test_task4_p1c_two_fresh_destinations_are_byte_identical_and_evidence_has_no
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
     first, second = tmp_path / "first", tmp_path / "second"
     _task4_install_custom_runtime(t, monkeypatch, outcome_factory=lambda module, ci: _task4_p1c_mutation_outcome(module, ci))
-    assert t.teacher_main(_task4_args(root, first), _trust_policy=_policy_for(root)) in (0, 1)
+    assert t.teacher_main(_task4_args(root, first), _trust_policy=_policy_for(root)) == 0
     _task4_install_custom_runtime(t, monkeypatch, outcome_factory=lambda module, ci: _task4_p1c_mutation_outcome(module, ci))
-    assert t.teacher_main(_task4_args(root, second), _trust_policy=_policy_for(root)) in (0, 1)
+    assert t.teacher_main(_task4_args(root, second), _trust_policy=_policy_for(root)) == 0
     assert {name: (first / name).read_bytes() for name in _TASK4_FILES} == {
         name: (second / name).read_bytes() for name in _TASK4_FILES
     }
