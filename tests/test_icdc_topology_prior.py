@@ -5668,9 +5668,15 @@ def test_task4_p1b_energy_batch_is_exact_scaled_cpu_f64(monkeypatch):
                 "scale", "n_soft", "tau_sharp", "tau_soft"}
     assert set(seen["batch"]) == expected
     batch = seen["batch"]
-    assert batch["scale"].tolist() == [3.0]
-    assert batch["tau_sharp"].tolist() == [3e-5]
-    assert batch["tau_soft"].tolist() == [3e-2]
+    assert torch.equal(batch["scale"], torch.tensor([3.0], dtype=torch.float64))
+    assert torch.equal(batch["tau_sharp"], 1e-5 * batch["scale"])
+    assert torch.equal(batch["tau_soft"], 1e-2 * batch["scale"])
+    assert torch.equal(batch["area"], torch.tensor([[4.0, 5.0]], dtype=torch.float64))
+    assert torch.equal(batch["hpwl_ref"], torch.tensor([7.0], dtype=torch.float64))
+    assert torch.equal(batch["area_ref"], torch.tensor([9.0], dtype=torch.float64))
+    assert torch.equal(batch["b2b"], torch.tensor([[[0.0, 1.0, 2.5]]], dtype=torch.float64))
+    assert torch.equal(batch["p2b"], torch.tensor([[[0.0, 1.0, 3.5]]], dtype=torch.float64))
+    assert torch.equal(batch["pins"], torch.tensor([[[7.0, 11.0]]], dtype=torch.float64))
     assert torch.equal(batch["n_soft"], t._ENERGY.n_soft(batch["cons"], batch["area"]))
     for key in ("area", "cons", "b2b", "p2b", "pins", "hpwl_ref", "area_ref",
                 "scale", "n_soft", "tau_sharp", "tau_soft"):
@@ -5679,14 +5685,9 @@ def test_task4_p1b_energy_batch_is_exact_scaled_cpu_f64(monkeypatch):
 
 def test_task4_p1b_sanitized_empty_edges_reaches_official_and_energy(monkeypatch):
     case = _p1b_case() | {
-        "b2b": torch.empty((0, 3), dtype=torch.float64),
-        "p2b": torch.empty((0, 3), dtype=torch.float64),
-        "pins": torch.empty((0, 2), dtype=torch.float64),
+        "b2b": [], "p2b": [], "pins": [],
         "hpwl_ref": 0.0, "area_ref": 2.0,
     }
-    assert torch.as_tensor(case["b2b"], dtype=torch.float64).reshape(0, 3).shape == (0, 3)
-    assert torch.as_tensor(case["p2b"], dtype=torch.float64).reshape(0, 3).shape == (0, 3)
-    assert torch.as_tensor(case["pins"], dtype=torch.float64).reshape(0, 2).shape == (0, 2)
     scorer = _P1BScorer((True, 2.0))
     out, trace = _p1b_run(monkeypatch, scorer, case=case, stream=[("base", _p1b_raw())], energy_results=[4.0])
     assert out.winner_ordinal == 0 and out.candidates[0].official_cost == 2.0
@@ -5696,6 +5697,67 @@ def test_task4_p1b_sanitized_empty_edges_reaches_official_and_energy(monkeypatch
     assert args[3].shape == (0, 3) and args[4].shape == (0, 3) and args[5].shape == (0, 2)
     assert all(x.device.type == "cpu" and x.dtype == torch.float64 for x in args[3:7])
     assert len(trace["admit"]) == len(trace["hard"]) == len(trace["intent"]) == len(trace["energy"]) == 1
+
+
+def _p1b_named_case():
+    return _p1b_case() | {
+        "cons": [[0, 1, 0, 1, 0], [0, 0, 0, 1, 0]],
+        "tp": [[0.0, 0.0, 1.0, 1.0], [-1.0, -1.0, -1.0, -1.0]],
+    }
+
+
+@pytest.mark.parametrize("cfg,stream", [
+    (topology_prior.ProposalConfig(total_cap=1), ["base", "axis:0:1:0:0"]),
+    (topology_prior.ProposalConfig(total_cap=2), ["base", "axis:0:1:0:0", "axis:0:1:1:0"]),
+    (topology_prior.ProposalConfig(axis_exchange_cap=0), ["base", "axis:0:1:0:0"]),
+    (topology_prior.ProposalConfig(axis_exchange_cap=1), ["base", "axis:0:1:0:0", "axis:0:1:1:0"]),
+    (topology_prior.ProposalConfig(pin_repair_cap=0), ["base", "pin:0:1:0:1"]),
+    (topology_prior.ProposalConfig(pin_repair_cap=1), ["base", "pin:0:1:0:1", "pin:0:1:1:0"]),
+    (topology_prior.ProposalConfig(group_contact_cap=0), ["base", "contact:1:0:1:0:1"]),
+    (topology_prior.ProposalConfig(group_contact_cap=1), ["base", "contact:1:0:1:0:1", "contact:1:0:1:1:0"]),
+])
+def test_task4_p1b_named_caps_reject_overproposal_before_sinks(monkeypatch, cfg, stream):
+    trace = {}; scorer = _P1BScorer()
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        _p1b_run(monkeypatch, scorer, case=_p1b_named_case(), cfg=cfg,
+                 stream=[(name, _p1b_raw()) for name in stream], trace_out=trace)
+    assert scorer.calls == []
+    assert trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
+
+
+@pytest.mark.parametrize("name", [
+    "axis:1:0:0:0", "axis:0:0:0:0", "axis:0:9:0:0", "axis:0:1:2:0", "axis:0:1:0:2",
+    "pin:1:0:0:1", "pin:0:0:0:1", "pin:0:9:0:1", "pin:0:1:2:0", "pin:0:1:0:2",
+    "contact:0:0:1:0:1", "contact:2:0:1:0:1", "contact:1:1:0:0:1", "contact:1:0:9:0:1",
+    "contact:1:0:1:2:1", "contact:1:0:1:0:2", "contact:1:0:1:0:1:extra",
+])
+def test_task4_p1b_semantic_names_fail_closed_before_sinks(monkeypatch, name):
+    trace = {}; scorer = _P1BScorer()
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        _p1b_run(monkeypatch, scorer, case=_p1b_named_case(),
+                 stream=[("base", _p1b_raw()), (name, _p1b_raw())], trace_out=trace)
+    assert scorer.calls == []
+    assert trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
+
+
+class _P1BOverCapStream:
+    def __init__(self):
+        self.requests = 0
+    def __len__(self):
+        return 3
+    def __iter__(self):
+        self.requests += 1; yield ("base", _p1b_raw())
+        self.requests += 1; yield ("axis:0:1:0:0", _p1b_raw())
+        self.requests += 1; raise AssertionError("over-consumed")
+
+
+def test_task4_p1b_total_cap_bounded_consumption(monkeypatch):
+    stream = _P1BOverCapStream(); trace = {}; scorer = _P1BScorer()
+    with pytest.raises((TypeError, ValueError, RuntimeError, AssertionError)):
+        _p1b_run(monkeypatch, scorer, cfg=topology_prior.ProposalConfig(total_cap=1),
+                 stream=stream, trace_out=trace)
+    assert stream.requests == 2
+    assert scorer.calls == [] and trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
 
 
 @pytest.mark.parametrize("stream,cfg", [
