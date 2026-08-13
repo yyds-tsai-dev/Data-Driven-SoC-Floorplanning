@@ -491,7 +491,7 @@ def _task4_static_forbidden(source):
                 if v and aliases.get(n.targets[0].id) != v: aliases[n.targets[0].id] = v; changed = True
     bad = ("load_test_cases", "floorplandatasetlitetest", "bandfilesampler._instance", "shelf_fallback", "engine.load_model", "engine.sample_bank", "collate", "tfdl")
     literals = {"golden", "validation", "test"}
-    forbidden_runtime = ("proposal", "admission", "tfdl", "hard-legal", "intent", "energy", "evaluate_solution", "official_score", "winner")
+    forbidden_runtime = ("proposal", "admission", "tfdl", "hard-legal", "hard_legal", "intent", "energy", "evaluate_solution", "official_score", "winner")
     for n in ast.walk(tree):
         if isinstance(n, ast.Call):
             path = resolve(n.func)
@@ -645,8 +645,6 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
     def sampler(*args, **kwargs):
         calls["sample"].append((args, kwargs, kwargs["generator"].initial_seed()))
         return torch.rand((1, 3, 4), generator=kwargs["generator"])
-    def decoder(raw, area, cons, tp, scale):
-        calls["decode"].append((raw, area, cons, tp, scale)); return raw.double()
     monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", sampler, raising=False)
     def decoder(raw, area, cons, tp, scale):
         calls["decode"].append((raw, area, cons, tp, scale))
@@ -722,6 +720,17 @@ def test_task4_runtime_materializes_lazily_caches_and_never_reopens(tmp_path, mo
     materialize_calls = []; sample_calls = []; materialized = object()
     monkeypatch.setattr(torch, "load", lambda *a, **k: pytest.fail("reopened checkpoint"))
     import icdc.engine as engine
+    import icdc.topology_prior as topology_prior
+    for mod_name in ("icdc.energy", "icdc.tfdl"):
+        try:
+            mod = __import__(mod_name, fromlist=["*"])
+        except ImportError:
+            mod = None
+        if mod is not None:
+            for name in ("energy", "tfdl"):
+                if hasattr(mod, name):
+                    # Captured below in each process_with_seams context.
+                    pass
     if hasattr(engine, "load_model"):
         monkeypatch.setattr(engine, "load_model", lambda *a, **k: pytest.fail("legacy reopen"))
     monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"), raising=False)
@@ -752,12 +761,26 @@ def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_cl
     monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sampled.append(seed) or torch.ones((3, 4), dtype=torch.float64), raising=False)
     for name in ("_run_candidate_lifecycle", "_admit_candidate", "_score_official_candidate"):
         monkeypatch.setattr(t, name, lambda *a, _name=name, **k: pytest.fail(_name), raising=False)
-    monkeypatch.setattr(t._EVALUATOR, "evaluate_solution", lambda *a, **k: pytest.fail("evaluate_solution"), raising=False)
     import icdc.engine as engine
-    for module, name in ((t, "_SAMPLE_DIRECT_DPM"), (engine, "z_to_legal"), (engine, "build_cond")):
-        if hasattr(module, name): monkeypatch.setattr(module, name, lambda *a, _name=name, **k: pytest.fail(_name))
-    runtime.preflight(policy(paths[0], p1), paths[0]); runtime.process_case(_task4_case_input(t, 101))
-    runtime.preflight(policy(paths[1], p2), paths[1]); runtime.process_case(_task4_case_input(t, 202))
+    def process_with_seams(seed):
+        with monkeypatch.context() as m:
+            m.setattr(t._EVALUATOR, "evaluate_solution", lambda *a, **k: pytest.fail("evaluate_solution"), raising=False)
+            for module, name in ((t, "_run_candidate_lifecycle"), (t, "_admit_candidate"), (t, "_score_official_candidate"), (engine, "z_to_legal")):
+                if hasattr(module, name): m.setattr(module, name, lambda *a, _name=name, **k: pytest.fail(_name))
+            for module, name in ((topology_prior, "generate_proposals"), (topology_prior, "pin_feasible_then_exact_tfdl")):
+                if hasattr(module, name): m.setattr(module, name, lambda *a, _name=name, **k: pytest.fail(_name))
+            for mod_name in ("icdc.energy", "icdc.tfdl"):
+                try:
+                    mod = __import__(mod_name, fromlist=["*"])
+                except ImportError:
+                    mod = None
+                if mod is not None:
+                    name = "energy" if mod_name.endswith("energy") else "tfdl"
+                    if hasattr(mod, name): m.setattr(mod, name, lambda *a, _name=name, **k: pytest.fail(_name))
+            with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
+                runtime.process_case(_task4_case_input(t, seed))
+    runtime.preflight(policy(paths[0], p1), paths[0]); process_with_seams(101)
+    runtime.preflight(policy(paths[1], p2), paths[1]); process_with_seams(202)
     assert [t._checkpoint_identity(x) for x in materialized] == [t._checkpoint_identity(p1), t._checkpoint_identity(p2)]
     assert sampled == [101, 202]
     with pytest.raises(ValueError, match="scorer_sha256"):
