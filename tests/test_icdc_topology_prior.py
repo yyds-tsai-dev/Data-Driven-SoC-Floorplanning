@@ -1383,7 +1383,7 @@ def test_teacher_streaming_b1_review_population_rejects_duplicate_instance():
         acc.add({**row, "relative_path": "worker_2/layouts_1.th", "layout_index": 1})
 
 
-def test_teacher_streaming_b1_population_spool_connect_failure_removes_all_artifacts(tmp_path, monkeypatch):
+def test_teacher_streaming_b1_cleanup_population_spool_connect_failure_removes_all_artifacts(tmp_path, monkeypatch):
     t = _teacher()
     db_path = tmp_path / "population.sqlite"
     sentinel = RuntimeError("sqlite connect sentinel")
@@ -1403,7 +1403,7 @@ def test_teacher_streaming_b1_population_spool_connect_failure_removes_all_artif
     assert all(not Path(f"{db_path}{suffix}").exists() for suffix in ("", "-journal", "-wal", "-shm"))
 
 
-def test_teacher_streaming_b1_baseexception_failure_cleans_transaction(tmp_path, monkeypatch):
+def test_teacher_streaming_b1_cleanup_baseexception_failure_cleans_transaction(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
     _task4_shard(root, relative_path="worker_0/layouts_0.th"); _task4_fake_runtime(t, monkeypatch)
     class CustomBase(BaseException):
