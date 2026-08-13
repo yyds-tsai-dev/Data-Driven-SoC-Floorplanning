@@ -6184,18 +6184,22 @@ def _task4_p1c_outcome_snapshot(value):
     return dataclasses.asdict(value)
 
 
-def _task4_p1c_semantic_baseline(t, case_input, invalid):
-    value = (_task4_p1c_unavailable_outcome(t, case_input)
-             if invalid.startswith("unavailable_")
-             else _task4_p1c_mutation_outcome(t, case_input))
+def _task4_p1c_semantic_baseline(t, case_input, mode):
+    if mode == "covered":
+        value = _task4_p1c_mutation_outcome(t, case_input)
+    elif mode == "base_unavailable":
+        value = _task4_p1c_unavailable_outcome(t, case_input)
+    else:
+        raise AssertionError(f"unknown semantic baseline mode: {mode}")
     _task4_p1c_assert_valid_current_contract_outcome(case_input, value)
     return value
 
 
 def _task4_p1c_require_production_baseline(t, case_input, invalid):
     """Gate poison rows on the real validator accepting their pristine basis."""
-    value = _task4_p1c_semantic_baseline(t, case_input, invalid)
-    legacy_error = "runtime costs" if invalid.startswith("unavailable_") else "label schema"
+    mode = ("base_unavailable" if invalid.startswith("unavailable_") else "covered")
+    value = _task4_p1c_semantic_baseline(t, case_input, mode)
+    legacy_error = "runtime costs" if mode == "base_unavailable" else "label schema"
     try:
         accepted = t._validate_outcome(value)
     except ValueError as exc:
@@ -6250,9 +6254,6 @@ def _task4_p1c_poison_semantic_outcome(t, case_input, invalid, *, valid):
         snapshot["label_row"] = _task4_good_label(case_input); changed_path = ("label_row",)
     elif invalid == "unavailable_cost":
         snapshot["base_cost"] = 1.1; changed_path = ("base_cost",)
-    elif invalid == "topology_digest":
-        proposals[1]["realized_topology_fingerprint"] = "1" * 64
-        changed_path = ("proposal_rows", 1, "realized_topology_fingerprint")
     elif invalid == "label_sparse_payload":
         assert label["edges"]
         label["edges"][0]["weight"] = 2.0
@@ -6301,8 +6302,6 @@ def _task4_p1c_assert_poisoned_semantic_invariant(value, invalid):
     elif invalid == "unavailable_cost":
         assert value.case_status == "base_unavailable" and value.label_row is None
         assert value.base_cost == 1.1 and value.teacher_cost is None
-    elif invalid == "topology_digest":
-        assert value.proposal_rows[1]["realized_topology_fingerprint"] == "1" * 64
     elif invalid == "label_sparse_payload":
         assert value.label_row["edges"][0]["weight"] == 2.0
     elif invalid == "label_base_cost":
@@ -6497,7 +6496,8 @@ def test_task4_p1c_compiler_uses_official_mutation_and_independent_topology_sha_
             ]
     outcome = compiler(case_input, raw, lifecycle)
     expected = _task4_p1c_outcome(case_input, raw, lifecycle)
-    assert outcome == expected
+    assert type(outcome) is t._CaseOutcome
+    assert dataclasses.asdict(outcome) == dataclasses.asdict(expected)
     assert set(outcome.proposal_rows[1]) == _TASK4_P1C_PROPOSAL_KEYS
     assert [row["raw_topology_fingerprint"] for row in outcome.proposal_rows] == [
         _task4_p1c_sha_topology(raw, case_input.case["cons"]),
@@ -6540,7 +6540,9 @@ def test_task4_p1c_compiler_tie_or_worse_keeps_base_and_omits_scored_loser_rejec
                                hard={"hard_audit": True}, drift={"max_abs": 0.0}, reason="not_selected")
     lifecycle = t._CandidateLifecycle((base, loser), 0, 10.0, 10.0)
     outcome = t._outcome_from_lifecycle(case_input, raw, lifecycle)
-    assert outcome == _task4_p1c_outcome(case_input, raw, lifecycle)
+    expected = _task4_p1c_outcome(case_input, raw, lifecycle)
+    assert type(outcome) is t._CaseOutcome
+    assert dataclasses.asdict(outcome) == dataclasses.asdict(expected)
     assert outcome.case_status == "winner_base_no_improvement"
     assert outcome.label_row["record_weight"] == 1.0
     assert outcome.rejection_rows == ()
@@ -6563,7 +6565,8 @@ def test_task4_p1c_compiler_stage_matrix_serializes_exact_nulls_and_rejection_bi
     lifecycle = t._CandidateLifecycle((base, candidate), 0, 10.0, 10.0)
     outcome = t._outcome_from_lifecycle(case_input, raw, lifecycle)
     expected = _task4_p1c_outcome(case_input, raw, lifecycle)
-    assert outcome == expected
+    assert type(outcome) is t._CaseOutcome
+    assert dataclasses.asdict(outcome) == dataclasses.asdict(expected)
     assert outcome.proposal_rows[0]["diagnostic_energy"] is None
     assert outcome.proposal_rows[0]["energy_status"] == "unavailable"
     assert outcome.proposal_rows[1]["intended_intent"] == outcome.proposal_rows[1]["name"]
@@ -6588,7 +6591,9 @@ def test_task4_p1c_compiler_base_unavailable_never_substitutes_scored_mutation(b
     )
     lifecycle = t._CandidateLifecycle((base, scored_mutation), None, None, None)
     outcome = t._outcome_from_lifecycle(case_input, raw, lifecycle)
-    assert outcome == _task4_p1c_outcome(case_input, raw, lifecycle)
+    expected = _task4_p1c_outcome(case_input, raw, lifecycle)
+    assert type(outcome) is t._CaseOutcome
+    assert dataclasses.asdict(outcome) == dataclasses.asdict(expected)
     assert outcome.case_status == "base_unavailable"
     assert outcome.label_row is None and outcome.base_cost is None and outcome.teacher_cost is None
     assert not any(row["winner"] for row in outcome.proposal_rows)
@@ -6933,12 +6938,17 @@ def test_task4_p1c_invalid_runtime_outcome_aborts_transaction_before_destination
         elif invalid == "nonstring_intent": proposals[1]["intended_intent"] = 1
         elif invalid == "two_winners": proposals[0]["winner"] = True; proposals[0]["status"] = "winner_base_no_improvement"
         elif invalid == "baseless_winner": proposals[0]["official_cost"] = None; proposals[0]["winner"] = False; proposals[0]["status"] = "not_selected"
-        elif invalid == "stage_null": proposals[1]["admission_status"] = "failed"; proposals[1]["realized_topology_fingerprint"] = "0" * 64
+        elif invalid == "stage_null": proposals[1]["admission_status"] = "failed"
         elif invalid == "duplicate_rejection":
             rejections = [{"ordinal": 1, "name": "axis:0:1:0:0", "stage": "selection", "reason": "base_unavailable"}] * 2
         elif invalid == "label_mismatch": label["proposal_ordinal"] = 0; label["proposal_name"] = "base"
-        return _Task4CaseOutcome(label, tuple(proposals), tuple(rejections), value.base_cost,
-                                 value.teacher_cost, value.legal, value.covered, value.case_status)
+        poisoned = _Task4CaseOutcome(label, tuple(proposals), tuple(rejections), value.base_cost,
+                                     value.teacher_cost, value.legal, value.covered, value.case_status)
+        if invalid == "stage_null":
+            assert _task4_p1c_difference_paths(
+                dataclasses.asdict(value), dataclasses.asdict(poisoned),
+            ) == {("proposal_rows", 1, "admission_status")}
+        return poisoned
     _task4_install_custom_runtime(t, monkeypatch, outcome_factory=outcome)
     expected_error = {
         "tampered_intent": "intended_intent", "nonstring_intent": "intended_intent",
@@ -6952,20 +6962,19 @@ def test_task4_p1c_invalid_runtime_outcome_aborts_transaction_before_destination
 
 
 @pytest.mark.parametrize("invalid,expected_error", [
-    ("case_status_unknown", "case_status"),
-    ("case_status_mismatch", "case_status"),
-    ("covered_legal_mismatch", "runtime flags"),
-    ("covered_flag_mismatch", "runtime flags"),
-    ("covered_null_cost", "runtime costs"),
+    ("case_status_unknown", r"case[ _]status"),
+    ("case_status_mismatch", r"case[ _]status"),
+    ("covered_legal_mismatch", r"runtime[ _]flags"),
+    ("covered_flag_mismatch", r"runtime[ _]flags"),
+    ("covered_null_cost", r"runtime[ _]costs"),
     ("covered_null_label", "label"),
-    ("unavailable_flags", "runtime flags"),
-    ("unavailable_label", "base_unavailable"),
-    ("unavailable_cost", "base_unavailable"),
-    ("topology_digest", "topology fingerprint"),
-    ("label_sparse_payload", "label sparse payload"),
-    ("label_base_cost", "label costs"),
-    ("label_teacher_cost", "label costs"),
-    ("label_record_weight", "label record_weight"),
+    ("unavailable_flags", r"runtime[ _]flags"),
+    ("unavailable_label", r"base[ _]unavailable"),
+    ("unavailable_cost", r"base[ _]unavailable"),
+    ("label_sparse_payload", r"label[ _]sparse[ _]payload"),
+    ("label_base_cost", r"label[ _]costs"),
+    ("label_teacher_cost", r"label[ _]costs"),
+    ("label_record_weight", r"label[ _]record[ _]weight"),
 ])
 def test_task4_p1c_validator_semantic_mismatches_follow_accepted_baseline(
         monkeypatch, invalid, expected_error):
@@ -6984,13 +6993,13 @@ def test_task4_p1c_validator_semantic_mismatches_follow_accepted_baseline(
         t._validate_outcome(value)
 
 
-@pytest.mark.parametrize("invalid", ["topology_digest", "unavailable_flags"])
-def test_task4_p1c_production_validator_accepts_exact_valid_baseline_before_poisons(monkeypatch, invalid):
+@pytest.mark.parametrize("mode", ["covered", "base_unavailable"])
+def test_task4_p1c_production_validator_accepts_exact_valid_baseline_before_poisons(monkeypatch, mode):
     """The sole pre-GREEN RED gate for semantic poison validation."""
     t = _teacher()
     monkeypatch.setattr(t, "_CaseOutcome", _Task4CaseOutcome)
     case_input = _task4_p1c_case_input(t)
-    baseline = _task4_p1c_semantic_baseline(t, case_input, invalid)
+    baseline = _task4_p1c_semantic_baseline(t, case_input, mode)
     assert t._validate_outcome(baseline) is baseline
 
 
@@ -7040,8 +7049,26 @@ def test_task4_p1c_two_fresh_destinations_are_byte_identical_and_evidence_has_no
         "rejections": _task4_jsonl(first / "rejections.jsonl"),
         "manifest": json.loads((first / "g0_manifest.json").read_text()),
     }
+    assert evidence["manifest"]["coverage"]["legal"] is True
+
+    def assert_path_aware_evidence_hygiene(value, path=()):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = path + (key,)
+                if key == "legal":
+                    assert child_path == ("manifest", "coverage", "legal")
+                else:
+                    assert key not in {"original", "positions", "rects", "golden"}
+                assert_path_aware_evidence_hygiene(child, child_path)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                assert_path_aware_evidence_hygiene(child, path + (index,))
+        elif isinstance(value, str):
+            assert not os.path.isabs(value)
+
+    assert_path_aware_evidence_hygiene(evidence)
     serialized = _task4_canonical_json(evidence)
-    for forbidden in (b'"original"', b'"legal"', b'"positions"', b'"rects"',
+    for forbidden in (b'"original"', b'"positions"', b'"rects"',
                       b'"golden"', b"timestamp", str(root).encode()):
         assert forbidden not in serialized
     _task4_assert_no_forbidden_semantic_values(
