@@ -176,9 +176,8 @@ def test_teacher_publish_b2_eintr_ambiguous_source_replacement_is_untouched(tmp_
 @pytest.mark.parametrize("replacement", ["symlink", "foreign"])
 def test_teacher_publish_b2_transaction_cleanup_refuses_replacement(tmp_path, monkeypatch, replacement):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
-    _task4_fake_runtime(
-        t, monkeypatch, outcome_factory=_task4_legacy_validation_outcome,
-    ); stages = []
+    _task4_fake_runtime(t, monkeypatch); stages = []
+    monkeypatch.setattr(t, "_validate_outcome", lambda value: value)
     real_new = t._new_staging
     def new_staging(destination):
         stage = real_new(destination); stages.append(Path(getattr(stage, "path", stage))); return stage
@@ -205,9 +204,8 @@ def test_teacher_publish_b2_transaction_cleanup_refuses_replacement(tmp_path, mo
 
 def test_teacher_publish_b2_transaction_existing_destination_race(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
-    _task4_fake_runtime(
-        t, monkeypatch, outcome_factory=_task4_legacy_validation_outcome,
-    ); stages = []
+    _task4_fake_runtime(t, monkeypatch); stages = []
+    monkeypatch.setattr(t, "_validate_outcome", lambda value: value)
     real_new = t._new_staging
     def new_staging(destination):
         stage = real_new(destination); stages.append(Path(getattr(stage, "path", stage))); return stage
@@ -1432,25 +1430,6 @@ def _task4_good_outcome(t, case_input, *, cost=1.1):
         _task4_good_label(case_input, base_cost=cost, teacher_cost=cost),
         (_task4_good_proposal(t, case_input, cost=cost),), (),
         cost, cost, True, True, "winner_base_no_improvement",
-    )
-
-
-def _task4_legacy_validation_outcome(t, _case_input):
-    """Minimal pre-P1-C outcome used only by publication/cleanup seam probes.
-
-    Those probes own staging and publish mechanics, not the P1-C evidence
-    migration.  Keeping this adapter local avoids weakening any P1-C fixture
-    while allowing the old validator to reach their injected publication seam.
-    """
-    return t._CaseOutcome(
-        {"edges": [], "contacts": [], "pin_paths": []},
-        ({
-            "ordinal": 0, "name": "base", "intended_intent": "base",
-            "admission_status": "admitted", "admission_reason": None,
-            "drift": {"max_abs": 0.0}, "hard": {"legal": True},
-            "diagnostic_energy": 0.0, "official_cost": 1.1,
-            "feasible": True, "winner": True, "status": "winner",
-        },), (), 1.1, 1.1, True, True, "winner_base_no_improvement",
     )
 
 
