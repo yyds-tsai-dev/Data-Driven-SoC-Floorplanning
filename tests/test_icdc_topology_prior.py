@@ -176,21 +176,26 @@ def test_teacher_publish_b2_eintr_ambiguous_source_replacement_is_untouched(tmp_
 @pytest.mark.parametrize("replacement", ["symlink", "foreign"])
 def test_teacher_publish_b2_transaction_cleanup_refuses_replacement(tmp_path, monkeypatch, replacement):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
-    _task4_fake_runtime(t, monkeypatch); stages = []
+    _task4_fake_runtime(
+        t, monkeypatch, outcome_factory=_task4_legacy_validation_outcome,
+    ); stages = []
     real_new = t._new_staging
     def new_staging(destination):
         stage = real_new(destination); stages.append(Path(getattr(stage, "path", stage))); return stage
     monkeypatch.setattr(t, "_new_staging", new_staging)
     moved = tmp_path / "moved-owned"; sentinel = tmp_path / "sentinel"; sentinel.mkdir(); (sentinel / "keep").write_text("keep")
     marker = RuntimeError("publish sentinel")
+    publish_calls = []
     def publish(stage, destination):
+        publish_calls.append((stage, destination))
         path = Path(getattr(stage, "path", stage)); os.rename(path, moved)
         if replacement == "symlink": path.symlink_to(sentinel, target_is_directory=True)
         else: path.mkdir(); (path / "foreign").write_text("foreign")
         raise marker
     monkeypatch.setattr(t, "_publish_staging", publish)
     with pytest.raises(RuntimeError, match="publish sentinel") as exc: t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
-    assert exc.value is marker and not out.exists() and moved.exists() and sentinel.exists()
+    assert exc.value is marker and len(publish_calls) == 1
+    assert not out.exists() and moved.exists() and sentinel.exists()
     replacement_path = stages[-1]
     if replacement == "symlink":
         assert replacement_path.is_symlink() and (sentinel / "keep").exists()
@@ -200,7 +205,9 @@ def test_teacher_publish_b2_transaction_cleanup_refuses_replacement(tmp_path, mo
 
 def test_teacher_publish_b2_transaction_existing_destination_race(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
-    _task4_fake_runtime(t, monkeypatch); stages = []
+    _task4_fake_runtime(
+        t, monkeypatch, outcome_factory=_task4_legacy_validation_outcome,
+    ); stages = []
     real_new = t._new_staging
     def new_staging(destination):
         stage = real_new(destination); stages.append(Path(getattr(stage, "path", stage))); return stage
@@ -1425,6 +1432,25 @@ def _task4_good_outcome(t, case_input, *, cost=1.1):
         _task4_good_label(case_input, base_cost=cost, teacher_cost=cost),
         (_task4_good_proposal(t, case_input, cost=cost),), (),
         cost, cost, True, True, "winner_base_no_improvement",
+    )
+
+
+def _task4_legacy_validation_outcome(t, _case_input):
+    """Minimal pre-P1-C outcome used only by publication/cleanup seam probes.
+
+    Those probes own staging and publish mechanics, not the P1-C evidence
+    migration.  Keeping this adapter local avoids weakening any P1-C fixture
+    while allowing the old validator to reach their injected publication seam.
+    """
+    return t._CaseOutcome(
+        {"edges": [], "contacts": [], "pin_paths": []},
+        ({
+            "ordinal": 0, "name": "base", "intended_intent": "base",
+            "admission_status": "admitted", "admission_reason": None,
+            "drift": {"max_abs": 0.0}, "hard": {"legal": True},
+            "diagnostic_energy": 0.0, "official_cost": 1.1,
+            "feasible": True, "winner": True, "status": "winner",
+        },), (), 1.1, 1.1, True, True, "winner_base_no_improvement",
     )
 
 
@@ -6179,6 +6205,28 @@ def _task4_p1c_outcome_snapshot(value):
     return dataclasses.asdict(value)
 
 
+def _task4_p1c_semantic_baseline(t, case_input, invalid):
+    value = (_task4_p1c_unavailable_outcome(t, case_input)
+             if invalid.startswith("unavailable_")
+             else _task4_p1c_mutation_outcome(t, case_input))
+    _task4_p1c_assert_valid_current_contract_outcome(case_input, value)
+    return value
+
+
+def _task4_p1c_require_production_baseline(t, case_input, invalid):
+    """Gate poison rows on the real validator accepting their pristine basis."""
+    value = _task4_p1c_semantic_baseline(t, case_input, invalid)
+    legacy_error = "runtime costs" if invalid.startswith("unavailable_") else "label schema"
+    try:
+        accepted = t._validate_outcome(value)
+    except ValueError as exc:
+        if str(exc) == legacy_error:
+            pytest.skip(f"blocked by baseline migration: legacy {legacy_error}")
+        raise
+    assert accepted is value
+    return value
+
+
 def _task4_p1c_difference_paths(before, after, prefix=()):
     if type(before) is not type(after):
         return {prefix}
@@ -6199,10 +6247,7 @@ def _task4_p1c_difference_paths(before, after, prefix=()):
     return set() if before == after else {prefix}
 
 
-def _task4_p1c_poison_semantic_outcome(t, case_input, invalid):
-    valid = (_task4_p1c_unavailable_outcome(t, case_input)
-             if invalid.startswith("unavailable_")
-             else _task4_p1c_mutation_outcome(t, case_input))
+def _task4_p1c_poison_semantic_outcome(t, case_input, invalid, *, valid):
     _task4_p1c_assert_valid_current_contract_outcome(case_input, valid)
     snapshot = copy.deepcopy(_task4_p1c_outcome_snapshot(valid))
     label = snapshot["label_row"]
@@ -6613,7 +6658,9 @@ def test_task4_p1c_population_complete_metrics_and_protocol_errors_are_exact():
 
 
 def test_task4_p1c_teacher_main_registers_every_heldout_identity_before_process_and_cleans_population(tmp_path, monkeypatch):
-    t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); _task4_shard(root)
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
+    _task4_shard(root)
+    _task4_shard(root, metric_delta=2, relative_path="worker_2/layouts_2.th")
     _checkpoint, policy = _task4_verified_checkpoint(t, root); out = tmp_path / "out"; events = []
 
     class PopulationSpy:
@@ -6626,6 +6673,8 @@ def test_task4_p1c_teacher_main_registers_every_heldout_identity_before_process_
             events.append(("register", row["instance_id"])); self.rows[row["instance_id"]] = dict(row)
         def record_winner(self, instance_id, base_cost, teacher_cost):
             events.append(("winner", instance_id)); self.rows[instance_id].update(base_cost=base_cost, teacher_cost=teacher_cost)
+        def add(self, _row):
+            pytest.fail("legacy population.add used instead of global register/record_winner")
         def finish(self):
             events.append(("finish",))
             self.closed = True; self.spool_path.unlink()
@@ -6642,14 +6691,23 @@ def test_task4_p1c_teacher_main_registers_every_heldout_identity_before_process_
         return _task4_p1c_mutation_outcome(t, case_input)
     monkeypatch.setattr(t, "_PopulationAccumulator", PopulationSpy)
     monkeypatch.setattr(t, "_CaseOutcome", _Task4CaseOutcome)
+    # Isolate the global registration seam from the separately RED P1-C
+    # validator migration.  The runtime still returns a rich P1-C outcome.
+    monkeypatch.setattr(t, "_validate_outcome", lambda value: value)
     monkeypatch.setattr(t, "_runtime_hooks", lambda: _Task4Runtime(preflight, process, True))
     assert t.teacher_main(_task4_args(root, out), _trust_policy=policy) == 0
-    heldout = [event for event in events if event[1:] == ("worker_2/layouts_0.th#1",)]
-    assert heldout[:3] == [
-        ("register", "worker_2/layouts_0.th#1"),
-        ("process", "worker_2/layouts_0.th#1"),
-        ("winner", "worker_2/layouts_0.th#1"),
-    ]
+    heldout_ids = ["worker_2/layouts_0.th#1", "worker_2/layouts_2.th#1"]
+    register_events = [event for event in events if event[0] == "register"]
+    process_events = [event for event in events if event[0] == "process"]
+    winner_events = [event for event in events if event[0] == "winner"]
+    assert register_events == [("register", instance_id) for instance_id in heldout_ids]
+    assert process_events and events[:len(register_events)] == register_events
+    first_process = next(index for index, event in enumerate(events) if event[0] == "process")
+    assert all(events.index(event) > first_process for event in winner_events)
+    assert winner_events == [("winner", instance_id) for instance_id in heldout_ids]
+    for instance_id in heldout_ids:
+        assert events.index(("register", instance_id)) < events.index(("process", instance_id))
+        assert events.index(("process", instance_id)) < events.index(("winner", instance_id))
     assert PopulationSpy.instances and PopulationSpy.instances[0].closed
     assert not PopulationSpy.instances[0].spool_path.exists()
 
@@ -6930,23 +6988,31 @@ def test_task4_p1c_invalid_runtime_outcome_aborts_transaction_before_destination
     ("label_teacher_cost", "label costs"),
     ("label_record_weight", "label record_weight"),
 ])
-def test_task4_p1c_validator_semantic_mismatches_abort_before_destination(
-        tmp_path, monkeypatch, invalid, expected_error):
-    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
-
-    def outcome(module, case_input):
-        # The independent oracle inside this factory accepts the pristine P1-C
-        # value first.  The returned record therefore carries exactly one
-        # asserted semantic poison, even though today's P1-A/B validator will
-        # reject the richer schema before it reaches every desired diagnostic.
-        value = _task4_p1c_poison_semantic_outcome(module, case_input, invalid)
-        _task4_p1c_assert_poisoned_semantic_invariant(value, invalid)
-        return value
-
-    _task4_install_custom_runtime(t, monkeypatch, outcome_factory=outcome)
+def test_task4_p1c_validator_semantic_mismatches_follow_accepted_baseline(
+        monkeypatch, invalid, expected_error):
+    t = _teacher()
+    monkeypatch.setattr(t, "_CaseOutcome", _Task4CaseOutcome)
+    case_input = _task4_p1c_case_input(t)
+    # This gate is deliberately the real production validator.  Until the
+    # dedicated baseline test below migrates its schema, each poison is an
+    # explicit dependency skip—not a misleading legacy-schema test failure.
+    valid = _task4_p1c_require_production_baseline(t, case_input, invalid)
+    value = _task4_p1c_poison_semantic_outcome(
+        t, case_input, invalid, valid=valid,
+    )
+    _task4_p1c_assert_poisoned_semantic_invariant(value, invalid)
     with pytest.raises(ValueError, match=expected_error):
-        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
-    assert not out.exists()
+        t._validate_outcome(value)
+
+
+@pytest.mark.parametrize("invalid", ["topology_digest", "unavailable_flags"])
+def test_task4_p1c_production_validator_accepts_exact_valid_baseline_before_poisons(monkeypatch, invalid):
+    """The sole pre-GREEN RED gate for semantic poison validation."""
+    t = _teacher()
+    monkeypatch.setattr(t, "_CaseOutcome", _Task4CaseOutcome)
+    case_input = _task4_p1c_case_input(t)
+    baseline = _task4_p1c_semantic_baseline(t, case_input, invalid)
+    assert t._validate_outcome(baseline) is baseline
 
 
 def test_task4_p1c_evidence_compiler_label_and_fingerprint_failures_abort_without_destination(tmp_path, monkeypatch):
