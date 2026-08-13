@@ -2390,8 +2390,27 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
     for name in _TASK4_JSONL:
         rows = _task4_jsonl(out / name)
         assert (out / name).read_bytes() == b"".join(_task4_canonical_json(row) + b"\n" for row in rows)
-    assert sum(len(_task4_jsonl(out / "proposals.jsonl")) for _ in [0]) == 2 * len(calls)
     expected_outcomes = [_task4_p1c_mutation_outcome(t, case_input) for case_input in calls]
+    expected_proposals = [
+        {
+            **_task4_envelope(
+                case_input.case, dataclasses.asdict(case_input.receipt),
+                case_input.partition, case_input.sample_seed,
+            ),
+            **dict(proposal),
+        }
+        for case_input, outcome in zip(calls, expected_outcomes)
+        for proposal in sorted(
+            outcome.proposal_rows,
+            key=lambda row: (row["ordinal"], row["name"]),
+        )
+    ]
+    actual_proposals = _task4_jsonl(out / "proposals.jsonl")
+    assert actual_proposals == expected_proposals
+    assert len(actual_proposals) == 2 * len(calls)
+    assert len(actual_proposals) == sum(
+        len(outcome.proposal_rows) for outcome in expected_outcomes
+    )
     expected_rejections = [
         {
             **_task4_envelope(
@@ -2417,11 +2436,13 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
     assert [r["instance_id"] for r in _task4_jsonl(out / "heldout_corpus.jsonl")] == held_ids
     assert [r["instance_id"] for r in _task4_jsonl(out / "train_labels.jsonl")] == train_ids
     assert [r["instance_id"] for r in _task4_jsonl(out / "heldout_labels.jsonl")] == held_ids
-    assert [r["instance_id"] for r in _task4_jsonl(out / "proposals.jsonl")] == expected_all
+    assert [r["instance_id"] for r in actual_proposals] == [
+        row["instance_id"] for row in expected_proposals
+    ]
     assert [r["instance_id"] for r in actual_rejections] == [
         row["instance_id"] for row in expected_rejections
     ]
-    assert len(_task4_jsonl(out / "proposals.jsonl")) == 2 * len(calls)
+    assert len(actual_proposals) == len(expected_proposals)
     assert len(actual_rejections) == len(expected_rejections)
 
 
