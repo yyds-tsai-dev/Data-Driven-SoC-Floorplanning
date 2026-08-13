@@ -1114,6 +1114,23 @@ def _task4_private_case_spool(stage, expected_identity=None):
     return identity, tuple(private_entries)
 
 
+def _task4_stage_fd_targets(stage):
+    """Open descriptors bound to a staging tree, including deleted children."""
+    fd_root = Path("/proc/self/fd")
+    if not fd_root.is_dir():
+        pytest.skip("/proc/self/fd is unavailable")
+    stage_text = str(Path(stage).absolute())
+    targets = []
+    for fd in fd_root.iterdir():
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target == stage_text or target.startswith(stage_text + os.sep):
+            targets.append((fd.name, target))
+    return targets
+
+
 @dataclasses.dataclass(frozen=True)
 class _Task4CaseInput:
     case: collections.abc.Mapping
@@ -2290,6 +2307,117 @@ def test_teacher_staged_case_spool_failure_is_transactional(tmp_path, monkeypatc
     assert not out.exists() and stages and not stages[-1].exists()
     assert spool_identity is not None
     assert observed_spool_paths and all(not path.exists() for path in observed_spool_paths)
+    assert not _task4_stage_fd_targets(stages[-1]), (
+        "transactional failure must close every descriptor into the removed staging tree"
+    )
+
+
+@pytest.mark.parametrize("poison, changed_column", [
+    ("stored_fingerprint", 8),
+    ("instance_id", 6),
+    ("relative_path", 3),
+    ("source_row_count", 5),
+    ("case_instance_id", 7),
+    ("case_fingerprint", 7),
+    ("noncanonical_case_json", 7),
+    ("file_sha256", 4),
+])
+def test_teacher_replay_revalidates_tampered_case_spool_rows_before_runtime(
+        tmp_path, monkeypatch, poison, changed_column):
+    """Stored case records are a binding, not merely convenient replay input."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    source_path = _task4_shard(root)
+    calls = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls,
+                        outcome_factory=_task4_p1c_mutation_outcome)
+    stages = []; real_staging = t._new_staging
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+    real_connect = t.sqlite3.connect
+    baseline_rows = []
+    changed_rows = []
+
+    def canonical_case_text(case):
+        return json.dumps(case, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True, allow_nan=False)
+
+    def poison_row(row):
+        values = list(row)
+        if poison == "stored_fingerprint":
+            values[8] = "0" * 64
+        elif poison == "instance_id":
+            values[6] = "worker_2/layouts_0.th#99"
+        elif poison == "relative_path":
+            values[3] = "worker_99/layouts_7.th"
+        elif poison == "source_row_count":
+            values[5] = 0
+        elif poison == "file_sha256":
+            values[4] = "not-a-sha256"
+        else:
+            case = json.loads(values[7])
+            if poison == "case_instance_id":
+                case["instance_id"] = "worker_2/layouts_0.th#99"
+                values[7] = canonical_case_text(case)
+            elif poison == "case_fingerprint":
+                case["area"][0] += 0.25
+                values[7] = canonical_case_text(case)
+            else:
+                values[7] = json.dumps(case, sort_keys=False, indent=1,
+                                       ensure_ascii=True, allow_nan=False)
+        return tuple(values)
+
+    class ReplayConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, statement, parameters=()):
+            cursor = self._connection.execute(statement, parameters)
+            if " FROM CASES" not in statement.upper():
+                return cursor
+            assert not calls, "the canonical spool baseline must be observed before runtime"
+            rows = list(cursor)
+            assert len(rows) == 2
+            digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            for source_row_index, row in enumerate(rows):
+                case = json.loads(row[7])
+                assert (row[0], row[1], row[2], row[3], row[4], row[5], row[6]) == (
+                    2, 0, source_row_index, "worker_2/layouts_0.th", digest, 2,
+                    f"worker_2/layouts_0.th#{source_row_index}",
+                )
+                assert case == _task4_expected_case(source_row_index)
+                assert row[7] == canonical_case_text(case)
+                assert row[8] == fingerprint_case(case)
+            target = 1 if poison == "source_row_count" else 0
+            changed = poison_row(rows[target])
+            assert [index for index, (before, after) in enumerate(zip(rows[target], changed))
+                    if before != after] == [changed_column]
+            baseline_rows.extend(rows)
+            changed_rows.extend([*rows[:target], changed, *rows[target + 1:]])
+            return iter(changed_rows)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def connect(database, *args, **kwargs):
+        connection = real_connect(database, *args, **kwargs)
+        if stages and Path(database).absolute() == (stages[-1] / "case_spool.sqlite").absolute():
+            return ReplayConnection(connection)
+        return connection
+
+    monkeypatch.setattr(t.sqlite3, "connect", connect)
+    raised = None
+    try:
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    except ValueError as exc:
+        raised = exc
+    assert baseline_rows and changed_rows
+    assert isinstance(raised, ValueError), (
+        f"replay accepted tampered stored {poison} after reading its canonical baseline"
+    )
+    assert calls == []
+    assert not out.exists() and stages and not stages[-1].exists()
 
 
 def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
