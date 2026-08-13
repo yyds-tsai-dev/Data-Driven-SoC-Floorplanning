@@ -1709,15 +1709,16 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 partition = split_for_id(iid, args.heldout_mod); seed = _sample_seed(args.seed, iid, 0)
                 ci = _CaseInput(case, receipt, partition, seed); outcome = _validate_outcome(runtime.process_case(ci)); processed += 1
                 env = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "partition": partition, "sample_seed": seed, "n": case["n"]}
-                label = {**dict(outcome.label_row), **env, "proposal_ordinal": 0, "proposal_name": "base", "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost, "record_weight": outcome.base_cost / outcome.teacher_cost}
+                label = None if outcome.label_row is None else {**dict(outcome.label_row), **env}
                 writer.write("train_corpus.jsonl" if partition == "train" else "heldout_corpus.jsonl", case)
-                writer.write("train_labels.jsonl" if partition == "train" else "heldout_labels.jsonl", label)
+                if label is not None: writer.write("train_labels.jsonl" if partition == "train" else "heldout_labels.jsonl", label)
                 for p in sorted(outcome.proposal_rows, key=lambda x: (x["ordinal"], x["name"])): writer.write("proposals.jsonl", {**env, **dict(p)})
                 for r in sorted(outcome.rejection_rows, key=lambda x: (x.get("ordinal", 0), x.get("name", ""))): writer.write("rejections.jsonl", {**env, **dict(r)})
                 if partition == "train": train_count += 1
                 else:
                     held_count += 1; heldout_winners += 1
-                    population.add({"relative_path": rel, "layout_index": index, "instance_id": iid, "n": case["n"], "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost})
+                    population.register({"relative_path": rel, "layout_index": index, "instance_id": iid, "n": case["n"]})
+                    if outcome.base_cost is not None: population.record_winner(iid, outcome.base_cost, outcome.teacher_cost)
                 legal = legal and outcome.legal; covered = covered and outcome.covered
                 rows.append({**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": "processed"})
             del source, raw
