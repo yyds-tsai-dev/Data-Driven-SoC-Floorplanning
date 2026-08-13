@@ -1,5 +1,6 @@
 import dataclasses
 import ast
+import copy
 import errno
 import collections.abc
 import gc
@@ -6091,6 +6092,205 @@ def _task4_p1c_outcome(case_input, raw, lifecycle):
     )
 
 
+def _task4_p1c_assert_valid_current_contract_outcome(case_input, value):
+    """Independent P1-C acceptance oracle for fixtures before they are poisoned.
+
+    This deliberately does not invoke the production validator: pre-GREEN it
+    still implements the incompatible P1-A/B label schema.  Its purpose is to
+    prove that a later poison is the one semantic defect under test, rather
+    than a malformed runtime fixture.
+    """
+    assert type(value) is _Task4CaseOutcome
+    raw = _task4_p1c_raw(case_input.case); mutation = _task4_p1c_mutation(raw)
+    rows = tuple(value.proposal_rows)
+    assert rows and all(set(row) == _TASK4_P1C_PROPOSAL_KEYS for row in rows)
+    assert [(row["ordinal"], row["name"]) for row in rows] == [
+        (index, "base" if index == 0 else "axis:0:1:0:0")
+        for index in range(len(rows))
+    ]
+    assert all(type(row["intended_intent"]) is str
+               and row["intended_intent"] == row["name"] for row in rows)
+    expected_raw_sha = _task4_p1c_sha_topology(raw, case_input.case["cons"])
+    expected_mutation_sha = _task4_p1c_sha_topology(mutation, case_input.case["cons"])
+    for row in rows:
+        expected_layout_sha = expected_raw_sha if row["ordinal"] == 0 else expected_mutation_sha
+        assert row["raw_topology_fingerprint"] == expected_raw_sha
+        assert row["intended_topology_fingerprint"] == expected_layout_sha
+        assert row["realized_topology_fingerprint"] == expected_layout_sha
+
+    if value.case_status == "base_unavailable":
+        assert value.legal is False and value.covered is False
+        assert value.label_row is value.base_cost is value.teacher_cost is None
+        assert not any(row["winner"] for row in rows)
+        assert len(rows) == 2
+        assert rows[0]["admission_status"] == "admitted"
+        assert rows[0]["admission_reason"] is None
+        assert rows[0]["hard_status"] == "passed"
+        assert rows[0]["intent_status"] == "passed"
+        assert rows[0]["status"] == "rejected"
+        assert rows[0]["official_status"] == "invalid_cost"
+        assert rows[0]["official_cost"] is rows[0]["feasible"] is None
+        assert rows[0]["diagnostic_energy"] is None
+        assert rows[0]["energy_status"] == "not_reached"
+        assert rows[1]["admission_status"] == "admitted"
+        assert rows[1]["admission_reason"] is None
+        assert rows[1]["hard_status"] == "passed"
+        assert rows[1]["intent_status"] == "passed"
+        assert rows[1]["status"] == "base_unavailable"
+        assert rows[1]["official_status"] == "scored"
+        assert rows[1]["feasible"] is True and rows[1]["official_cost"] > 0
+        assert rows[1]["diagnostic_energy"] == 3.0
+        assert rows[1]["energy_status"] == "recorded"
+        assert tuple(value.rejection_rows) == (
+            {"ordinal": 0, "name": "base", "stage": "official",
+             "reason": "official_invalid_cost"},
+            {"ordinal": 1, "name": "axis:0:1:0:0", "stage": "selection",
+             "reason": "base_unavailable"},
+        )
+        return
+
+    assert value.case_status in {"winner_base_no_improvement", "winner_mutation"}
+    assert value.legal is True and value.covered is True
+    assert type(value.base_cost) in (int, float) and value.base_cost > 0
+    assert type(value.teacher_cost) in (int, float) and 0 < value.teacher_cost <= value.base_cost
+    winners = [row for row in rows if row["winner"]]
+    assert len(winners) == 1
+    assert len(rows) == 2
+    assert all(row["admission_status"] == "admitted" for row in rows)
+    assert all(row["admission_reason"] is None for row in rows)
+    assert all(row["hard_status"] == "passed" for row in rows)
+    assert all(row["intent_status"] == "passed" for row in rows)
+    assert all(row["official_status"] == "scored" and row["feasible"] is True for row in rows)
+    assert all(row["energy_status"] == "recorded" for row in rows)
+    winner = winners[0]
+    assert winner["official_status"] == "scored" and winner["official_cost"] == value.teacher_cost
+    base = next(row for row in rows if row["ordinal"] == 0)
+    assert base["official_status"] == "scored" and base["official_cost"] == value.base_cost
+    assert base["winner"] is False and base["status"] == "not_selected"
+    assert winner["status"] == value.case_status
+    assert value.rejection_rows == ()
+    assert value.label_row == _task4_p1c_label(
+        case_input, raw if winner["ordinal"] == 0 else mutation,
+        winner["ordinal"], winner["name"], value.base_cost, value.teacher_cost,
+    )
+
+
+def _task4_p1c_outcome_snapshot(value):
+    return dataclasses.asdict(value)
+
+
+def _task4_p1c_difference_paths(before, after, prefix=()):
+    if type(before) is not type(after):
+        return {prefix}
+    if isinstance(before, dict):
+        if set(before) != set(after):
+            return {prefix}
+        return set().union(*(
+            _task4_p1c_difference_paths(before[key], after[key], prefix + (key,))
+            for key in before
+        ))
+    if isinstance(before, (tuple, list)):
+        if len(before) != len(after):
+            return {prefix}
+        return set().union(*(
+            _task4_p1c_difference_paths(left, right, prefix + (index,))
+            for index, (left, right) in enumerate(zip(before, after))
+        ))
+    return set() if before == after else {prefix}
+
+
+def _task4_p1c_poison_semantic_outcome(t, case_input, invalid):
+    valid = (_task4_p1c_unavailable_outcome(t, case_input)
+             if invalid.startswith("unavailable_")
+             else _task4_p1c_mutation_outcome(t, case_input))
+    _task4_p1c_assert_valid_current_contract_outcome(case_input, valid)
+    snapshot = copy.deepcopy(_task4_p1c_outcome_snapshot(valid))
+    label = snapshot["label_row"]
+    proposals = snapshot["proposal_rows"]
+    changed_path = None
+    if invalid == "case_status_unknown":
+        snapshot["case_status"] = "winner_unknown"; changed_path = ("case_status",)
+    elif invalid == "case_status_mismatch":
+        snapshot["case_status"] = "winner_base_no_improvement"; changed_path = ("case_status",)
+    elif invalid == "covered_legal_mismatch":
+        snapshot["legal"] = False; changed_path = ("legal",)
+    elif invalid == "covered_flag_mismatch":
+        snapshot["covered"] = False; changed_path = ("covered",)
+    elif invalid == "covered_null_cost":
+        snapshot["base_cost"] = None; changed_path = ("base_cost",)
+    elif invalid == "covered_null_label":
+        snapshot["label_row"] = None; changed_path = ("label_row",)
+    elif invalid == "unavailable_flags":
+        snapshot["legal"] = True; changed_path = ("legal",)
+    elif invalid == "unavailable_label":
+        snapshot["label_row"] = _task4_good_label(case_input); changed_path = ("label_row",)
+    elif invalid == "unavailable_cost":
+        snapshot["base_cost"] = 1.1; changed_path = ("base_cost",)
+    elif invalid == "topology_digest":
+        proposals[1]["realized_topology_fingerprint"] = "1" * 64
+        changed_path = ("proposal_rows", 1, "realized_topology_fingerprint")
+    elif invalid == "label_sparse_payload":
+        assert label["edges"]
+        label["edges"][0]["weight"] = 2.0
+        changed_path = ("label_row", "edges", 0, "weight")
+    elif invalid == "label_base_cost":
+        label["base_cost"] = 1.2; changed_path = ("label_row", "base_cost")
+    elif invalid == "label_teacher_cost":
+        label["teacher_cost"] = 0.9; changed_path = ("label_row", "teacher_cost")
+    elif invalid == "label_record_weight":
+        label["record_weight"] = 1.0; changed_path = ("label_row", "record_weight")
+    else:
+        raise AssertionError(invalid)
+    poisoned = _Task4CaseOutcome(
+        snapshot["label_row"], tuple(snapshot["proposal_rows"]),
+        tuple(snapshot["rejection_rows"]), snapshot["base_cost"],
+        snapshot["teacher_cost"], snapshot["legal"], snapshot["covered"],
+        snapshot["case_status"],
+    )
+    assert _task4_p1c_difference_paths(
+        _task4_p1c_outcome_snapshot(valid), _task4_p1c_outcome_snapshot(poisoned),
+    ) == {changed_path}
+    return poisoned
+
+
+def _task4_p1c_assert_poisoned_semantic_invariant(value, invalid):
+    if invalid == "case_status_unknown":
+        assert value.case_status == "winner_unknown"
+    elif invalid == "case_status_mismatch":
+        assert value.case_status == "winner_base_no_improvement"
+        assert value.proposal_rows[1]["winner"] is True
+    elif invalid == "covered_legal_mismatch":
+        assert value.covered is True and value.legal is False
+    elif invalid == "covered_flag_mismatch":
+        assert value.legal is True and value.covered is False
+    elif invalid == "covered_null_cost":
+        assert value.covered is value.legal is True
+        assert value.base_cost is None and value.teacher_cost > 0 and value.label_row is not None
+    elif invalid == "covered_null_label":
+        assert value.covered is value.legal is True
+        assert value.label_row is None and value.base_cost > 0 and value.teacher_cost > 0
+    elif invalid == "unavailable_flags":
+        assert value.case_status == "base_unavailable" and value.legal is True and value.covered is False
+    elif invalid == "unavailable_label":
+        assert value.case_status == "base_unavailable" and value.label_row is not None
+        assert value.base_cost is value.teacher_cost is None
+    elif invalid == "unavailable_cost":
+        assert value.case_status == "base_unavailable" and value.label_row is None
+        assert value.base_cost == 1.1 and value.teacher_cost is None
+    elif invalid == "topology_digest":
+        assert value.proposal_rows[1]["realized_topology_fingerprint"] == "1" * 64
+    elif invalid == "label_sparse_payload":
+        assert value.label_row["edges"][0]["weight"] == 2.0
+    elif invalid == "label_base_cost":
+        assert value.label_row["base_cost"] != value.base_cost
+    elif invalid == "label_teacher_cost":
+        assert value.label_row["teacher_cost"] != value.teacher_cost
+    elif invalid == "label_record_weight":
+        assert value.label_row["record_weight"] != value.base_cost / value.teacher_cost
+    else:
+        raise AssertionError(invalid)
+
+
 def _task4_p1c_mutation_outcome(t, case_input, *, base_cost=1.1, teacher_cost=1.0):
     raw = _task4_p1c_raw(case_input.case); mutation = _task4_p1c_mutation(raw)
     base = _task4_p1c_record(
@@ -6419,16 +6619,21 @@ def test_task4_p1c_teacher_main_registers_every_heldout_identity_before_process_
     class PopulationSpy:
         instances = []
         def __init__(self):
-            self.rows = {}; self.aborted = False; type(self).instances.append(self)
+            self.rows = {}; self.closed = False
+            self.spool_path = tmp_path / f"population-{len(type(self).instances)}.spool"
+            self.spool_path.touch(); type(self).instances.append(self)
         def register(self, row):
             events.append(("register", row["instance_id"])); self.rows[row["instance_id"]] = dict(row)
         def record_winner(self, instance_id, base_cost, teacher_cost):
             events.append(("winner", instance_id)); self.rows[instance_id].update(base_cost=base_cost, teacher_cost=teacher_cost)
         def finish(self):
             events.append(("finish",))
+            self.closed = True; self.spool_path.unlink()
             return _task4_p1c_canonical_population(list(self.rows.values()))
         def abort(self):
-            self.aborted = True; events.append(("abort",))
+            self.closed = True
+            self.spool_path.unlink(missing_ok=True)
+            events.append(("abort",))
 
     def preflight(_policy, _checkpoint):
         return _task4_expected_trust(policy)
@@ -6445,8 +6650,8 @@ def test_task4_p1c_teacher_main_registers_every_heldout_identity_before_process_
         ("process", "worker_2/layouts_0.th#1"),
         ("winner", "worker_2/layouts_0.th#1"),
     ]
-    assert PopulationSpy.instances and PopulationSpy.instances[0].aborted
-    assert events[-2:] == [("finish",), ("abort",)]
+    assert PopulationSpy.instances and PopulationSpy.instances[0].closed
+    assert not PopulationSpy.instances[0].spool_path.exists()
 
 
 def _task4_p1c_artifact_rows(out):
@@ -6620,6 +6825,27 @@ def test_task4_p1c_teacher_main_rejection_reason_coverage_matrix_is_exact(
     assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 1
     rows = _task4_p1c_artifact_rows(out)
     outcomes = [factory(t, case_input) for case_input in calls]
+    for case_input, outcome in zip(calls, outcomes):
+        envelope = _task4_envelope(
+            case_input.case, dataclasses.asdict(case_input.receipt),
+            case_input.partition, case_input.sample_seed,
+        )
+        proposals = [row for row in rows["proposals.jsonl"]
+                     if row["instance_id"] == case_input.case["instance_id"]]
+        rejections = [row for row in rows["rejections.jsonl"]
+                      if row["instance_id"] == case_input.case["instance_id"]]
+        assert proposals == [
+            {**envelope, **dict(row)} for row in outcome.proposal_rows
+        ]
+        assert rejections == [
+            {**envelope, **dict(row)} for row in outcome.rejection_rows
+        ]
+        assert all(set(row) == _TASK4_P1C_PROPOSAL_KEYS | set(envelope)
+                   for row in proposals)
+        assert all(set(row) == {"ordinal", "name", "stage", "reason"} | set(envelope)
+                   for row in rejections)
+        assert all({key: row[key] for key in envelope} == envelope
+                   for row in (*proposals, *rejections))
     assert rows["manifest"]["coverage"] == _task4_p1c_coverage(calls, outcomes)
     counts = rows["manifest"]["coverage"]["rejection_counts"]
     expected_counts = {
@@ -6709,54 +6935,13 @@ def test_task4_p1c_validator_semantic_mismatches_abort_before_destination(
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
 
     def outcome(module, case_input):
-        if invalid.startswith("unavailable_"):
-            value = _task4_p1c_unavailable_outcome(module, case_input)
-        else:
-            value = _task4_p1c_mutation_outcome(module, case_input)
-        label = None if value.label_row is None else dict(value.label_row)
-        proposals = [dict(row) for row in value.proposal_rows]
-        base_cost, teacher_cost = value.base_cost, value.teacher_cost
-        legal, covered, case_status = value.legal, value.covered, value.case_status
-        if invalid == "case_status_unknown":
-            case_status = "winner_unknown"
-        elif invalid == "case_status_mismatch":
-            case_status = "winner_base_no_improvement"
-        elif invalid == "covered_legal_mismatch":
-            legal = False
-        elif invalid == "covered_flag_mismatch":
-            covered = False
-        elif invalid == "covered_null_cost":
-            base_cost = None
-        elif invalid == "covered_null_label":
-            label = None
-        elif invalid == "unavailable_label":
-            label = _task4_good_label(case_input)
-        elif invalid == "unavailable_flags":
-            legal = True
-        elif invalid == "unavailable_cost":
-            base_cost = teacher_cost = 1.1
-        elif invalid == "topology_digest":
-            proposals[1]["realized_topology_fingerprint"] = "1" * 64
-        elif invalid == "label_sparse_payload":
-            if label["edges"]:
-                label["edges"][0] = {**label["edges"][0], "weight": 2.0}
-            else:
-                label["edges"] = [{
-                    "src": 0, "dst": 1, "axis": 0, "margin": 0.0,
-                    "kind": "sep", "weight": 1.0,
-                }]
-        elif invalid == "label_base_cost":
-            label["base_cost"] = 1.2
-        elif invalid == "label_teacher_cost":
-            label["teacher_cost"] = 0.9
-        elif invalid == "label_record_weight":
-            label["record_weight"] = 1.0
-        else:
-            raise AssertionError(invalid)
-        return _Task4CaseOutcome(
-            label, tuple(proposals), value.rejection_rows, base_cost, teacher_cost,
-            legal, covered, case_status,
-        )
+        # The independent oracle inside this factory accepts the pristine P1-C
+        # value first.  The returned record therefore carries exactly one
+        # asserted semantic poison, even though today's P1-A/B validator will
+        # reject the richer schema before it reaches every desired diagnostic.
+        value = _task4_p1c_poison_semantic_outcome(module, case_input, invalid)
+        _task4_p1c_assert_poisoned_semantic_invariant(value, invalid)
+        return value
 
     _task4_install_custom_runtime(t, monkeypatch, outcome_factory=outcome)
     with pytest.raises(ValueError, match=expected_error):
