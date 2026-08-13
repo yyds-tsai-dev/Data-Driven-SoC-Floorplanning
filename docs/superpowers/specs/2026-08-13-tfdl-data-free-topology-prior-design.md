@@ -149,11 +149,12 @@ unchanged.
   as every other candidate. Soft V in `fp_sol` is not a rejection condition.
 - The G0 candidate set is exactly two logical slots: `0=production-base` and
   `1=transient-fp-exact-tfdl`. The historical 25 blind axis/pin/contact
-  mutations are excluded. The raw frozen production winner and the
-  transient-fp seed each pass the same deterministic pin-feasible exact-TFDL
-  admission, zero-drift check, and official hard audit before scoring. A base
-  admission failure kills coverage; no alternate candidate may substitute for
-  it. Each eligible case retains the admitted production base when the fp
+  mutations are excluded. The raw frozen production winner is first hard
+  audited unchanged; only a failing raw winner receives one deterministic
+  pin-feasible exact-TFDL repair and zero-drift check before a second hard
+  audit. The transient-fp seed always receives that exact admission. A base
+  repair failure kills coverage; no alternate candidate may substitute for it.
+  Each eligible case retains the hard-legal production base when the fp
   candidate is rejected, unavailable, or does not improve official
   `cost_no_runtime`.
 - Dense fp coordinates exist only inside the per-case offline teacher call.
@@ -465,9 +466,10 @@ diagnostic kill only.  Between hard and target, stop with no training
 authority; only the target permits Task 5.  G1 remains the sole causal
 transfer proof.
 
-Pass the raw production winner through deterministic pin-feasible exact-TFDL
-once, require zero drift and a successful official hard audit, then score that
-admitted production base exactly once. Score the transient-fp slot
+Hard-audit the raw production winner unchanged. If it fails, pass it through
+deterministic pin-feasible exact-TFDL once, require zero drift and a successful
+second hard audit, then score the resulting hard-legal production base exactly
+once. Score the transient-fp slot
 exactly once only after exact admission and hard audit, using the SHA-pinned
 provided/local contest evaluator:
 `evaluate_solution({"positions": ..., "runtime": 1.0}, ...,

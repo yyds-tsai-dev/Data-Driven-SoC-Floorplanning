@@ -208,7 +208,7 @@ def evaluate_case(
         pin_feasible_then_exact_tfdl
     ),
 ) -> G0CaseResult:
-    """Exactly admit and evaluate the production and transient-fp slots."""
+    """Hard-admit the production base and evaluate both logical slots."""
     if type(sample_seed) is not int or isinstance(sample_seed, bool):
         raise ValueError("sample seed")
     instance_id = case.get("instance_id") if isinstance(case, Mapping) else None
@@ -238,10 +238,14 @@ def evaluate_case(
         except Exception:
             return None
 
-    base_legal = exact_admit(base_rects, "base legal")
-    if base_legal is None:
-        raise ValueError("base admission")
+    base_legal = base_rects
     base_hard = _hard_audit(base_legal, area, cons, tp)
+    if not all(base_hard.values()):
+        admitted_base = exact_admit(base_rects, "base legal")
+        if admitted_base is None:
+            raise ValueError("base admission")
+        base_legal = admitted_base
+        base_hard = _hard_audit(base_legal, area, cons, tp)
     if not all(base_hard.values()):
         raise ValueError("base hard audit")
     base_feasible, base_cost = _official_cost(

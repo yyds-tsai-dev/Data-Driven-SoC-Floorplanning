@@ -80,16 +80,7 @@ def _admit_identity(proposal: torch.Tensor, _case: dict):
 
 
 def _admit_base_then_reject_teacher():
-    calls = 0
-
     def admit(proposal: torch.Tensor, _case: dict):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return (
-                proposal.clone(),
-                torch.zeros((proposal.shape[0], 2), dtype=torch.float64),
-            )
         return None
 
     return admit
@@ -217,11 +208,29 @@ def test_production_base_is_exactly_admitted_before_hard_audit_and_scoring():
     assert out.winner == "production-base"
 
 
+def test_hard_legal_production_base_is_not_unnecessarily_reprojected():
+    raw_base = _rects()
+    calls = []
+
+    def admit(proposal, case):
+        calls.append(proposal.clone())
+        return proposal.clone(), torch.zeros((2, 2), dtype=torch.float64)
+
+    scorer = _Scorer([1.2, 1.3])
+    out = evaluate_case(
+        raw_base, _rects(1.0), _case(), scorer, sample_seed=17, admit=admit
+    )
+    assert len(calls) == 1
+    assert torch.equal(calls[0], _rects(1.0))
+    assert scorer.calls[0]["solution"]["positions"] == raw_base.tolist()
+    assert out.winner == "production-base"
+
+
 def test_failed_production_base_admission_fails_closed_before_scoring():
     scorer = _Scorer([])
     with pytest.raises(ValueError, match="base admission"):
         evaluate_case(
-            _rects(), _rects(1.0), _case(), scorer, sample_seed=17,
+            _rects(-0.25), _rects(1.0), _case(), scorer, sample_seed=17,
             admit=lambda proposal, case: None,
         )
     assert scorer.calls == []
