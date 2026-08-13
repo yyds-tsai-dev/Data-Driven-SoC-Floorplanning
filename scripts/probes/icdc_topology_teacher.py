@@ -12,6 +12,7 @@ import json
 import math
 import numbers
 import os
+import secrets
 import sqlite3
 import stat
 import shutil
@@ -1203,55 +1204,250 @@ def _path_matches_lease(path: Path, lease: _StagingLease) -> bool:
     return stat.S_ISDIR(info.st_mode) and info.st_dev == lease.st_dev and info.st_ino == lease.st_ino
 
 
-def _cleanup_owned_staging(lease: _StagingLease) -> bool:
-    _after_ownership_validation("staging_root", lease.path)
-    root_fd = None
+def _after_ownership_validation(operation: str, target: Path) -> None:
+    return None
+
+def _safe_component(name: str) -> str:
+    if (not isinstance(name, str) or not name or name in {".", ".."}
+            or "\x00" in name or os.sep in name
+            or (os.altsep is not None and os.altsep in name)):
+        raise ValueError("unsafe path component")
+    return name
+
+
+def _lstat_identity_at(directory_fd: int, name: str) -> tuple[int, int, int]:
+    _safe_component(name)
+    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
+
+
+def _identity_matches(info: tuple[int, int, int], expected: tuple[int, int, int]) -> bool:
+    return info == expected
+
+
+def _random_private_component(prefix: str) -> str:
+    return _safe_component(f".{prefix}-{secrets.token_hex(16)}")
+
+
+def _new_private_quarantine(parent_fd: int, prefix: str) -> tuple[str, int]:
+    """Create a same-filesystem, owner-only directory for claimed names."""
+    for _ in range(32):
+        name = _random_private_component(prefix)
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                     dir_fd=parent_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+                raise OSError(errno.EPERM, "unsafe quarantine mode")
+        except BaseException:
+            os.close(fd)
+            raise
+        return name, fd
+    raise OSError(errno.EEXIST, "unable to reserve private quarantine")
+
+
+def _renameat2_noreplace_at(old_dir_fd: int, old_name: str,
+                            new_dir_fd: int, new_name: str) -> None:
+    """Rename safe single components without ever resolving a public path twice."""
+    old_name = _safe_component(old_name)
+    new_name = _safe_component(new_name)
+    libc = ctypes.CDLL(None, use_errno=True)
     try:
-        fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW); root_fd = fd
-        info = os.fstat(fd)
-        if (info.st_dev, info.st_ino) != (lease.st_dev, lease.st_ino):
-            os.close(fd); return False
-        _remove_owned_staging_contents_fd(fd)
-        os.close(fd); root_fd = None
-        if not _path_matches_lease(lease.path, lease):
+        renameat2 = libc.renameat2
+    except AttributeError:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(old_dir_fd, os.fsencode(old_name), new_dir_fd,
+                       os.fsencode(new_name), 1)  # RENAME_NOREPLACE
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+
+
+def _restore_private_claim(claim_dir_fd: int, claim_name: str,
+                           public_dir_fd: int, public_name: str) -> bool:
+    """Restore only when the public name remains vacant; otherwise retain it."""
+    try:
+        _renameat2_noreplace_at(claim_dir_fd, claim_name,
+                                public_dir_fd, public_name)
+    except OSError:
+        return False
+    return True
+
+
+def _claim_to_private_quarantine(
+        public_dir_fd: int, public_name: str, expected: tuple[int, int, int],
+        quarantine_fd: int, *, operation: Optional[str] = None,
+        public_target: Optional[Path] = None) -> Optional[str]:
+    """Claim an exact lstat identity, returning its private name on success.
+
+    A caller only ever removes the returned private name.  If the entry changes
+    in the hook-to-rename window, the different identity is restored with
+    RENAME_NOREPLACE and is never destructively touched.
+    """
+    public_name = _safe_component(public_name)
+    try:
+        if not _identity_matches(_lstat_identity_at(public_dir_fd, public_name), expected):
+            return None
+    except OSError:
+        return None
+    if operation is not None:
+        if public_target is None:
+            raise ValueError("missing public target")
+        _after_ownership_validation(operation, public_target)
+    for _ in range(32):
+        claim_name = _random_private_component("claim")
+        try:
+            _renameat2_noreplace_at(public_dir_fd, public_name,
+                                    quarantine_fd, claim_name)
+        except FileExistsError:
+            continue
+        except OSError:
+            return None
+        try:
+            claimed = _lstat_identity_at(quarantine_fd, claim_name)
+        except OSError:
+            return None
+        if _identity_matches(claimed, expected):
+            return claim_name
+        _restore_private_claim(quarantine_fd, claim_name,
+                               public_dir_fd, public_name)
+        return None
+    return None
+
+
+_STAGING_CLEANUP_PATHS: dict[int, Path] = {}
+
+
+def _remove_owned_staging_contents_at(owned_fd: int, public_root: Path) -> None:
+    """Remove a descriptor-bound staging tree through private atomic claims."""
+    quarantine_name = None
+    quarantine_fd = None
+    try:
+        quarantine_name, quarantine_fd = _new_private_quarantine(owned_fd, "staging-q")
+        for name in os.listdir(owned_fd):
+            if name == quarantine_name:
+                continue
+            expected = _lstat_identity_at(owned_fd, name)
+            target = public_root / name
+            if stat.S_ISDIR(expected[2]):
+                claimed_name = _claim_to_private_quarantine(
+                    owned_fd, name, expected, quarantine_fd,
+                    operation="staging_child", public_target=target,
+                )
+                if claimed_name is None:
+                    raise OSError(errno.ESTALE, "staging child ownership mismatch")
+                child_fd = None
+                try:
+                    child_fd = os.open(
+                        claimed_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=quarantine_fd,
+                    )
+                    if not _identity_matches(
+                            (lambda info: (info.st_dev, info.st_ino,
+                                           stat.S_IFMT(info.st_mode)))(os.fstat(child_fd)),
+                            expected):
+                        raise OSError(errno.ESTALE, "claimed staging child mismatch")
+                    _remove_owned_staging_contents_at(child_fd, target)
+                    os.rmdir(claimed_name, dir_fd=quarantine_fd)
+                except BaseException:
+                    _restore_private_claim(quarantine_fd, claimed_name,
+                                           owned_fd, name)
+                    raise
+                finally:
+                    if child_fd is not None:
+                        os.close(child_fd)
+            else:
+                claimed_name = _claim_to_private_quarantine(
+                    owned_fd, name, expected, quarantine_fd,
+                    operation="staging_leaf", public_target=target,
+                )
+                if claimed_name is None:
+                    raise OSError(errno.ESTALE, "staging leaf ownership mismatch")
+                os.unlink(claimed_name, dir_fd=quarantine_fd)
+        os.close(quarantine_fd); quarantine_fd = None
+        os.rmdir(quarantine_name, dir_fd=owned_fd)
+    finally:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+
+
+def _remove_owned_staging_contents_fd(owned_fd: int) -> None:
+    """External descriptor-cleanup seam retained for the staging contracts."""
+    try:
+        public_root = _STAGING_CLEANUP_PATHS[owned_fd]
+    except KeyError as exc:
+        raise OSError(errno.EBADF, "missing staging cleanup context") from exc
+    _remove_owned_staging_contents_at(owned_fd, public_root)
+
+
+def _cleanup_owned_staging(lease: _StagingLease) -> bool:
+    parent_fd = root_fd = quarantine_fd = None
+    quarantine_name = None
+    root_name = lease.path.name
+    try:
+        parent_fd = os.open(lease.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        expected = _lstat_identity_at(parent_fd, root_name)
+        if expected != (lease.st_dev, lease.st_ino, stat.S_IFDIR):
             return False
-        _after_ownership_validation("staging_root", lease.path)
-        if not _path_matches_lease(lease.path, lease): return False
-        lease.path.rmdir()
+        root_fd = os.open(root_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=parent_fd)
+        root_info = os.fstat(root_fd)
+        if (root_info.st_dev, root_info.st_ino, stat.S_IFMT(root_info.st_mode)) != expected:
+            return False
+        _STAGING_CLEANUP_PATHS[root_fd] = lease.path
+        _remove_owned_staging_contents_fd(root_fd)
+        _STAGING_CLEANUP_PATHS.pop(root_fd, None)
+        os.close(root_fd); root_fd = None
+
+        # Reserve this before semantic validation so the hook is immediately
+        # adjacent to the atomic root claim.
+        quarantine_name, quarantine_fd = _new_private_quarantine(parent_fd, "staging-root-q")
+        expected = _lstat_identity_at(parent_fd, root_name)
+        if expected != (lease.st_dev, lease.st_ino, stat.S_IFDIR):
+            return False
+        claimed_name = _claim_to_private_quarantine(
+            parent_fd, root_name, expected, quarantine_fd,
+            operation="staging_root", public_target=lease.path,
+        )
+        if claimed_name is None:
+            return False
+        os.rmdir(claimed_name, dir_fd=quarantine_fd)
+        os.close(quarantine_fd); quarantine_fd = None
+        os.rmdir(quarantine_name, dir_fd=parent_fd)
+        quarantine_name = None
         return True
     except OSError:
         return False
     finally:
         if root_fd is not None:
-            try: os.close(root_fd)
-            except OSError: pass
-
-def _after_ownership_validation(operation: str, target: Path) -> None:
-    return None
-
-def _remove_owned_staging_contents_fd(owned_fd: int) -> None:
-    for name in os.listdir(owned_fd):
-        st = os.stat(name, dir_fd=owned_fd, follow_symlinks=False)
-        if stat.S_ISDIR(st.st_mode):
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=owned_fd)
+            _STAGING_CLEANUP_PATHS.pop(root_fd, None)
             try:
-                now = os.fstat(child)
-                if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
-                    continue
-                _remove_owned_staging_contents_fd(child)
-            finally:
-                os.close(child)
-            _after_ownership_validation("staging_child", Path(os.readlink(f"/proc/self/fd/{owned_fd}")) / name)
-            try: os.rmdir(name, dir_fd=owned_fd)
-            except FileNotFoundError: pass
-        else:
-            target = Path(os.readlink(f"/proc/self/fd/{owned_fd}")) / name
-            _after_ownership_validation("staging_leaf", target)
+                os.close(root_fd)
+            except OSError:
+                pass
+        if quarantine_fd is not None:
             try:
-                now = os.stat(name, dir_fd=owned_fd, follow_symlinks=False)
-                if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino): continue
-                os.unlink(name, dir_fd=owned_fd)
-            except FileNotFoundError: pass
+                os.close(quarantine_fd)
+            except OSError:
+                pass
+        if quarantine_name is not None and parent_fd is not None:
+            try:
+                os.rmdir(quarantine_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
 
 
 def _renameat2_noreplace(source: Path, destination: Path) -> None:
@@ -1269,6 +1465,48 @@ def _renameat2_noreplace(source: Path, destination: Path) -> None:
         return
     error = ctypes.get_errno()
     raise OSError(error, os.strerror(error))
+
+
+def _remove_owned_case_spool(lease: _StagingLease, spool_path: Path,
+                             spool_identity: tuple[int, int]) -> None:
+    """Delete the closed case spool only after atomically claiming its inode."""
+    root_fd = quarantine_fd = None
+    quarantine_name = None
+    try:
+        if spool_path.parent != lease.path:
+            raise ValueError("case spool location")
+        root_fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root = os.fstat(root_fd)
+        if (root.st_dev, root.st_ino) != (lease.st_dev, lease.st_ino):
+            raise ValueError("case spool staging mismatch")
+        quarantine_name, quarantine_fd = _new_private_quarantine(root_fd, "case-spool-q")
+        expected = (spool_identity[0], spool_identity[1], stat.S_IFREG)
+        claimed_name = _claim_to_private_quarantine(
+            root_fd, spool_path.name, expected, quarantine_fd,
+            operation="case_spool", public_target=spool_path,
+        )
+        if claimed_name is None:
+            raise ValueError("case spool ownership mismatch")
+        os.unlink(claimed_name, dir_fd=quarantine_fd)
+        os.close(quarantine_fd); quarantine_fd = None
+        os.rmdir(quarantine_name, dir_fd=root_fd)
+        quarantine_name = None
+    finally:
+        if quarantine_fd is not None:
+            try:
+                os.close(quarantine_fd)
+            except OSError:
+                pass
+        if quarantine_name is not None and root_fd is not None:
+            try:
+                os.rmdir(quarantine_name, dir_fd=root_fd)
+            except OSError:
+                pass
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
 
 
 def _publish_staging(lease: _StagingLease, destination: Path) -> None:
@@ -1425,8 +1663,8 @@ def _write_json_fsync(path: Path, value: Any) -> None:
 
 _TASK4_JSONL = ("train_corpus.jsonl", "heldout_corpus.jsonl", "train_labels.jsonl",
                 "heldout_labels.jsonl", "proposals.jsonl", "rejections.jsonl")
-_POP_OWNERS: dict[int, set[tuple[int, int]]] = {}
-_POP_SIDECARS: dict[int, dict[str, tuple[int, int]]] = {}
+_POP_OWNERS: dict[int, tuple[int, int, int]] = {}
+_POP_SIDECARS: dict[int, dict[str, tuple[int, int, int]]] = {}
 
 
 class _JsonlWriter:
@@ -1490,7 +1728,7 @@ class _PopulationAccumulator:
         temp = tempfile.NamedTemporaryFile(prefix="floorset-population-", suffix=".sqlite", delete=False)
         self._db_path = Path(temp.name)
         temp.close()
-        _POP_OWNERS[id(self)] = {(os.stat(self._db_path).st_dev, os.stat(self._db_path).st_ino)}
+        _POP_OWNERS[id(self)] = self._path_identity(self._db_path)
         _POP_SIDECARS[id(self)] = {}
         self._db: Optional[sqlite3.Connection] = None
         try:
@@ -1515,14 +1753,20 @@ class _PopulationAccumulator:
         self.register({k: row[k] for k in ("relative_path", "layout_index", "instance_id", "n")})
         self.record_winner(row["instance_id"], row["base_cost"], row["teacher_cost"])
 
+    @staticmethod
+    def _path_identity(path: Path) -> tuple[int, int, int]:
+        info = os.stat(path, follow_symlinks=False)
+        return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
+
     def _capture_sidecars(self) -> None:
         for suffix in ("-journal", "-wal", "-shm"):
             path = Path(f"{self._db_path}{suffix}")
             try:
-                st = os.stat(path)
+                identity = self._path_identity(path)
             except FileNotFoundError:
                 continue
-            _POP_SIDECARS[id(self)][suffix] = (st.st_dev, st.st_ino)
+            if stat.S_ISREG(identity[2]):
+                _POP_SIDECARS[id(self)][suffix] = identity
 
     def register(self, row: Mapping[str, Any]) -> None:
         if self._finished is not None: raise RuntimeError("population already finished")
@@ -1629,53 +1873,114 @@ class _PopulationAccumulator:
             self._close_spool()
 
     def _close_spool(self) -> None:
+        """Detach SQLite, protect sidecars, then remove only our claimed main."""
         db, self._db = self._db, None
+        parent_fd = quarantine_fd = None
+        quarantine_name = None
+        claimed_sidecars: list[tuple[str, str, bool]] = []
         primary: Optional[BaseException] = None
-        foreign_sidecar = False
-        for suffix in ("-journal", "-wal", "-shm"):
-            try:
-                os.stat(f"{self._db_path}{suffix}")
-                if suffix not in _POP_SIDECARS.get(id(self), {}):
-                    foreign_sidecar = True
-            except OSError:
-                pass
-        if db is not None:
-            preserved = []
+        db_close_attempted = False
+        sidecars_finalized = False
+        main_identity = _POP_OWNERS.get(id(self))
+        sidecar_identities = _POP_SIDECARS.get(id(self), {})
+        try:
+            db_parent = self._db_path.parent
+            main_name = _safe_component(self._db_path.name)
+            parent_fd = os.open(db_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            # The quarantine is reserved before observation so every sidecar
+            # check is immediately followed by an atomic move away from SQLite.
+            quarantine_name, quarantine_fd = _new_private_quarantine(parent_fd, "population-q")
             for suffix in ("-journal", "-wal", "-shm"):
-                path = Path(f"{self._db_path}{suffix}")
-                if path.exists() and suffix not in _POP_SIDECARS.get(id(self), {}):
-                    backup = Path(f"{path}.preserve-{os.getpid()}-{id(self)}")
-                    try: os.link(path, backup); preserved.append((path, backup))
-                    except OSError: pass
-            try:
-                db.close()
-            except BaseException as exc:
-                primary = exc
-            for path, backup in preserved:
+                name = _safe_component(f"{main_name}{suffix}")
                 try:
-                    if not path.exists(): os.rename(backup, path)
-                    else: backup.unlink(missing_ok=True)
-                except OSError: pass
-        for suffix in ("", "-journal", "-wal", "-shm"):
-            try:
-                target = Path(f"{self._db_path}{suffix}")
-                if suffix == "":
-                    info = os.stat(target)
-                    if (info.st_dev, info.st_ino) not in _POP_OWNERS.get(id(self), set()): continue
-                    _after_ownership_validation("population_main", target)
-                    info2 = os.stat(target)
-                    if (info2.st_dev, info2.st_ino) not in _POP_OWNERS.get(id(self), set()): continue
-                else:
+                    observed = _lstat_identity_at(parent_fd, name)
+                except FileNotFoundError:
                     continue
-                target.unlink()
-            except FileNotFoundError:
-                pass
-            except BaseException as exc:
-                if primary is None:
+                owned = (sidecar_identities.get(suffix) == observed
+                         and stat.S_ISREG(observed[2]))
+                claimed_name = _claim_to_private_quarantine(
+                    parent_fd, name, observed, quarantine_fd,
+                )
+                if claimed_name is None:
+                    raise ValueError("population sidecar ownership mismatch")
+                claimed_sidecars.append((name, claimed_name, owned))
+
+            if db is not None:
+                try:
+                    db.close()
+                except BaseException as exc:
                     primary = exc
+                finally:
+                    db_close_attempted = True
+
+            # SQLite is now detached.  Foreign (and any failure-path) claims
+            # return through no-replace; a public replacement is never touched.
+            for name, claimed_name, owned in claimed_sidecars:
+                if primary is not None or not owned:
+                    if not _restore_private_claim(quarantine_fd, claimed_name,
+                                                  parent_fd, name) and primary is None:
+                        primary = ValueError("population sidecar restore mismatch")
+                else:
+                    try:
+                        os.unlink(claimed_name, dir_fd=quarantine_fd)
+                    except OSError as exc:
+                        if primary is None:
+                            primary = exc
+            sidecars_finalized = True
+
+            if primary is None and main_identity is not None:
+                claimed_name = _claim_to_private_quarantine(
+                    parent_fd, main_name, main_identity, quarantine_fd,
+                    operation="population_main", public_target=self._db_path,
+                )
+                if claimed_name is None:
+                    primary = ValueError("population main ownership mismatch")
+                else:
+                    try:
+                        os.unlink(claimed_name, dir_fd=quarantine_fd)
+                    except OSError as exc:
+                        primary = exc
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+        finally:
+            # A setup or claim failure cannot leave the detached SQLite handle
+            # live.  Preserve the earlier failure while still issuing close.
+            if db is not None and not db_close_attempted:
+                try:
+                    db.close()
+                except BaseException as exc:
+                    if primary is None:
+                        primary = exc
+                finally:
+                    db_close_attempted = True
+            # A partially prepared close is a failure path: every claimed
+            # sidecar is restored, including an owned one, rather than deleted.
+            if (not sidecars_finalized and quarantine_fd is not None
+                    and parent_fd is not None):
+                for name, claimed_name, _owned in claimed_sidecars:
+                    if not _restore_private_claim(quarantine_fd, claimed_name,
+                                                  parent_fd, name) and primary is None:
+                        primary = ValueError("population sidecar restore mismatch")
+            _POP_OWNERS.pop(id(self), None)
+            _POP_SIDECARS.pop(id(self), None)
+            if quarantine_fd is not None:
+                try:
+                    os.close(quarantine_fd)
+                except OSError:
+                    pass
+            if quarantine_name is not None and parent_fd is not None:
+                try:
+                    os.rmdir(quarantine_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
+            if parent_fd is not None:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
         if primary is not None:
             raise primary
-        _POP_OWNERS.pop(id(self), None); _POP_SIDECARS.pop(id(self), None)
 
     def abort(self) -> None:
         try:
@@ -2005,14 +2310,12 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         index_fd.write(b'],"schema":"icdc_topology_training_index_v1"}\n'); index_fd.flush(); os.fsync(index_fd.fileno()); index_fd.close()
         spool.close(); spool = None
         try:
-            info = os.stat(spool_path)
-            if (info.st_dev, info.st_ino) == spool_identity:
-                _after_ownership_validation("case_spool", spool_path)
-                info2 = os.stat(spool_path)
-                if (info2.st_dev, info2.st_ino) == spool_identity: spool_path.unlink()
-                else: raise ValueError("case spool ownership mismatch")
-            else: raise ValueError("case spool ownership mismatch")
-        except FileNotFoundError: pass
+            if lease is None or spool_identity is None:
+                raise ValueError("case spool ownership mismatch")
+            _remove_owned_case_spool(lease, spool_path, spool_identity)
+        except BaseException:
+            spool_mismatch = True
+            raise
         pop = population.finish()
         coverage = {"eligible_train": train_count, "eligible_heldout": held_count, "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_count) and bool(held_count) and heldout_winners == held_count,
                     "mutation_proposals": mutation_proposals, "mutation_admitted": mutation_admitted,
