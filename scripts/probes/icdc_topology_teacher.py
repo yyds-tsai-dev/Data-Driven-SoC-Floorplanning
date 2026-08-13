@@ -346,14 +346,6 @@ class _CaseOutcome:
     covered: bool
     case_status: str
 
-    def __eq__(self, other: Any) -> bool:
-        if not hasattr(other, "__dataclass_fields__"):
-            return NotImplemented
-        names = tuple(self.__dataclass_fields__)
-        if tuple(other.__dataclass_fields__) != names:
-            return False
-        return all(getattr(self, n) == getattr(other, n) for n in names)
-
 @dataclass(frozen=True)
 class _TeacherRuntime:
     preflight: Callable[[TeacherTrustPolicy, Path], Mapping[str, Any]]
@@ -1587,6 +1579,8 @@ def _topology_sha(rects: Optional[torch.Tensor], case: Mapping[str, Any]) -> Opt
 def _outcome_from_lifecycle(case_input: _CaseInput, raw_rects: torch.Tensor, lifecycle: _CandidateLifecycle) -> _CaseOutcome:
     if not isinstance(lifecycle, _CandidateLifecycle) or not isinstance(raw_rects, torch.Tensor):
         raise ValueError("lifecycle")
+    if raw_rects.ndim != 2 or raw_rects.shape[-1] != 4 or raw_rects.dtype not in (torch.float32, torch.float64) or not bool(torch.isfinite(raw_rects).all()):
+        raise ValueError("raw compiler input")
     rows = []
     rejects = []
     base = next((r for r in lifecycle.candidates if r.name == "base"), None)
@@ -1596,16 +1590,22 @@ def _outcome_from_lifecycle(case_input: _CaseInput, raw_rects: torch.Tensor, lif
     if base_ok and winner is not None:
         status = "winner_mutation" if winner.name != "base" else "winner_base_no_improvement"
     for r in lifecycle.candidates:
-        admission = "admitted" if r.legal is not None else "failed"
-        reason = "" if r.legal is not None else "admission_failed"
-        if r.rejection_reason in {"hard_audit_failed", "intent_not_survived", "official_infeasible", "official_invalid_cost", "official_evaluator_error"}:
-            reason = r.rejection_reason
-        if r.legal is not None and not r.hard: admission, reason = "admitted", "hard_audit_failed"
-        hard_status = "passed" if r.hard and all(r.hard.values()) else ("failed" if r.legal is not None else "not_reached")
-        intent_status = "passed" if r.legal is not None and hard_status == "passed" and reason not in {"intent_not_survived"} else ("failed" if reason == "intent_not_survived" else "not_reached")
-        official_status = "scored" if r.official_cost is not None else ({"official_infeasible":"infeasible","official_invalid_cost":"invalid_cost","official_evaluator_error":"error"}.get(reason, "not_reached"))
-        terminal = status if winner is r else ("base_unavailable" if not base_ok and r.official_cost is not None else ("not_selected" if r.official_cost is not None and reason == "" else "rejected"))
-        row = {"ordinal":r.ordinal,"name":r.name,"intended_intent":r.name,"raw_topology_fingerprint":_topology_sha(raw_rects,case_input.case),"intended_topology_fingerprint":_topology_sha(r.original,case_input.case),"realized_topology_fingerprint":_topology_sha(r.legal,case_input.case),"admission_status":admission,"admission_reason":(None if admission == "admitted" else "admission_failed"),"drift":(dict(r.drift) if r.drift else None),"hard":(dict(r.hard) if r.hard else None),"hard_status":hard_status,"intent_status":intent_status,"official_cost":r.official_cost,"feasible":(True if r.official_cost is not None else (False if reason == "official_infeasible" else None)),"official_status":official_status,"diagnostic_energy":r.diagnostic_energy,"energy_status":r.energy_status,"winner":winner is r,"status":terminal}
+        reason = r.rejection_reason
+        admitted = r.legal is not None
+        admission = "admitted" if admitted else "failed"
+        if not admitted: reason = "admission_failed"
+        hard_pass = admitted and bool(r.hard) and all(r.hard.values())
+        hard_status = "passed" if hard_pass else ("failed" if admitted else "not_reached")
+        intent_failed = reason == "intent_not_survived"
+        intent_status = "failed" if intent_failed else ("passed" if hard_pass else "not_reached")
+        official_status = {"official_infeasible":"infeasible","official_invalid_cost":"invalid_cost","official_evaluator_error":"error"}.get(reason, "scored" if r.official_cost is not None else "not_reached")
+        terminal = status if lifecycle.winner_ordinal == r.ordinal else ("base_unavailable" if lifecycle.winner_ordinal is None and r.official_cost is not None else ("not_selected" if official_status == "scored" else "rejected"))
+        if reason in {"admission_failed", "hard_audit_failed", "intent_not_survived", "official_infeasible", "official_invalid_cost", "official_evaluator_error"}:
+            official_status = {"official_infeasible":"infeasible","official_invalid_cost":"invalid_cost","official_evaluator_error":"error"}.get(reason, "not_reached")
+        if reason in {"admission_failed", "hard_audit_failed", "intent_not_survived"}:
+            terminal = "rejected"
+        reached_official = official_status == "scored"
+        row = {"ordinal":r.ordinal,"name":r.name,"intended_intent":r.name,"raw_topology_fingerprint":_topology_sha(raw_rects,case_input.case),"intended_topology_fingerprint":_topology_sha(r.original,case_input.case),"realized_topology_fingerprint":_topology_sha(r.legal,case_input.case),"admission_status":admission,"admission_reason":(None if admitted else "admission_failed"),"drift":(dict(r.drift) if admitted else None),"hard":(dict(r.hard) if admitted else None),"hard_status":hard_status,"intent_status":intent_status,"official_cost":r.official_cost if reached_official else None,"feasible":(True if reached_official else (False if reason == "official_infeasible" else None)),"official_status":official_status,"diagnostic_energy":r.diagnostic_energy if reached_official else None,"energy_status":r.energy_status if reached_official else "not_reached","winner":lifecycle.winner_ordinal == r.ordinal,"status":terminal}
         rows.append(row)
         if r.rejection_reason and r.rejection_reason != "not_selected":
             reason = r.rejection_reason
@@ -1615,7 +1615,7 @@ def _outcome_from_lifecycle(case_input: _CaseInput, raw_rects: torch.Tensor, lif
     if base_ok and winner is not None:
         bc, tc = float(lifecycle.base_cost), float(lifecycle.teacher_cost)
         sparse = extract_sparse_label(winner.legal, case_input.case, case_input.case["instance_id"], case_input.sample_seed, tc, bc)
-        label = {"edges":[{k:getattr(x,k) for k in ("src","dst","axis","margin","kind","weight")} for x in sparse.edges],"contacts":[{k:getattr(x,k) for k in ("a","b","axis","a_before_b","perp_margin","weight")} for x in sparse.contacts],"pin_paths":[list(x) for x in sparse.pin_paths],"proposal_ordinal":winner.ordinal,"proposal_name":winner.name,"base_cost":bc,"teacher_cost":tc,"record_weight":bc/tc}
+        label = {"edges":[{"src":x.src,"dst":x.dst,"axis":x.axis,"margin":x.margin,"kind":x.kind,"weight":x.weight} for x in sparse.edges],"contacts":[{"a":x.a,"b":x.b,"axis":x.axis,"a_before_b":x.a_before_b,"perp_margin":x.perp_margin,"weight":x.weight} for x in sparse.contacts],"pin_paths":[list(x) for x in sparse.pin_paths],"proposal_ordinal":winner.ordinal,"proposal_name":winner.name,"base_cost":bc,"teacher_cost":tc,"record_weight":bc/tc}
     return _CaseOutcome(label, tuple(rows), tuple(rejects), bc, tc, bool(base_ok), bool(base_ok), status)
 
 def _finite_json(value: Any) -> None:
@@ -1640,10 +1640,12 @@ def _validate_outcome(value: Any) -> _CaseOutcome:
     if type(value.legal) is not bool or type(value.covered) is not bool: raise ValueError("runtime flags")
     if value.case_status not in {"winner_base_no_improvement","winner_mutation","base_unavailable"}: raise ValueError("case status")
     if value.case_status == "base_unavailable":
-        if value.legal or value.covered or value.label_row is not None or value.base_cost is not None or value.teacher_cost is not None: raise ValueError("base unavailable")
+        if type(value.legal) is not bool or type(value.covered) is not bool or value.legal or value.covered: raise ValueError("runtime flags")
+        if value.label_row is not None or value.base_cost is not None or value.teacher_cost is not None: raise ValueError("base unavailable")
     else:
+        if not value.legal or not value.covered: raise ValueError("runtime flags")
         if not all(isinstance(x, numbers.Real) and not isinstance(x, bool) and math.isfinite(float(x)) and float(x)>0 for x in (value.base_cost,value.teacher_cost)): raise ValueError("runtime costs")
-        if value.teacher_cost > value.base_cost or not value.legal or not value.covered: raise ValueError("runtime costs")
+        if value.teacher_cost > value.base_cost: raise ValueError("runtime costs")
         if not isinstance(value.label_row, Mapping): raise ValueError("label schema")
     rows = list(value.proposal_rows)
     if any(not isinstance(row, Mapping) for row in rows): raise ValueError("proposal schema")
@@ -1653,10 +1655,25 @@ def _validate_outcome(value: Any) -> _CaseOutcome:
     if any(set(r) != expected for r in rows): raise ValueError("proposal schema")
     for row in rows:
         if row["diagnostic_energy"] is not None and (not isinstance(row["diagnostic_energy"], numbers.Real) or not math.isfinite(float(row["diagnostic_energy"]))): raise ValueError("diagnostic_energy")
-    if len(names) != len(set(names)) or len(ords) != len(set(ords)) or any(k in r for r in rows for k in _PROTECTED): raise ValueError("proposal provenance")
+    if len(names) != len(set(names)) or len(ords) != len(set(ords)) or ords != list(range(len(rows))) or any(k in r for r in rows for k in _PROTECTED): raise ValueError("proposal provenance")
+    if any(r["intended_intent"] != r["name"] or type(r["intended_intent"]) is not str for r in rows): raise ValueError("intended_intent")
+    allowed_status = {"admitted", "failed"}; allowed_hard = {"passed", "failed", "not_reached"}
+    for r in rows:
+        if r["admission_status"] not in allowed_status or r["hard_status"] not in allowed_hard or r["intent_status"] not in {"passed", "failed", "not_reached"}: raise ValueError("stage")
+        if r["admission_status"] == "failed" and any(r[k] is not None for k in ("drift", "hard", "official_cost", "feasible", "diagnostic_energy")): raise ValueError("stage null")
+        if r["admission_status"] == "failed" and r["official_status"] != "not_reached": raise ValueError("stage")
     winners = [r for r in rows if r.get("winner") is True]
     if value.case_status != "base_unavailable" and len(winners) != 1: raise ValueError("runtime winner count")
     if value.case_status == "base_unavailable" and winners: raise ValueError("runtime winner count")
+    if value.case_status != "base_unavailable":
+        winner = winners[0]; base = next((r for r in rows if r["name"] == "base"), None)
+        if base is None or winner["official_cost"] != value.teacher_cost or base["official_cost"] != value.base_cost: raise ValueError("winner/base costs")
+        if value.label_row["proposal_ordinal"] != winner["ordinal"] or value.label_row["proposal_name"] != winner["name"]: raise ValueError("label mismatch")
+        if value.label_row["base_cost"] != value.base_cost or value.label_row["teacher_cost"] != value.teacher_cost: raise ValueError("label costs")
+        if value.label_row["record_weight"] != value.base_cost / value.teacher_cost: raise ValueError("label record weight")
+        if any(edge.get("weight") != 1.0 for edge in value.label_row.get("edges", ())) or any(c.get("weight") != 1.0 for c in value.label_row.get("contacts", ())): raise ValueError("label sparse payload")
+        if value.case_status != winner["status"]: raise ValueError("case status")
+    if len({(r.get("ordinal"), r.get("name")) for r in value.rejection_rows}) != len(value.rejection_rows): raise ValueError("rejection duplicate")
     if any(k in r for r in value.rejection_rows for k in _PROTECTED): raise ValueError("rejection provenance")
     for row in [value.label_row, *rows, *value.rejection_rows]: _finite_json(row)
     return value
