@@ -35,21 +35,23 @@ transiently and exactly from `(w,h,x,y)` to `(x,y,w,h)`. Validation/test
 `fp_sol` is forbidden for gradient training, thresholds, proposals, tuning, or
 checkpoint selection; after freeze, full100 G1 cannot feed back. Dense fp
 coordinates are never serialized, entered into the student, used in a
-coordinate/value loss, used to seed proposals, or used at inference.
+coordinate/value loss, or used at inference. The approved G0-v2 amendment
+below is the sole exception to the earlier proposal-seeding prohibition: a
+verified training row may transiently seed one offline exact-TFDL teacher
+candidate, after which the dense tensor is discarded.
 
-Outside transient receipt-verified conversion of training `fp_sol` to
-`fp_topology_v1`, `fp_sol` is read only to derive input-authorized
-fixed/preplaced geometry; it is never serialized as dense data or used as a
-coordinate target. Training `fp_sol` transiently produces only the sparse
-realizer-input `fp_topology_v1`; that record is distinct from the
-winner-derived `TopologyLabel`. The realizer consumes `fp_topology_v1`, a base
-seed, and sanitized input; it never receives fp rectangles. After exact TFDL
-and scoring, `TopologyLabel` links the originating `fp_topology_sha256` and
-alone carries winner-only margins, `pin_paths`, proposal identity, ordinal,
-name, cost, and record weight. `fp_topology_v1` contains only the receipt/input
-fingerprint, `axis_edges`, `contacts`, and `topology_sha256`; it must not
-contain origin, width, height, gap, overlap magnitude, dense rectangles, or
-dense fp fields.
+The sparse-only path converts receipt-verified training `fp_sol` to
+`fp_topology_v1`; that record is distinct from the winner-derived
+`TopologyLabel`. In that path the realizer consumes `fp_topology_v1`, a base
+seed, and sanitized input, and never receives fp rectangles. G0-v2 instead
+permits one transient dense teacher seed in memory, but its persistence and
+student contracts are identical: after exact TFDL and scoring,
+`TopologyLabel` alone carries winner-linked sparse margins, `pin_paths`,
+proposal identity, ordinal, name, cost, and record weight. Neither path may
+persist dense fp data or use it as a coordinate target. `fp_topology_v1`
+contains only the receipt/input fingerprint, `axis_edges`, `contacts`, and
+`topology_sha256`; it must not contain origin, width, height, gap, overlap
+magnitude, dense rectangles, or dense fp fields.
 
 The canonical `fp_topology_v1` record has these logical fields, in this order:
 `schema` (string, exactly `fp_topology_v1`), `version` (integer, exactly 1),
@@ -91,12 +93,14 @@ still require bit-equal face coordinates. The manifest binds the `S` formula,
 normalized coefficient `1e-9`, and CPU-float64 dtype in
 `extractor_config_sha256`.
 
-The canonical flow is: verified training shard → transient canonical fp →
-sparse realizer-input `fp_topology_v1` → realize from `fp_topology_v1`, Direct/base
-seed, and sanitized input → SHA-pinned provided/local contest-evaluator hard
-audit (soft V is accepted and recorded) → exact TFDL with no shelf fallback →
-hard audit → SHA-pinned provided/local contest-evaluator no-runtime scorer →
-deterministic winner → winner-linked TopologyLabel/student. Task 3 has
+The canonical sparse-only flow is: verified training shard → transient
+canonical fp → sparse realizer-input `fp_topology_v1` → realize from
+`fp_topology_v1`, Direct/base seed, and sanitized input → SHA-pinned
+provided/local contest-evaluator hard audit (soft V is accepted and recorded)
+→ exact TFDL with no shelf fallback → hard audit → SHA-pinned provided/local
+contest-evaluator no-runtime scorer → deterministic winner → winner-linked
+TopologyLabel/student. G0-v2 supersedes only the offline teacher-candidate
+portion of this flow as specified below. Task 3 has
 six fixed ordinal slots, never renumbered: `0=base`, `1=fp-axis`,
 `2=existing axis`, `3=pin`, `4=fp-contact`, `5=existing contact`. Every slot
 records exactly one status: `candidate`, `rejected`, or `duplicate`; duplicate
@@ -112,7 +116,8 @@ The RED acceptance matrix is normative: test source roles/conversion; tree
 invariance and absence from every call path; validation/test rejection; no
 dense serialization; soft-V golden acceptance; preplaced plus boundary
 immobility; target100 `99/101` accepted and `98.99/101.01` hard-failed;
-topology invariance; no fp-rectangle realizer path; all candidates through
+topology invariance; no fp-rectangle student, persistence, or production path;
+all candidates through
 the SHA-pinned provided/local evaluator pipeline; deterministic
 base/no-improvement; and exact binding of receipt, source, extractor, TFDL,
 and scorer.
@@ -123,6 +128,48 @@ Manifest and preflight fail on absence or mismatch. QA A4 governs soft golden
 acceptance, A5 governs preplaced/boundary behavior, A6 governs area tolerance,
 A15 governs the published runtime formula, and A16 governs the `fp_sol` and
 `tree_sol` roles.
+
+### Approved G0-v2 transient-fp oracle amendment (Option A)
+
+The user approved this amendment and Option A on 2026-08-14. It is normative
+for G0 and overrides only conflicting sparse-only teacher-oracle language
+above; student, persistence, validation/test, and inference prohibitions remain
+unchanged.
+
+- The G0 base is the frozen production hard-legal portfolio, with exactly six
+  candidates split as `3` Direct DPM++/2 and `3` Flow Euler/8. The same wrapper,
+  checkpoints, seeds, ranker, repair policy, environment, and official scorer
+  are bound in the G0 receipt.
+- For each receipt-verified eligible training-heldout row, G0 may read
+  `fp_sol` exactly once, convert `(w,h,x,y)` to CPU-float64 `(x,y,w,h)`, and use
+  it transiently as exactly one candidate seed for exact TFDL. The candidate
+  must pass the same preplaced, fixed, area, overlap, and official hard audit
+  as every other candidate. Soft V in `fp_sol` is not a rejection condition.
+- The G0 candidate set is exactly two logical slots: `0=production-base` and
+  `1=transient-fp-exact-tfdl`. The historical 25 blind axis/pin/contact
+  mutations are excluded. Each eligible case retains the base when the fp
+  candidate is rejected, unavailable, or does not improve official
+  `cost_no_runtime`.
+- Dense fp coordinates exist only inside the per-case offline teacher call.
+  They are cleared before any record is emitted and must never appear in JSONL,
+  SQLite, labels, manifests, checkpoints, student inputs or losses, validation,
+  full100 G1, or production inference. Persisted output is limited to
+  receipt/fingerprint binding, sparse winner-linked topology labels, candidate
+  status and costs, hard/soft audit evidence, and deterministic winner linkage.
+- `tree_sol` remains schema-only and cannot affect the base, transient-fp
+  candidate, TFDL result, winner, label, or checkpoint selection.
+- The formal oracle gate is the complete immutable eligible heldout population
+  `H`. A bounded 100-shard tracer may validate feasibility, gain direction,
+  runtime, and artifact hygiene, but is explicitly non-authorizing and cannot
+  advance training.
+- Validation/test `fp_sol` remains forbidden. No G0 or G1 outcome may feed back
+  into proposal policy, thresholds, labels, training, or checkpoint selection.
+
+The amendment is supported by a predeclared 100-shard non-authorizing tracer:
+`100/100` hard feasible, `98/100` positive teacher gain,
+`B_H=1.3026596150248044`, `T_H=1.134337069411285`, and
+`Delta_H=0.16832254561351934`. These numbers justify running full `H`; they are
+not the formal G0 result.
 
 ### Approved 3-Direct / 3-Flow amendment
 
@@ -179,15 +226,19 @@ not imitate coordinates.
 
 ## Chosen architecture
 
-The development path is:
+The G0-v2 development path is:
 
-1. Freeze the Direct baseline checkpoint and configuration.
-2. Generate bounded, deterministic offline topology proposals.
+1. Freeze the production six-candidate baseline and exact `3` Direct / `3`
+   Flow configuration.
+2. Generate exactly one transient-fp exact-TFDL teacher candidate per eligible
+   receipt-bound training-heldout row; do not run the historical blind mutation
+   bank.
 3. Run an equality-pinned preplaced-feasibility check.
-4. Evaluate admitted proposals with exact TFDL (no shelf fallback), the
+4. Evaluate the teacher candidate with exact TFDL (no shelf fallback), the
    SHA-pinned provided/local contest-evaluator scorer, diagnostic energy, and
    exact boundary/grouping geometry.
-5. Convert only sparse critical constraints into labels.
+5. Retain the production base unless the teacher is legal and strictly better,
+   then convert only sparse winner-linked critical constraints into labels.
 6. Distill those labels into a `DirectDenoiser` checkpoint with the SAME SHAPE.
 
 Production changes the Direct checkpoint inside the approved fixed portfolio:
@@ -390,8 +441,9 @@ study. It must not be inferred from the 3/3 approval.
 ### G0 — teacher oracle
 
 Define the eligible held-out population `H` by the immutable receipt-bound
-index (`n >= 100`, `split_for_id(instance_id, heldout_mod=10) == "heldout"`), with exactly one fixed
-Direct seed per case.  Do not compare an absolute held-out statistic with the
+index (`n >= 100`, `split_for_id(instance_id, heldout_mod=10) == "heldout"`).
+Each case has exactly one frozen production `3` Direct / `3` Flow base and one
+transient-fp exact-TFDL teacher slot. Do not compare an absolute held-out statistic with the
 validation/full100-derived `1.075` or `1.0829742560590576` bars.  With
 `w=exp(n/12)`, bind the ordered IDs, `n`, weights, denominator, population
 SHA, provided/local-scorer weighted base mean `B_H`, teacher mean `T_H`, and gain
@@ -407,21 +459,24 @@ diagnostic kill only.  Between hard and target, stop with no training
 authority; only the target permits Task 5.  G1 remains the sole causal
 transfer proof.
 
-For every fixed slot with status `candidate` (base or mutation) that passes
-exact admission and named-intent survival, call the SHA-pinned provided/local
-contest evaluator exactly once:
+Score the hard-legal production base exactly once. Score the transient-fp slot
+exactly once only after exact admission and hard audit, using the SHA-pinned
+provided/local contest evaluator:
 `evaluate_solution({"positions": ..., "runtime": 1.0}, ...,
 median_runtime=1.0).cost_no_runtime`. `rejected` and `duplicate` slots receive
 no evaluator call.
 `EN.energy` is called only after exact legal admission, recorded diagnostically,
 and never shortlists or filters. Select by deterministic
-`(cost_no_runtime, ordinal, name)` among candidates, with base present exactly
-once; `B_H`, `T_H`, labels, and record weights use `cost_no_runtime`. If no
-proposal improves, select the base candidate with `teacher_cost == base_cost`,
+`(cost_no_runtime, ordinal, name)` over the two logical slots, with base present
+exactly once; `B_H`, `T_H`, labels, and record weights use `cost_no_runtime`.
+If the transient-fp candidate does not improve, select the base candidate with
+`teacher_cost == base_cost`,
 explicit no-improvement status, and retained label/evidence (`record_weight=1`). The
 coverage denominator is every eligible held-out case and exactly one
-provided/local-evaluator-scored winner per case; separately report mutation
-admission, intent survival, and positive-gain weighted coverage.
+provided/local-evaluator-scored winner per case; separately report teacher
+admission and positive-gain weighted coverage. Dense fp rectangles are deleted
+before the record is serialized; only sparse winner-linked evidence may leave
+the per-case call.
 
 G0 terminal states are `KILLED_INPUT_CHECKPOINT_OR_SCORER`,
 `KILLED_LEGALITY_OR_COVERAGE`, `KILLED_TEACHER_GT_1_5`,
