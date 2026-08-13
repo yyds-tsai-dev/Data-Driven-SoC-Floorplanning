@@ -14,6 +14,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any, Optional
 
 import torch
@@ -32,13 +33,13 @@ __all__ = ["teacher_main"]
 
 _CHECKPOINT_SHA256 = "508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659"
 _SCORER_SHA256 = "7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1"
-_MODEL_IDENTITY = {
+_MODEL_IDENTITY = MappingProxyType({
     "identity_schema": IDENTITY_SCHEMA,
     "model_config_sha256": "4c6a1e19f0574af348efa81a758c05524522ad3501d46f18e839774fa933971b",
     "model_keyset_sha256": "79a51975d9b9f583143259198d244554c8a4e97122fc5e5cf150ec64f4429ba7",
     "ema_keyset_sha256": "79a51975d9b9f583143259198d244554c8a4e97122fc5e5cf150ec64f4429ba7",
     "ema_state_sha256": "92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb",
-}
+})
 
 
 @dataclass(frozen=True)
@@ -50,12 +51,21 @@ class TeacherTrustPolicy:
     scorer_contract: str
     shapely_version: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.allowed_model_identity, Mapping):
+            raise TypeError("allowed_model_identity must be a mapping")
+        object.__setattr__(
+            self,
+            "allowed_model_identity",
+            MappingProxyType(dict(self.allowed_model_identity)),
+        )
+
 
 def _production_trust_policy() -> TeacherTrustPolicy:
     return TeacherTrustPolicy(
         canonical_root=(_REPO / "FloorSet" / "floorset_lite").resolve(),
         expected_checkpoint_sha256=_CHECKPOINT_SHA256,
-        allowed_model_identity=dict(_MODEL_IDENTITY),
+        allowed_model_identity=_MODEL_IDENTITY,
         expected_scorer_sha256=_SCORER_SHA256,
         scorer_contract="iccad2026_evaluate_cost_no_runtime_v1",
         shapely_version="2.0.5",
@@ -124,21 +134,49 @@ def _validate_case(case: Any) -> tuple[int, list[list[int]], torch.Tensor]:
     if type(n) is not int or n <= 0:
         raise ValueError("case n")
     cons = case.get("cons")
-    if isinstance(cons, (str, bytes)) or not isinstance(cons, Sequence) or len(cons) != n:
+    if not isinstance(cons, (list, tuple)) or len(cons) != n:
         raise ValueError("case constraints")
+    widths: set[int] = set()
+    for row in cons:
+        if not isinstance(row, (list, tuple)):
+            raise ValueError("case constraint row")
+        widths.add(len(row))
+    if widths not in ({2}, {5}):
+        raise ValueError("case constraint widths")
     normalized_cons: list[list[int]] = []
     for row in cons:
-        if isinstance(row, (str, bytes)) or not isinstance(row, Sequence) or len(row) != 5:
+        if len(row) not in (2, 5):
             raise ValueError("case constraint row")
         if any(not _is_integral(value) for value in row):
             raise ValueError("case constraint value")
-        normalized_cons.append([int(value) for value in row])
+        normalized = [int(value) for value in row]
+        if normalized[0] not in (0, 1) or normalized[1] not in (0, 1):
+            raise ValueError("case fixed/preplaced flag")
+        if len(normalized) == 2:
+            normalized.extend((0, 0, 0))
+        elif normalized[2] < 0 or normalized[3] < 0 or not 0 <= normalized[4] <= 15:
+            raise ValueError("case constraint metadata")
+        normalized_cons.append(normalized)
+    area = case.get("area")
+    if not isinstance(area, (list, tuple)) or len(area) != n:
+        raise ValueError("case area")
+    for value in area:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("case area")
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError("case area")
     try:
         tp = torch.as_tensor(case.get("tp"), dtype=torch.float64, device="cpu")
     except Exception as exc:
         raise ValueError("case tp") from exc
     if tp.shape != (n, 4) or not bool(torch.isfinite(tp).all()):
         raise ValueError("case tp")
+    for index, row in enumerate(normalized_cons):
+        if row[0] != 0 or row[1] != 0:
+            if tp[index, 2] <= 0 or tp[index, 3] <= 0:
+                raise ValueError("case fixed dimensions")
+        if row[1] != 0 and (tp[index, 0] < 0 or tp[index, 1] < 0):
+            raise ValueError("case preplaced origin")
     return n, normalized_cons, tp
 
 

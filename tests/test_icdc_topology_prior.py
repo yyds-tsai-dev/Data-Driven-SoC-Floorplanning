@@ -101,7 +101,7 @@ def test_teacher_sample_seed_is_stable_order_independent_and_signed63():
 def test_teacher_intent_parser_requires_exact_realized_geometry():
     t = _teacher(); rects = torch.tensor(
         [[0., 0., 1., 1.], [2., 0., 1., 1.]], dtype=torch.float64)
-    case = {"n": 2, "cons": [[0, 1, 5, 5, 5], [0, 0, 5, 5, 5]], "pins": [], "tp": [[0., 0., 1., 1.], [-1]*4], "groups": [[0, 1]]}
+    case = {"n": 2, "area": [1., 1.], "cons": [[0, 1, 5, 5, 5], [0, 0, 5, 5, 5]], "pins": [], "tp": [[0., 0., 1., 1.], [-1]*4], "groups": [[0, 1]]}
     assert t._proposal_intent_holds("base", rects, case)
     axis = rects.clone(); axis[1, 0] = 1.
     assert t._proposal_intent_holds("axis:0:1:0:1", axis, case)
@@ -344,6 +344,16 @@ def test_teacher_default_policy_binds_frozen_production_inputs():
     assert policy.shapely_version == "2.0.5"
 
 
+def test_teacher_production_identity_is_immutable_and_stable():
+    t = _teacher()
+    first = t._production_trust_policy()
+    second = t._production_trust_policy()
+    assert first.allowed_model_identity == second.allowed_model_identity
+    with pytest.raises(TypeError):
+        first.allowed_model_identity["ema_state_sha256"] = "forged"
+    assert second.allowed_model_identity["ema_state_sha256"] == "92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb"
+
+
 def test_teacher_default_relative_root_and_bounded_flags_reach_unimplemented(monkeypatch, tmp_path):
     t = _teacher(); out = tmp_path / "out"
     monkeypatch.setattr(torch, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
@@ -372,9 +382,48 @@ def test_teacher_intent_rejects_malformed_case_contract(field, value):
     assert not t._proposal_intent_holds("base", rects, case)
 
 
+def test_teacher_intent_accepts_uniform_two_column_constraints():
+    t = _teacher()
+    case = {"n": 2, "area": [1., 1.], "cons": [[0, 1], [0, 0]],
+            "tp": [[0., 0., 1., 1.], [-1., -1., 1., 1.]]}
+    rects = torch.tensor([[0., 0., 1., 1.], [1., 0., 1., 1.]], dtype=torch.float64)
+    assert t._proposal_intent_holds("base", rects, case)
+    assert t._proposal_intent_holds("axis:0:1:0:1", rects, case)
+    assert t._proposal_intent_holds("pin:0:1:0:1", rects, case)
+    assert not t._proposal_intent_holds("contact:5:0:1:0:1", rects, case)
+
+
+@pytest.mark.parametrize("cons", [
+    [[0, 0], [0, 0, 0, 0, 0]],
+    [[2, 0], [0, 0]],
+    [[0, 0, -1, 0, 0], [0, 0, 0, 0, 0]],
+    [[0, 0, 0, -1, 0], [0, 0, 0, 0, 0]],
+    [[0, 0, 0, 0, 99], [0, 0, 0, 0, 0]],
+])
+def test_teacher_intent_rejects_constraint_width_and_metadata_gaps(cons):
+    case = {"n": 2, "area": [1., 1.], "cons": cons,
+            "tp": [[0., 0., 1., 1.], [-1., -1., 1., 1.]]}
+    rects = torch.tensor([[0., 0., 1., 1.], [1., 0., 1., 1.]], dtype=torch.float64)
+    assert not _teacher()._proposal_intent_holds("base", rects, case)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("area", None), ("area", [1.]), ("area", [0., 1.]),
+    ("area", [float("nan"), 1.]), ("area", [True, 1.]),
+    ("tp", [[0., 0., -1., 1.], [-1., -1., 1., 1.]]),
+    ("tp", [[-1., 0., 1., 1.], [-1., -1., 1., 1.]]),
+])
+def test_teacher_intent_rejects_area_and_authorized_geometry_gaps(field, value):
+    case = {"n": 2, "area": [1., 1.], "cons": [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]],
+            "tp": [[0., 0., 1., 1.], [0., 0., 1., 1.]]}
+    case[field] = value
+    rects = torch.tensor([[0., 0., 1., 1.], [1., 0., 1., 1.]], dtype=torch.float64)
+    assert not _teacher()._proposal_intent_holds("base", rects, case)
+
+
 def test_teacher_intent_rejects_wrong_rect_contract_and_unauthorized_pin():
     t = _teacher()
-    case = {"n": 2, "cons": [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0]],
+    case = {"n": 2, "area": [1., 1.], "cons": [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0]],
             "tp": [[-1., -1., 1., 1.], [-1.] * 4]}
     assert not t._proposal_intent_holds(
         "base", torch.tensor([[0., 0., 1., 1.]]), case)
@@ -392,7 +441,7 @@ def test_teacher_intent_rejects_wrong_rect_contract_and_unauthorized_pin():
 
 
 def test_teacher_contact_requires_exact_face_and_positive_perpendicular_overlap():
-    t = _teacher(); case = {"n": 2, "cons": [[0, 0, 0, 5, 0]] * 2, "tp": [[-1.] * 4] * 2}
+    t = _teacher(); case = {"n": 2, "area": [4., 4.], "cons": [[0, 0, 0, 5, 0]] * 2, "tp": [[-1.] * 4] * 2}
     partial = torch.tensor([[0., 0., 2., 2.], [2., 1.5, 2., 2.]])
     no_overlap = torch.tensor([[0., 0., 2., 2.], [2., 2., 2., 2.]])
     face_gap = torch.tensor([[0., 0., 2., 2.], [2.01, 0., 2., 2.]])
