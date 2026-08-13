@@ -488,17 +488,25 @@ def _task4_static_forbidden(source, *, require_exact_loads=False):
                     aliases[x.asname or x.name.split(".")[0]] = (f"{n.module}.{x.name}" if isinstance(n, ast.ImportFrom) and n.module else x.name)
             if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
                 v = resolve(n.value)
+                if (isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name)
+                        and n.value.func.id == "getattr" and len(n.value.args) == 2
+                        and isinstance(n.value.args[1], ast.Constant)
+                        and n.value.args[1].value == "load" and resolve(n.value.args[0]) == "torch"):
+                    v = "torch.load"
                 if v and aliases.get(n.targets[0].id) != v: aliases[n.targets[0].id] = v; changed = True
     bad = ("load_test_cases", "floorplandatasetlitetest", "bandfilesampler._instance", "shelf_fallback", "engine.load_model", "engine.sample_bank", "collate", "tfdl")
-    literals = {"golden", "validation", "test"}
+    literals = {"golden", "validation", "test", "test_id", "validation_case", "golden_target"}
+    def forbidden_literal(value):
+        key = str(value).lower()
+        return key in literals or key.startswith(("test_", "validation_", "golden_"))
     forbidden_runtime = ("proposal", "admission", "tfdl", "hard-legal", "hard_legal", "intent", "energy", "evaluate_solution", "official_score", "winner")
     for n in ast.walk(tree):
         if isinstance(n, ast.Call):
             path = resolve(n.func)
             if any(part in path.lower() for part in bad): return False
             if isinstance(n.func, ast.Name) and n.func.id == "getattr" and len(n.args) >= 2 and isinstance(n.args[1], ast.Constant) and any(x in str(n.args[1].value).lower() for x in (*bad, "load_model", "sample_bank")): return False
-        if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and str(n.slice.value).lower() in literals: return False
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and n.args and isinstance(n.args[0], ast.Constant) and str(n.args[0].value).lower() in literals: return False
+        if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and forbidden_literal(n.slice.value): return False
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and n.args and isinstance(n.args[0], ast.Constant) and forbidden_literal(n.args[0].value): return False
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"process_case", "_sample_direct_once", "_build_teacher_batches"}:
             if any(isinstance(x, ast.Call) and any(part in resolve(x.func).lower() for part in forbidden_runtime) for x in ast.walk(node)):
@@ -525,6 +533,10 @@ def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
     assert not _task4_static_forbidden("def process_case(x):\n  fake_admission(x)\n  fake_tfdl(x)\n  official_score(x)")
     assert _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu')", require_exact_loads=True)
     assert not _task4_static_forbidden("import io, torch\na='x'; b='y'; c='z'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu'); torch_alias=torch; getattr(torch_alias, 'load')(io.BytesIO(c), weights_only=True, map_location='cpu')", require_exact_loads=True)
+    assert not _task4_static_forbidden("import io, torch\na='x'; b='y'; c='z'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu'); torch_alias=torch; loader=getattr(torch_alias, 'load'); loader(io.BytesIO(c), weights_only=True, map_location='cpu')", require_exact_loads=True)
+    assert not _task4_static_forbidden("case['test_id']")
+    assert not _task4_static_forbidden("case.get('validation_case')")
+    assert not _task4_static_forbidden("case['golden_target']")
     assert not _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a, extra=True), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu')", require_exact_loads=True)
 
 
@@ -589,7 +601,8 @@ def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
     "same_key_model_order", "same_key_ema_order", "model_ema_reversed", "ema_dtype", "model_nonfinite", "ema_nonfinite",
     "missing_model", "model_nonmapping", "model_empty",
     "missing_ema", "ema_nonmapping", "ema_empty", "key_mismatch", "extra_ema", "shape",
-    "nontensor", "inf", "zdim", "zrepr", "unknown", "model_shape", "model_dtype"])
+    "nontensor", "inf", "zdim", "zrepr", "unknown", "model_shape", "model_dtype",
+    "timesteps_zero", "timesteps_bool", "dropout_nan", "dropout_negative"])
 def test_task4_materializer_rejects_malformed_payload(kind):
     bad = _task4_teacher_payload()
     if kind == "nonmapping": bad = []
@@ -626,6 +639,10 @@ def test_task4_materializer_rejects_malformed_payload(kind):
         k = next(iter(bad["model"])); v = bad["model"][k]; bad["model"][k] = torch.cat((v.reshape(-1), v.new_zeros(1)))
     elif kind == "model_dtype":
         k = next(k for k, v in bad["model"].items() if v.is_floating_point()); bad["model"][k] = bad["model"][k].double()
+    elif kind == "timesteps_zero": bad["model_config"]["timesteps"] = 0
+    elif kind == "timesteps_bool": bad["model_config"]["timesteps"] = True
+    elif kind == "dropout_nan": bad["model_config"]["dropout"] = float("nan")
+    elif kind == "dropout_negative": bad["model_config"]["dropout"] = -0.1
     with pytest.raises(ValueError):
         _teacher()._materialize_teacher_model(bad, torch.device("cpu"))
 
@@ -653,6 +670,9 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
             expected = torch.as_tensor(case[key], dtype=batch[key].dtype).unsqueeze(0)
             if key in ("b2b", "p2b", "pins"): expected = expected.reshape(batch[key].shape)
             assert torch.equal(batch[key], expected)
+    expected_scale = torch.sqrt(torch.as_tensor(case["area"], dtype=torch.float32)[torch.as_tensor(case["area"], dtype=torch.float32) > 0].sum()).clamp_min(1.0)
+    assert direct["scale"].item() == expected_scale.item()
+    assert diagnostic["scale"].item() == expected_scale.double().item()
     f64_scale = torch.sqrt(torch.tensor(case["area"], dtype=torch.float64).sum())
     assert diagnostic["scale"].item() != f64_scale.item()
     tiny = t._sanitize_case(dict(_task4_case_input(t).case, area=[0.1, 0.2, 0.3]), artifact=True)
