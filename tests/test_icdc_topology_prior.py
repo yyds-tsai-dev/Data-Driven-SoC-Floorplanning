@@ -2513,6 +2513,125 @@ def test_teacher_replay_uses_real_spooled_row_validator_immediately_before_runti
         assert process_event[2:] == validate_event[3:]
 
 
+@pytest.mark.parametrize("poison, changed_leaf", [
+    ("source_row_count", "source_row_count"),
+    ("file_sha256", "file_sha256"),
+])
+def test_teacher_replay_summary_is_from_verified_ingestion_not_spooled_record(
+        tmp_path, monkeypatch, poison, changed_leaf):
+    """A poisoned decoded spool record cannot rewrite its verified shard summary."""
+    t = _teacher()
+    validator = getattr(t, "_validate_spooled_case_row", None)
+    summary_builder = getattr(t, "_trusted_shard_summary_from_verified_source", None)
+    record_decoder = getattr(t, "_replay_record_from_spool", None)
+    assert callable(validator), "missing real _validate_spooled_case_row semantic replay seam"
+    assert callable(summary_builder), (
+        "missing _trusted_shard_summary_from_verified_source ingestion seam"
+    )
+    assert callable(record_decoder), "missing _replay_record_from_spool semantic replay seam"
+    root = tmp_path / "floorset_lite"; source_path = _task4_shard(root); out = tmp_path / "out"
+    expected_summary = _task4_trusted_shard_summary(source_path)
+    calls = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls,
+                        outcome_factory=_task4_p1c_mutation_outcome)
+    stages = []; real_staging = t._new_staging
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+    real_read = t._read_verified_shard
+    real_source_validate = t._validate_source_shard
+    verified = []
+    flow = []
+
+    def read_verified(root_path, worker, layout):
+        raw, source = real_read(root_path, worker, layout)
+        verified.append({"worker": worker, "layout": layout, "raw": raw, "source": source})
+        flow.append(("read_verified", worker, layout))
+        return raw, source
+
+    def validate_source(source):
+        result = real_source_validate(source)
+        for item in verified:
+            if item["source"] is source:
+                item["source_row_count"] = result[0]
+                flow.append(("validate_source", item["worker"], item["layout"]))
+        return result
+
+    monkeypatch.setattr(t, "_read_verified_shard", read_verified)
+    monkeypatch.setattr(t, "_validate_source_shard", validate_source)
+    real_summary_builder = summary_builder
+    constructed_summaries = []
+
+    def build_trusted_summary(worker, layout, relative_path, raw, source_row_count):
+        result = real_summary_builder(worker, layout, relative_path, raw, source_row_count)
+        constructed_summaries.append({
+            "worker": worker, "layout": layout, "relative_path": relative_path,
+            "raw": raw, "source_row_count": source_row_count, "result": result,
+        })
+        flow.append(("build_summary", worker, layout))
+        return result
+
+    monkeypatch.setattr(t, "_trusted_shard_summary_from_verified_source",
+                        build_trusted_summary)
+    real_record_decoder = record_decoder
+    decoded = []
+
+    def decode_replay_record(*args, **kwargs):
+        record = real_record_decoder(*args, **kwargs)
+        before = copy.deepcopy(record)
+        after = copy.deepcopy(record)
+        if isinstance(after, collections.abc.Mapping) and not decoded:
+            after = dict(after)
+            after[changed_leaf] = (1 if poison == "source_row_count" else "0" * 64)
+        decoded.append((before, after))
+        if isinstance(after, collections.abc.Mapping):
+            flow.append(("decode_record", after.get("worker"), after.get("layout")))
+        return after
+
+    monkeypatch.setattr(t, "_replay_record_from_spool", decode_replay_record)
+    real_validator = validator
+    validations = []
+
+    def validate_record(record, shard_summary):
+        validations.append((copy.deepcopy(record), copy.deepcopy(shard_summary)))
+        flow.append(("validate_record", _task4_semantic_value(record, "worker"),
+                     _task4_semantic_value(record, "layout")))
+        return real_validator(record, shard_summary)
+
+    monkeypatch.setattr(t, "_validate_spooled_case_row", validate_record)
+    with pytest.raises(ValueError):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert len(verified) == 1
+    verified_shard = verified[0]
+    assert verified_shard["worker"] == expected_summary["worker"]
+    assert verified_shard["layout"] == expected_summary["layout"]
+    assert hashlib.sha256(verified_shard["raw"]).hexdigest() == expected_summary["file_sha256"]
+    assert verified_shard["source_row_count"] == expected_summary["source_row_count"]
+    assert len(constructed_summaries) == 1
+    construction = constructed_summaries[0]
+    assert {name: construction[name] for name in expected_summary} == expected_summary
+    assert construction["raw"] == verified_shard["raw"]
+    assert construction["source_row_count"] == verified_shard["source_row_count"]
+    assert {name: _task4_semantic_value(construction["result"], name)
+            for name in expected_summary} == expected_summary
+    assert len(decoded) == len(validations) == 1
+    before, after = decoded[0]
+    assert isinstance(before, collections.abc.Mapping) and isinstance(after, collections.abc.Mapping)
+    assert [name for name, value in _task4_spooled_replay_leaves(before).items()
+            if value != _task4_spooled_replay_leaves(after)[name]] == [changed_leaf]
+    poisoned_record, passed_summary = validations[0]
+    assert poisoned_record == after
+    assert {name: _task4_semantic_value(passed_summary, name)
+            for name in expected_summary} == expected_summary
+    assert flow == [
+        ("read_verified", 2, 0), ("validate_source", 2, 0), ("build_summary", 2, 0),
+        ("decode_record", 2, 0), ("validate_record", 2, 0),
+    ]
+    assert calls == []
+    assert not out.exists() and stages and not stages[-1].exists()
+
+
 def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
     policy = _policy_for(root); calls = []; preflight_calls = []
