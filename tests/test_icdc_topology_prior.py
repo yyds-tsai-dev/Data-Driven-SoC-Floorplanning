@@ -2684,15 +2684,17 @@ def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
 def test_cleanup_owned_staging_backend_race_preserves_foreign_directory(tmp_path, monkeypatch):
     t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
     lease = t._new_staging_lease(owned); moved = tmp_path / "moved-owned"
-    remover = getattr(t, "_remove_owned_staging_contents", None)
+    remover = getattr(t, "_remove_owned_staging_contents_fd", None)
     assert callable(remover), "missing descriptor-bound staging cleanup seam"
 
-    def race(held_lease):
+    def race(owned_fd):
+        fd_info = os.fstat(owned_fd)
+        assert (fd_info.st_dev, fd_info.st_ino) == (lease.st_dev, lease.st_ino)
         owned.rename(moved)
         owned.mkdir(); (owned / "sentinel").write_text("foreign")
-        return remover(held_lease)
+        return remover(owned_fd)
 
-    monkeypatch.setattr(t, "_remove_owned_staging_contents", race)
+    monkeypatch.setattr(t, "_remove_owned_staging_contents_fd", race)
     assert t._cleanup_owned_staging(lease) is False
     assert moved.exists() and owned.is_dir() and (owned / "sentinel").exists()
 
