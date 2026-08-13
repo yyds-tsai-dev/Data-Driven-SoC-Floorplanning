@@ -2730,6 +2730,101 @@ def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monk
     assert (replacement.stat().st_dev, replacement.stat().st_ino) == attacked["foreign_identity"]
 
 
+def test_teacher_normal_case_spool_close_rejects_foreign_replacement(
+        tmp_path, monkeypatch):
+    """The normal close-to-remove path cannot unlink a replacement inode."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"; stages = []; moved = tmp_path / "closed-owned-spool"
+    _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
+    real_staging = t._new_staging
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+    real_connect = t.sqlite3.connect; attacked = {}
+
+    class CaseConnectionProxy:
+        def __init__(self, connection, path):
+            self._connection = connection
+            self._path = path
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def close(self):
+            result = self._connection.close()
+            if not attacked:
+                original = self._path.stat()
+                self._path.rename(moved)
+                moved_info = moved.stat()
+                self._path.write_bytes(b"foreign-after-close")
+                foreign = self._path.stat()
+                attacked.update(
+                    path=self._path,
+                    original=(original.st_dev, original.st_ino),
+                    moved=(moved_info.st_dev, moved_info.st_ino),
+                    foreign=(foreign.st_dev, foreign.st_ino),
+                )
+            return result
+
+    def connect(database, *args, **kwargs):
+        connection = real_connect(database, *args, **kwargs)
+        path = Path(database)
+        if stages and path.parent == stages[-1]:
+            return CaseConnectionProxy(connection, path)
+        return connection
+
+    monkeypatch.setattr(t.sqlite3, "connect", connect)
+    with pytest.raises(ValueError):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert attacked and not out.exists()
+    replacement = Path(attacked["path"])
+    assert moved.exists() and (moved.stat().st_dev, moved.stat().st_ino) == attacked["moved"]
+    assert replacement.exists() and replacement.read_bytes() == b"foreign-after-close"
+    assert (replacement.stat().st_dev, replacement.stat().st_ino) == attacked["foreign"]
+
+
+@pytest.mark.parametrize("suffix", ["", "-journal", "-wal", "-shm"])
+def test_teacher_primary_failure_preserves_population_foreign_replacement(
+        tmp_path, monkeypatch, suffix):
+    """Cleanup preserves the primary failure and never unlinks an unowned inode."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"; populations = []; attacked = {}
+    marker = RuntimeError(f"population replacement {suffix or 'main'}")
+    _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
+    real_init = t._PopulationAccumulator.__init__
+
+    def population_init(population):
+        real_init(population)
+        populations.append(population)
+
+    monkeypatch.setattr(t._PopulationAccumulator, "__init__", population_init)
+    runtime = t._runtime_hooks()
+
+    def process(_case_input):
+        path = Path(f"{populations[0]._db_path}{suffix}")
+        if path.exists():
+            path.unlink()
+        path.write_bytes(b"foreign-population-replacement")
+        info = path.stat()
+        attacked.update(path=path, identity=(info.st_dev, info.st_ino))
+        raise marker
+
+    monkeypatch.setattr(
+        t, "_runtime_hooks", lambda: dataclasses.replace(runtime, process_case=process)
+    )
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+        assert exc.value is marker and not out.exists() and attacked
+        path = Path(attacked["path"])
+        assert path.exists() and path.read_bytes() == b"foreign-population-replacement"
+        assert (path.stat().st_dev, path.stat().st_ino) == attacked["identity"]
+    finally:
+        if attacked:
+            Path(attacked["path"]).unlink(missing_ok=True)
+
+
 def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
     policy = _policy_for(root); calls = []; preflight_calls = []
