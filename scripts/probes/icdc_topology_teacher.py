@@ -12,6 +12,7 @@ import json
 import math
 import numbers
 import os
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -700,7 +701,17 @@ _TASK4_JSONL = ("train_corpus.jsonl", "heldout_corpus.jsonl", "train_labels.json
 
 class _JsonlWriter:
     def __init__(self, staging: Path) -> None:
-        self._files = {name: open(staging / name, "wb") for name in _TASK4_JSONL}
+        self._files: dict[str, Any] = {}
+        try:
+            for name in _TASK4_JSONL:
+                self._files[name] = open(staging / name, "wb")
+        except BaseException:
+            for handle in self._files.values():
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            raise
 
     def write(self, name: str, value: Any) -> None:
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -710,51 +721,170 @@ class _JsonlWriter:
         handle.flush()
 
     def close(self) -> None:
-        try:
-            for name in _TASK4_JSONL:
-                handle = self._files[name]
-                handle.flush()
-                os.fsync(handle.fileno())
-                handle.close()
-        except Exception:
-            for handle in self._files.values():
+        primary: Optional[BaseException] = None
+        for name in _TASK4_JSONL:
+            handle = self._files.get(name)
+            if handle is None:
+                continue
+            try:
+                if not handle.closed:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+            finally:
+                try:
+                    if not handle.closed:
+                        handle.close()
+                except BaseException as exc:
+                    if primary is None:
+                        primary = exc
+        if primary is not None:
+            raise primary
+
+    def abort(self) -> None:
+        for handle in self._files.values():
+            try:
                 if not handle.closed:
                     handle.close()
-            raise
+            except BaseException:
+                pass
 
 
 class _PopulationAccumulator:
     def __init__(self) -> None:
         self.denominator = self.base_total = self.teacher_total = 0.0
         self.count = 0
-        self._hash = hashlib.sha256()
-        self._hash.update(b"[")
+        self._finished: Optional[dict[str, float | str]] = None
+        temp = tempfile.NamedTemporaryFile(prefix="floorset-population-", suffix=".sqlite", delete=False)
+        self._db_path = Path(temp.name)
+        temp.close()
+        self._db: Optional[sqlite3.Connection] = None
+        try:
+            self._db = sqlite3.connect(str(self._db_path))
+            self._db.execute(
+                "CREATE TABLE population ("
+                "relative_path TEXT NOT NULL, layout_index TEXT NOT NULL, "
+                "instance_id TEXT NOT NULL, n TEXT NOT NULL, base_cost REAL NOT NULL, "
+                "teacher_cost REAL NOT NULL, weight REAL NOT NULL, "
+                "UNIQUE(relative_path, layout_index), UNIQUE(instance_id))"
+            )
+            self._db.commit()
+        except BaseException:
+            self.abort()
+            raise
 
     def add(self, row: Mapping[str, Any]) -> None:
+        if self._finished is not None:
+            raise RuntimeError("population already finished")
+        required = {"relative_path", "layout_index", "instance_id", "n", "base_cost", "teacher_cost"}
+        if not isinstance(row, Mapping) or set(row) != required:
+            raise ValueError("population row keys")
         relative_path = _canonical_relative_path(row["relative_path"])
+        layout_index = row["layout_index"]
+        if type(layout_index) is not int or layout_index < 0:
+            raise ValueError("layout_index")
+        instance_id = row["instance_id"]
+        if not isinstance(instance_id, str) or not instance_id or "\0" in instance_id:
+            raise ValueError("instance_id")
         n = row["n"]
-        weight = math.exp(n / 12)
-        if self.count:
-            self._hash.update(b",")
-        identity = {"relative_path": relative_path, "layout_index": row["layout_index"],
-                    "instance_id": row["instance_id"], "n": n, "weight": weight}
-        self._hash.update(json.dumps(identity, sort_keys=True, separators=(",", ":"),
-                                      ensure_ascii=True, allow_nan=False).encode("utf-8"))
+        if type(n) is not int or n < 0:
+            raise ValueError("n")
+        base_cost = _finite_number(row["base_cost"], "base_cost")
+        teacher_cost = _finite_number(row["teacher_cost"], "teacher_cost")
+        try:
+            weight = math.exp(n / 12)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("weight") from exc
+        if not math.isfinite(weight):
+            raise ValueError("weight")
+        base_product = weight * base_cost
+        teacher_product = weight * teacher_cost
+        if not math.isfinite(base_product) or not math.isfinite(teacher_product):
+            raise ValueError("weighted cost")
+        assert self._db is not None
+        try:
+            self._db.execute(
+                "INSERT INTO population VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (relative_path, str(layout_index), instance_id, str(n), base_cost,
+                 teacher_cost, weight),
+            )
+            self._db.commit()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("duplicate population identity") from exc
         self.count += 1
-        self.denominator += weight
-        self.base_total += weight * _finite_number(row["base_cost"], "base_cost")
-        self.teacher_total += weight * _finite_number(row["teacher_cost"], "teacher_cost")
 
     def finish(self) -> dict[str, float | str]:
-        if not self.count:
-            return {"denominator": 0.0, "B_H": 0.0, "T_H": 0.0, "Delta_H": 0.0,
-                    "population_sha256": hashlib.sha256(b"[]").hexdigest()}
-        self._hash.update(b"]")
-        denominator = self.denominator
-        base = self.base_total / denominator
-        teacher = self.teacher_total / denominator
-        return {"denominator": denominator, "B_H": base, "T_H": teacher,
-                "Delta_H": base - teacher, "population_sha256": self._hash.hexdigest()}
+        if self._finished is not None:
+            return dict(self._finished)
+        if self._db is None:
+            raise RuntimeError("population spool closed")
+        try:
+            if not self.count:
+                result = {"denominator": 0.0, "B_H": 0.0, "T_H": 0.0, "Delta_H": 0.0,
+                          "population_sha256": hashlib.sha256(b"[]").hexdigest()}
+            else:
+                population_hash = hashlib.sha256(b"[")
+                denominator = base_total = teacher_total = 0.0
+                first = True
+                for relative_path, layout_index, instance_id, n_text, base_cost, teacher_cost, weight in self._db.execute(
+                        "SELECT relative_path, layout_index, instance_id, n, base_cost, teacher_cost, weight "
+                        "FROM population ORDER BY relative_path, LENGTH(layout_index), layout_index"):
+                    layout_index = int(layout_index)
+                    n = int(n_text)
+                    if not first:
+                        population_hash.update(b",")
+                    first = False
+                    identity = {"relative_path": relative_path, "layout_index": layout_index,
+                                "instance_id": instance_id, "n": n, "weight": weight}
+                    population_hash.update(json.dumps(identity, sort_keys=True, separators=(",", ":"),
+                                                  ensure_ascii=True, allow_nan=False).encode("utf-8"))
+                    base_product = weight * base_cost
+                    teacher_product = weight * teacher_cost
+                    if not math.isfinite(base_product) or not math.isfinite(teacher_product):
+                        raise ValueError("weighted cost")
+                    denominator += weight
+                    base_total += base_product
+                    teacher_total += teacher_product
+                    if (not math.isfinite(denominator) or not math.isfinite(base_total)
+                            or not math.isfinite(teacher_total)):
+                        raise ValueError("weighted population arithmetic")
+                if denominator <= 0 or not math.isfinite(denominator):
+                    raise ValueError("denominator")
+                base_mean = base_total / denominator
+                teacher_mean = teacher_total / denominator
+                delta = base_mean - teacher_mean
+                if not all(math.isfinite(value) for value in (base_mean, teacher_mean, delta)):
+                    raise ValueError("weighted population result")
+                population_hash.update(b"]")
+                result = {"denominator": denominator, "B_H": base_mean, "T_H": teacher_mean,
+                          "Delta_H": delta, "population_sha256": population_hash.hexdigest()}
+            self._finished = result
+            self.denominator = result["denominator"]
+            self.base_total = base_total if self.count else 0.0
+            self.teacher_total = teacher_total if self.count else 0.0
+            return dict(result)
+        finally:
+            self._close_spool()
+
+    def _close_spool(self) -> None:
+        db, self._db = self._db, None
+        if db is not None:
+            try:
+                db.close()
+            finally:
+                for path in (self._db_path, Path(str(self._db_path) + "-journal")):
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+    def abort(self) -> None:
+        try:
+            self._close_spool()
+        except BaseException:
+            pass
 
 def _source_case(source: Sequence[torch.Tensor], index: int, instance_id: str) -> dict[str, Any]:
     inp, b2b, p2b, pins, _tree, fp, metrics = source
@@ -857,13 +987,16 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     root, destination = Path(args.data_root).resolve(), Path(args.out_dir)
     runtime = _runtime_hooks()
     trust = _validate_preflight(runtime.preflight(policy, Path(args.checkpoint)), policy)
-    staging = _new_staging(destination)
-    writer = _JsonlWriter(staging)
-    rows: list[dict[str, Any]] = []
-    population = _PopulationAccumulator()
-    train_count = held_count = heldout_winners = 0
-    legal = covered = True; processed = 0
+    staging: Optional[Path] = None
+    writer: Optional[_JsonlWriter] = None
+    population: Optional[_PopulationAccumulator] = None
     try:
+        staging = _new_staging(destination)
+        writer = _JsonlWriter(staging)
+        rows: list[dict[str, Any]] = []
+        population = _PopulationAccumulator()
+        train_count = held_count = heldout_winners = 0
+        legal = covered = True; processed = 0
         files = _iter_approved_shards(root)
         if args.max_files is not None: files = files[:args.max_files]
         for _worker, _layout, path in files:
@@ -901,20 +1034,30 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         with open(staging / "training_index.json", "wb") as fd:
             fd.write(json.dumps({"schema":"icdc_topology_training_index_v1","rows":rows}, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n"); fd.flush(); os.fsync(fd.fileno())
         def _fsync_dir() -> None:
-            fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY); os.fsync(fd); os.close(fd)
+            fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+            primary: Optional[BaseException] = None
+            try:
+                os.fsync(fd)
+            except BaseException as exc:
+                primary = exc
+            try:
+                os.close(fd)
+            except BaseException:
+                if primary is None:
+                    raise
+            if primary is not None:
+                raise primary
         _fsync_dir()
         manifest["support_hashes"] = {n: hashlib.sha256((staging/n).read_bytes()).hexdigest() for n in (*_TASK4_JSONL,"training_index.json")}; manifest["self_sha256"] = _manifest_self_sha256(manifest); _write_json_fsync(staging/"g0_manifest.json", manifest)
         _fsync_dir()
         _publish_staging(staging, destination)
         return 0 if authorized else 1
     except Exception:
-        try:
-            for handle in writer._files.values():
-                if not handle.closed:
-                    handle.close()
-        except Exception:
-            pass
-        if 'staging' in locals() and staging.exists():
+        if population is not None:
+            population.abort()
+        if writer is not None:
+            writer.abort()
+        if staging is not None and staging.exists():
             import shutil; shutil.rmtree(staging)
         raise
 
