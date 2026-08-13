@@ -685,6 +685,77 @@ def _trim_rows(tensor: torch.Tensor, width: int, index: int) -> list[list[float]
 def _dump_json(path: Path, value: Any) -> None:
     path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n")
 
+
+def _write_json_fsync(path: Path, value: Any) -> None:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n"
+    with open(path, "wb") as fd:
+        fd.write(encoded)
+        fd.flush()
+        os.fsync(fd.fileno())
+
+
+_TASK4_JSONL = ("train_corpus.jsonl", "heldout_corpus.jsonl", "train_labels.jsonl",
+                "heldout_labels.jsonl", "proposals.jsonl", "rejections.jsonl")
+
+
+class _JsonlWriter:
+    def __init__(self, staging: Path) -> None:
+        self._files = {name: open(staging / name, "wb") for name in _TASK4_JSONL}
+
+    def write(self, name: str, value: Any) -> None:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=True, allow_nan=False).encode("utf-8") + b"\n"
+        handle = self._files[name]
+        handle.write(encoded)
+        handle.flush()
+
+    def close(self) -> None:
+        try:
+            for name in _TASK4_JSONL:
+                handle = self._files[name]
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
+        except Exception:
+            for handle in self._files.values():
+                if not handle.closed:
+                    handle.close()
+            raise
+
+
+class _PopulationAccumulator:
+    def __init__(self) -> None:
+        self.denominator = self.base_total = self.teacher_total = 0.0
+        self.count = 0
+        self._hash = hashlib.sha256()
+        self._hash.update(b"[")
+
+    def add(self, row: Mapping[str, Any]) -> None:
+        relative_path = _canonical_relative_path(row["relative_path"])
+        n = row["n"]
+        weight = math.exp(n / 12)
+        if self.count:
+            self._hash.update(b",")
+        identity = {"relative_path": relative_path, "layout_index": row["layout_index"],
+                    "instance_id": row["instance_id"], "n": n, "weight": weight}
+        self._hash.update(json.dumps(identity, sort_keys=True, separators=(",", ":"),
+                                      ensure_ascii=True, allow_nan=False).encode("utf-8"))
+        self.count += 1
+        self.denominator += weight
+        self.base_total += weight * _finite_number(row["base_cost"], "base_cost")
+        self.teacher_total += weight * _finite_number(row["teacher_cost"], "teacher_cost")
+
+    def finish(self) -> dict[str, float | str]:
+        if not self.count:
+            return {"denominator": 0.0, "B_H": 0.0, "T_H": 0.0, "Delta_H": 0.0,
+                    "population_sha256": hashlib.sha256(b"[]").hexdigest()}
+        self._hash.update(b"]")
+        denominator = self.denominator
+        base = self.base_total / denominator
+        teacher = self.teacher_total / denominator
+        return {"denominator": denominator, "B_H": base, "T_H": teacher,
+                "Delta_H": base - teacher, "population_sha256": self._hash.hexdigest()}
+
 def _source_case(source: Sequence[torch.Tensor], index: int, instance_id: str) -> dict[str, Any]:
     inp, b2b, p2b, pins, _tree, fp, metrics = source
     row = inp[index].tolist(); fprow = fp[index].tolist(); metric = metrics[index].tolist()
@@ -786,9 +857,12 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     root, destination = Path(args.data_root).resolve(), Path(args.out_dir)
     runtime = _runtime_hooks()
     trust = _validate_preflight(runtime.preflight(policy, Path(args.checkpoint)), policy)
-    rows: list[dict[str, Any]] = []; train_c: list[Any] = []; held_c: list[Any] = []
-    train_l: list[Any] = []; held_l: list[Any] = []; proposals: list[Any] = []; rejections: list[Any] = []
-    population: list[dict[str, Any]] = []; legal = covered = True; processed = 0
+    staging = _new_staging(destination)
+    writer = _JsonlWriter(staging)
+    rows: list[dict[str, Any]] = []
+    population = _PopulationAccumulator()
+    train_count = held_count = heldout_winners = 0
+    legal = covered = True; processed = 0
     try:
         files = _iter_approved_shards(root)
         if args.max_files is not None: files = files[:args.max_files]
@@ -806,30 +880,40 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 ci = _CaseInput(case, receipt, partition, seed); outcome = _validate_outcome(runtime.process_case(ci)); processed += 1
                 env = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "partition": partition, "sample_seed": seed, "n": case["n"]}
                 label = {**dict(outcome.label_row), **env, "proposal_ordinal": 0, "proposal_name": "base", "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost, "record_weight": outcome.base_cost / outcome.teacher_cost}
-                for p in outcome.proposal_rows: proposals.append({**env, **dict(p)})
-                for r in outcome.rejection_rows: rejections.append({**env, **dict(r)})
-                (train_c if partition == "train" else held_c).append(case); (train_l if partition == "train" else held_l).append(label)
-                if partition == "heldout":
-                    population.append({"relative_path": rel, "layout_index": index, "instance_id": iid, "n": case["n"], "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost})
+                writer.write("train_corpus.jsonl" if partition == "train" else "heldout_corpus.jsonl", case)
+                writer.write("train_labels.jsonl" if partition == "train" else "heldout_labels.jsonl", label)
+                for p in sorted(outcome.proposal_rows, key=lambda x: (x["ordinal"], x["name"])): writer.write("proposals.jsonl", {**env, **dict(p)})
+                for r in sorted(outcome.rejection_rows, key=lambda x: (x.get("ordinal", 0), x.get("name", ""))): writer.write("rejections.jsonl", {**env, **dict(r)})
+                if partition == "train": train_count += 1
+                else:
+                    held_count += 1; heldout_winners += 1
+                    population.add({"relative_path": rel, "layout_index": index, "instance_id": iid, "n": case["n"], "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost})
                 legal = legal and outcome.legal; covered = covered and outcome.covered
                 rows.append({**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": "processed"})
-        pop = _weighted_population(population) if population else {"denominator": 0.0, "B_H": 0.0, "T_H": 0.0, "Delta_H": 0.0, "population_sha256": hashlib.sha256(b"[]").hexdigest()}
-        heldout_winners = sum(1 for label in held_l if label.get("proposal_name") == "base")
-        coverage = {"eligible_train": len(train_c), "eligible_heldout": len(held_c), "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_c) and bool(held_c) and heldout_winners == len(held_c)}
+            del source, raw
+        pop = population.finish()
+        coverage = {"eligible_train": train_count, "eligible_heldout": held_count, "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_count) and bool(held_count) and heldout_winners == held_count}
         state = _g0_state({**trust, "legal": legal, "coverage": coverage["covered"], "teacher_mean": pop["T_H"], "delta": pop["Delta_H"]})
         authorized = runtime.authorizing and state == "TARGET_GAIN_MET" and args.max_files is None
         if not processed: state = "KILLED_LEGALITY_OR_COVERAGE"; authorized = False
         manifest = {"schema":"icdc_topology_teacher_g0_v1","status":"complete","state":state,"secondary_reasons":[],"training_authorized":authorized,"bounded_max_files":args.max_files is not None,"trust":trust,"population":pop,"coverage":coverage}
-        staging = _new_staging(destination)
-        outputs = {"train_corpus.jsonl":train_c,"heldout_corpus.jsonl":held_c,"train_labels.jsonl":train_l,"heldout_labels.jsonl":held_l,"proposals.jsonl":proposals,"rejections.jsonl":rejections}
-        for name, vals in outputs.items():
-            ordered = sorted(vals, key=lambda x: (x.get("instance_id", ""), x.get("proposal_ordinal", 0)))
-            (staging / name).write_bytes(b"".join(json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n" for v in ordered))
-        _dump_json(staging / "training_index.json", {"schema":"icdc_topology_training_index_v1","rows":rows})
-        manifest["support_hashes"] = {n: hashlib.sha256((staging/n).read_bytes()).hexdigest() for n in (*outputs,"training_index.json")}; manifest["self_sha256"] = _manifest_self_sha256(manifest); _dump_json(staging/"g0_manifest.json", manifest)
+        writer.close()
+        with open(staging / "training_index.json", "wb") as fd:
+            fd.write(json.dumps({"schema":"icdc_topology_training_index_v1","rows":rows}, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n"); fd.flush(); os.fsync(fd.fileno())
+        def _fsync_dir() -> None:
+            fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY); os.fsync(fd); os.close(fd)
+        _fsync_dir()
+        manifest["support_hashes"] = {n: hashlib.sha256((staging/n).read_bytes()).hexdigest() for n in (*_TASK4_JSONL,"training_index.json")}; manifest["self_sha256"] = _manifest_self_sha256(manifest); _write_json_fsync(staging/"g0_manifest.json", manifest)
+        _fsync_dir()
         _publish_staging(staging, destination)
         return 0 if authorized else 1
     except Exception:
+        try:
+            for handle in writer._files.values():
+                if not handle.closed:
+                    handle.close()
+        except Exception:
+            pass
         if 'staging' in locals() and staging.exists():
             import shutil; shutil.rmtree(staging)
         raise
