@@ -585,77 +585,375 @@ def _task4_expected_trust(policy):
     }
 
 
-# Task 4 source-fix A: explicit RED probes for the remaining evidence boundary.
+# Task 4 source-fix A: transaction-level RED probes for the evidence boundary.
+def _task4_padded_tensors():
+    source = list(_task4_tensors())
+    padding_input = torch.tensor([[[-1, 0, 0, 0, 0, 0]]] * 2, dtype=torch.float32)
+    source[0] = torch.cat((source[0], padding_input), dim=1)
+    source[1] = torch.tensor(
+        [[[0, 1, 1.5], [-1, -1, -1]], [[1, 2, 2.5], [-1, -1, -1]]],
+        dtype=torch.float32,
+    )
+    source[2] = torch.tensor(
+        [[[0, 2, 3], [-1, -1, -1]], [[0, 0, 4], [-1, -1, -1]]],
+        dtype=torch.float32,
+    )
+    source[3] = torch.tensor(
+        [[[1.25, 2.5], [-1, -1]], [[3.5, 4.5], [-1, -1]]],
+        dtype=torch.float32,
+    )
+    source[4] = torch.zeros((2, 3, 3), dtype=torch.float32)
+    source[5] = torch.cat(
+        (source[5], torch.full((2, 1, 4), -1.0, dtype=torch.float32)), dim=1
+    )
+    return tuple(source)
+
+
+def _task4_good_proposal(cost=1.0):
+    return {
+        "ordinal": 0, "name": "base", "intended_intent": "base",
+        "admission_status": "admitted", "admission_reason": "fixture",
+        "drift": {"max_abs": 0.0}, "hard": {"legal": True},
+        "diagnostic_energy": 0.0, "official_cost": cost,
+        "feasible": True, "winner": True, "status": "winner",
+    }
+
+
+def _task4_good_outcome(t, *, base_cost=1.1, teacher_cost=1.0,
+                        label_row=None, proposal_rows=None, rejection_rows=(),
+                        legal=True, covered=True):
+    return t._CaseOutcome(
+        label_row=(label_row if label_row is not None else
+                   {"edges": [], "contacts": [], "pin_paths": []}),
+        proposal_rows=(tuple(proposal_rows) if proposal_rows is not None else
+                       (_task4_good_proposal(teacher_cost),)),
+        rejection_rows=tuple(rejection_rows), base_cost=base_cost,
+        teacher_cost=teacher_cost, legal=legal, covered=covered,
+    )
+
+
+def _task4_install_custom_runtime(t, monkeypatch, *, preflight_factory=None,
+                                  outcome_factory=None, process_calls=None,
+                                  preflight_calls=None):
+    process_calls = [] if process_calls is None else process_calls
+    preflight_calls = [] if preflight_calls is None else preflight_calls
+
+    def preflight(policy, checkpoint):
+        preflight_calls.append((policy, checkpoint))
+        value = _task4_expected_trust(policy)
+        return preflight_factory(dict(value), policy) if preflight_factory else value
+
+    def process(case_input):
+        process_calls.append(case_input)
+        return (outcome_factory(t, case_input) if outcome_factory else
+                _task4_good_outcome(t))
+
+    monkeypatch.setattr(
+        t, "_runtime_hooks", lambda: t._TeacherRuntime(preflight, process, True)
+    )
+    return process_calls, preflight_calls
+
+
+def _task4_execute_tensors(tmp_path, monkeypatch, tensors, *, heldout_mod=2,
+                           preflight_factory=None, outcome_factory=None):
+    t = _teacher(); root = tmp_path / "floorset_lite"
+    path = root / "worker_2" / "layouts_0.th"; path.parent.mkdir(parents=True)
+    torch.save(tensors, path); out = tmp_path / "out"
+    calls, preflight_calls = _task4_install_custom_runtime(
+        t, monkeypatch, preflight_factory=preflight_factory,
+        outcome_factory=outcome_factory,
+    )
+    policy = _policy_for(root)
+    result = t.teacher_main(
+        _task4_args(root, out, heldout_mod=heldout_mod), _trust_policy=policy
+    )
+    return t, root, out, calls, preflight_calls, policy, result
+
+
 def test_teacher_evidence_a_cli_help_exposes_data_root():
     import subprocess
-    proc = subprocess.run([sys.executable, "scripts/probes/icdc_topology_teacher.py", "--help"],
-                          cwd=Path(__file__).parents[1], capture_output=True, text=True)
-    assert proc.returncode == 0
-    assert "--data-root" in proc.stdout
+    proc = subprocess.run(
+        [sys.executable, "scripts/probes/icdc_topology_teacher.py", "--help"],
+        cwd=Path(__file__).parents[1], capture_output=True, text=True,
+    )
+    assert proc.returncode == 0 and "--data-root" in proc.stdout
 
 
-def test_teacher_evidence_a_padded_connectivity_is_retained_and_fingerprinted():
-    t = _teacher(); source = list(_task4_tensors())
-    source[0] = torch.cat((source[0], torch.full((2, 1, 6), -1.0)), dim=1)
-    source[1] = torch.tensor([[[0, 1, 1.5], [-1, -1, -1]], [[1, 2, 2.5], [-1, -1, -1]]], dtype=torch.float32)
-    source[2] = torch.tensor([[[0, 2, 3], [-1, -1, -1]], [[0, 0, 4], [-1, -1, -1]]], dtype=torch.float32)
-    source[3] = torch.tensor([[[1.25, 2.5], [-1, -1]], [[3.5, 4.5], [-1, -1]]], dtype=torch.float32)
-    source[4] = torch.zeros((2, 3, 3), dtype=torch.float32)
-    source[5] = torch.cat((source[5], torch.full((2, 1, 4), -1.0)), dim=1)
-    assert t._validate_source_shard(tuple(source)) == (2, 4)
-    cases = [t._source_case_from_shard(tuple(source), i, f"x#{i}") for i in range(2)]
-    assert [c["b2b"] for c in cases] == [[[0, 1, 1.5]], [[1, 2, 2.5]]]
-    assert [c["p2b"] for c in cases] == [[[0, 2, 3]], [[0, 0, 4]]]
-    assert [c["pins"] for c in cases] == [[[1.25, 2.5]], [[3.5, 4.5]]]
-    assert all(c["n"] == 3 for c in cases)
+def test_teacher_evidence_a_padded_connectivity_transaction(tmp_path, monkeypatch):
+    t, _root, out, calls, _preflight, _policy, result = _task4_execute_tensors(
+        tmp_path, monkeypatch, _task4_padded_tensors()
+    )
+    assert result == 0 and len(calls) == 2
+    expected_connections = (
+        ([[0, 1, 1.5]], [[0, 2, 3.0]], [[1.25, 2.5]]),
+        ([[1, 2, 2.5]], [[0, 0, 4.0]], [[3.5, 4.5]]),
+    )
+    for case_input, (b2b, p2b, pins) in zip(calls, expected_connections):
+        assert case_input.case["n"] == 3
+        assert (case_input.case["b2b"], case_input.case["p2b"],
+                case_input.case["pins"]) == (b2b, p2b, pins)
+    corpora = (_task4_jsonl(out / "train_corpus.jsonl") +
+               _task4_jsonl(out / "heldout_corpus.jsonl"))
+    assert {row["instance_id"] for row in corpora} == {
+        "worker_2/layouts_0.th#0", "worker_2/layouts_0.th#1"
+    }
+    index = json.loads((out / "training_index.json").read_text())
+    assert all(row["block_count"] == 3 for row in index["rows"])
+    by_id = {row["instance_id"]: row for row in corpora}
+    for index_value, (b2b, p2b, pins) in enumerate(expected_connections):
+        emitted = by_id[f"worker_2/layouts_0.th#{index_value}"]
+        assert emitted["n"] == 3
+        assert (emitted["b2b"], emitted["p2b"], emitted["pins"]) == (
+            b2b, p2b, pins,
+        )
+        assert all(len(emitted[field]) == 3 for field in ("area", "cons", "tp"))
+    assert all(
+        row["receipt"]["fingerprint"] == fingerprint_case(by_id[row["instance_id"]])
+        for row in index["rows"]
+    )
 
 
-@pytest.mark.parametrize("mutator", [
-    lambda s: s[0].clone().masked_fill_(torch.tensor([[[True,False,False,False,False,False]]*3]*2), float("nan")),
-    lambda s: s[0].to(torch.bool), lambda s: tuple(x.clone().requires_grad_() for x in s),
-    lambda s: s[1][:, :, :2], lambda s: s[1].new_zeros((2, 1, 2)),
-    lambda s: s[0].new_zeros((1, 3, 6)), lambda s: s[4].new_zeros((2, 2)),
-    lambda s: s[0].clone().index_put_((torch.tensor([0]), torch.tensor([2]), torch.tensor([0])), torch.tensor([1.])),
-    lambda s: s[1].new_tensor([[[0, 1, -1], [-1,-1,-1]], [[1,2,2.5],[-1,-1,-1]]]),
-    lambda s: s[2].new_tensor([[[0, 2, 3], [0,-1,-1]], [[0,0,4],[-1,-1,-1]]]),
-    lambda s: s[3].new_tensor([[[1.25,2.5],[0,0]], [[3.5,4.5],[-1,-1]]]),
-    lambda s: s[1].new_tensor([[[0,1,-2],[-1,-1,-1]], [[1,2,2.5],[-1,-1,-1]]]),
-    lambda s: s[1].new_tensor([[[0,9,1],[-1,-1,-1]], [[1,2,2.5],[-1,-1,-1]]]),
-    lambda s: s[2].new_tensor([[[0,0,1],[-1,-1,-1]], [[0,0,4],[-1,-1,-1]]]),
-    lambda s: s[4].new_tensor([[[2.5,3,3]], [[2,3,3]]]),
-])
-def test_teacher_evidence_a_source_shard_malformed_transaction(mutator):
-    t = _teacher(); source = list(_task4_tensors()); changed = mutator(source)
-    if changed is not None: source = list(changed)
+_TASK4_BAD_SOURCE_KINDS = (
+    "nan", "bool", "requires_grad", "wrong_width", "wrong_batch",
+    "wrong_tree", "area_after_pad", "partial_b2b", "partial_p2b",
+    "partial_pins", "edge_after_pad", "p2b_after_pad", "pin_after_pad",
+    "negative_weight", "p2b_negative_weight", "b2b_range", "p2b_pin_range",
+    "p2b_block_range", "fractional_constraint",
+)
+
+_TASK4_BAD_SOURCE_ERRORS = {
+    "nan": "source tensors",
+    "bool": "source tensors",
+    "requires_grad": "source tensors",
+    "wrong_width": "source shapes",
+    "wrong_batch": "source batch",
+    "wrong_tree": "source tree",
+    "area_after_pad": "area padding",
+    "partial_b2b": "partial padding",
+    "partial_p2b": "partial padding",
+    "partial_pins": "partial padding",
+    "edge_after_pad": "noncontiguous padding",
+    "p2b_after_pad": "noncontiguous padding",
+    "pin_after_pad": "noncontiguous padding",
+    "negative_weight": "b2b weight",
+    "p2b_negative_weight": "p2b weight",
+    "b2b_range": "b2b endpoint",
+    "p2b_pin_range": "p2b endpoint",
+    "p2b_block_range": "p2b endpoint",
+    "fractional_constraint": "constraint",
+}
+
+
+def _task4_bad_source(kind):
+    source = list(_task4_padded_tensors())
+    if kind == "nan": source[6] = source[6].clone(); source[6][0, 0] = float("nan")
+    elif kind == "bool": source[6] = source[6].to(torch.bool)
+    elif kind == "requires_grad": source = [value.clone().requires_grad_() for value in source]
+    elif kind == "wrong_width": source[1] = source[1][..., :2]
+    elif kind == "wrong_batch": source[1] = source[1][:1]
+    elif kind == "wrong_tree": source[4] = source[4][:, :2]
+    elif kind == "area_after_pad": source[0] = source[0].clone(); source[0][0, 1, 0] = -1
+    elif kind == "partial_b2b": source[1] = source[1].clone(); source[1][0, 1] = torch.tensor([0, -1, -1.])
+    elif kind == "partial_p2b": source[2] = source[2].clone(); source[2][0, 1] = torch.tensor([0, -1, -1.])
+    elif kind == "partial_pins": source[3] = source[3].clone(); source[3][0, 1] = torch.tensor([0, -1.])
+    elif kind == "edge_after_pad": source[1] = source[1].clone(); source[1][0] = torch.tensor([[-1, -1, -1.], [0, 1, 1.]])
+    elif kind == "p2b_after_pad": source[2] = source[2].clone(); source[2][0] = torch.tensor([[-1, -1, -1.], [0, 1, 1.]])
+    elif kind == "pin_after_pad": source[3] = source[3].clone(); source[3][0] = torch.tensor([[-1, -1.], [1, 2.]])
+    elif kind == "negative_weight": source[1] = source[1].clone(); source[1][0, 0, 2] = -2
+    elif kind == "p2b_negative_weight": source[2] = source[2].clone(); source[2][0, 0, 2] = -2
+    elif kind == "b2b_range": source[1] = source[1].clone(); source[1][0, 0, 1] = 9
+    elif kind == "p2b_pin_range": source[2] = source[2].clone(); source[2][0, 0, 0] = 9
+    elif kind == "p2b_block_range": source[2] = source[2].clone(); source[2][0, 0, 1] = 9
+    elif kind == "fractional_constraint": source[0] = source[0].clone(); source[0][0, 0, 1] = .5
+    else: raise AssertionError(kind)
+    return tuple(source)
+
+
+@pytest.mark.parametrize("kind", _TASK4_BAD_SOURCE_KINDS)
+def test_teacher_evidence_a_malformed_source_transaction(tmp_path, monkeypatch, kind):
+    t = _teacher(); root = tmp_path / "floorset_lite"
+    path = root / "worker_2" / "layouts_0.th"; path.parent.mkdir(parents=True)
+    torch.save(_task4_bad_source(kind), path); out = tmp_path / "out"
+    calls, _ = _task4_install_custom_runtime(t, monkeypatch)
+    with pytest.raises(ValueError, match=_TASK4_BAD_SOURCE_ERRORS[kind]):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert calls == [] and not out.exists()
+
+
+def test_teacher_evidence_a_sparse_layout_rejected():
+    t = _teacher(); source = list(_task4_tensors()); source[6] = source[6].to_sparse()
     with pytest.raises(ValueError): t._validate_source_shard(tuple(source))
 
 
-def test_teacher_evidence_a_preflight_is_exact_and_boolean():
-    t = _teacher(); policy = _policy_for(Path("/tmp/canonical"))
-    good = _task4_expected_trust(policy)
-    for key in (*good, "unknown"):
-        bad = dict(good); bad[key] = (1 if key in good else True)
-        if key == "unknown":
-            with pytest.raises(ValueError): t._validate_preflight(bad, policy)
-            continue
-        with pytest.raises(ValueError): t._validate_preflight(bad, policy)
-    bad = dict(good); bad.pop("trust_ok")
-    with pytest.raises(ValueError): t._validate_preflight(bad, policy)
+_TASK4_PREFLIGHT_FIELDS = (
+    "trust_ok", "input_ok", "scorer_ok", "checkpoint_sha256",
+    "model_identity", "scorer_sha256", "scorer_contract", "shapely_version",
+)
 
 
-def test_teacher_evidence_a_outcome_rejects_nan_and_ratio_overflow():
-    t = _teacher(); base = _Task4CaseOutcome({"edges": [], "contacts": [], "pin_paths": []},
-        ({"ordinal": 0, "name": "base", "status": "winner", "feasible": True, "winner": True,
-          "official_cost": 1.0},), (), 1.0, 1.0, True, True)
-    for bad in (dataclasses.replace(base, base_cost=float("nan")),
-                dataclasses.replace(base, teacher_cost=float("inf")),
-                dataclasses.replace(base, base_cost=1e308, teacher_cost=1e-308)):
-        with pytest.raises(ValueError): t._validate_outcome(bad)
+_TASK4_BAD_PREFLIGHT_KINDS = tuple(
+    [f"missing:{key}" for key in _TASK4_PREFLIGHT_FIELDS] +
+    ["extra"] + [f"mismatch:{key}" for key in (
+        "checkpoint_sha256", "model_identity", "scorer_sha256",
+        "scorer_contract", "shapely_version")] +
+    [f"false:{key}" for key in ("trust_ok", "input_ok", "scorer_ok")] +
+    [f"nonbool:{key}" for key in ("trust_ok", "input_ok", "scorer_ok")]
+)
 
 
-def test_teacher_evidence_a_canonical_serialization_rejects_infinity():
-    with pytest.raises((ValueError, TypeError, OverflowError)):
-        _task4_canonical_json({"bad": float("inf")})
+@pytest.mark.parametrize("kind", _TASK4_BAD_PREFLIGHT_KINDS)
+def test_teacher_evidence_a_preflight_transaction(tmp_path, monkeypatch, kind):
+    def mutate(value, _policy):
+        action, _, field = kind.partition(":")
+        if action == "missing": value.pop(field)
+        elif action == "extra": value["extra"] = 1
+        elif action == "mismatch": value[field] = "mismatch"
+        elif action == "false": value[field] = False
+        elif action == "nonbool": value[field] = 1
+        return value
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    calls, _ = _task4_install_custom_runtime(t, monkeypatch, preflight_factory=mutate)
+    with pytest.raises(ValueError):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert calls == [] and not out.exists()
+
+
+_TASK4_PROTECTED_FIELDS = (
+    "receipt", "instance_id", "partition", "sample_seed", "n",
+    "base_cost", "teacher_cost", "record_weight",
+)
+
+
+_TASK4_BAD_OUTCOME_KINDS = (
+    "base_nan", "base_inf", "base_zero", "base_negative", "teacher_nan",
+    "teacher_inf", "teacher_zero", "teacher_negative", "teacher_gt_base",
+    "ratio_overflow", "legal_nonbool", "covered_nonbool", "label_extra",
+    "label_protected", "label_nan",
+    *(f"proposal_protected:{key}" for key in _TASK4_PROTECTED_FIELDS),
+    *(f"rejection_protected:{key}" for key in _TASK4_PROTECTED_FIELDS),
+    "no_winner", "two_winners", "nonbase_winner", "ordinal_bool",
+    "ordinal_negative", "name_empty", "name_duplicate", "ordinal_duplicate",
+    "feasible_false", "status_bad", "official_bool", "official_nan",
+    "official_zero", "official_mismatch", "hard_nan", "diagnostic_energy_nan",
+    "drift_nan", "missing_proposal_field",
+)
+
+
+def _task4_bad_outcome(t, kind):
+    label = {"edges": [], "contacts": [], "pin_paths": []}
+    proposal = _task4_good_proposal(1.0); proposals = [proposal]
+    rejections = []; base_cost = teacher_cost = 1.0; legal = covered = True
+    if kind.startswith("base_"):
+        base_cost = {"base_nan": float("nan"), "base_inf": float("inf"),
+                     "base_zero": 0.0, "base_negative": -1.0}[kind]
+    elif kind.startswith("teacher_"):
+        teacher_cost = {"teacher_nan": float("nan"), "teacher_inf": float("inf"),
+                        "teacher_zero": 0.0, "teacher_negative": -1.0,
+                        "teacher_gt_base": 2.0}[kind]
+        proposal["official_cost"] = teacher_cost
+    elif kind == "ratio_overflow": base_cost, teacher_cost = 1e308, 1e-308; proposal["official_cost"] = teacher_cost
+    elif kind == "legal_nonbool": legal = 1
+    elif kind == "covered_nonbool": covered = "yes"
+    elif kind == "label_extra": label["extra"] = 1
+    elif kind == "label_protected": label["receipt"] = {}
+    elif kind == "label_nan": label["edges"] = [{"weight": float("nan")}]
+    elif kind.startswith("proposal_protected:"):
+        proposal[kind.partition(":")[2]] = "forged"
+    elif kind.startswith("rejection_protected:"):
+        rejections = [{kind.partition(":")[2]: "forged"}]
+    elif kind == "no_winner": proposal["winner"] = False
+    elif kind == "two_winners": proposals.append({**proposal, "name": "other", "ordinal": 1})
+    elif kind == "nonbase_winner": proposal["winner"] = False; proposals.append({**proposal, "name": "other", "ordinal": 1, "winner": True})
+    elif kind == "ordinal_bool": proposal["ordinal"] = False
+    elif kind == "ordinal_negative": proposal["ordinal"] = -1
+    elif kind == "name_empty": proposal["name"] = ""
+    elif kind == "name_duplicate": proposals.append({**proposal, "ordinal": 1, "winner": False})
+    elif kind == "ordinal_duplicate": proposals.append({**proposal, "name": "other", "winner": False})
+    elif kind == "feasible_false": proposal["feasible"] = False
+    elif kind == "status_bad": proposal["status"] = "candidate"
+    elif kind == "official_bool": proposal["official_cost"] = True
+    elif kind == "official_nan": proposal["official_cost"] = float("nan")
+    elif kind == "official_zero": proposal["official_cost"] = 0.0
+    elif kind == "official_mismatch": proposal["official_cost"] = .5
+    elif kind == "hard_nan": proposal["hard"] = {"legal": float("nan")}
+    elif kind == "diagnostic_energy_nan": proposal["diagnostic_energy"] = float("nan")
+    elif kind == "drift_nan": proposal["drift"] = {"max_abs": float("nan")}
+    elif kind == "missing_proposal_field": proposal.pop("admission_status")
+    else: raise AssertionError(kind)
+    return t._CaseOutcome(label, tuple(proposals), tuple(rejections),
+                          base_cost, teacher_cost, legal, covered)
+
+
+@pytest.mark.parametrize("kind", _TASK4_BAD_OUTCOME_KINDS)
+def test_teacher_evidence_a_outcome_transaction(tmp_path, monkeypatch, kind):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    calls, _ = _task4_install_custom_runtime(
+        t, monkeypatch, outcome_factory=lambda module, _case: _task4_bad_outcome(module, kind)
+    )
+    with pytest.raises(ValueError):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert len(calls) == 1 and not out.exists()
+
+
+def test_teacher_evidence_a_ratio_transaction(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    calls, _ = _task4_install_custom_runtime(
+        t, monkeypatch,
+        outcome_factory=lambda module, _case: _task4_good_outcome(
+            module, base_cost=2.5, teacher_cost=1.25,
+            proposal_rows=(_task4_good_proposal(1.25),)),
+    )
+    result = t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert result == 0 and len(calls) == 2
+    labels = (_task4_jsonl(out / "train_labels.jsonl") +
+              _task4_jsonl(out / "heldout_labels.jsonl"))
+    assert [row["record_weight"] for row in labels] == [2.0, 2.0]
+    population = json.loads((out / "g0_manifest.json").read_text())["population"]
+    assert (population["B_H"], population["T_H"], population["Delta_H"]) == (2.5, 1.25, 1.25)
+
+
+@pytest.mark.parametrize("kind", ("worker", "shard"))
+def test_teacher_evidence_a_numeric_symlink_rejected_before_load(tmp_path, monkeypatch, kind):
+    t = _teacher(); root = tmp_path / "floorset_lite"; root.mkdir(); external = tmp_path / "external"
+    _task4_shard(external)
+    if kind == "worker": (root / "worker_2").symlink_to(external / "worker_2", target_is_directory=True)
+    else:
+        worker = root / "worker_2"; worker.mkdir()
+        (worker / "layouts_0.th").symlink_to(external / "worker_2" / "layouts_0.th")
+    loads = []; calls, _ = _task4_install_custom_runtime(t, monkeypatch)
+    monkeypatch.setattr(torch, "load", lambda *a, **k: loads.append((a, k)))
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="symlink"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert loads == [] and calls == [] and not out.exists()
+
+
+def test_teacher_evidence_a_nonnumeric_symlink_decoys_are_ignored(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    external = tmp_path / "external"; _task4_shard(external)
+    (root / "worker_bad").symlink_to(external / "worker_2", target_is_directory=True)
+    (root / "worker_2" / "layouts_bad.th").symlink_to(external / "worker_2" / "layouts_0.th")
+    out = tmp_path / "out"; calls, _ = _task4_install_custom_runtime(t, monkeypatch)
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("heldout_mod,expected_train,expected_heldout", ((3, 2, 0), (1, 0, 2)))
+def test_teacher_evidence_a_one_sided_split_is_coverage_kill(
+        tmp_path, monkeypatch, heldout_mod, expected_train, expected_heldout):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    calls, _ = _task4_install_custom_runtime(t, monkeypatch)
+    result = t.teacher_main(
+        _task4_args(root, out, heldout_mod=heldout_mod), _trust_policy=_policy_for(root)
+    )
+    assert result != 0 and len(calls) == 2
+    manifest = json.loads((out / "g0_manifest.json").read_text())
+    assert manifest["state"] == "KILLED_LEGALITY_OR_COVERAGE"
+    assert manifest["training_authorized"] is False
+    assert manifest["coverage"] == {
+        "eligible_train": expected_train, "eligible_heldout": expected_heldout,
+        "heldout_winners": expected_heldout, "legal": True, "covered": False,
+    }
 
 
 def _task4_assert_success_artifacts(t, root, out, calls, policy,
