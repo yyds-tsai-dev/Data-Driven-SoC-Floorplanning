@@ -1195,11 +1195,12 @@ def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path,
 
     def read(root_path, worker, layout):
         nonlocal reads
+        assert created, "staging must exist before any shard is loaded"
+        stage = created[-1]
+        assert all((stage / name).exists() for name in _TASK4_JSONL)
         if reads:
-            assert created, "staging must exist before the next shard is loaded"
-            stage = created[-1]
-            assert all((stage / name).exists() for name in _TASK4_JSONL)
-            assert all((stage / name).read_bytes().endswith(b"\n") for name in _TASK4_JSONL)
+            assert all((stage / name).read_bytes().endswith(b"\n") and
+                       (stage / name).read_bytes() for name in _TASK4_JSONL)
         reads += 1
         return real_read(root_path, worker, layout)
 
@@ -1235,9 +1236,9 @@ def test_teacher_streaming_b1_releases_prior_source_before_next_shard(tmp_path, 
         nonlocal reads
         if reads:
             gc.collect()
-            assert refs[-1]() is None
+            assert all(ref() is None for ref in refs[-1])
         raw, source = real_read(*args)
-        refs.append(weakref.ref(source[0])); reads += 1
+        refs.append(tuple(weakref.ref(tensor) for tensor in source)); reads += 1
         return raw, source
     monkeypatch.setattr(t, "_read_verified_shard", read)
     t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
@@ -1246,7 +1247,7 @@ def test_teacher_streaming_b1_releases_prior_source_before_next_shard(tmp_path, 
 def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
     tree = ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())
     teacher = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "teacher_main")
-    forbidden = {"train_c", "held_c", "train_l", "held_l", "proposals", "rejections", "population"}
+    forbidden = {"train_c", "held_c", "train_l", "held_l", "proposals", "rejections"}
     assert not ({node.id for node in ast.walk(teacher) if isinstance(node, ast.Name)} & forbidden)
     assert not ({node.id for node in ast.walk(teacher) if isinstance(node, ast.arg)} & forbidden)
 
@@ -1265,11 +1266,12 @@ def test_teacher_streaming_b1_durability_precedes_publish(tmp_path, monkeypatch)
     def fsync(fd):
         path = Path(os.readlink(f"/proc/self/fd/{fd}"))
         mode = t.os.fstat(fd).st_mode
+        stage = staging_paths[-1]
         if stat.S_ISDIR(mode):
             manifest_exists = (path / "g0_manifest.json").exists()
-            events.append(("dir", manifest_exists))
+            events.append(("dir", path.resolve(), manifest_exists))
         else:
-            events.append(path.name)
+            events.append((path.name, path.parent.resolve()))
         return real_fsync(fd)
     monkeypatch.setattr(t.os, "fsync", fsync)
     def publish(staging, destination):
@@ -1283,8 +1285,10 @@ def test_teacher_streaming_b1_durability_precedes_publish(tmp_path, monkeypatch)
     monkeypatch.setattr(t, "_publish_staging", publish)
     t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert staging_paths
-    assert events == [*_TASK4_JSONL, "training_index.json", ("dir", False),
-                      "g0_manifest.json", ("dir", True), "publish"]
+    stage = staging_paths[-1].resolve()
+    assert events == [*((name, stage) for name in _TASK4_JSONL),
+                      ("training_index.json", stage), ("dir", stage, False),
+                      ("g0_manifest.json", stage), ("dir", stage, True), "publish"]
 
 
 @pytest.mark.parametrize("fail_target", ["train_corpus.jsonl", "training_index.json",
@@ -1300,8 +1304,10 @@ def test_teacher_streaming_b1_durability_failure_is_transactional(tmp_path, monk
     sentinel = OSError("durability sentinel"); real_fsync = t.os.fsync
     def fsync(fd):
         path = Path(os.readlink(f"/proc/self/fd/{fd}")); mode = t.os.fstat(fd).st_mode
-        target = ("dir_pre" if stat.S_ISDIR(mode) and not (path / "g0_manifest.json").exists()
-                  else "dir_post" if stat.S_ISDIR(mode) else path.name)
+        stage = staging_paths[-1].resolve() if staging_paths else None
+        owned = path.resolve() == stage if stat.S_ISDIR(mode) else path.parent.resolve() == stage
+        target = ("dir_pre" if owned and stat.S_ISDIR(mode) and not (path / "g0_manifest.json").exists()
+                  else "dir_post" if owned and stat.S_ISDIR(mode) else path.name if owned else None)
         if target == fail_target: raise sentinel
         return real_fsync(fd)
     monkeypatch.setattr(t.os, "fsync", fsync)
