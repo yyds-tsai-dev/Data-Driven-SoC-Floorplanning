@@ -26,6 +26,7 @@ sys.path.insert(0, str(_REPO / "partner"))
 
 import torch
 from icdc.topology_data import CorpusSourceReceipt, fingerprint_case, split_for_id
+from icdc.topology_data import _sanitize as _sanitize_case
 
 from icdc.checkpoint_identity import (  # noqa: E402
     IDENTITY_SCHEMA,
@@ -620,7 +621,7 @@ def _validate_source_shard(source: Any) -> tuple[int, int]:
     b, n = inp.shape[:2]
     if b < 1 or n < 1 or any(t.shape[0] != b for t in source[1:]):
         raise ValueError("source batch")
-    if tree.shape[1] not in (n - 1,): raise ValueError("source tree")
+    if tree.shape[1] != n - 1: raise ValueError("source tree")
     for row in inp:
         seen_pad = False
         for item in row:
@@ -631,15 +632,36 @@ def _validate_source_shard(source: Any) -> tuple[int, int]:
         for row in tensor.reshape(-1, width):
             pads = [float(x) == -1.0 for x in row]
             if any(pads) and not all(pads): raise ValueError("partial padding")
+            if not any(pads):
+                if width == 3:
+                    if not all(_is_integral(x) for x in row[:2]) or float(row[0]) < 0 or float(row[1]) < 0:
+                        raise ValueError("edge endpoint")
+                elif any(not math.isfinite(float(x)) for x in row):
+                    raise ValueError("pin value")
     return int(b), int(n)
+
+def _trim_rows(tensor: torch.Tensor, width: int, index: int) -> list[list[float]]:
+    out = []
+    padded = False
+    for row in tensor[index].tolist():
+        is_pad = all(float(v) == -1.0 for v in row)
+        if is_pad:
+            padded = True
+        elif padded:
+            raise ValueError("noncontiguous padding")
+        else:
+            out.append([float(v) for v in row])
+    return out
 
 def _dump_json(path: Path, value: Any) -> None:
     path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n")
 
 def _source_case(source: Sequence[torch.Tensor], index: int, instance_id: str) -> dict[str, Any]:
-    inp, _b2b, _p2b, _pins, _tree, fp, metrics = source
+    inp, b2b, p2b, pins, _tree, fp, metrics = source
     row = inp[index].tolist(); fprow = fp[index].tolist(); metric = metrics[index].tolist()
-    n = len(row)
+    n = next((i for i, x in enumerate(row) if float(x[0]) == -1.0), len(row))
+    if n <= 0 or any(float(x[0]) != -1.0 for x in row[n:]): raise ValueError("area padding")
+    row, fprow = row[:n], fprow[:n]
     area = [float(x[0]) for x in row]
     cons = [[int(x[1]), int(x[2]), int(x[3]), int(x[4]), int(x[5])] for x in row]
     tp = []
@@ -648,8 +670,45 @@ def _source_case(source: Sequence[torch.Tensor], index: int, instance_id: str) -
         tp.append([float(vals[2]) if pre else -1.0, float(vals[3]) if pre else -1.0,
                    float(vals[0]) if fixed or pre else -1.0, float(vals[1]) if fixed or pre else -1.0])
     return {"instance_id": instance_id, "n": n, "area": area, "cons": cons, "tp": tp,
-            "b2b": [], "p2b": [], "pins": [], "hpwl_ref": float(metric[6] + metric[7]),
+            "b2b": _trim_rows(b2b, 3, index), "p2b": _trim_rows(p2b, 3, index),
+            "pins": _trim_rows(pins, 2, index), "hpwl_ref": float(metric[6] + metric[7]),
             "area_ref": float(metric[0])}
+
+def _source_case_from_shard(source: Sequence[torch.Tensor], index: int, instance_id: str) -> dict[str, Any]:
+    return _sanitize_case(_source_case(source, index, instance_id))
+
+_TRUST_FIELDS = ("trust_ok", "input_ok", "scorer_ok", "checkpoint_sha256", "model_identity", "scorer_sha256", "scorer_contract", "shapely_version")
+_PROTECTED = {"receipt", "instance_id", "partition", "sample_seed", "n", "base_cost", "teacher_cost", "record_weight"}
+
+def _finite_json(value: Any) -> None:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("noncanonical runtime evidence") from exc
+
+def _validate_preflight(value: Any, policy: TeacherTrustPolicy) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or tuple(value) != _TRUST_FIELDS:
+        raise ValueError("preflight schema")
+    expected = {"checkpoint_sha256": policy.expected_checkpoint_sha256, "model_identity": dict(policy.allowed_model_identity), "scorer_sha256": policy.expected_scorer_sha256, "scorer_contract": policy.scorer_contract, "shapely_version": policy.shapely_version}
+    for key in ("trust_ok", "input_ok", "scorer_ok"):
+        if type(value[key]) is not bool or not value[key]: raise ValueError("preflight policy")
+    for key, expected_value in expected.items():
+        if value[key] != expected_value: raise ValueError("preflight policy")
+    _finite_json(value)
+    return dict(value)
+
+def _validate_outcome(value: Any) -> _CaseOutcome:
+    if type(value) is not _CaseOutcome: raise ValueError("runtime outcome type")
+    if type(value.legal) is not bool or type(value.covered) is not bool: raise ValueError("runtime flags")
+    if not all(isinstance(x, numbers.Real) and not isinstance(x, bool) and math.isfinite(float(x)) and float(x) > 0 for x in (value.base_cost, value.teacher_cost)) or value.teacher_cost > value.base_cost: raise ValueError("runtime costs")
+    if set(value.label_row) != {"edges", "contacts", "pin_paths"} or any(k in value.label_row for k in _PROTECTED): raise ValueError("label schema")
+    rows = list(value.proposal_rows); names = [r.get("name") for r in rows]; ords = [r.get("ordinal") for r in rows]
+    if len(names) != len(set(names)) or len(ords) != len(set(ords)) or any(k in r for r in rows for k in _PROTECTED): raise ValueError("proposal provenance")
+    winners = [r for r in rows if r.get("winner") is True]
+    base = [r for r in winners if r.get("ordinal") == 0 and r.get("name") == "base" and r.get("status") == "winner" and r.get("feasible") is True]
+    if len(base) != 1 or base[0].get("official_cost") != value.teacher_cost: raise ValueError("runtime winner")
+    for row in [value.label_row, *rows, *value.rejection_rows]: _finite_json(row)
+    return value
 
 
 def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optional[TeacherTrustPolicy] = None) -> int:
@@ -668,7 +727,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     _validate_outputs(args.out_dir, args.index_out)
     root, destination = Path(args.data_root).resolve(), Path(args.out_dir)
     runtime = _runtime_hooks()
-    trust = dict(runtime.preflight(policy, Path(args.checkpoint)))
+    trust = _validate_preflight(runtime.preflight(policy, Path(args.checkpoint)), policy)
     rows: list[dict[str, Any]] = []; train_c: list[Any] = []; held_c: list[Any] = []
     train_l: list[Any] = []; held_l: list[Any] = []; proposals: list[Any] = []; rejections: list[Any] = []
     population: list[dict[str, Any]] = []; legal = covered = True; processed = 0
@@ -680,15 +739,15 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
             count, blocks = _validate_source_shard(source)
             rel = path.relative_to(root).as_posix()
             for index in range(count):
-                iid = f"{rel}#{index}"; case = _source_case(source, index, iid)
+                iid = f"{rel}#{index}"; case = _source_case_from_shard(source, index, iid)
                 receipt = CorpusSourceReceipt(rel, digest, index, fingerprint_case(case))
                 entry = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "source_row_count": count, "block_count": blocks}
                 if case["n"] < args.n_min:
                     rows.append({**entry, "partition": None, "sample_ordinal": None, "sample_seed": None, "status": "excluded_n_min"}); continue
                 partition = split_for_id(iid, args.heldout_mod); seed = _sample_seed(args.seed, iid, 0)
-                ci = _CaseInput(case, receipt, partition, seed); outcome = runtime.process_case(ci); processed += 1
+                ci = _CaseInput(case, receipt, partition, seed); outcome = _validate_outcome(runtime.process_case(ci)); processed += 1
                 env = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "partition": partition, "sample_seed": seed, "n": case["n"]}
-                label = {**env, "proposal_ordinal": 0, "proposal_name": "base", "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost, "record_weight": outcome.base_cost, **dict(outcome.label_row)}
+                label = {**dict(outcome.label_row), **env, "proposal_ordinal": 0, "proposal_name": "base", "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost, "record_weight": outcome.base_cost / outcome.teacher_cost}
                 for p in outcome.proposal_rows: proposals.append({**env, **dict(p)})
                 for r in outcome.rejection_rows: rejections.append({**env, **dict(r)})
                 (train_c if partition == "train" else held_c).append(case); (train_l if partition == "train" else held_l).append(label)
