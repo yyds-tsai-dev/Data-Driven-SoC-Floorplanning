@@ -7,13 +7,13 @@ import hashlib
 import io
 import importlib
 import importlib.util
+import inspect
 import os
 import stat
 import sys
 import weakref
 import json
 import math
-import re
 import tracemalloc
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
@@ -1003,7 +1003,7 @@ def test_task4_runtime_materializes_lazily_caches_and_never_reopens(tmp_path, mo
     identity = t._checkpoint_identity(payload)
     policy = t.TeacherTrustPolicy(root, hashlib.sha256(path.read_bytes()).hexdigest(), identity,
                                   t._SCORER_SHA256, "iccad2026_evaluate_cost_no_runtime_v1", "2.0.5")
-    runtime = t._runtime_hooks(); assert runtime.authorizing is False
+    runtime = t._runtime_hooks(); assert runtime.authorizing is True
     runtime.preflight(policy, path)
     materialize_calls = []; sample_calls = []; materialized = object()
     monkeypatch.setattr(torch, "load", lambda *a, **k: pytest.fail("reopened checkpoint"))
@@ -1013,11 +1013,11 @@ def test_task4_runtime_materializes_lazily_caches_and_never_reopens(tmp_path, mo
     monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"), raising=False)
     monkeypatch.setattr(t, "_materialize_teacher_model", lambda p, d: materialize_calls.append((p, d)) or materialized, raising=False)
     monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sample_calls.append((s, seed)) or torch.ones((3, 4), dtype=torch.float64), raising=False)
+    monkeypatch.setattr(t, "_run_candidate_lifecycle", lambda *args, **kwargs: object(), raising=False)
+    monkeypatch.setattr(t, "_outcome_from_lifecycle", lambda *args: object(), raising=False)
     ci1 = _task4_case_input(t, 101); ci2 = _task4_case_input(t, 202)
-    with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
-        runtime.process_case(ci1)
-    with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
-        runtime.process_case(ci2)
+    runtime.process_case(ci1)
+    runtime.process_case(ci2)
     assert len(materialize_calls) == 1 and materialize_calls[0][1].type == "cpu"
     assert t._checkpoint_identity(materialize_calls[0][0]) == identity
     assert [seed for _, seed in sample_calls] == [101, 202]
@@ -1042,26 +1042,11 @@ def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_cl
     monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"), raising=False)
     monkeypatch.setattr(t, "_materialize_teacher_model", materialize, raising=False)
     monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sampled.append(seed) or torch.ones((3, 4), dtype=torch.float64), raising=False)
-    for name in ("_run_candidate_lifecycle", "_admit_candidate", "_score_official_candidate"):
-        monkeypatch.setattr(t, name, lambda *a, _name=name, **k: pytest.fail(_name), raising=False)
-    import icdc.engine as engine
     def process_with_seams(seed):
         with monkeypatch.context() as m:
-            m.setattr(t._EVALUATOR, "evaluate_solution", lambda *a, **k: pytest.fail("evaluate_solution"), raising=False)
-            for module, name in ((t, "_run_candidate_lifecycle"), (t, "_admit_candidate"), (t, "_score_official_candidate"), (engine, "z_to_legal")):
-                if hasattr(module, name): m.setattr(module, name, lambda *a, _name=name, **k: pytest.fail(_name))
-            for module, name in ((topology_prior, "generate_proposals"), (topology_prior, "pin_feasible_then_exact_tfdl")):
-                if hasattr(module, name): m.setattr(module, name, lambda *a, _name=name, **k: pytest.fail(_name))
-            for mod_name in ("icdc.energy", "icdc.tfdl"):
-                try:
-                    mod = __import__(mod_name, fromlist=["*"])
-                except ImportError:
-                    mod = None
-                if mod is not None:
-                    name = "energy" if mod_name.endswith("energy") else "tfdl"
-                    if hasattr(mod, name): m.setattr(mod, name, lambda *a, _name=name, **k: pytest.fail(_name))
-            with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
-                runtime.process_case(_task4_case_input(t, seed))
+            m.setattr(t, "_run_candidate_lifecycle", lambda *args, **kwargs: object(), raising=False)
+            m.setattr(t, "_outcome_from_lifecycle", lambda *args: object(), raising=False)
+            runtime.process_case(_task4_case_input(t, seed))
     runtime.preflight(policy(paths[0], p1), paths[0]); process_with_seams(101)
     assert [t._checkpoint_identity(x) for x in materialized] == [t._checkpoint_identity(p1)]
     assert refs[0]() is not None
@@ -1104,6 +1089,7 @@ class _Task4CaseOutcome:
     teacher_cost: float
     legal: bool
     covered: bool
+    case_status: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1193,15 +1179,14 @@ def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None,
     preflight_calls = [] if preflight_calls is None else preflight_calls
     events = [] if events is None else events
     case_input_type = getattr(t, "_CaseInput", _Task4CaseInput)
-    case_outcome_type = getattr(t, "_CaseOutcome", _Task4CaseOutcome)
+    # P1-C freezes this schema independently of the production dataclass so
+    # teacher_main validation, rather than test-fixture construction, is the
+    # first RED boundary until the bridge lands.
+    case_outcome_type = _Task4CaseOutcome
     runtime_type = getattr(t, "_TeacherRuntime", _Task4Runtime)
     if case_input_type is not _Task4CaseInput:
         assert [field.name for field in dataclasses.fields(case_input_type)] == [
             "case", "receipt", "partition", "sample_seed"]
-    if case_outcome_type is not _Task4CaseOutcome:
-        assert [field.name for field in dataclasses.fields(case_outcome_type)] == [
-            "label_row", "proposal_rows", "rejection_rows", "base_cost",
-            "teacher_cost", "legal", "covered"]
     if runtime_type is not _Task4Runtime:
         assert [field.name for field in dataclasses.fields(runtime_type)] == [
             "preflight", "process_case", "authorizing"]
@@ -1223,19 +1208,11 @@ def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None,
                        case_input.receipt.layout_index))
         if fail_at is not None and len(calls) - 1 == fail_at:
             raise _Task4ProcessFailure(f"process failure at {fail_at}")
-        return case_outcome_type(
-            label_row={"edges": [], "contacts": [], "pin_paths": []},
-            proposal_rows=({
-                "ordinal": 0, "name": "base", "intended_intent": "base",
-                "admission_status": "admitted", "admission_reason": "fixture",
-                "drift": {"max_abs": 0.0}, "hard": {"legal": True},
-                "diagnostic_energy": 0.0, "official_cost": 1.0,
-                "feasible": True, "winner": True, "status": "winner",
-            },),
-            rejection_rows=(), base_cost=1.10, teacher_cost=1.00,
-            legal=True, covered=True,
-        )
+        return _task4_good_outcome(case_outcome_type)
 
+    monkeypatch.setattr(
+        t, "_CaseOutcome", case_outcome_type,
+    )
     monkeypatch.setattr(
         t, "_runtime_hooks", lambda: runtime_type(preflight, process_case, True),
         raising=False,
@@ -1410,26 +1387,56 @@ def _task4_padded_tensors():
     return tuple(source)
 
 
-def _task4_good_proposal(cost=1.0):
+_TASK4_P1C_PROPOSAL_KEYS = {
+    "ordinal", "name", "intended_intent", "raw_topology_fingerprint",
+    "intended_topology_fingerprint", "realized_topology_fingerprint",
+    "admission_status", "admission_reason", "drift", "hard",
+    "hard_status", "intent_status", "official_cost", "feasible",
+    "official_status", "diagnostic_energy", "energy_status", "winner",
+    "status",
+}
+
+
+def _task4_good_label(*, proposal_ordinal=0, proposal_name="base",
+                      base_cost=1.1, teacher_cost=1.0):
     return {
-        "ordinal": 0, "name": "base", "intended_intent": "base",
-        "admission_status": "admitted", "admission_reason": "fixture",
-        "drift": {"max_abs": 0.0}, "hard": {"legal": True},
-        "diagnostic_energy": 0.0, "official_cost": cost,
-        "feasible": True, "winner": True, "status": "winner",
+        "edges": [], "contacts": [], "pin_paths": [],
+        "proposal_ordinal": proposal_ordinal, "proposal_name": proposal_name,
+        "base_cost": base_cost, "teacher_cost": teacher_cost,
+        "record_weight": base_cost / teacher_cost,
+    }
+
+
+def _task4_good_proposal(cost=1.0, *, winner=True, ordinal=0, name="base"):
+    return {
+        "ordinal": ordinal, "name": name,
+        "intended_intent": name if name != "base" else "base",
+        "raw_topology_fingerprint": "0" * 64,
+        "intended_topology_fingerprint": "0" * 64,
+        "realized_topology_fingerprint": "0" * 64,
+        "admission_status": "admitted", "admission_reason": None,
+        "drift": {"max_abs": 0.0}, "hard": {"hard_audit": True},
+        "hard_status": "passed", "intent_status": "passed",
+        "diagnostic_energy": 0.0, "energy_status": "recorded",
+        "official_cost": cost, "feasible": True, "official_status": "scored",
+        "winner": winner,
+        "status": "winner_base_no_improvement" if winner and name == "base" else "not_selected",
     }
 
 
 def _task4_good_outcome(t, *, base_cost=1.1, teacher_cost=1.0,
                         label_row=None, proposal_rows=None, rejection_rows=(),
-                        legal=True, covered=True):
-    return t._CaseOutcome(
+                        legal=True, covered=True,
+                        case_status="winner_base_no_improvement"):
+    outcome_type = t if isinstance(t, type) else t._CaseOutcome
+    return outcome_type(
         label_row=(label_row if label_row is not None else
-                   {"edges": [], "contacts": [], "pin_paths": []}),
+                   _task4_good_label(base_cost=base_cost, teacher_cost=teacher_cost)),
         proposal_rows=(tuple(proposal_rows) if proposal_rows is not None else
                        (_task4_good_proposal(teacher_cost),)),
         rejection_rows=tuple(rejection_rows), base_cost=base_cost,
         teacher_cost=teacher_cost, legal=legal, covered=covered,
+        case_status=case_status,
     )
 
 
@@ -1447,8 +1454,9 @@ def _task4_install_custom_runtime(t, monkeypatch, *, preflight_factory=None,
     def process(case_input):
         process_calls.append(case_input)
         return (outcome_factory(t, case_input) if outcome_factory else
-                _task4_good_outcome(t))
+                _task4_good_outcome(t._CaseOutcome))
 
+    monkeypatch.setattr(t, "_CaseOutcome", _Task4CaseOutcome)
     monkeypatch.setattr(
         t, "_runtime_hooks", lambda: t._TeacherRuntime(preflight, process, True)
     )
@@ -1641,7 +1649,7 @@ _TASK4_BAD_OUTCOME_KINDS = (
 
 
 def _task4_bad_outcome(t, kind):
-    label = {"edges": [], "contacts": [], "pin_paths": []}
+    label = _task4_good_label(base_cost=1.0, teacher_cost=1.0)
     proposal = _task4_good_proposal(1.0); proposals = [proposal]
     rejections = []; base_cost = teacher_cost = 1.0; legal = covered = True
     if kind.startswith("base_"):
@@ -1682,7 +1690,8 @@ def _task4_bad_outcome(t, kind):
     elif kind == "missing_proposal_field": proposal.pop("admission_status")
     else: raise AssertionError(kind)
     return t._CaseOutcome(label, tuple(proposals), tuple(rejections),
-                          base_cost, teacher_cost, legal, covered)
+                          base_cost, teacher_cost, legal, covered,
+                          "winner_base_no_improvement")
 
 
 @pytest.mark.parametrize("kind", _TASK4_BAD_OUTCOME_KINDS)
@@ -1754,6 +1763,16 @@ def test_teacher_evidence_a_one_sided_split_is_coverage_kill(
     assert manifest["coverage"] == {
         "eligible_train": expected_train, "eligible_heldout": expected_heldout,
         "heldout_winners": expected_heldout, "legal": True, "covered": False,
+        "mutation_proposals": 0, "mutation_admitted": 0,
+        "mutation_intent_survived": 0, "positive_gain_heldout": 0,
+        "eligible_heldout_weight": expected_heldout * math.exp(3 / 12),
+        "positive_gain_heldout_weight": 0.0,
+        "rejection_counts": {
+            "admission_failed": 0, "hard_audit_failed": 0,
+            "intent_not_survived": 0, "official_infeasible": 0,
+            "official_invalid_cost": 0, "official_evaluator_error": 0,
+            "base_unavailable": 0,
+        },
     }
 
 
@@ -1782,21 +1801,9 @@ def _task4_assert_success_artifacts(t, root, out, calls, policy,
         expected_cases[i], expected_receipts[i], partition,
         t._sample_seed(20260813, expected_cases[i]["instance_id"], 0),
     )
-    expected_labels = [
-        {**env(0, "train"), "proposal_ordinal": 0, "proposal_name": "base",
-         "base_cost": 1.1, "teacher_cost": 1.0, "record_weight": 1.1,
-         "edges": [], "contacts": [], "pin_paths": []},
-        {**env(1, "heldout"), "proposal_ordinal": 0, "proposal_name": "base",
-         "base_cost": 1.1, "teacher_cost": 1.0, "record_weight": 1.1,
-         "edges": [], "contacts": [], "pin_paths": []},
-    ]
-    fake_fields = {
-        "ordinal": 0, "name": "base", "intended_intent": "base",
-        "admission_status": "admitted", "admission_reason": "fixture",
-        "drift": {"max_abs": 0.0}, "hard": {"legal": True},
-        "diagnostic_energy": 0.0, "official_cost": 1.0,
-        "feasible": True, "winner": True, "status": "winner",
-    }
+    expected_labels = [{**env(index, partition), **_task4_good_label()}
+                       for index, partition in ((0, "train"), (1, "heldout"))]
+    fake_fields = _task4_good_proposal()
     expected_proposals = [{**env(0, "train"), **fake_fields},
                           {**env(1, "heldout"), **fake_fields}]
     assert _task4_jsonl(out / "train_labels.jsonl") == [expected_labels[0]]
@@ -1811,10 +1818,10 @@ def _task4_assert_success_artifacts(t, root, out, calls, policy,
          "source_row_count": 2, "block_count": 3,
          "partition": ("train" if i == 0 else "heldout"), "sample_ordinal": 0,
          "sample_seed": t._sample_seed(20260813, expected_cases[i]["instance_id"], 0),
-         "status": "processed"}
+         "status": "winner_base_no_improvement"}
         for i in range(2)]
 
-    expected_population = t._weighted_population([{
+    expected_population = _task4_p1c_canonical_population([{
         "relative_path": "worker_2/layouts_0.th", "layout_index": 1,
         "instance_id": expected_cases[1]["instance_id"], "n": 3,
         "base_cost": 1.1, "teacher_cost": 1.0,
@@ -1834,6 +1841,16 @@ def _task4_assert_success_artifacts(t, root, out, calls, policy,
     assert manifest["coverage"] == {
         "eligible_train": 1, "eligible_heldout": 1, "heldout_winners": 1,
         "legal": True, "covered": True,
+        "mutation_proposals": 0, "mutation_admitted": 0,
+        "mutation_intent_survived": 0, "positive_gain_heldout": 0,
+        "eligible_heldout_weight": math.exp(3 / 12),
+        "positive_gain_heldout_weight": 0.0,
+        "rejection_counts": {
+            "admission_failed": 0, "hard_audit_failed": 0,
+            "intent_not_survived": 0, "official_infeasible": 0,
+            "official_invalid_cost": 0, "official_evaluator_error": 0,
+            "base_unavailable": 0,
+        },
     }
     assert manifest["support_hashes"] == {
         name: hashlib.sha256((out / name).read_bytes()).hexdigest()
@@ -1979,8 +1996,20 @@ def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path,
     runtime = t._runtime_hooks()
     original_process = runtime.process_case
     def process(case_input):
-        outcome = original_process(case_input)
-        return dataclasses.replace(outcome, rejection_rows=({"reason": "not_selected"},))
+        original_process(case_input)
+        raw = _task4_p1c_raw(case_input.case); mutation = _task4_p1c_mutation(raw)
+        base = _task4_p1c_record(
+            t, 0, "base", raw, raw, cost=1.1, energy=0.0,
+            energy_status="recorded", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+        )
+        rejected = _task4_p1c_record(
+            t, 1, "axis:0:1:0:0", mutation, mutation,
+            reason="official_invalid_cost", hard={"hard_audit": True},
+            drift={"max_abs": 0.0},
+        )
+        return _task4_p1c_outcome(
+            case_input, raw, t._CandidateLifecycle((base, rejected), 0, 1.1, 1.1)
+        )
     monkeypatch.setattr(t, "_runtime_hooks", lambda: dataclasses.replace(runtime, process_case=process))
     created = []; reads = 0
     real_new_staging = t._new_staging
@@ -2008,7 +2037,7 @@ def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path,
     for name in _TASK4_JSONL:
         rows = _task4_jsonl(out / name)
         assert (out / name).read_bytes() == b"".join(_task4_canonical_json(row) + b"\n" for row in rows)
-    assert sum(len(_task4_jsonl(out / "proposals.jsonl")) for _ in [0]) == len(calls)
+    assert sum(len(_task4_jsonl(out / "proposals.jsonl")) for _ in [0]) == 2 * len(calls)
     assert sum(len(_task4_jsonl(out / "rejections.jsonl")) for _ in [0]) == len(calls)
     expected_all = [c.case["instance_id"] for c in calls]
     train_ids = [c.case["instance_id"] for c in calls if c.partition == "train"]
@@ -2019,7 +2048,7 @@ def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path,
     assert [r["instance_id"] for r in _task4_jsonl(out / "heldout_labels.jsonl")] == held_ids
     assert [r["instance_id"] for r in _task4_jsonl(out / "proposals.jsonl")] == expected_all
     assert [r["instance_id"] for r in _task4_jsonl(out / "rejections.jsonl")] == expected_all
-    assert len(_task4_jsonl(out / "proposals.jsonl")) == len(calls)
+    assert len(_task4_jsonl(out / "proposals.jsonl")) == 2 * len(calls)
     assert len(_task4_jsonl(out / "rejections.jsonl")) == len(calls)
 
 
@@ -2313,11 +2342,25 @@ def test_teacher_excluded_rows_publish_empty_non_authorizing_terminal_evidence(t
     assert manifest["training_authorized"] is False
     assert manifest["bounded_max_files"] is False
     assert manifest["trust"] == _task4_expected_trust(policy)
+    assert manifest["population"] == _task4_p1c_canonical_population([])
     assert manifest["coverage"]["eligible_train"] == 0
     assert manifest["coverage"]["eligible_heldout"] == 0
     assert manifest["coverage"]["heldout_winners"] == 0
     assert manifest["coverage"]["legal"] is True
     assert manifest["coverage"]["covered"] is False
+    assert manifest["coverage"] == {
+        "eligible_train": 0, "eligible_heldout": 0, "heldout_winners": 0,
+        "legal": True, "covered": False,
+        "mutation_proposals": 0, "mutation_admitted": 0,
+        "mutation_intent_survived": 0, "positive_gain_heldout": 0,
+        "eligible_heldout_weight": 0.0, "positive_gain_heldout_weight": 0.0,
+        "rejection_counts": {
+            "admission_failed": 0, "hard_audit_failed": 0,
+            "intent_not_survived": 0, "official_infeasible": 0,
+            "official_invalid_cost": 0, "official_evaluator_error": 0,
+            "base_unavailable": 0,
+        },
+    }
     assert manifest["support_hashes"] == {
         name: hashlib.sha256((out / name).read_bytes()).hexdigest()
         for name in _TASK4_FILES if name != "g0_manifest.json"
@@ -2341,6 +2384,16 @@ def test_teacher_bounded_max_files_is_non_authorizing_even_with_positive_fake_ga
     assert manifest["coverage"] == {
         "eligible_train": 1, "eligible_heldout": 1, "heldout_winners": 1,
         "legal": True, "covered": True,
+        "mutation_proposals": 0, "mutation_admitted": 0,
+        "mutation_intent_survived": 0, "positive_gain_heldout": 0,
+        "eligible_heldout_weight": math.exp(3 / 12),
+        "positive_gain_heldout_weight": 0.0,
+        "rejection_counts": {
+            "admission_failed": 0, "hard_audit_failed": 0,
+            "intent_not_survived": 0, "official_infeasible": 0,
+            "official_invalid_cost": 0, "official_evaluator_error": 0,
+            "base_unavailable": 0,
+        },
     }
 
 
@@ -2437,8 +2490,9 @@ def test_teacher_evidence_a_diagnostic_evidence_schema_is_semantically_rejected(
     out = tmp_path / "out"; calls, _ = _task4_install_custom_runtime(
         t, monkeypatch,
         outcome_factory=lambda module, _case: module._CaseOutcome(
-            {"edges": [], "contacts": [], "pin_paths": []},
-            (dict(_task4_good_proposal(), **{field: value}),), (), 1.1, 1.0, True, True))
+            _task4_good_label(),
+            (dict(_task4_good_proposal(), **{field: value}),), (), 1.1, 1.0,
+            True, True, "winner_base_no_improvement"))
     with pytest.raises(ValueError, match=match):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert len(calls) == 1 and not out.exists()
@@ -2578,9 +2632,8 @@ def test_teacher_runtime_preflight_binds_verified_checkpoint_and_literal_scorer_
     runtime = t._runtime_hooks()
     assert runtime.authorizing is True
     assert runtime.preflight(policy, checkpoint) == _task4_expected_trust(policy)
-    assert runtime.process_case(None).case_status in {
-        "winner_base_no_improvement", "winner_mutation", "base_unavailable"
-    }
+    with pytest.raises(ValueError, match="case input"):
+        runtime.process_case(None)
 
 
 def test_teacher_scorer_source_file_seam_rejects_symlink_and_is_static(tmp_path, monkeypatch):
@@ -2739,11 +2792,12 @@ def test_teacher_rejects_noncanonical_and_symlink_roots_before_pipeline(tmp_path
     with pytest.raises(ValueError): t.teacher_main(args, _trust_policy=_policy_for(canonical))
 
 
-def test_teacher_valid_canonical_root_reaches_explicit_unimplemented_after_preflight(tmp_path):
+def test_teacher_valid_canonical_root_runs_the_authorizing_bridge_without_claiming_g0_gain(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); out = tmp_path / "out"
     _task4_shard(root); _checkpoint, policy = _task4_verified_checkpoint(t, root)
     args = _task4_args(root, out)
-    assert t.teacher_main(args, _trust_policy=policy) == 0
+    _task4_fake_runtime(t, monkeypatch)
+    assert t.teacher_main(args, _trust_policy=policy) in (0, 1)
     assert out.exists()
 
 
@@ -2774,9 +2828,9 @@ def test_teacher_production_identity_is_immutable_and_stable():
     assert second.allowed_model_identity["ema_state_sha256"] == "92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb"
 
 
-def test_teacher_default_runtime_is_non_authorizing_until_process_slice():
+def test_teacher_default_runtime_is_authorizing_after_process_slice():
     runtime = _teacher()._runtime_hooks()
-    assert runtime.authorizing is False
+    assert runtime.authorizing is True
 
 
 @pytest.mark.parametrize("bad", ["--scorer", "--unknown"])
@@ -5776,40 +5830,739 @@ def test_task4_p1b_caps_and_names_fail_closed_before_candidate_sinks(monkeypatch
     assert trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
 
 
-def test_task4_p1c_runtime_uses_real_case_input_and_lifecycle_identity(monkeypatch):
-    t = _teacher(); runtime = t._runtime_hooks(); events = []
-    raw = _p1b_raw(); scorer = object(); lifecycle = object(); outcome = object()
-    case = _p1b_case(); receipt = _task4_receipt_bytes(b"fixture", 0, case)
-    ci = t._CaseInput(case, receipt, "heldout", 7)
-    monkeypatch.setattr(t, "_materialize_teacher_model", lambda *a: object())
-    monkeypatch.setattr(t, "_sample_direct_once", lambda *a: events.append(("sample",)) or raw)
-    monkeypatch.setattr(t, "_run_candidate_lifecycle", lambda got, c, *, scorer=None, cfg=None: events.append(("lifecycle", got, scorer, cfg)) or lifecycle)
-    monkeypatch.setattr(t, "_outcome_from_lifecycle", lambda got, c, raw_rects: events.append(("compile", got, raw_rects)) or outcome)
+def _task4_p1c_case_input(t, index=0, *, partition="heldout", seed=7123):
+    case = dict(_task4_expected_case(index))
+    receipt = CorpusSourceReceipt(
+        relative_path="worker_2/layouts_0.th",
+        file_sha256=hashlib.sha256(b"p1c-source").hexdigest(),
+        layout_index=index,
+        fingerprint=fingerprint_case(case),
+    )
+    return t._CaseInput(case, receipt, partition, seed)
+
+
+def _task4_p1c_raw(case):
+    # This is a complete sanitized corpus case: block 1 preserves its fixed
+    # dimensions and block 2 its preplaced origin.  It is deliberately not the
+    # minimal P1-B adapter fixture, which is not fingerprintable corpus data.
+    assert case["n"] == 3 and set(case) >= {
+        "instance_id", "area", "cons", "tp", "b2b", "p2b", "pins",
+        "hpwl_ref", "area_ref",
+    }
+    return torch.tensor(
+        [[0.0, 0.0, 2.0, 2.0], [3.0, 0.0, 2.0, 3.0],
+         [10.0, 11.0, 3.0, 3.0]], dtype=torch.float64,
+    )
+
+
+def _task4_p1c_mutation(raw):
+    changed = raw.clone()
+    changed[0, 0] = 5.0
+    return changed
+
+
+def _task4_p1c_sha_topology(rects, cons):
+    """Independent canonical relation oracle; it never calls production fp code."""
+    relations = []
+    for first in range(rects.shape[0]):
+        for second in range(first + 1, rects.shape[0]):
+            gaps = []
+            for axis in (0, 1):
+                a, b = rects[first], rects[second]
+                gaps.append(max(float(a[axis] - b[axis] - b[axis + 2]),
+                                float(b[axis] - a[axis] - a[axis + 2])))
+            axis = 0 if gaps[0] >= gaps[1] else 1
+            first_center = float(rects[first, axis] + rects[first, axis + 2] / 2)
+            second_center = float(rects[second, axis] + rects[second, axis + 2] / 2)
+            relations.append(("pair", first, second, axis,
+                              int((first_center, first) <= (second_center, second))))
+    for first in range(rects.shape[0]):
+        for second in range(first + 1, rects.shape[0]):
+            gid = cons[first][3]
+            if gid <= 0 or gid != cons[second][3]:
+                continue
+            for axis in (0, 1):
+                perpendicular = 1 - axis
+                overlap = min(float(rects[first, perpendicular] + rects[first, perpendicular + 2]),
+                              float(rects[second, perpendicular] + rects[second, perpendicular + 2])) - max(
+                                  float(rects[first, perpendicular]), float(rects[second, perpendicular]))
+                for order in (0, 1):
+                    face = (rects[first, axis] + rects[first, axis + 2] == rects[second, axis]
+                            if order else rects[second, axis] + rects[second, axis + 2] == rects[first, axis])
+                    if bool(face) and overlap > 0:
+                        relations.append(("contact", gid, first, second, axis, order))
+    canonical = json.dumps(relations, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True, allow_nan=False).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _task4_p1c_record(t, ordinal, name, original, legal, *, cost=None,
+                      energy=None, energy_status="not_reached", reason=None,
+                      drift=None, hard=None):
+    return t._CandidateRecord(
+        ordinal, name, original, legal,
+        {} if drift is None else drift,
+        {} if hard is None else hard,
+        cost, energy, energy_status, reason,
+    )
+
+
+def _task4_p1c_label(case_input, legal, ordinal, name, base_cost, teacher_cost):
+    label = topology_prior.extract_sparse_label(
+        legal, case_input.case, case_input.case["instance_id"],
+        case_input.sample_seed, teacher_cost, base_cost,
+    )
+    return {
+        "edges": [dataclasses.asdict(edge) for edge in label.edges],
+        "contacts": [dataclasses.asdict(contact) for contact in label.contacts],
+        "pin_paths": [list(path) for path in label.pin_paths],
+        "proposal_ordinal": ordinal, "proposal_name": name,
+        "base_cost": base_cost, "teacher_cost": teacher_cost,
+        "record_weight": base_cost / teacher_cost,
+    }
+
+
+def _task4_p1c_expected_row(case_input, raw, record, lifecycle):
+    name = record.name
+    reason = record.rejection_reason
+    row = {
+        "ordinal": record.ordinal, "name": name, "intended_intent": name,
+        "raw_topology_fingerprint": _task4_p1c_sha_topology(raw, case_input.case["cons"]),
+        "intended_topology_fingerprint": _task4_p1c_sha_topology(record.original, case_input.case["cons"]),
+        "realized_topology_fingerprint": (
+            _task4_p1c_sha_topology(record.legal, case_input.case["cons"])
+            if record.legal is not None else None),
+        "admission_status": "admitted" if record.legal is not None else "failed",
+        "admission_reason": None if record.legal is not None else "admission_failed",
+        "drift": None, "hard": None, "hard_status": "not_reached",
+        "intent_status": "not_reached", "official_cost": None,
+        "feasible": None, "official_status": "not_reached",
+        "diagnostic_energy": None, "energy_status": "not_reached",
+        "winner": False, "status": "rejected",
+    }
+    if record.legal is None:
+        return row
+    row.update(drift=dict(record.drift), hard=dict(record.hard))
+    if reason == "hard_audit_failed":
+        row["hard_status"] = "failed"
+        return row
+    row["hard_status"] = "passed"
+    if reason == "intent_not_survived":
+        row["intent_status"] = "failed"
+        return row
+    row["intent_status"] = "passed"
+    if reason in {"official_infeasible", "official_invalid_cost", "official_evaluator_error"}:
+        row.update(
+            official_status={
+                "official_infeasible": "infeasible",
+                "official_invalid_cost": "invalid_cost",
+                "official_evaluator_error": "error",
+            }[reason],
+            feasible=False if reason == "official_infeasible" else None,
+        )
+        return row
+    assert record.official_cost is not None
+    row.update(
+        official_cost=record.official_cost, feasible=True, official_status="scored",
+        diagnostic_energy=record.diagnostic_energy,
+        energy_status=record.energy_status,
+    )
+    if lifecycle.winner_ordinal is None:
+        row["status"] = "base_unavailable"
+    elif record.ordinal == lifecycle.winner_ordinal:
+        row.update(winner=True, status=("winner_base_no_improvement" if name == "base"
+                                        else "winner_mutation"))
+    else:
+        row["status"] = "not_selected"
+    return row
+
+
+def _task4_p1c_expected_rejections(lifecycle):
+    mapping = {
+        "admission_failed": "admission", "hard_audit_failed": "hard",
+        "intent_not_survived": "intent", "official_infeasible": "official",
+        "official_invalid_cost": "official", "official_evaluator_error": "official",
+        "base_unavailable": "selection",
+    }
+    return tuple(
+        {"ordinal": r.ordinal, "name": r.name, "stage": mapping[r.rejection_reason],
+         "reason": r.rejection_reason}
+        for r in lifecycle.candidates
+        if r.rejection_reason in mapping
+    )
+
+
+def _task4_p1c_outcome(case_input, raw, lifecycle):
+    rows = tuple(_task4_p1c_expected_row(case_input, raw, r, lifecycle)
+                 for r in lifecycle.candidates)
+    if lifecycle.winner_ordinal is None:
+        return _Task4CaseOutcome(None, rows, _task4_p1c_expected_rejections(lifecycle),
+                                 None, None, False, False, "base_unavailable")
+    winner = next(r for r in lifecycle.candidates if r.ordinal == lifecycle.winner_ordinal)
+    return _Task4CaseOutcome(
+        _task4_p1c_label(case_input, winner.legal, winner.ordinal, winner.name,
+                         lifecycle.base_cost, lifecycle.teacher_cost),
+        rows, _task4_p1c_expected_rejections(lifecycle), lifecycle.base_cost,
+        lifecycle.teacher_cost, True, True,
+        "winner_base_no_improvement" if winner.name == "base" else "winner_mutation",
+    )
+
+
+def _task4_p1c_mutation_outcome(t, case_input, *, base_cost=1.1, teacher_cost=1.0):
+    raw = _task4_p1c_raw(case_input.case); mutation = _task4_p1c_mutation(raw)
+    base = _task4_p1c_record(
+        t, 0, "base", raw, raw, cost=base_cost, energy=-1000.0,
+        energy_status="recorded", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    winner = _task4_p1c_record(
+        t, 1, "axis:0:1:0:0", mutation, mutation, cost=teacher_cost, energy=1000.0,
+        energy_status="recorded", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    return _task4_p1c_outcome(
+        case_input, raw,
+        t._CandidateLifecycle((base, winner), 1, base_cost, teacher_cost),
+    )
+
+
+def _task4_p1c_base_no_improvement_outcome(t, case_input, *, cost=1.1):
+    raw = _task4_p1c_raw(case_input.case)
+    base = _task4_p1c_record(
+        t, 0, "base", raw, raw, cost=cost, energy=None,
+        energy_status="unavailable", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    return _task4_p1c_outcome(
+        case_input, raw, t._CandidateLifecycle((base,), 0, cost, cost)
+    )
+
+
+def _task4_p1c_unavailable_outcome(t, case_input, *, base_reason="official_invalid_cost"):
+    raw = _task4_p1c_raw(case_input.case); mutation = _task4_p1c_mutation(raw)
+    base_legal = None if base_reason == "admission_failed" else raw
+    base = _task4_p1c_record(
+        t, 0, "base", raw, base_legal, reason=base_reason,
+        hard={} if base_legal is None else ({"hard_audit": False}
+                                             if base_reason == "hard_audit_failed"
+                                             else {"hard_audit": True}),
+        drift={} if base_legal is None else {"max_abs": 0.0},
+    )
+    scored = _task4_p1c_record(
+        t, 1, "axis:0:1:0:0", mutation, mutation, cost=1.0, energy=3.0,
+        energy_status="recorded", reason="base_unavailable",
+        hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    return _task4_p1c_outcome(
+        case_input, raw, t._CandidateLifecycle((base, scored), None, None, None)
+    )
+
+
+def _task4_p1c_canonical_population(rows):
+    ordered = sorted(rows, key=lambda row: (row["relative_path"], row["layout_index"]))
+    encoded = b"[" + b",".join(
+        json.dumps({
+            "relative_path": row["relative_path"], "layout_index": row["layout_index"],
+            "instance_id": row["instance_id"], "n": row["n"],
+            "weight": math.exp(row["n"] / 12),
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+           allow_nan=False).encode("utf-8") for row in ordered
+    ) + b"]"
+    denominator = sum(math.exp(row["n"] / 12) for row in ordered)
+    scored = [row for row in ordered if "base_cost" in row]
+    scored_denominator = sum(math.exp(row["n"] / 12) for row in scored)
+    if len(scored) != len(ordered) or not ordered:
+        metrics = {"B_H": None, "T_H": None, "Delta_H": None}
+    else:
+        b_h = sum(math.exp(row["n"] / 12) * row["base_cost"] for row in ordered) / denominator
+        t_h = sum(math.exp(row["n"] / 12) * row["teacher_cost"] for row in ordered) / denominator
+        metrics = {"B_H": b_h, "T_H": t_h, "Delta_H": b_h - t_h}
+    return {
+        "eligible_count": len(ordered), "scored_winner_count": len(scored),
+        "denominator": denominator, "scored_denominator": scored_denominator,
+        **metrics, "population_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _task4_p1c_verified_runtime(t, tmp_path, monkeypatch):
+    root = tmp_path / "verified"; root.mkdir()
+    checkpoint, policy = _task4_verified_checkpoint(t, root)
+    runtime = t._runtime_hooks()
+    assert runtime.preflight(policy, checkpoint) == _task4_expected_trust(policy)
+    return runtime
+
+
+def test_task4_p1c_runtime_runs_one_authorizing_sample_lifecycle_compiler_chain(tmp_path, monkeypatch):
+    t = _teacher(); runtime = _task4_p1c_verified_runtime(t, tmp_path, monkeypatch)
+    case_input = _task4_p1c_case_input(t)
+    raw = _task4_p1c_raw(case_input.case); lifecycle = object(); outcome = object(); events = []
+    model = object()
+    monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(t, "_materialize_teacher_model",
+                        lambda payload, device: events.append(("materialize", payload, device)) or model)
+    monkeypatch.setattr(t, "_sample_direct_once", lambda got, case, seed:
+                        events.append(("sample", got, case, seed)) or raw)
+    monkeypatch.setattr(t, "_run_candidate_lifecycle", lambda got, case, *, scorer, cfg:
+                        events.append(("lifecycle", got, case, scorer, cfg)) or lifecycle)
+    # This deliberate wished-for seam makes the first pre-GREEN failure the
+    # missing bridge behavior, never fixture construction.
+    monkeypatch.setattr(t, "_outcome_from_lifecycle", lambda got_ci, got_raw, got_lifecycle:
+                        events.append(("compiler", got_ci, got_raw, got_lifecycle)) or outcome,
+                        raising=False)
     assert runtime.authorizing is True
-    assert runtime.process_case(ci) is outcome
-    assert [event[0] for event in events] == ["sample", "lifecycle", "compile"]
-    assert events[1][1] is raw and events[2][2] is raw
-    assert events[1][3] == t.ProposalConfig()
+    assert runtime.process_case(case_input) is outcome
+    assert [event[0] for event in events] == ["materialize", "sample", "lifecycle", "compiler"]
+    assert events[1][1:] == (model, case_input.case, case_input.sample_seed)
+    assert events[2][1] is raw and events[2][2] is case_input.case
+    assert events[2][3] is t._EVALUATOR and events[2][4] == t.ProposalConfig()
+    assert events[3][1] is case_input and events[3][2] is raw and events[3][3] is lifecycle
 
 
-@pytest.mark.parametrize("seam", ["_sample_direct_once", "_run_candidate_lifecycle", "_outcome_from_lifecycle"])
-def test_task4_p1c_runtime_propagates_bridge_failures(monkeypatch, seam):
-    t = _teacher(); runtime = t._runtime_hooks(); case = _p1b_case()
-    receipt = _task4_receipt_bytes(b"fixture", 0, case)
-    ci = t._CaseInput(case, receipt, "heldout", 7)
-    monkeypatch.setattr(t, "_materialize_teacher_model", lambda *a: object())
-    monkeypatch.setattr(t, seam, lambda *a, **k: (_ for _ in ()).throw(RuntimeError(seam)))
-    with pytest.raises(RuntimeError, match=seam): runtime.process_case(ci)
+@pytest.mark.parametrize("seam", ["sample", "lifecycle", "compiler"])
+def test_task4_p1c_runtime_bridge_errors_are_transactional(tmp_path, monkeypatch, seam):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); _task4_shard(root)
+    _checkpoint, policy = _task4_verified_checkpoint(t, root); out = tmp_path / "out"
+    sentinel = RuntimeError(f"p1c-{seam}-fatal")
+    monkeypatch.setattr(t, "_materialize_teacher_model", lambda *args: object())
+    if seam == "sample":
+        monkeypatch.setattr(t, "_sample_direct_once", lambda *args: (_ for _ in ()).throw(sentinel))
+    else:
+        monkeypatch.setattr(t, "_sample_direct_once", lambda *_: _task4_p1c_raw(_task4_expected_case(0)))
+        if seam == "lifecycle":
+            monkeypatch.setattr(t, "_run_candidate_lifecycle", lambda *args, **kwargs: (_ for _ in ()).throw(sentinel))
+        else:
+            monkeypatch.setattr(t, "_run_candidate_lifecycle", lambda *args, **kwargs: object())
+            monkeypatch.setattr(t, "_outcome_from_lifecycle", lambda *args: (_ for _ in ()).throw(sentinel), raising=False)
+    with pytest.raises(RuntimeError, match=rf"p1c-{seam}-fatal"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=policy)
+    assert not out.exists()
 
 
-def test_task4_p1c_compiler_is_real_and_not_winner_only():
-    t = _teacher(); assert hasattr(t, "_outcome_from_lifecycle")
-    base = t._CandidateRecord(0, "base", _p1b_raw(), _p1b_raw(), {"max_abs": 0.0}, {"ok": True}, 10.0, 99.0, "recorded", None)
-    mutation = t._CandidateRecord(1, "axis:0:1:0:0", _p1b_raw(), _p1b_raw(), {"max_abs": 0.0}, {"ok": True}, 8.0, 1.0, "recorded", None)
-    life = t._CandidateLifecycle((base, mutation), 1, 10.0, 8.0)
-    outcome = t._outcome_from_lifecycle(life, _p1b_case(), _p1b_raw())
-    assert outcome.case_status == "winner_mutation"
-    assert outcome.teacher_cost == 8.0 and outcome.label_row["proposal_ordinal"] == 1
+def test_task4_p1c_case_outcome_schema_is_explicit_and_process_none_is_invalid(tmp_path, monkeypatch):
+    t = _teacher()
+    assert [field.name for field in dataclasses.fields(t._CaseOutcome)] == [
+        "label_row", "proposal_rows", "rejection_rows", "base_cost", "teacher_cost",
+        "legal", "covered", "case_status",
+    ]
+    assert _Task4CaseOutcome.__dataclass_fields__.keys() == t._CaseOutcome.__dataclass_fields__.keys()
+    runtime = _task4_p1c_verified_runtime(t, tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="case input"):
+        runtime.process_case(None)
+
+
+def test_task4_p1c_compiler_uses_official_mutation_and_independent_topology_sha_oracles():
+    t = _teacher(); case_input = _task4_p1c_case_input(t); raw = _task4_p1c_raw(case_input.case)
+    mutation = _task4_p1c_mutation(raw)
+    base = _task4_p1c_record(t, 0, "base", raw, raw, cost=10.0, energy=-999.0,
+                              energy_status="recorded", hard={"hard_audit": True}, drift={"max_abs": 0.0})
+    candidate = _task4_p1c_record(t, 1, "axis:0:1:0:0", mutation, mutation,
+                                   cost=8.0, energy=999.0, energy_status="recorded",
+                                   hard={"hard_audit": True}, drift={"max_abs": 0.0})
+    lifecycle = t._CandidateLifecycle((base, candidate), 1, 10.0, 8.0)
+    compiler = t._outcome_from_lifecycle
+    signature = inspect.signature(compiler)
+    assert [(parameter.name, parameter.kind, parameter.default)
+            for parameter in signature.parameters.values()] == [
+                ("case_input", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+                ("raw_rects", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+                ("lifecycle", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+            ]
+    outcome = compiler(case_input, raw, lifecycle)
+    expected = _task4_p1c_outcome(case_input, raw, lifecycle)
+    assert outcome == expected
+    assert set(outcome.proposal_rows[1]) == _TASK4_P1C_PROPOSAL_KEYS
+    assert [row["raw_topology_fingerprint"] for row in outcome.proposal_rows] == [
+        _task4_p1c_sha_topology(raw, case_input.case["cons"]),
+        _task4_p1c_sha_topology(raw, case_input.case["cons"]),
+    ]
+    assert outcome.proposal_rows[1]["intended_topology_fingerprint"] == _task4_p1c_sha_topology(
+        mutation, case_input.case["cons"]
+    )
+    assert outcome.proposal_rows[1]["realized_topology_fingerprint"] == _task4_p1c_sha_topology(
+        mutation, case_input.case["cons"]
+    )
+    assert all(type(row["intended_intent"]) is str and row["intended_intent"] == row["name"]
+               for row in outcome.proposal_rows)
+    assert set(outcome.label_row) == {
+        "edges", "contacts", "pin_paths", "proposal_ordinal", "proposal_name",
+        "base_cost", "teacher_cost", "record_weight",
+    }
+    assert outcome.label_row["edges"] == expected.label_row["edges"]
+    assert outcome.label_row["contacts"] == expected.label_row["contacts"]
+    assert outcome.label_row["pin_paths"] == expected.label_row["pin_paths"]
+    assert all(set(edge) == {"src", "dst", "axis", "margin", "kind", "weight"}
+               for edge in outcome.label_row["edges"])
+    assert all(set(contact) == {"a", "b", "axis", "a_before_b", "perp_margin", "weight"}
+               for contact in outcome.label_row["contacts"])
+    assert all(all(type(node) is int for node in path)
+               for path in outcome.label_row["pin_paths"])
+    assert outcome.label_row["proposal_ordinal"] == 1
+    assert outcome.label_row["proposal_name"] == "axis:0:1:0:0"
+    assert outcome.label_row["base_cost"] == 10.0 and outcome.label_row["teacher_cost"] == 8.0
+    assert outcome.label_row["record_weight"] == 1.25
+
+
+@pytest.mark.parametrize("mutation_cost", [10.0, 12.0])
+def test_task4_p1c_compiler_tie_or_worse_keeps_base_and_omits_scored_loser_rejection(mutation_cost):
+    t = _teacher(); case_input = _task4_p1c_case_input(t); raw = _task4_p1c_raw(case_input.case)
+    base = _task4_p1c_record(t, 0, "base", raw, raw, cost=10.0, energy=20.0,
+                              energy_status="recorded", hard={"hard_audit": True}, drift={"max_abs": 0.0})
+    loser = _task4_p1c_record(t, 1, "axis:0:1:0:0", _task4_p1c_mutation(raw), _task4_p1c_mutation(raw),
+                               cost=mutation_cost, energy=-20.0, energy_status="recorded",
+                               hard={"hard_audit": True}, drift={"max_abs": 0.0}, reason="not_selected")
+    lifecycle = t._CandidateLifecycle((base, loser), 0, 10.0, 10.0)
+    outcome = t._outcome_from_lifecycle(case_input, raw, lifecycle)
+    assert outcome == _task4_p1c_outcome(case_input, raw, lifecycle)
+    assert outcome.case_status == "winner_base_no_improvement"
+    assert outcome.label_row["record_weight"] == 1.0
+    assert outcome.rejection_rows == ()
+
+
+@pytest.mark.parametrize("reason", ["admission_failed", "hard_audit_failed", "intent_not_survived",
+                                     "official_infeasible", "official_invalid_cost", "official_evaluator_error"])
+def test_task4_p1c_compiler_stage_matrix_serializes_exact_nulls_and_rejection_bijection(reason):
+    t = _teacher(); case_input = _task4_p1c_case_input(t); raw = _task4_p1c_raw(case_input.case)
+    base = _task4_p1c_record(t, 0, "base", raw, raw, cost=10.0, energy=None,
+                              energy_status="unavailable", hard={"hard_audit": True}, drift={"max_abs": 0.0})
+    legal = None if reason == "admission_failed" else _task4_p1c_mutation(raw)
+    hard = {} if legal is None else ({"hard_audit": False} if reason == "hard_audit_failed" else {"hard_audit": True})
+    candidate = _task4_p1c_record(
+        t, 1, "axis:0:1:0:0", _task4_p1c_mutation(raw), legal,
+        cost=8.0 if reason not in {"official_infeasible", "official_invalid_cost", "official_evaluator_error"} else None,
+        energy=None, energy_status="not_reached", reason=reason,
+        hard=hard, drift={} if legal is None else {"max_abs": 0.0},
+    )
+    lifecycle = t._CandidateLifecycle((base, candidate), 0, 10.0, 10.0)
+    outcome = t._outcome_from_lifecycle(case_input, raw, lifecycle)
+    expected = _task4_p1c_outcome(case_input, raw, lifecycle)
+    assert outcome == expected
+    assert outcome.proposal_rows[0]["diagnostic_energy"] is None
+    assert outcome.proposal_rows[0]["energy_status"] == "unavailable"
+    assert outcome.proposal_rows[1]["intended_intent"] == outcome.proposal_rows[1]["name"]
+    assert tuple(outcome.rejection_rows) == _task4_p1c_expected_rejections(lifecycle)
+
+
+@pytest.mark.parametrize("base_reason", ["admission_failed", "hard_audit_failed", "intent_not_survived",
+                                          "official_infeasible", "official_invalid_cost", "official_evaluator_error"])
+def test_task4_p1c_compiler_base_unavailable_never_substitutes_scored_mutation(base_reason):
+    t = _teacher(); case_input = _task4_p1c_case_input(t); raw = _task4_p1c_raw(case_input.case)
+    base_legal = None if base_reason == "admission_failed" else raw
+    base = _task4_p1c_record(
+        t, 0, "base", raw, base_legal, reason=base_reason,
+        hard={} if base_legal is None else ({"hard_audit": False} if base_reason == "hard_audit_failed" else {"hard_audit": True}),
+        drift={} if base_legal is None else {"max_abs": 0.0},
+    )
+    mutation = _task4_p1c_mutation(raw)
+    scored_mutation = _task4_p1c_record(
+        t, 1, "axis:0:1:0:0", mutation, mutation, cost=8.0, energy=1.0,
+        energy_status="recorded", reason="base_unavailable",
+        hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    lifecycle = t._CandidateLifecycle((base, scored_mutation), None, None, None)
+    outcome = t._outcome_from_lifecycle(case_input, raw, lifecycle)
+    assert outcome == _task4_p1c_outcome(case_input, raw, lifecycle)
+    assert outcome.case_status == "base_unavailable"
+    assert outcome.label_row is None and outcome.base_cost is None and outcome.teacher_cost is None
+    assert not any(row["winner"] for row in outcome.proposal_rows)
+    assert outcome.proposal_rows[1]["official_cost"] == 8.0
+    assert tuple(outcome.rejection_rows) == _task4_p1c_expected_rejections(lifecycle)
+
+
+def test_task4_p1c_population_two_phase_hashes_full_eligible_population_and_nulls_incomplete():
+    t = _teacher()
+    rows = [
+        {"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+         "instance_id": "worker_2/layouts_0.th#0", "n": 0,
+         "base_cost": 4.0, "teacher_cost": 3.0},
+        {"relative_path": "worker_10/layouts_0.th", "layout_index": 1,
+         "instance_id": "worker_10/layouts_0.th#1", "n": 12},
+    ]
+    expected = _task4_p1c_canonical_population(rows)
+    population = t._PopulationAccumulator()
+    for row in rows:
+        population.register({key: row[key] for key in ("relative_path", "layout_index", "instance_id", "n")})
+    population.record_winner(rows[0]["instance_id"], rows[0]["base_cost"], rows[0]["teacher_cost"])
+    assert population.finish() == expected
+
+
+def test_task4_p1c_population_complete_metrics_and_protocol_errors_are_exact():
+    t = _teacher()
+    first = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+             "instance_id": "a", "n": 0}
+    second = {"relative_path": "worker_10/layouts_0.th", "layout_index": 1,
+              "instance_id": "b", "n": 12}
+    expected = _task4_p1c_canonical_population([
+        {**first, "base_cost": 4.0, "teacher_cost": 3.0},
+        {**second, "base_cost": 10.0, "teacher_cost": 7.0},
+    ])
+    population = t._PopulationAccumulator()
+    population.register(first); population.register(second)
+    with pytest.raises((ValueError, KeyError, RuntimeError)):
+        population.register(first)
+    with pytest.raises((ValueError, KeyError, RuntimeError)):
+        population.record_winner("unknown", 1.0, 1.0)
+    population.record_winner("a", 4.0, 3.0)
+    with pytest.raises((ValueError, KeyError, RuntimeError)):
+        population.record_winner("a", 4.0, 3.0)
+    population.record_winner("b", 10.0, 7.0)
+    assert population.finish() == expected
+
+
+def test_task4_p1c_teacher_main_registers_every_heldout_identity_before_process_and_cleans_population(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); _task4_shard(root)
+    _checkpoint, policy = _task4_verified_checkpoint(t, root); out = tmp_path / "out"; events = []
+
+    class PopulationSpy:
+        instances = []
+        def __init__(self):
+            self.rows = {}; self.aborted = False; type(self).instances.append(self)
+        def register(self, row):
+            events.append(("register", row["instance_id"])); self.rows[row["instance_id"]] = dict(row)
+        def record_winner(self, instance_id, base_cost, teacher_cost):
+            events.append(("winner", instance_id)); self.rows[instance_id].update(base_cost=base_cost, teacher_cost=teacher_cost)
+        def finish(self):
+            events.append(("finish",))
+            return _task4_p1c_canonical_population(list(self.rows.values()))
+        def abort(self):
+            self.aborted = True; events.append(("abort",))
+
+    def preflight(_policy, _checkpoint):
+        return _task4_expected_trust(policy)
+    def process(case_input):
+        events.append(("process", case_input.case["instance_id"]))
+        return _task4_p1c_mutation_outcome(t, case_input)
+    monkeypatch.setattr(t, "_PopulationAccumulator", PopulationSpy)
+    monkeypatch.setattr(t, "_CaseOutcome", _Task4CaseOutcome)
+    monkeypatch.setattr(t, "_runtime_hooks", lambda: _Task4Runtime(preflight, process, True))
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=policy) in (0, 1)
+    heldout = [event for event in events if event[1:] == ("worker_2/layouts_0.th#1",)]
+    assert heldout[:3] == [
+        ("register", "worker_2/layouts_0.th#1"),
+        ("process", "worker_2/layouts_0.th#1"),
+        ("winner", "worker_2/layouts_0.th#1"),
+    ]
+    assert PopulationSpy.instances and PopulationSpy.instances[0].aborted
+    assert events[-2:] == [("finish",), ("abort",)]
+
+
+def _task4_p1c_artifact_rows(out):
+    return {
+        name: _task4_jsonl(out / name)
+        for name in _TASK4_JSONL
+    } | {
+        "index": json.loads((out / "training_index.json").read_text()),
+        "manifest": json.loads((out / "g0_manifest.json").read_text()),
+    }
+
+
+@pytest.mark.parametrize("mode", ["mutation", "base_no_improvement"])
+def test_task4_p1c_teacher_main_artifacts_preserve_dynamic_winner_label_and_receipt_joins(
+        tmp_path, monkeypatch, mode):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    outcome_factory = (_task4_p1c_mutation_outcome if mode == "mutation"
+                       else _task4_p1c_base_no_improvement_outcome)
+    expected_status = "winner_mutation" if mode == "mutation" else "winner_base_no_improvement"
+    expected_name = "axis:0:1:0:0" if mode == "mutation" else "base"
+    expected_ordinal = 1 if mode == "mutation" else 0
+    expected_teacher_cost = 1.0 if mode == "mutation" else 1.1
+    expected_proposal_count = 2 if mode == "mutation" else 1
+    expected_positive_gain = 1 if mode == "mutation" else 0
+    calls, _ = _task4_install_custom_runtime(
+        t, monkeypatch, outcome_factory=lambda module, case_input:
+        outcome_factory(module, case_input),
+    )
+    result = t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert result in (0, 1)  # P1-C must not hard-code a G0 success result.
+    rows = _task4_p1c_artifact_rows(out)
+    corpus = rows["train_corpus.jsonl"] + rows["heldout_corpus.jsonl"]
+    labels = rows["train_labels.jsonl"] + rows["heldout_labels.jsonl"]
+    assert len(calls) == len(corpus) == len(labels) == 2
+    for case_input in calls:
+        iid = case_input.case["instance_id"]
+        index_row = next(row for row in rows["index"]["rows"] if row["instance_id"] == iid)
+        label = next(row for row in labels if row["instance_id"] == iid)
+        assert index_row["receipt"] == dataclasses.asdict(case_input.receipt)
+        assert index_row["status"] == expected_status
+        assert fingerprint_case(next(row for row in corpus if row["instance_id"] == iid)) == case_input.receipt.fingerprint
+        proposals = [row for row in rows["proposals.jsonl"] if row["instance_id"] == iid]
+        assert len(proposals) == expected_proposal_count
+        for row in (label, *proposals):
+            assert row["receipt"] == dataclasses.asdict(case_input.receipt)
+            assert row["partition"] == case_input.partition and row["sample_seed"] == case_input.sample_seed
+            if "ordinal" in row:
+                assert set(row) == _TASK4_P1C_PROPOSAL_KEYS | {
+                    "receipt", "instance_id", "partition", "sample_seed", "n",
+                }
+                assert type(row["intended_intent"]) is str and row["intended_intent"] == row["name"]
+        winner = next(row for row in proposals if row["winner"])
+        assert label["proposal_ordinal"] == expected_ordinal and label["proposal_name"] == expected_name
+        assert label["base_cost"] == 1.1 and label["teacher_cost"] == expected_teacher_cost
+        assert label["record_weight"] == 1.1 / expected_teacher_cost
+        assert winner["ordinal"] == expected_ordinal and winner["name"] == expected_name
+        assert winner["status"] == expected_status
+    assert rows["manifest"]["population"] == _task4_p1c_canonical_population([{
+        "relative_path": "worker_2/layouts_0.th", "layout_index": 1,
+        "instance_id": "worker_2/layouts_0.th#1", "n": 3,
+        "base_cost": 1.1, "teacher_cost": expected_teacher_cost,
+    }])
+    assert rows["manifest"]["coverage"] == {
+        "eligible_train": 1, "eligible_heldout": 1, "heldout_winners": 1,
+        "legal": True, "covered": True,
+        "mutation_proposals": 2 if mode == "mutation" else 0,
+        "mutation_admitted": 2 if mode == "mutation" else 0,
+        "mutation_intent_survived": 2 if mode == "mutation" else 0,
+        "positive_gain_heldout": expected_positive_gain,
+        "eligible_heldout_weight": math.exp(3 / 12),
+        "positive_gain_heldout_weight": expected_positive_gain * math.exp(3 / 12),
+        "rejection_counts": {
+            "admission_failed": 0, "hard_audit_failed": 0,
+            "intent_not_survived": 0, "official_infeasible": 0,
+            "official_invalid_cost": 0, "official_evaluator_error": 0,
+            "base_unavailable": 0,
+        },
+    }
+    assert rows["manifest"]["status"] == "complete"
+    assert rows["manifest"]["state"] == (
+        "TARGET_GAIN_MET" if mode == "mutation" else "STOP_HARD_GAIN_MISSED"
+    )
+    assert rows["manifest"]["training_authorized"] is (mode == "mutation")
+
+
+def test_task4_p1c_teacher_main_base_unavailable_retains_corpus_and_rejections_but_no_label(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    calls, _ = _task4_install_custom_runtime(
+        t, monkeypatch, outcome_factory=lambda module, case_input:
+        _task4_p1c_unavailable_outcome(module, case_input),
+    )
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 1
+    rows = _task4_p1c_artifact_rows(out)
+    corpus = rows["train_corpus.jsonl"] + rows["heldout_corpus.jsonl"]
+    assert len(corpus) == 2 and rows["train_labels.jsonl"] == rows["heldout_labels.jsonl"] == []
+    assert {row["status"] for row in rows["index"]["rows"]} == {"base_unavailable"}
+    assert len(rows["proposals.jsonl"]) == len(rows["rejections.jsonl"]) == 4
+    for case_input in calls:
+        iid = case_input.case["instance_id"]
+        envelope = _task4_envelope(case_input.case, dataclasses.asdict(case_input.receipt),
+                                   case_input.partition, case_input.sample_seed)
+        assert fingerprint_case(next(row for row in corpus if row["instance_id"] == iid)) == case_input.receipt.fingerprint
+        index_row = next(row for row in rows["index"]["rows"] if row["instance_id"] == iid)
+        assert index_row["receipt"] == dataclasses.asdict(case_input.receipt)
+        expected = _task4_p1c_unavailable_outcome(t, case_input)
+        proposals = [row for row in rows["proposals.jsonl"] if row["instance_id"] == iid]
+        rejections = [row for row in rows["rejections.jsonl"] if row["instance_id"] == iid]
+        assert [{key: value for key, value in row.items() if key not in envelope}
+                for row in proposals] == list(expected.proposal_rows)
+        assert [{key: value for key, value in row.items() if key not in envelope}
+                for row in rejections] == list(expected.rejection_rows)
+        assert all({key: row[key] for key in envelope} == envelope for row in (*proposals, *rejections))
+        assert all(set(row) == _TASK4_P1C_PROPOSAL_KEYS | set(envelope) for row in proposals)
+        assert all(set(row) == {"ordinal", "name", "stage", "reason"} | set(envelope)
+                   for row in rejections)
+    manifest = rows["manifest"]
+    assert manifest["status"] == "complete" and manifest["state"] == "KILLED_LEGALITY_OR_COVERAGE"
+    assert manifest["training_authorized"] is False
+    assert manifest["secondary_reasons"].count("base_unavailable") == 1
+    assert manifest["population"] == _task4_p1c_canonical_population([{
+        "relative_path": "worker_2/layouts_0.th", "layout_index": 1,
+        "instance_id": "worker_2/layouts_0.th#1", "n": 3,
+    }])
+    assert manifest["coverage"] == {
+        "eligible_train": 1, "eligible_heldout": 1, "heldout_winners": 0,
+        "legal": False, "covered": False,
+        "mutation_proposals": 2, "mutation_admitted": 2,
+        "mutation_intent_survived": 2, "positive_gain_heldout": 0,
+        "eligible_heldout_weight": math.exp(3 / 12),
+        "positive_gain_heldout_weight": 0.0,
+        "rejection_counts": {
+            "admission_failed": 0, "hard_audit_failed": 0,
+            "intent_not_survived": 0, "official_infeasible": 0,
+            "official_invalid_cost": 2, "official_evaluator_error": 0,
+            "base_unavailable": 2,
+        },
+    }
+
+
+@pytest.mark.parametrize("invalid", ["tampered_intent", "nonstring_intent", "two_winners",
+                                     "baseless_winner", "stage_null", "duplicate_rejection",
+                                     "label_mismatch"])
+def test_task4_p1c_invalid_runtime_outcome_aborts_transaction_before_destination(tmp_path, monkeypatch, invalid):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    def outcome(module, case_input):
+        value = _task4_p1c_mutation_outcome(module, case_input)
+        proposals = [dict(row) for row in value.proposal_rows]
+        rejections = list(value.rejection_rows); label = dict(value.label_row)
+        if invalid == "tampered_intent": proposals[1]["intended_intent"] = "base"
+        elif invalid == "nonstring_intent": proposals[1]["intended_intent"] = 1
+        elif invalid == "two_winners": proposals[0]["winner"] = True; proposals[0]["status"] = "winner_base_no_improvement"
+        elif invalid == "baseless_winner": proposals[0]["official_cost"] = None; proposals[0]["winner"] = False; proposals[0]["status"] = "not_selected"
+        elif invalid == "stage_null": proposals[1]["admission_status"] = "failed"; proposals[1]["realized_topology_fingerprint"] = "0" * 64
+        elif invalid == "duplicate_rejection":
+            rejections = [{"ordinal": 1, "name": "axis:0:1:0:0", "stage": "selection", "reason": "base_unavailable"}] * 2
+        elif invalid == "label_mismatch": label["proposal_ordinal"] = 0; label["proposal_name"] = "base"
+        return _Task4CaseOutcome(label, tuple(proposals), tuple(rejections), value.base_cost,
+                                 value.teacher_cost, value.legal, value.covered, value.case_status)
+    _task4_install_custom_runtime(t, monkeypatch, outcome_factory=outcome)
+    expected_error = {
+        "tampered_intent": "intended_intent", "nonstring_intent": "intended_intent",
+        "two_winners": "winner",
+        "baseless_winner": "base", "stage_null": "stage",
+        "duplicate_rejection": "rejection", "label_mismatch": "label mismatch",
+    }[invalid]
+    with pytest.raises(ValueError, match=expected_error):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert not out.exists()
+
+
+def test_task4_p1c_evidence_compiler_label_and_fingerprint_failures_abort_without_destination(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); _task4_shard(root)
+    _checkpoint, policy = _task4_verified_checkpoint(t, root)
+    monkeypatch.setattr(t, "_materialize_teacher_model", lambda *args: object())
+    for seam in ("compiler", "label", "fingerprint"):
+        out = tmp_path / seam
+        case = _task4_expected_case(0); raw = _task4_p1c_raw(case)
+        if seam == "compiler":
+            lifecycle = object()  # deliberately malformed compiler input
+        elif seam == "label":
+            bad_legal = raw.to(dtype=torch.float32)
+            record = _task4_p1c_record(
+                t, 0, "base", raw, bad_legal, cost=1.0, energy=None,
+                energy_status="unavailable", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+            )
+            lifecycle = t._CandidateLifecycle((record,), 0, 1.0, 1.0)
+        else:
+            raw = raw.clone(); raw[0, 0] = float("nan")
+            record = _task4_p1c_record(
+                t, 0, "base", _task4_p1c_raw(case), _task4_p1c_raw(case), cost=1.0,
+                energy=None, energy_status="unavailable", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+            )
+            lifecycle = t._CandidateLifecycle((record,), 0, 1.0, 1.0)
+        monkeypatch.setattr(t, "_sample_direct_once", lambda *args, _raw=raw: _raw)
+        monkeypatch.setattr(t, "_run_candidate_lifecycle", lambda *args, _life=lifecycle, **kwargs: _life)
+        with pytest.raises((ValueError, TypeError)):
+            t.teacher_main(_task4_args(root, out), _trust_policy=policy)
+        assert not out.exists()
+
+
+def test_task4_p1c_two_fresh_destinations_are_byte_identical_and_evidence_has_no_geometry_leaks(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    first, second = tmp_path / "first", tmp_path / "second"
+    _task4_install_custom_runtime(t, monkeypatch, outcome_factory=lambda module, ci: _task4_p1c_mutation_outcome(module, ci))
+    assert t.teacher_main(_task4_args(root, first), _trust_policy=_policy_for(root)) in (0, 1)
+    _task4_install_custom_runtime(t, monkeypatch, outcome_factory=lambda module, ci: _task4_p1c_mutation_outcome(module, ci))
+    assert t.teacher_main(_task4_args(root, second), _trust_policy=_policy_for(root)) in (0, 1)
+    assert {name: (first / name).read_bytes() for name in _TASK4_FILES} == {
+        name: (second / name).read_bytes() for name in _TASK4_FILES
+    }
+    evidence = {
+        "labels": _task4_jsonl(first / "train_labels.jsonl") + _task4_jsonl(first / "heldout_labels.jsonl"),
+        "proposals": _task4_jsonl(first / "proposals.jsonl"),
+        "rejections": _task4_jsonl(first / "rejections.jsonl"),
+        "manifest": json.loads((first / "g0_manifest.json").read_text()),
+    }
+    serialized = _task4_canonical_json(evidence)
+    for forbidden in (b'"original"', b'"legal"', b'"positions"', b'"rects"',
+                      b'"golden"', b"timestamp", str(root).encode()):
+        assert forbidden not in serialized
+    _task4_assert_no_forbidden_semantic_values(
+        evidence, (701, 703, 401, 403, 709, 719, 809, 811)
+    )
 
 
 def _p1b_reachable_forbidden(source):
