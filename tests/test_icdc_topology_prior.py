@@ -5081,70 +5081,800 @@ def test_collate_rejects_bad_labels_container(bad):
 def test_collate_rejects_wrong_label_instance_type():
     with pytest.raises(ValueError):
         collate_labels([object()], torch.device("cpu"), torch.float32)
-# P1-B RED: teacher-owned candidate lifecycle contract.
+
+
+# P1-B RED: teacher-owned, in-memory candidate lifecycle contract.
 def _p1b_case():
-    return {"n": 2, "area": [1., 1.], "cons": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
-            "b2b": [[0, 1, 2.5]], "p2b": [[0, 1, 3.5]], "pins": [[7., 11.]],
-            "tp": [[-1., -1., -1., -1.], [-1., -1., -1., -1.]],
-            "hpwl_ref": 13., "area_ref": 2.}
+    return {
+        "n": 2,
+        "area": [1.0, 1.0],
+        "cons": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+        "b2b": [[0, 1, 2.5]],
+        "p2b": [[0, 1, 3.5]],
+        "pins": [[7.0, 11.0]],
+        "tp": [[-1.0, -1.0, -1.0, -1.0], [-1.0, -1.0, -1.0, -1.0]],
+        "hpwl_ref": 13.0,
+        "area_ref": 2.0,
+    }
+
 
 def _p1b_raw():
-    return torch.tensor([[0., 0., 1., 1.], [2., 0., 1., 1.]], dtype=torch.float64)
+    return torch.tensor(
+        [[0.0, 0.0, 1.0, 1.0], [2.0, 0.0, 1.0, 1.0]],
+        dtype=torch.float64,
+    )
+
+
+def _p1b_stream():
+    return [
+        ("base", _p1b_raw()),
+        (
+            "axis:0:1:0:0",
+            torch.tensor(
+                [[0.0, 0.0, 1.0, 1.0], [-2.0, 0.0, 1.0, 1.0]],
+                dtype=torch.float64,
+            ),
+        ),
+    ]
+
 
 class _P1BScorer:
-    def __init__(self, *results): self.results, self.calls = list(results), []
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = []
+
     def evaluate_solution(self, *args, **kwargs):
-        self.calls.append((args, kwargs)); result = self.results.pop(0) if self.results else (True, 1.)
-        if isinstance(result, BaseException): raise result
-        if isinstance(result, tuple): return __import__("types").SimpleNamespace(is_feasible=result[0], cost_no_runtime=result[1])
+        self.calls.append((args, kwargs))
+        result = self.results.pop(0) if self.results else (True, 1.0)
+        if isinstance(result, BaseException):
+            raise result
+        if isinstance(result, tuple):
+            return __import__("types").SimpleNamespace(
+                is_feasible=result[0], cost_no_runtime=result[1]
+            )
         return result
 
-def _p1b_run(monkeypatch, scorer, *, admissions=None, hard=True, intent=True, energy=0.):
-    t, raw, case = _teacher(), _p1b_raw(), _p1b_case()
-    yielded = [("base", raw.clone()), ("axis:0:1:0:0", torch.tensor([[0.,0.,1.,1.],[1.,0.,1.,1.]], dtype=torch.float64))]
-    monkeypatch.setattr(t, "_GENERATE_PROPOSALS", lambda *a: ((n, x.clone()) for n, x in yielded), raising=False)
-    q = iter(admissions if admissions is not None else [(_p1b_raw(), torch.zeros((2,2), dtype=torch.float64))] * 2)
-    monkeypatch.setattr(t, "_ADMIT_PROPOSAL", lambda *a: next(q), raising=False)
-    monkeypatch.setattr(t, "_VERIFY_HARD_LEGAL", lambda *a: hard, raising=False)
-    monkeypatch.setattr(t, "_proposal_intent_holds", lambda *a: intent, raising=False)
-    monkeypatch.setattr(t, "_DIAGNOSTIC_ENERGY", lambda *a: energy, raising=False)
-    return t._run_candidate_lifecycle(raw, case, scorer=scorer, cfg=topology_prior.ProposalConfig())
 
-def test_task4_p1b_normal_schema_immutability(monkeypatch):
-    raw = _p1b_raw(); before = raw.clone(); out = _p1b_run(monkeypatch, _P1BScorer((True, 2.), (True, 1.)))
-    assert torch.equal(raw, before)  # helper sanity; lifecycle must not mutate input
+def _p1b_run(
+    monkeypatch,
+    scorer,
+    *,
+    stream=None,
+    admissions=None,
+    hard_results=None,
+    intent_results=None,
+    energy_results=None,
+    raw=None,
+    case=None,
+    cfg=None,
+    generator_error=None,
+    trace_out=None,
+):
+    t = _teacher()
+    raw = _p1b_raw() if raw is None else raw
+    case = _p1b_case() if case is None else case
+    cfg = topology_prior.ProposalConfig() if cfg is None else cfg
+    stream = _p1b_stream() if stream is None else stream
+    raw_before = raw.clone() if isinstance(raw, torch.Tensor) else raw
+    case_before = repr(case)
+    trace = {
+        "generator": [],
+        "yielded": [],
+        "admit": [],
+        "hard": [],
+        "intent": [],
+        "energy": [],
+    }
+    if trace_out is not None:
+        trace_out.update(trace)
+
+    def generate(rects, received_case, received_cfg):
+        trace["generator"].append(
+            (rects, rects.clone(), repr(received_case), received_cfg)
+        )
+        if generator_error is not None:
+            raise generator_error
+        for name, template in stream:
+            candidate = template.clone() if isinstance(template, torch.Tensor) else template
+            trace["yielded"].append(candidate)
+            yield name, candidate
+
+    admission_queue = None if admissions is None else iter(admissions)
+
+    def admit(proposal, received_case):
+        trace["admit"].append((proposal, proposal.clone(), repr(received_case)))
+        if admission_queue is None:
+            return proposal.clone(), torch.zeros((proposal.shape[0], 2), dtype=torch.float64)
+        result = next(admission_queue)
+        if result == "pass":
+            return proposal.clone(), torch.zeros((proposal.shape[0], 2), dtype=torch.float64)
+        return result
+
+    hard_queue = iter(hard_results if hard_results is not None else [{"legal": True}] * len(stream))
+
+    def verify_hard(legal, received_case):
+        trace["hard"].append((legal, legal.clone(), repr(received_case)))
+        return next(hard_queue)
+
+    intent_queue = iter(intent_results if intent_results is not None else [True] * len(stream))
+
+    def intent(name, legal, received_case):
+        trace["intent"].append((name, legal, legal.clone(), repr(received_case)))
+        return next(intent_queue)
+
+    energy_queue = iter(energy_results if energy_results is not None else [0.0] * len(stream))
+
+    def diagnostic_energy(legal, received_case):
+        trace["energy"].append((legal, legal.clone(), repr(received_case)))
+        result = next(energy_queue)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(t, "_GENERATE_PROPOSALS", generate, raising=False)
+    monkeypatch.setattr(t, "_ADMIT_PROPOSAL", admit, raising=False)
+    monkeypatch.setattr(t, "_VERIFY_HARD_LEGAL", verify_hard, raising=False)
+    monkeypatch.setattr(t, "_proposal_intent_holds", intent, raising=False)
+    monkeypatch.setattr(t, "_DIAGNOSTIC_ENERGY", diagnostic_energy, raising=False)
+    out = t._run_candidate_lifecycle(raw, case, scorer=scorer, cfg=cfg)
+    if isinstance(raw_before, torch.Tensor):
+        assert torch.equal(raw, raw_before)
+    assert repr(case) == case_before
+    return out, trace
+
+
+def _p1b_assert_accounting(out):
+    winners = [record for record in out.candidates if record.rejection_reason is None]
+    if out.winner_ordinal is None:
+        assert winners == []
+    else:
+        assert len(winners) == 1 and winners[0].ordinal == out.winner_ordinal
+    assert all(
+        record.rejection_reason is None
+        or (isinstance(record.rejection_reason, str) and record.rejection_reason)
+        for record in out.candidates
+    )
+
+
+def test_task4_p1b_normal_schema_order_immutability_and_accounting(monkeypatch):
+    raw = _p1b_raw()
+    case = _p1b_case()
+    stream = _p1b_stream()
+    raw_before = raw.clone()
+    case_before = repr(case)
+    scorer = _P1BScorer((True, 3.0), (True, 2.0))
+    out, trace = _p1b_run(
+        monkeypatch,
+        scorer,
+        raw=raw,
+        case=case,
+        stream=stream,
+        energy_results=[-100.0, 100.0],
+    )
+    assert torch.equal(raw, raw_before) and repr(case) == case_before
     assert dataclasses.is_dataclass(out) and dataclasses.is_dataclass(out.candidates[0])
-    assert [f.name for f in fields(out.candidates[0])] == ["ordinal","name","original","legal","drift","hard","official_cost","diagnostic_energy","energy_status","rejection_reason"]
-    assert [r.name for r in out.candidates] == ["base", "axis:0:1:0:0"] and [r.ordinal for r in out.candidates] == [0,1]
-    with pytest.raises(FrozenInstanceError): out.candidates[0].name = "x"
+    assert [field.name for field in fields(out)] == [
+        "candidates", "winner_ordinal", "base_cost", "teacher_cost"
+    ]
+    assert [field.name for field in fields(out.candidates[0])] == [
+        "ordinal", "name", "original", "legal", "drift", "hard",
+        "official_cost", "diagnostic_energy", "energy_status",
+        "rejection_reason",
+    ]
+    assert isinstance(out.candidates, tuple)
+    assert [record.ordinal for record in out.candidates] == [0, 1]
+    assert [record.name for record in out.candidates] == ["base", "axis:0:1:0:0"]
+    assert sum(record.name == "base" for record in out.candidates) == 1
+    assert len(trace["generator"]) == 1
+    generated_raw, generated_value, generated_case, generated_cfg = trace["generator"][0]
+    assert generated_raw.data_ptr() == raw.data_ptr()
+    assert torch.equal(generated_value, _p1b_raw())
+    assert generated_case == repr(_p1b_case())
+    assert generated_cfg == topology_prior.ProposalConfig()
+    for index, record in enumerate(out.candidates):
+        assert torch.equal(record.original, stream[index][1])
+        assert record.original.data_ptr() != trace["yielded"][index].data_ptr()
+        assert record.original.data_ptr() != generated_raw.data_ptr()
+        assert record.original.data_ptr() != trace["admit"][index][0].data_ptr()
+        assert record.legal.device.type == "cpu"
+        assert record.legal.dtype == torch.float64
+        assert record.drift == {"max_abs": 0.0}
+        assert record.hard == {"legal": True}
+    assert out.candidates[0].original.data_ptr() != out.candidates[1].original.data_ptr()
+    assert out.winner_ordinal == 1 and out.base_cost == 3.0 and out.teacher_cost == 2.0
+    assert out.candidates[0].rejection_reason == "not_selected"
+    assert out.candidates[1].rejection_reason is None
+    _p1b_assert_accounting(out)
+    with pytest.raises(FrozenInstanceError):
+        out.winner_ordinal = 0
+    with pytest.raises(FrozenInstanceError):
+        out.candidates[0].name = "changed"
 
-@pytest.mark.parametrize("stream", [[], [("mutation", _p1b_raw())], [("base",_p1b_raw()),("base",_p1b_raw())], [("",_p1b_raw())], [(1,_p1b_raw())], [("base", [[0.,0.]])], [("base", torch.ones(3,4))], [("base", torch.ones(2,4,dtype=torch.float32))]])
-def test_task4_p1b_generator_invalid_fail_closed(monkeypatch, stream):
-    t = _teacher(); monkeypatch.setattr(t, "_GENERATE_PROPOSALS", lambda *a: iter(stream), raising=False)
-    with pytest.raises((ValueError, TypeError, RuntimeError)): t._run_candidate_lifecycle(_p1b_raw(), _p1b_case(), scorer=_P1BScorer(), cfg=topology_prior.ProposalConfig())
 
-def test_task4_p1b_admission_hard_intent_gates(monkeypatch):
-    out = _p1b_run(monkeypatch, _P1BScorer((True,2.)), admissions=[(_p1b_raw(),torch.zeros(2,2,dtype=torch.float64)),None], hard=True)
+@pytest.mark.parametrize(
+    "stream",
+    [
+        [],
+        [("axis:0:1:0:0", _p1b_raw())],
+        [("axis:0:1:0:0", _p1b_raw()), ("base", _p1b_raw())],
+        [("base", _p1b_raw()), ("base", _p1b_raw())],
+        [("base", _p1b_raw()), ("axis:0:1:0:0", _p1b_raw()), ("axis:0:1:0:0", _p1b_raw())],
+        [("base", _p1b_raw()), ("mutation", _p1b_raw())],
+        [("base", _p1b_raw()), ("contact:1:0:1:0:1", _p1b_raw()), ("axis:0:1:0:0", _p1b_raw())],
+        [("base", _p1b_raw()), ("pin:0:1:0:1", _p1b_raw()), ("axis:0:1:0:0", _p1b_raw())],
+        [("base", _p1b_raw()), ("contact:1:0:1:0:1", _p1b_raw()), ("pin:0:1:0:1", _p1b_raw())],
+        [("", _p1b_raw())],
+        [(1, _p1b_raw())],
+        ["not-a-pair"],
+        [("base", [[0.0, 0.0, 1.0, 1.0]])],
+        [("base", torch.ones((1, 4), dtype=torch.float64))],
+        [("base", torch.ones((2, 4), dtype=torch.float32))],
+        [("base", torch.tensor([[0.0, 0.0, 1.0, 1.0], [float("nan"), 0.0, 1.0, 1.0]], dtype=torch.float64))],
+        [("base", torch.tensor([[0.0, 0.0, 0.0, 1.0], [2.0, 0.0, 1.0, 1.0]], dtype=torch.float64))],
+    ],
+)
+def test_task4_p1b_invalid_generator_stream_fails_before_candidate_work(monkeypatch, stream):
+    scorer = _P1BScorer()
+    trace = {}
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        _p1b_run(monkeypatch, scorer, stream=stream, trace_out=trace)
+    assert scorer.calls == []
+    assert trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
+
+
+def test_task4_p1b_generator_exception_fails_closed(monkeypatch):
+    scorer = _P1BScorer()
+    trace = {}
+    with pytest.raises((ValueError, RuntimeError)):
+        _p1b_run(
+            monkeypatch,
+            scorer,
+            generator_error=RuntimeError("generator"),
+            trace_out=trace,
+        )
+    assert scorer.calls == []
+    assert trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
+
+
+@pytest.mark.parametrize(
+    "raw,case,cfg",
+    [
+        (torch.ones((1, 4), dtype=torch.float64), _p1b_case(), topology_prior.ProposalConfig()),
+        (_p1b_raw().float(), _p1b_case(), topology_prior.ProposalConfig()),
+        (torch.tensor([[0.0, 0.0, 1.0, 1.0], [float("inf"), 0.0, 1.0, 1.0]], dtype=torch.float64), _p1b_case(), topology_prior.ProposalConfig()),
+        (torch.tensor([[0.0, 0.0, -1.0, 1.0], [2.0, 0.0, 1.0, 1.0]], dtype=torch.float64), _p1b_case(), topology_prior.ProposalConfig()),
+        (_p1b_raw(), {**_p1b_case(), "area": [1.0]}, topology_prior.ProposalConfig()),
+        (_p1b_raw(), _p1b_case(), object()),
+    ],
+)
+def test_task4_p1b_invalid_input_fails_before_generation(monkeypatch, raw, case, cfg):
+    scorer = _P1BScorer()
+    trace = {}
+    with pytest.raises((TypeError, ValueError)):
+        _p1b_run(
+            monkeypatch,
+            scorer,
+            raw=raw,
+            case=case,
+            cfg=cfg,
+            trace_out=trace,
+        )
+    assert scorer.calls == []
+    assert all(trace[key] == [] for key in trace)
+
+
+def test_task4_p1b_admission_failure_is_opaque_and_processing_continues(monkeypatch):
+    scorer = _P1BScorer((True, 2.0))
+    out, trace = _p1b_run(monkeypatch, scorer, admissions=["pass", None], energy_results=[7.0])
+    assert len(trace["admit"]) == 2
+    assert len(trace["hard"]) == len(trace["intent"]) == len(trace["energy"]) == 1
+    assert len(scorer.calls) == 1
+    assert out.winner_ordinal == 0 and out.base_cost == out.teacher_cost == 2.0
+    assert out.candidates[0].rejection_reason is None
     assert out.candidates[1].rejection_reason == "admission_failed"
-    out = _p1b_run(monkeypatch, _P1BScorer((True,2.)), hard=False); assert out.candidates[0].rejection_reason == "hard_audit_failed"
-    out = _p1b_run(monkeypatch, _P1BScorer((True,2.)), intent=False); assert out.candidates[0].rejection_reason == "intent_not_survived"
+    assert out.candidates[1].energy_status == "not_reached"
+    _p1b_assert_accounting(out)
 
-@pytest.mark.parametrize("result,reason", [(RuntimeError(),"official_evaluator_error"), (None,"official_evaluator_error"), ((False,1.),"official_infeasible"), ((True,True),"official_invalid_cost"), ((True,float('nan')),"official_invalid_cost"), ((True,0.),"official_invalid_cost")])
-def test_task4_p1b_official_failure_matrix(monkeypatch, result, reason):
-    out = _p1b_run(monkeypatch, _P1BScorer((True,3.), result)); assert out.candidates[1].rejection_reason == reason
 
-def test_task4_p1b_official_cost_beats_energy_and_ties(monkeypatch):
-    out = _p1b_run(monkeypatch, _P1BScorer((True,3.),(True,2.)), energy=100.); assert out.winner_ordinal == 1
-    out = _p1b_run(monkeypatch, _P1BScorer((True,2.),(True,2.))); assert out.winner_ordinal == 0
-    out = _p1b_run(monkeypatch, _P1BScorer((True,2.),(True,3.))); assert out.winner_ordinal == 0
+@pytest.mark.parametrize(
+    "hard_result",
+    [
+        {"legal": False},
+        {},
+        {"legal": "true"},
+        {"legal": 1},
+        {"legal": True, "evidence": 1},
+        {"legal": True, "evidence": False},
+    ],
+)
+def test_task4_p1b_hard_failure_never_reaches_intent_score_or_energy(monkeypatch, hard_result):
+    scorer = _P1BScorer((True, 2.0))
+    out, trace = _p1b_run(
+        monkeypatch,
+        scorer,
+        hard_results=[{"legal": True}, hard_result],
+        intent_results=[True],
+        energy_results=[5.0],
+    )
+    assert len(trace["hard"]) == 2
+    assert len(trace["intent"]) == len(scorer.calls) == len(trace["energy"]) == 1
+    assert out.candidates[1].rejection_reason == "hard_audit_failed"
+    assert out.candidates[1].energy_status == "not_reached"
+    _p1b_assert_accounting(out)
 
-@pytest.mark.parametrize("energy", [RuntimeError(), float('nan'), float('inf'), True, "x"])
-def test_task4_p1b_energy_unavailable(monkeypatch, energy):
-    out = _p1b_run(monkeypatch, _P1BScorer((True,1.)), energy=energy); assert out.winner_ordinal == 0 and out.candidates[0].energy_status == "unavailable"
 
-def test_task4_p1b_base_unavailable(monkeypatch):
-    out = _p1b_run(monkeypatch, _P1BScorer((True,2.)), admissions=[None,(_p1b_raw(),torch.zeros(2,2,dtype=torch.float64))]); assert out.winner_ordinal is None and out.base_cost is out.teacher_cost is None and out.candidates[1].rejection_reason == "base_unavailable"
+def test_task4_p1b_intent_loss_never_reaches_score_or_energy(monkeypatch):
+    scorer = _P1BScorer((True, 2.0))
+    out, trace = _p1b_run(
+        monkeypatch,
+        scorer,
+        intent_results=[True, False],
+        energy_results=[5.0],
+    )
+    assert len(trace["intent"]) == 2
+    assert len(scorer.calls) == len(trace["energy"]) == 1
+    assert out.candidates[1].rejection_reason == "intent_not_survived"
+    assert out.candidates[1].energy_status == "not_reached"
+    _p1b_assert_accounting(out)
 
-def test_task4_p1b_scope_guard():
-    path = Path("scripts/probes/icdc_topology_teacher.py"); assert _task4_static_forbidden(path.read_text(), require_exact_loads=True)
-    tree = ast.parse(path.read_text()); local = {n.name:n for n in tree.body if isinstance(n, ast.FunctionDef)}; assert "_run_candidate_lifecycle" in local
+
+def test_task4_p1b_all_downstream_stages_use_admitted_legal_geometry(monkeypatch):
+    original = _p1b_raw()
+    legal = torch.tensor(
+        [[10.0, 5.0, 1.0, 1.0], [12.0, 5.0, 1.0, 1.0]],
+        dtype=torch.float64,
+    )
+    scorer = _P1BScorer((True, 2.0))
+    out, trace = _p1b_run(
+        monkeypatch,
+        scorer,
+        stream=[("base", original)],
+        admissions=[(legal, torch.zeros((2, 2), dtype=torch.float64))],
+        energy_results=[9.0],
+    )
+    assert torch.equal(out.candidates[0].original, original)
+    assert torch.equal(out.candidates[0].legal, legal)
+    assert out.candidates[0].original.data_ptr() != out.candidates[0].legal.data_ptr()
+    assert torch.equal(trace["hard"][0][1], legal)
+    assert torch.equal(trace["intent"][0][2], legal)
+    assert torch.equal(trace["energy"][0][1], legal)
+    args, kwargs = scorer.calls[0]
+    assert args[0]["positions"] == legal.tolist()
+    assert kwargs == {"median_runtime": 1.0}
+
+
+@pytest.mark.parametrize(
+    "scorer",
+    [
+        lambda *args, **kwargs: None,
+        object(),
+        __import__("types").SimpleNamespace(evaluate_solution=1),
+    ],
+)
+def test_task4_p1b_scorer_requires_callable_evaluate_solution_before_generation(monkeypatch, scorer):
+    trace = {}
+    with pytest.raises((TypeError, ValueError)):
+        _p1b_run(monkeypatch, scorer, trace_out=trace)
+    assert all(trace[key] == [] for key in trace)
+
+
+def test_task4_p1b_official_evaluator_adapter_is_exact(monkeypatch):
+    scorer = _P1BScorer((True, 2.0))
+    out, _trace = _p1b_run(
+        monkeypatch,
+        scorer,
+        stream=[("base", _p1b_raw())],
+        energy_results=[0.0],
+    )
+    assert out.winner_ordinal == 0
+    assert len(scorer.calls) == 1
+    args, kwargs = scorer.calls[0]
+    assert len(args) == 8 and kwargs == {"median_runtime": 1.0}
+    solution, baseline, cons, b2b, p2b, pins, area, tp = args
+    assert solution == {
+        "positions": [[0.0, 0.0, 1.0, 1.0], [2.0, 0.0, 1.0, 1.0]],
+        "runtime": 1.0,
+    }
+    assert all(type(value) is float for row in solution["positions"] for value in row)
+    assert baseline == {"hpwl_baseline": 13.0, "area_baseline": 2.0}
+    assert cons.device.type == "cpu" and cons.dtype == torch.int64
+    assert tuple(cons.shape) == (2, 5) and cons.tolist() == _p1b_case()["cons"]
+    expected = [
+        (b2b, (1, 3), _p1b_case()["b2b"]),
+        (p2b, (1, 3), _p1b_case()["p2b"]),
+        (pins, (1, 2), _p1b_case()["pins"]),
+        (area, (2,), _p1b_case()["area"]),
+    ]
+    for tensor, shape, values in expected:
+        assert tensor.device.type == "cpu" and tensor.dtype == torch.float64
+        assert tuple(tensor.shape) == shape and tensor.tolist() == values
+    assert tp == _p1b_case()["tp"]
+
+
+def test_task4_p1b_official_cost_beats_inverted_energy(monkeypatch):
+    scorer = _P1BScorer((True, 3.0), (True, 2.0))
+    out, trace = _p1b_run(
+        monkeypatch, scorer, energy_results=[-100.0, 100.0]
+    )
+    assert len(trace["energy"]) == 2
+    assert [record.official_cost for record in out.candidates] == [3.0, 2.0]
+    assert [record.diagnostic_energy for record in out.candidates] == [-100.0, 100.0]
+    assert [record.energy_status for record in out.candidates] == ["recorded", "recorded"]
+    assert out.winner_ordinal == 1
+    assert out.candidates[0].rejection_reason == "not_selected"
+    assert out.candidates[1].rejection_reason is None
+    _p1b_assert_accounting(out)
+
+
+@pytest.mark.parametrize("mutation_cost", [2.0, 3.0])
+def test_task4_p1b_tie_or_worse_mutation_keeps_base(monkeypatch, mutation_cost):
+    scorer = _P1BScorer((True, 2.0), (True, mutation_cost))
+    out, _trace = _p1b_run(monkeypatch, scorer, energy_results=[10.0, -10.0])
+    assert out.winner_ordinal == 0
+    assert out.base_cost == out.teacher_cost == 2.0
+    assert out.candidates[0].rejection_reason is None
+    assert out.candidates[1].official_cost == mutation_cost
+    assert out.candidates[1].rejection_reason == "not_selected"
+    _p1b_assert_accounting(out)
+
+
+_P1B_MISSING_FEASIBLE = __import__("types").SimpleNamespace(cost_no_runtime=1.0)
+_P1B_MISSING_COST = __import__("types").SimpleNamespace(is_feasible=True)
+
+
+@pytest.mark.parametrize(
+    "result,reason",
+    [
+        (RuntimeError("scorer"), "official_evaluator_error"),
+        (None, "official_evaluator_error"),
+        (object(), "official_evaluator_error"),
+        ({"is_feasible": True, "cost_no_runtime": 1.0}, "official_evaluator_error"),
+        (_P1B_MISSING_FEASIBLE, "official_evaluator_error"),
+        (_P1B_MISSING_COST, "official_evaluator_error"),
+        ((None, 1.0), "official_evaluator_error"),
+        ((1, 1.0), "official_evaluator_error"),
+        ((False, 1.0), "official_infeasible"),
+        ((True, True), "official_invalid_cost"),
+        ((True, "1"), "official_invalid_cost"),
+        ((True, float("nan")), "official_invalid_cost"),
+        ((True, float("inf")), "official_invalid_cost"),
+        ((True, 0.0), "official_invalid_cost"),
+        ((True, -1.0), "official_invalid_cost"),
+    ],
+)
+def test_task4_p1b_official_failure_has_one_reason_and_no_energy(monkeypatch, result, reason):
+    scorer = _P1BScorer((True, 3.0), result)
+    out, trace = _p1b_run(monkeypatch, scorer, energy_results=[4.0])
+    assert len(scorer.calls) == 2
+    assert len(trace["energy"]) == 1
+    assert out.candidates[0].diagnostic_energy == 4.0
+    assert out.candidates[1].official_cost is None
+    assert out.candidates[1].diagnostic_energy is None
+    assert out.candidates[1].energy_status == "not_reached"
+    assert out.candidates[1].rejection_reason == reason
+    _p1b_assert_accounting(out)
+
+
+@pytest.mark.parametrize(
+    "energy_result",
+    [RuntimeError("energy"), float("nan"), float("inf"), True, "bad"],
+)
+def test_task4_p1b_unavailable_energy_does_not_block_scored_winner(monkeypatch, energy_result):
+    scorer = _P1BScorer((True, 1.0))
+    out, trace = _p1b_run(
+        monkeypatch,
+        scorer,
+        stream=[("base", _p1b_raw())],
+        energy_results=[energy_result],
+    )
+    assert len(scorer.calls) == len(trace["energy"]) == 1
+    assert out.winner_ordinal == 0 and out.base_cost == out.teacher_cost == 1.0
+    assert out.candidates[0].official_cost == 1.0
+    assert out.candidates[0].diagnostic_energy is None
+    assert out.candidates[0].energy_status == "unavailable"
+    assert out.candidates[0].rejection_reason is None
+    _p1b_assert_accounting(out)
+
+
+def test_task4_p1b_base_unavailable_keeps_scored_mutation_evidence(monkeypatch):
+    scorer = _P1BScorer((True, 2.0))
+    out, trace = _p1b_run(
+        monkeypatch,
+        scorer,
+        admissions=[None, "pass"],
+        energy_results=[7.0],
+    )
+    assert len(trace["admit"]) == 2
+    assert len(trace["hard"]) == len(trace["intent"]) == 1
+    assert len(scorer.calls) == len(trace["energy"]) == 1
+    assert torch.equal(trace["energy"][0][1], _p1b_stream()[1][1])
+    assert out.winner_ordinal is None
+    assert out.base_cost is None and out.teacher_cost is None
+    assert out.candidates[0].official_cost is None
+    assert out.candidates[0].rejection_reason == "admission_failed"
+    assert out.candidates[1].official_cost == 2.0
+    assert out.candidates[1].diagnostic_energy == 7.0
+    assert out.candidates[1].energy_status == "recorded"
+    assert out.candidates[1].rejection_reason == "base_unavailable"
+    _p1b_assert_accounting(out)
+
+
+@pytest.mark.parametrize(
+    "base_failure,expected_reason",
+    [
+        ("hard", "hard_audit_failed"),
+        ("intent", "intent_not_survived"),
+        ("official", "official_evaluator_error"),
+    ],
+)
+def test_task4_p1b_base_late_failure_keeps_mutation_evidence_without_winner(
+    monkeypatch, base_failure, expected_reason
+):
+    scorer_results = (
+        [RuntimeError("base scorer"), (True, 2.0)]
+        if base_failure == "official"
+        else [(True, 2.0)]
+    )
+    hard_results = (
+        [{"legal": False}, {"legal": True}]
+        if base_failure == "hard"
+        else [{"legal": True}, {"legal": True}]
+    )
+    intent_results = (
+        [False, True]
+        if base_failure == "intent"
+        else [True] if base_failure == "hard" else [True, True]
+    )
+    scorer = _P1BScorer(*scorer_results)
+    out, trace = _p1b_run(
+        monkeypatch,
+        scorer,
+        hard_results=hard_results,
+        intent_results=intent_results,
+        energy_results=[7.0],
+    )
+    expected_scorer_calls = 2 if base_failure == "official" else 1
+    assert len(scorer.calls) == expected_scorer_calls
+    assert len(trace["energy"]) == 1
+    assert out.winner_ordinal is None
+    assert out.base_cost is None and out.teacher_cost is None
+    assert out.candidates[0].rejection_reason == expected_reason
+    assert out.candidates[1].official_cost == 2.0
+    assert out.candidates[1].diagnostic_energy == 7.0
+    assert out.candidates[1].rejection_reason == "base_unavailable"
+    _p1b_assert_accounting(out)
+
+
+def _p1b_reachable_forbidden(source):
+    tree = ast.parse(source)
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    methods = {
+        f"{owner.name}.{node.name}": node
+        for owner in ast.walk(tree)
+        if isinstance(owner, ast.ClassDef)
+        for node in owner.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    lambdas = {
+        f"<lambda@{node.lineno}>": node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Lambda)
+    }
+    classes = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+    callables = {**functions, **methods, **lambdas}
+    if "_run_candidate_lifecycle" not in functions:
+        return {"missing:_run_candidate_lifecycle"}
+
+    global_aliases = {}
+
+    def resolve(node, aliases):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            base = resolve(node.value, aliases)
+            return f"{base}.{node.attr}" if base else node.attr
+        if isinstance(node, ast.Call):
+            return resolve(node.func, aliases)
+        if isinstance(node, ast.Lambda):
+            return f"<lambda@{node.lineno}>"
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            base = resolve(node.value, aliases)
+            key = str(node.slice.value)
+            return aliases.get(f"{base}.{key}", f"{base}.{key}")
+        return ""
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                global_aliases[item.asname or item.name.split(".")[0]] = item.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for item in node.names:
+                global_aliases[item.asname or item.name] = f"{node.module}.{item.name}"
+        elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+              and isinstance(node.targets[0], ast.Name)):
+            value = resolve(node.value, global_aliases)
+            if value:
+                global_aliases[node.targets[0].id] = value
+        elif isinstance(node, ast.ClassDef):
+            global_aliases[node.name] = node.name
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            value = resolve(node.value, global_aliases)
+            if value:
+                global_aliases[node.target.id] = value
+
+    forbidden_tokens = (
+        "extract_sparse_label", "_g0_state", "_weighted_population",
+        "teacher_main", "writer", "jsonl", "manifest", "publish", "fsync",
+        "stagedpublication", "write_text", "write_bytes",
+    )
+    pending = ["_run_candidate_lifecycle"]
+    reachable = set()
+    findings = set()
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        reachable.add(name)
+        aliases = dict(global_aliases)
+
+        def executable_nodes(root):
+            for child in ast.iter_child_nodes(root):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    continue
+                yield child
+                yield from executable_nodes(child)
+
+        body_nodes = list(executable_nodes(callables[name]))
+        assignments = sorted(
+            (
+                node for node in body_nodes
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+            ),
+            key=lambda node: node.lineno,
+        )
+        for assignment in assignments:
+            target_node = (
+                assignment.targets[0]
+                if isinstance(assignment, ast.Assign) and len(assignment.targets) == 1
+                else assignment.target if isinstance(assignment, ast.AnnAssign) else None
+            )
+            if target_node is None:
+                continue
+            if isinstance(target_node, ast.Name) and isinstance(assignment.value, ast.Dict):
+                target = target_node.id
+                for key, value_node in zip(assignment.value.keys, assignment.value.values):
+                    if isinstance(key, ast.Constant):
+                        value = resolve(value_node, aliases)
+                        if value:
+                            aliases[f"{target}.{key.value}"] = value
+                continue
+            if (isinstance(target_node, ast.Subscript)
+                    and isinstance(target_node.slice, ast.Constant)):
+                target = resolve(target_node, aliases)
+                value = resolve(assignment.value, aliases)
+                if target and value:
+                    aliases[target] = value
+                continue
+            if not isinstance(target_node, ast.Name):
+                continue
+            value = resolve(assignment.value, aliases)
+            if value:
+                aliases[target_node.id] = value
+        for node in body_nodes:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                path = resolve(node, aliases)
+            elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+                path = resolve(node, aliases)
+            else:
+                continue
+            lowered = path.lower()
+            if any(token in lowered for token in forbidden_tokens):
+                findings.add(f"{name}:value:{path}")
+        for call in (
+            node for node in body_nodes if isinstance(node, ast.Call)
+        ):
+            path = resolve(call.func, aliases)
+            lowered = path.lower()
+            if any(token in lowered for token in forbidden_tokens):
+                findings.add(f"{name}:{path}")
+            if lowered == "open" or lowered.endswith(".open"):
+                mode_node = (
+                    call.args[1] if len(call.args) > 1 else
+                    next((item.value for item in call.keywords if item.arg == "mode"), None)
+                )
+                if (isinstance(mode_node, ast.Constant)
+                        and isinstance(mode_node.value, str)
+                        and any(flag in mode_node.value for flag in "wax+")):
+                    findings.add(f"{name}:write-open:{path}")
+            if (lowered == "write" or lowered.endswith(".write")
+                    or lowered.endswith(".write_text")
+                    or lowered.endswith(".write_bytes")):
+                findings.add(f"{name}:write-call:{path}")
+            target = path if path in callables else path.rsplit(".", 1)[-1]
+            if target in callables and target not in reachable:
+                pending.append(target)
+            if path in classes and f"{path}.__init__" in callables:
+                pending.append(f"{path}.__init__")
+    return findings
+
+
+def test_task4_p1b_reachable_scope_excludes_label_writer_and_g0():
+    source = Path("scripts/probes/icdc_topology_teacher.py").read_text()
+    assert _task4_static_forbidden(source, require_exact_loads=True)
+    assert _p1b_reachable_forbidden(source) == set()
+
+
+def test_task4_p1b_reachable_scope_checker_detects_indirect_calls():
+    assert _p1b_reachable_forbidden(
+        "def helper():\n  extract_sparse_label()\n"
+        "def _run_candidate_lifecycle():\n  helper()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def helper():\n  sink = extract_sparse_label\n  sink()\n"
+        "def _run_candidate_lifecycle():\n  helper()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def helper(writer):\n  writer.write({})\n"
+        "def _run_candidate_lifecycle():\n  helper(None)\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def _run_candidate_lifecycle():\n"
+        "  hooks = {'x': extract_sparse_label}\n"
+        "  hooks['x']()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def _run_candidate_lifecycle():\n  globals()['_g0_state']()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "class Sink:\n  def run(self):\n    extract_sparse_label()\n"
+        "def _run_candidate_lifecycle():\n  sink = Sink()\n  sink.run()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def _run_candidate_lifecycle():\n"
+        "  def never_called():\n    _g0_state()\n"
+        "  return 1\n"
+    ) == set()
+    assert _p1b_reachable_forbidden(
+        "def _run_candidate_lifecycle():\n"
+        "  sink = lambda: extract_sparse_label()\n"
+        "  sink()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def _run_candidate_lifecycle():\n"
+        "  sink: object = extract_sparse_label\n"
+        "  sink()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def _run_candidate_lifecycle():\n"
+        "  hooks = {}\n"
+        "  hooks['x'] = _g0_state\n"
+        "  hooks['x']()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "class Sink:\n"
+        "  def __init__(self):\n    extract_sparse_label()\n"
+        "def _run_candidate_lifecycle():\n  Sink()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "import functools\n"
+        "def _run_candidate_lifecycle():\n"
+        "  sink = functools.partial(extract_sparse_label)\n"
+        "  sink()\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def _run_candidate_lifecycle():\n"
+        "  open('proposals.jsonl', 'w')\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "from pathlib import Path\n"
+        "def _run_candidate_lifecycle():\n"
+        "  Path('proposals.jsonl').write_text('x')\n"
+    )
+    assert _p1b_reachable_forbidden(
+        "def unrelated():\n  _g0_state()\n"
+        "def _run_candidate_lifecycle():\n  return 1\n"
+    ) == set()
