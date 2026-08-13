@@ -529,7 +529,10 @@ def test_task4_materializer_rejects_malformed_payload(kind):
 
 
 def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
-    t = _teacher(); direct, diagnostic = t._build_teacher_batches(_task4_case_input(t).case, torch.device("cpu"))
+    t = _teacher(); case = _task4_case_input(t).case
+    if hasattr(t, "_sanitize_case"):
+        t._sanitize_case(case, artifact=True)
+    direct, diagnostic = t._build_teacher_batches(case, torch.device("cpu"))
     for key in ("area", "tp", "b2b", "p2b", "pins", "scale"):
         assert direct[key].dtype == torch.float32 and direct[key].device.type == "cpu"
     assert direct["cons"].dtype == torch.int64 and direct["cons"].shape[0] == 1
@@ -538,7 +541,7 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
     assert diagnostic["area"].dtype == torch.float64 and diagnostic["cons"].dtype == torch.int64
     assert diagnostic["scale"].item() == direct["scale"].double().item()
     assert diagnostic["hpwl_ref"].item() == 4.0 and diagnostic["area_ref"].item() == 4.0
-    f64_scale = torch.sqrt(torch.tensor(_task4_case_input(t).case["area"], dtype=torch.float64).sum())
+    f64_scale = torch.sqrt(torch.tensor(case["area"], dtype=torch.float64).sum())
     assert diagnostic["scale"].item() != f64_scale.item()
 
 
@@ -549,7 +552,7 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
         calls["sample"].append((args, kwargs, kwargs["generator"].initial_seed()))
         return torch.rand((1, 3, 4), generator=kwargs["generator"])
     def decoder(raw, area, cons, tp, scale):
-        calls["decode"].append((raw, area, cons, tp, scale)); return raw.squeeze(0).double()
+        calls["decode"].append((raw, area, cons, tp, scale)); return raw.double()
     monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", sampler, raising=False)
     monkeypatch.setattr(t, "_DECODE_RECTS", decoder, raising=False)
     case = _task4_case_input(t).case
@@ -569,22 +572,29 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
 
 
 def test_task4_runtime_materializes_lazily_caches_and_never_reopens(monkeypatch):
-    t = _teacher(); runtime = t._runtime_hooks(); assert runtime.authorizing is False
-    payload = _task4_teacher_payload(); materialized = object(); calls = []
-    monkeypatch.setattr(t, "_materialize_teacher_model",
-                        lambda payload, device: calls.append((payload, device)) or materialized,
-                        raising=False)
-    monkeypatch.setattr(t, "_sample_direct_once",
-                        lambda state, case, seed: calls.append(("sample", state, seed)) or torch.ones((2, 4), dtype=torch.float64),
-                        raising=False)
+    t = _teacher(); root = Path("/tmp") / "task4-red-runtime"; root.mkdir(exist_ok=True)
+    payload = _task4_teacher_payload(); path = root / "unused.th"; torch.save(payload, path)
+    identity = t._checkpoint_identity(payload)
+    policy = t.TeacherTrustPolicy(root, hashlib.sha256(path.read_bytes()).hexdigest(), identity,
+                                  t._SCORER_SHA256, "iccad2026_evaluate_cost_no_runtime_v1", "2.0.5")
+    runtime = t._runtime_hooks(); assert runtime.authorizing is False
+    runtime.preflight(policy, path)
+    materialize_calls = []; sample_calls = []; materialized = object()
     monkeypatch.setattr(torch, "load", lambda *a, **k: pytest.fail("reopened checkpoint"))
+    import icdc.engine as engine
+    if hasattr(engine, "load_model"):
+        monkeypatch.setattr(engine, "load_model", lambda *a, **k: pytest.fail("legacy reopen"))
+    monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"), raising=False)
+    monkeypatch.setattr(t, "_materialize_teacher_model", lambda p, d: materialize_calls.append((p, d)) or materialized, raising=False)
+    monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sample_calls.append((s, seed)) or torch.ones((3, 4), dtype=torch.float64), raising=False)
     ci1 = _task4_case_input(t, 101); ci2 = _task4_case_input(t, 202)
     with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
         runtime.process_case(ci1)
     with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
         runtime.process_case(ci2)
-    assert len([x for x in calls if isinstance(x, tuple) and x and x[0] == "sample"]) == 2
-    assert len([x for x in calls if isinstance(x, tuple) and x and x[0] != "sample"]) == 1
+    assert len(materialize_calls) == 1 and materialize_calls[0][1].type == "cpu"
+    assert t._checkpoint_identity(materialize_calls[0][0]) == identity
+    assert [seed for _, seed in sample_calls] == [101, 202]
 
 
 _TASK4_FILES = (
