@@ -1131,6 +1131,23 @@ def _task4_stage_fd_targets(stage):
     return targets
 
 
+def _task4_path_fd_targets(path):
+    """Live descriptors for a file path, including a deleted original inode."""
+    fd_root = Path("/proc/self/fd")
+    if not fd_root.is_dir():
+        pytest.skip("/proc/self/fd is unavailable")
+    path_text = str(Path(path).absolute())
+    targets = []
+    for fd in fd_root.iterdir():
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target == path_text or target.startswith(path_text + " "):
+            targets.append((fd.name, target))
+    return targets
+
+
 @dataclasses.dataclass(frozen=True)
 class _Task4CaseInput:
     case: collections.abc.Mapping
@@ -2624,6 +2641,38 @@ def test_teacher_ingestion_rejects_forged_builder_provenance_before_processing(
     assert len(forged) == 1 and calls == [] and not out.exists()
 
 
+def test_teacher_ingestion_rejects_builder_that_mutates_verified_two_row_source(
+        tmp_path, monkeypatch):
+    """All replay facts must be frozen before a replaceable summary callback runs."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; shard = _task4_shard(root)
+    out = tmp_path / "out"; calls = []; published = []; returned = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls,
+                        outcome_factory=_task4_p1c_mutation_outcome)
+    real_builder = t._verified_shard_summary
+    expected_raw = shard.read_bytes()
+    witness_raw, witness_source = t._read_verified_shard(root, 2, 0)
+    assert witness_raw == expected_raw and t._validate_source_shard(witness_source)[0] == 2
+
+    def mutate_then_summarize(raw, source, worker, layout):
+        # This is deliberately a non-raising hostile extension point.  It
+        # changes every batch tensor in place, then returns a self-consistent
+        # summary of the now-truncated decoded payload.
+        before = int(source[0].shape[0])
+        for tensor in source:
+            tensor.resize_((1, *tensor.shape[1:]))
+        returned.append((before, int(source[0].shape[0])))
+        return real_builder(raw, source, worker, layout)
+
+    monkeypatch.setattr(t, "_verified_shard_summary", mutate_then_summarize)
+    monkeypatch.setattr(t, "_publish_staging",
+                        lambda *args: published.append(args))
+    with pytest.raises(ValueError):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    final_raw, final_source = t._read_verified_shard(root, 2, 0)
+    assert returned == [(2, 1)] and calls == [] and not published and not out.exists()
+    assert final_raw == expected_raw and t._validate_source_shard(final_source)[0] == 2
+
+
 def test_population_finish_rejects_nonfinite_aggregate_even_when_each_product_is_finite():
     t = _teacher(); acc = t._PopulationAccumulator()
     try:
@@ -2644,6 +2693,30 @@ def test_population_finish_rejects_nonfinite_aggregate_even_when_each_product_is
     if db_path:
         assert all(not Path(f"{db_path}{suffix}").exists()
                    for suffix in ("", "-journal", "-wal", "-shm"))
+
+
+def test_population_finish_rejects_nonfinite_incomplete_aggregate_after_last_update():
+    t = _teacher(); acc = t._PopulationAccumulator()
+    try:
+        # Keep the aggregate intentionally incomplete.  A final-only metric
+        # check would otherwise notice the infinite base mean by accident.
+        acc.register({"relative_path": "worker_0/layouts_0.th", "layout_index": 0,
+                      "instance_id": "unscored", "n": 0})
+        for index in range(11):
+            row = {"relative_path": f"worker_2/layouts_{index}.th",
+                   "layout_index": index + 1, "instance_id": f"row-{index}", "n": 8000}
+            acc.register(row)
+            weight = math.exp(row["n"] / 12)
+            assert math.isfinite(weight)
+            assert math.isfinite(weight * 5e17)
+            assert math.isfinite(weight * 2.5e17)
+            acc.record_winner(row["instance_id"], 5e17, 2.5e17)
+        with pytest.raises(ValueError):
+            acc.finish()
+    finally:
+        acc.abort()
+    assert all(not Path(f"{acc._db_path}{suffix}").exists()
+               for suffix in ("", "-journal", "-wal", "-shm"))
 
 
 def test_population_abort_does_not_unlink_foreign_replacement(tmp_path):
@@ -2668,6 +2741,98 @@ def test_population_abort_preserves_untracked_foreign_sidecar(tmp_path, suffix):
         assert sidecar.read_bytes() == b"foreign-sidecar"
     finally:
         sidecar.unlink(missing_ok=True)
+
+
+def test_population_abort_refuses_main_replacement_after_ownership_check(tmp_path, monkeypatch):
+    t = _teacher(); acc = t._PopulationAccumulator(); db_path = Path(acc._db_path)
+    moved = tmp_path / "moved-owned-population"; real_stat = t.os.stat; attacked = {}
+
+    def stat_then_replace(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        candidate = Path(path)
+        if candidate == db_path and not attacked:
+            original = result
+            candidate.rename(moved)
+            candidate.write_bytes(b"foreign-after-population-check")
+            foreign = real_stat(candidate)
+            attacked.update(
+                original=(original.st_dev, original.st_ino),
+                foreign=(foreign.st_dev, foreign.st_ino),
+            )
+        return result
+
+    monkeypatch.setattr(t.os, "stat", stat_then_replace)
+    try:
+        acc.abort()
+        assert attacked and moved.exists()
+        assert db_path.exists(), "post-check replacement must remain at its original path"
+        assert db_path.read_bytes() == b"foreign-after-population-check"
+        assert (db_path.stat().st_dev, db_path.stat().st_ino) == attacked["foreign"]
+    finally:
+        try:
+            if acc._db is not None:
+                acc._db.close()
+        finally:
+            db_path.unlink(missing_ok=True)
+
+
+def test_population_abort_closes_active_connection_before_preserving_foreign_journal():
+    t = _teacher(); acc = t._PopulationAccumulator(); db = acc._db
+    assert db is not None
+    main = Path(acc._db_path); journal = Path(f"{main}-journal")
+    db.execute(
+        "INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) "
+        "VALUES (?,?,?,?,NULL,NULL,?)",
+        ("worker_2/layouts_0.th", 0, "active", 1, 1.0),
+    )
+    # This direct write intentionally leaves SQLite's transaction active.  The
+    # replacement journal was never captured as an owned sidecar.
+    assert journal.is_file()
+    assert "-journal" not in t._POP_SIDECARS.get(id(acc), {})
+    journal.unlink(missing_ok=True)
+    journal.write_bytes(b"foreign-untracked-journal")
+    foreign = journal.stat()
+    try:
+        acc.abort()
+        with pytest.raises(t.sqlite3.ProgrammingError):
+            db.execute("SELECT 1")
+        assert not main.exists()
+        assert journal.read_bytes() == b"foreign-untracked-journal"
+        assert (journal.stat().st_dev, journal.stat().st_ino) == (foreign.st_dev, foreign.st_ino)
+        assert not _task4_path_fd_targets(main)
+        assert not _task4_path_fd_targets(journal)
+    finally:
+        try:
+            db.close()
+        except t.sqlite3.ProgrammingError:
+            pass
+        main.unlink(missing_ok=True); journal.unlink(missing_ok=True)
+
+
+def test_population_ownership_metadata_is_torn_down_before_object_id_reuse():
+    t = _teacher()
+    owners = getattr(t, "_POP_OWNERS", None)
+    sidecars = getattr(t, "_POP_SIDECARS", None)
+    assert isinstance(owners, dict) and isinstance(sidecars, dict)
+    before_owners = {key: set(value) for key, value in owners.items()}
+    before_sidecars = {key: dict(value) for key, value in sidecars.items()}
+    retained = []
+    try:
+        for _ in range(16):
+            acc = t._PopulationAccumulator(); object_id = id(acc)
+            acc.abort()
+            assert object_id not in owners and object_id not in sidecars
+            retained.append(weakref.ref(acc))
+            del acc
+        gc.collect()
+        assert all(reference() is None for reference in retained)
+        assert {key: set(value) for key, value in owners.items()} == before_owners
+        assert {key: dict(value) for key, value in sidecars.items()} == before_sidecars
+    finally:
+        # A failing implementation may have leaked bookkeeping only; release
+        # all Python objects so the following tests cannot observe this test's
+        # allocator state.
+        gc.collect()
 
 
 def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
@@ -2695,6 +2860,89 @@ def test_cleanup_owned_staging_backend_race_preserves_foreign_directory(tmp_path
     monkeypatch.setattr(t, "_remove_owned_staging_contents_fd", race)
     assert t._cleanup_owned_staging(lease) is False
     assert moved.exists() and owned.is_dir() and (owned / "sentinel").exists()
+
+
+def test_cleanup_owned_staging_closes_root_fd_when_content_removal_raises(tmp_path, monkeypatch):
+    t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
+    lease = t._new_staging_lease(owned); observed_fds = []
+
+    def fail_after_root_open(owned_fd):
+        observed_fds.append(owned_fd)
+        raise OSError(errno.EIO, "injected content cleanup failure")
+
+    monkeypatch.setattr(t, "_remove_owned_staging_contents_fd", fail_after_root_open)
+    assert t._cleanup_owned_staging(lease) is False
+    assert observed_fds
+    assert not _task4_stage_fd_targets(owned), (
+        "a failed descriptor-relative cleanup must close its verified root fd"
+    )
+
+
+def test_cleanup_owned_staging_refuses_leaf_replacement_after_initial_stat(
+        tmp_path, monkeypatch):
+    t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
+    leaf = owned / "owned-leaf"; leaf.write_bytes(b"owned")
+    moved = tmp_path / "moved-owned-leaf"; lease = t._new_staging_lease(owned)
+    real_stat = t.os.stat; attacked = {}
+
+    def stat_then_replace(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if (path == leaf.name and kwargs.get("dir_fd") is not None
+                and kwargs.get("follow_symlinks") is False and not attacked):
+            leaf.rename(moved)
+            leaf.write_bytes(b"foreign-after-stat")
+            foreign = leaf.stat()
+            attacked.update(identity=(foreign.st_dev, foreign.st_ino))
+        return result
+
+    monkeypatch.setattr(t.os, "stat", stat_then_replace)
+    assert t._cleanup_owned_staging(lease) is False
+    assert attacked and moved.read_bytes() == b"owned"
+    assert leaf.read_bytes() == b"foreign-after-stat"
+    assert (leaf.stat().st_dev, leaf.stat().st_ino) == attacked["identity"]
+
+
+def test_cleanup_owned_staging_refuses_child_directory_replacement_after_fstat(
+        tmp_path, monkeypatch):
+    t = _teacher(); owned = tmp_path / "stage"; child = owned / "owned-child"
+    child.mkdir(parents=True); moved = tmp_path / "moved-owned-child"
+    lease = t._new_staging_lease(owned); child_identity = (child.stat().st_dev, child.stat().st_ino)
+    real_fstat = t.os.fstat; attacked = {}
+
+    def fstat_then_replace(fd):
+        result = real_fstat(fd)
+        if ((result.st_dev, result.st_ino) == child_identity and not attacked):
+            child.rename(moved)
+            child.mkdir()
+            foreign = child.stat()
+            attacked.update(identity=(foreign.st_dev, foreign.st_ino))
+        return result
+
+    monkeypatch.setattr(t.os, "fstat", fstat_then_replace)
+    assert t._cleanup_owned_staging(lease) is False
+    assert attacked and moved.is_dir() and child.is_dir()
+    assert (child.stat().st_dev, child.stat().st_ino) == attacked["identity"]
+
+
+def test_cleanup_owned_staging_refuses_root_replacement_after_final_identity_check(
+        tmp_path, monkeypatch):
+    t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
+    lease = t._new_staging_lease(owned); moved = tmp_path / "moved-owned-stage"
+    real_matches = t._path_matches_lease; attacked = {}
+
+    def match_then_replace(path, candidate_lease):
+        result = real_matches(path, candidate_lease)
+        if result and Path(path) == owned and not attacked:
+            owned.rename(moved)
+            owned.mkdir()
+            foreign = owned.stat()
+            attacked.update(identity=(foreign.st_dev, foreign.st_ino))
+        return result
+
+    monkeypatch.setattr(t, "_path_matches_lease", match_then_replace)
+    assert t._cleanup_owned_staging(lease) is False
+    assert attacked and moved.is_dir() and owned.is_dir()
+    assert (owned.stat().st_dev, owned.stat().st_ino) == attacked["identity"]
 
 
 def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monkeypatch):
@@ -2783,6 +3031,50 @@ def test_teacher_normal_case_spool_close_rejects_foreign_replacement(
     replacement = Path(attacked["path"])
     assert moved.exists() and (moved.stat().st_dev, moved.stat().st_ino) == attacked["moved"]
     assert replacement.exists() and replacement.read_bytes() == b"foreign-after-close"
+    assert (replacement.stat().st_dev, replacement.stat().st_ino) == attacked["foreign"]
+
+
+def test_teacher_normal_case_spool_close_refuses_post_check_replacement(
+        tmp_path, monkeypatch):
+    """A normal spool close must not unlink a replacement after its stat check."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"; stages = []; moved = tmp_path / "moved-owned-case-spool"
+    _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
+    real_staging = t._new_staging; real_stat = t.os.stat; attacked = {}; published = []
+    spool_stat_count = 0
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+
+    def stat_then_replace(path, *args, **kwargs):
+        nonlocal spool_stat_count
+        result = real_stat(path, *args, **kwargs)
+        candidate = Path(path)
+        if candidate.name == "case_spool.sqlite":
+            spool_stat_count += 1
+        # The creation identity reads dev and ino separately; the third stat
+        # is the normal close-to-remove ownership observation.
+        if candidate.name == "case_spool.sqlite" and spool_stat_count == 3 and not attacked:
+            original = result
+            candidate.rename(moved)
+            candidate.write_bytes(b"foreign-after-case-spool-check")
+            foreign = real_stat(candidate)
+            attacked.update(
+                path=candidate,
+                original=(original.st_dev, original.st_ino),
+                foreign=(foreign.st_dev, foreign.st_ino),
+            )
+        return result
+
+    monkeypatch.setattr(t.os, "stat", stat_then_replace)
+    monkeypatch.setattr(t, "_publish_staging",
+                        lambda *args: published.append(args))
+    with pytest.raises(ValueError):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert attacked and not published and not out.exists()
+    replacement = Path(attacked["path"])
+    assert moved.exists() and replacement.read_bytes() == b"foreign-after-case-spool-check"
     assert (replacement.stat().st_dev, replacement.stat().st_ino) == attacked["foreign"]
 
 
