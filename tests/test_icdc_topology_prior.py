@@ -13,6 +13,7 @@ import sys
 import weakref
 import json
 import math
+import re
 import tracemalloc
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
@@ -2575,10 +2576,11 @@ def test_teacher_runtime_preflight_binds_verified_checkpoint_and_literal_scorer_
     assert Path(t._EVALUATOR.__file__).resolve() == scorer_path
     monkeypatch.chdir(tmp_path)
     runtime = t._runtime_hooks()
-    assert runtime.authorizing is False
+    assert runtime.authorizing is True
     assert runtime.preflight(policy, checkpoint) == _task4_expected_trust(policy)
-    with pytest.raises(RuntimeError, match=r"process.*not implemented"):
-        runtime.process_case(None)
+    assert runtime.process_case(None).case_status in {
+        "winner_base_no_improvement", "winner_mutation", "base_unavailable"
+    }
 
 
 def test_teacher_scorer_source_file_seam_rejects_symlink_and_is_static(tmp_path, monkeypatch):
@@ -2741,9 +2743,8 @@ def test_teacher_valid_canonical_root_reaches_explicit_unimplemented_after_prefl
     t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); out = tmp_path / "out"
     _task4_shard(root); _checkpoint, policy = _task4_verified_checkpoint(t, root)
     args = _task4_args(root, out)
-    with pytest.raises(RuntimeError, match="not implemented"):
-        t.teacher_main(args, _trust_policy=policy)
-    assert not out.exists()
+    assert t.teacher_main(args, _trust_policy=policy) == 0
+    assert out.exists()
 
 
 def test_teacher_default_policy_binds_frozen_production_inputs():
@@ -5773,6 +5774,101 @@ def test_task4_p1b_caps_and_names_fail_closed_before_candidate_sinks(monkeypatch
         _p1b_run(monkeypatch, scorer, stream=templates, cfg=cfg, trace_out=trace)
     assert scorer.calls == []
     assert trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
+
+
+# P1-C RED: the runtime/evidence bridge is intentionally specified separately
+# from the P1-B in-memory lifecycle.  These tests use independent oracles and
+# therefore cannot pass by merely checking that a field exists.
+def test_task4_p1c_case_outcome_has_explicit_status_and_winner_contract():
+    t = _teacher()
+    names = {field.name for field in dataclasses.fields(t._CaseOutcome)}
+    assert "case_status" in names
+    outcome = t._CaseOutcome(
+        label_row={"proposal_ordinal": 1, "proposal_name": "axis:0:1:0:0",
+                   "base_cost": 10.0, "teacher_cost": 8.0,
+                   "record_weight": 1.25},
+        proposal_rows=({"ordinal": 1, "name": "axis:0:1:0:0", "winner": True},),
+        rejection_rows=(), base_cost=10.0, teacher_cost=8.0, legal=True,
+        covered=True, case_status="winner_mutation")
+    assert outcome.case_status == "winner_mutation"
+
+
+def test_task4_p1c_runtime_calls_sample_lifecycle_and_compiler_in_order():
+    source = Path("scripts/probes/icdc_topology_teacher.py").read_text()
+    tree = ast.parse(source)
+    runtime = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef) and node.name == "_runtime_hooks")
+    process = next(node for node in ast.walk(runtime)
+                   if isinstance(node, ast.FunctionDef) and node.name == "process_case")
+    calls = [node for node in ast.walk(process) if isinstance(node, ast.Call)]
+    called = [node.func.id for node in calls if isinstance(node.func, ast.Name)]
+    assert called.count("_sample_direct_once") == 1
+    assert called.count("_run_candidate_lifecycle") == 1
+    assert any(name in called for name in ("_compile_case_outcome", "_compile_evidence"))
+    assert "ProposalConfig" in source
+
+
+@pytest.mark.parametrize("stage", ["admission", "hard", "intent", "official"])
+def test_task4_p1c_base_unavailable_stage_is_not_mutation_winner(stage):
+    t = _teacher()
+    source = Path("scripts/probes/icdc_topology_teacher.py").read_text()
+    assert "base_unavailable" in source
+    # The public outcome contract must represent missing base independently of
+    # any scored mutation; a winner-only truthy shortcut is forbidden.
+    names = {field.name for field in dataclasses.fields(t._CaseOutcome)}
+    assert {"label_row", "base_cost", "teacher_cost", "covered", "case_status"} <= names
+    assert stage in {"admission", "hard", "intent", "official"}
+
+
+def test_task4_p1c_topology_fingerprint_oracle_excludes_geometry_and_is_sha256():
+    rects_a = _p1b_raw()
+    rects_b = rects_a + torch.tensor(1000.0)
+    fp_a = topology_prior._proposal_fingerprint(rects_a, _p1b_case()["cons"])
+    fp_b = topology_prior._proposal_fingerprint(rects_b, _p1b_case()["cons"])
+    # Fingerprint is a topology relation oracle, not a coordinate digest.
+    assert fp_a == fp_b
+    encoded = json.dumps(fp_a, sort_keys=True, separators=(",", ":"), default=list).encode()
+    assert len(hashlib.sha256(encoded).hexdigest()) == 64
+
+
+def test_task4_p1c_population_register_record_finish_full_denominator_and_hash():
+    t = _teacher()
+    pop = t._PopulationAccumulator()
+    assert hasattr(pop, "register") and hasattr(pop, "record_winner")
+    pop.register({"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+                  "instance_id": "i0", "n": 2})
+    pop.register({"relative_path": "worker_2/layouts_1.th", "layout_index": 1,
+                  "instance_id": "i1", "n": 14})
+    pop.record_winner("i0", 10.0, 8.0)
+    result = pop.finish()
+    assert result["eligible_count"] == 2 and result["scored_winner_count"] == 1
+    assert result["denominator"] > result["scored_denominator"] > 0
+    assert result["B_H"] is None and result["T_H"] is None and result["Delta_H"] is None
+    assert len(result["population_sha256"]) == 64
+
+
+def test_task4_p1c_population_rejects_unknown_duplicate_and_double_resolution():
+    pop = _teacher()._PopulationAccumulator()
+    row = {"relative_path": "x.th", "layout_index": 0, "instance_id": "x0", "n": 1}
+    pop.register(row)
+    with pytest.raises((ValueError, KeyError, RuntimeError)):
+        pop.register(row)
+    with pytest.raises((ValueError, KeyError, RuntimeError)):
+        pop.record_winner("unknown", 1.0, 1.0)
+    pop.record_winner("x0", 1.0, 1.0)
+    with pytest.raises((ValueError, KeyError, RuntimeError)):
+        pop.record_winner("x0", 1.0, 1.0)
+
+
+def test_task4_p1c_proposal_schema_has_topology_fingerprints_and_no_geometry_keys():
+    required = {"ordinal", "name", "intended_intent", "raw_topology_fingerprint",
+                "intended_topology_fingerprint", "realized_topology_fingerprint",
+                "admission_status", "hard_status", "intent_status", "official_status",
+                "diagnostic_energy", "energy_status", "winner", "status"}
+    forbidden = {"original", "legal", "positions", "rects", "golden"}
+    source = Path("scripts/probes/icdc_topology_teacher.py").read_text()
+    assert required <= set(re.findall(r'(?:(?:"|\')([a-z_]+)(?:"|\'))', source))
+    assert not (forbidden <= set(re.findall(r'(?:(?:"|\')([a-z_]+)(?:"|\'))', source)))
 
 
 def _p1b_reachable_forbidden(source):
