@@ -1937,17 +1937,22 @@ def _task4_verified_checkpoint(t, root):
     path = root / "unused.th"
     torch.save(checkpoint, path)
     identity = t._checkpoint_identity(checkpoint)
+    scorer_path = (t._REPO / "scripts" / "iccad2026_evaluate.py").resolve()
+    assert hashlib.sha256(scorer_path.read_bytes()).hexdigest() == t._SCORER_SHA256
     policy = t.TeacherTrustPolicy(
         root, hashlib.sha256(path.read_bytes()).hexdigest(), identity,
-        hashlib.sha256(Path("scripts/iccad2026_evaluate.py").read_bytes()).hexdigest(),
+        t._SCORER_SHA256,
         "iccad2026_evaluate_cost_no_runtime_v1", "2.0.5",
     )
     return path, policy
 
 
-def test_teacher_runtime_preflight_binds_verified_checkpoint_and_literal_scorer_contract(tmp_path):
+def test_teacher_runtime_preflight_binds_verified_checkpoint_and_literal_scorer_contract(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
     checkpoint, policy = _task4_verified_checkpoint(t, root)
+    scorer_path = (t._REPO / "scripts" / "iccad2026_evaluate.py").resolve()
+    assert Path(t._EVALUATOR.__file__).resolve() == scorer_path
+    monkeypatch.chdir(tmp_path)
     runtime = t._runtime_hooks()
     assert runtime.authorizing is False
     assert runtime.preflight(policy, checkpoint) == _task4_expected_trust(policy)
@@ -1955,31 +1960,31 @@ def test_teacher_runtime_preflight_binds_verified_checkpoint_and_literal_scorer_
         runtime.process_case(None)
 
 
-@pytest.mark.parametrize("broken", [
-    "sha", "shapely_available", "shapely_version", "signature",
-    "metrics", "weights",
+@pytest.mark.parametrize("broken, expected_label", [
+    ("scorer_sha256", "scorer_sha256"),
+    ("shapely_available", "shapely_available"),
+    ("shapely_version", "shapely_version"),
+    ("evaluate_solution_signature", "evaluate_solution_signature"),
+    ("cost_no_runtime", "cost_no_runtime"),
+    ("compute_total_score_weighting", "compute_total_score_weighting"),
 ])
-def test_teacher_runtime_preflight_rejects_broken_literal_scorer_contract(tmp_path, monkeypatch, broken):
+def test_teacher_runtime_preflight_rejects_broken_literal_scorer_contract(tmp_path, monkeypatch, broken, expected_label):
     t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
     checkpoint, policy = _task4_verified_checkpoint(t, root)
-    evaluator = getattr(t, "_EVALUATOR", type("Evaluator", (), {})())
-    monkeypatch.setattr(t, "_EVALUATOR", evaluator, raising=False)
+    evaluator = t._EVALUATOR
     if broken == "shapely_version":
-        import shapely
-        monkeypatch.setattr(t, "shapely", shapely, raising=False)
-    if broken == "sha":
+        monkeypatch.setattr(t.shapely, "__version__", "0.0.0")
+    if broken == "scorer_sha256":
         policy = dataclasses.replace(policy, expected_scorer_sha256="0" * 64)
     elif broken == "shapely_available":
-        monkeypatch.setattr(evaluator, "SHAPELY_AVAILABLE", False, raising=False)
-    elif broken == "shapely_version":
-        monkeypatch.setattr(t.shapely, "__version__", "0.0.0", raising=False)
-    elif broken == "signature":
-        monkeypatch.setattr(evaluator, "evaluate_solution", lambda bad: bad, raising=False)
-    elif broken == "metrics":
-        monkeypatch.setattr(evaluator, "SolutionMetrics", object, raising=False)
+        monkeypatch.setattr(evaluator, "SHAPELY_AVAILABLE", False)
+    elif broken == "evaluate_solution_signature":
+        monkeypatch.setattr(evaluator, "evaluate_solution", lambda bad: bad)
+    elif broken == "cost_no_runtime":
+        monkeypatch.delattr(evaluator.SolutionMetrics, "cost_no_runtime", raising=False)
     else:
-        monkeypatch.setattr(evaluator, "compute_total_score", lambda costs, counts: sum(costs), raising=False)
-    with pytest.raises(ValueError, match=r"(scorer|shapely|signature|weight|contract)"):
+        monkeypatch.setattr(evaluator, "compute_total_score", lambda costs, counts: sum(costs))
+    with pytest.raises(ValueError, match=expected_label):
         t._runtime_hooks().preflight(policy, checkpoint)
 
 
