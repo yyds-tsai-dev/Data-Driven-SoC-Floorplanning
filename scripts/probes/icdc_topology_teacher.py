@@ -150,6 +150,13 @@ def _sample_seed(seed: int, case_id: str, ordinal: int) -> int:
 
 
 def _is_integral(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 0 or value.device.type != "cpu" or value.dtype == torch.bool:
+            return False
+        try:
+            value = value.item()
+        except RuntimeError:
+            return False
     if isinstance(value, bool):
         return False
     if isinstance(value, numbers.Integral):
@@ -576,17 +583,17 @@ def _new_staging(destination: Path) -> Path:
 def _iter_approved_shards(root: Path) -> list[tuple[int, int, Path]]:
     found: list[tuple[int, int, Path]] = []
     for worker in root.iterdir():
-        if worker.name.startswith("worker_") and worker.is_symlink(): raise ValueError("numeric worker symlink")
-        if not worker.is_dir() or not worker.name.startswith("worker_"):
+        wbody = worker.name[7:] if worker.name.startswith("worker_") else ""
+        if wbody.isdigit() and worker.is_symlink(): raise ValueError("numeric worker symlink")
+        if not worker.is_dir() or not wbody.isdigit():
             continue
-        try: wid = int(worker.name[7:])
-        except ValueError: continue
+        wid = int(wbody)
         for shard in worker.iterdir():
-            if shard.name.startswith("layouts_") and shard.name.endswith(".th") and shard.is_symlink(): raise ValueError("numeric shard symlink")
-            if not shard.is_file() or not shard.name.startswith("layouts_") or not shard.name.endswith(".th"):
+            sbody = shard.name[8:-3] if shard.name.startswith("layouts_") and shard.name.endswith(".th") else ""
+            if sbody.isdigit() and shard.is_symlink(): raise ValueError("numeric shard symlink")
+            if not shard.is_file() or not sbody.isdigit():
                 continue
-            try: lid = int(shard.name[8:-3])
-            except ValueError: continue
+            lid = int(sbody)
             found.append((wid, lid, shard))
     return sorted(found, key=lambda x: (x[0], x[1]))
 
@@ -615,7 +622,7 @@ def _read_verified_shard(root: Path, worker: int, layout: int) -> tuple[bytes, A
 def _validate_source_shard(source: Any) -> tuple[int, int]:
     if not isinstance(source, (tuple, list)) or len(source) != 7:
         raise ValueError("source schema")
-    if any(not isinstance(t, torch.Tensor) or t.device.type != "cpu" or t.requires_grad or t.dtype == torch.bool or not t.is_floating_point() or not bool(torch.isfinite(t).all()) for t in source):
+    if any(not isinstance(t, torch.Tensor) or t.device.type != "cpu" or t.requires_grad or t.layout != torch.strided or t.dtype == torch.bool or not t.is_floating_point() for t in source):
         raise ValueError("source tensors")
     inp, b2b, p2b, pins, tree, fp, metrics = source
     if inp.ndim != 3 or inp.shape[2] != 6 or b2b.ndim != 3 or b2b.shape[2] != 3 or p2b.ndim != 3 or p2b.shape[2] != 3 or pins.ndim != 3 or pins.shape[2] != 2 or tree.ndim != 3 or tree.shape[2] != 3 or fp.ndim != 3 or fp.shape[2] != 4 or metrics.ndim != 2 or metrics.shape[1] != 8:
@@ -624,20 +631,31 @@ def _validate_source_shard(source: Any) -> tuple[int, int]:
     if b < 1 or n < 1 or any(t.shape[0] != b for t in source[1:]):
         raise ValueError("source batch")
     if tree.shape[1] != n - 1: raise ValueError("source tree")
+    if not bool(torch.isfinite(torch.cat([t.reshape(-1) for t in source])).all()):
+        raise ValueError("source tensors")
     for row in inp:
         seen_pad = False
         for item in row:
             pad = float(item[0]) == -1.0
             if pad: seen_pad = True
             elif seen_pad or float(item[0]) <= 0: raise ValueError("area padding")
-    for tensor, width in ((b2b, 3), (p2b, 3), (pins, 2)):
+            elif any(not _is_integral(x) for x in item[1:]): raise ValueError("constraint")
+    for tensor, width, kind in ((b2b, 3, "b2b"), (p2b, 3, "p2b"), (pins, 2, "pin")):
+        for batch in tensor:
+            padded = False
+            for row in batch:
+                is_pad = all(float(v) == -1.0 for v in row)
+                if is_pad: padded = True
+                elif padded: raise ValueError("noncontiguous padding")
         for row in tensor.reshape(-1, width):
             pads = [float(x) == -1.0 for x in row]
             if any(pads) and not all(pads): raise ValueError("partial padding")
             if not any(pads):
                 if width == 3:
-                    if not all(_is_integral(x) for x in row[:2]) or float(row[0]) < 0 or float(row[1]) < 0:
-                        raise ValueError("edge endpoint")
+                    if not all(_is_integral(x) for x in row[:2]): raise ValueError("edge endpoint")
+                    if kind == "b2b" and (float(row[0]) < 0 or float(row[0]) >= n or float(row[1]) < 0 or float(row[1]) >= n): raise ValueError("b2b endpoint")
+                    if kind == "p2b" and (float(row[1]) < 0 or float(row[1]) >= n or float(row[0]) < 0): raise ValueError("p2b endpoint")
+                    if float(row[2]) < 0: raise ValueError(f"{kind} weight")
                 elif any(not math.isfinite(float(x)) for x in row):
                     raise ValueError("pin value")
     return int(b), int(n)
@@ -703,14 +721,19 @@ def _validate_outcome(value: Any) -> _CaseOutcome:
     if type(value) is not _CaseOutcome: raise ValueError("runtime outcome type")
     if type(value.legal) is not bool or type(value.covered) is not bool: raise ValueError("runtime flags")
     if not all(isinstance(x, numbers.Real) and not isinstance(x, bool) and math.isfinite(float(x)) and float(x) > 0 for x in (value.base_cost, value.teacher_cost)) or value.teacher_cost > value.base_cost: raise ValueError("runtime costs")
+    if not math.isfinite(float(value.base_cost) / float(value.teacher_cost)): raise ValueError("runtime costs")
     if set(value.label_row) != {"edges", "contacts", "pin_paths"} or any(k in value.label_row for k in _PROTECTED): raise ValueError("label schema")
     rows = list(value.proposal_rows); names = [r.get("name") for r in rows]; ords = [r.get("ordinal") for r in rows]
     if any(not isinstance(n, str) or not n.strip() for n in names) or any(type(o) is not int or o < 0 for o in ords): raise ValueError("proposal identity")
+    expected = {"ordinal", "name", "intended_intent", "admission_status", "admission_reason", "drift", "hard", "diagnostic_energy", "official_cost", "feasible", "winner", "status"}
+    if any(set(r) != expected for r in rows): raise ValueError("proposal schema")
     if len(names) != len(set(names)) or len(ords) != len(set(ords)) or any(k in r for r in rows for k in _PROTECTED): raise ValueError("proposal provenance")
     winners = [r for r in rows if r.get("winner") is True]
     if len(winners) != 1: raise ValueError("runtime winner count")
     base = [r for r in winners if r.get("ordinal") == 0 and r.get("name") == "base" and r.get("status") == "winner" and r.get("feasible") is True]
-    if len(base) != 1 or base[0].get("official_cost") != value.teacher_cost: raise ValueError("runtime winner")
+    official = base[0].get("official_cost") if len(base) == 1 else None
+    if not isinstance(official, numbers.Real) or isinstance(official, bool) or not math.isfinite(float(official)) or float(official) <= 0 or float(official) != float(value.teacher_cost): raise ValueError("runtime winner")
+    if any(k in r for r in value.rejection_rows for k in _PROTECTED): raise ValueError("rejection provenance")
     for row in [value.label_row, *rows, *value.rejection_rows]: _finite_json(row)
     return value
 
@@ -745,7 +768,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
             for index in range(count):
                 iid = f"{rel}#{index}"; case = _source_case_from_shard(source, index, iid)
                 receipt = CorpusSourceReceipt(rel, digest, index, fingerprint_case(case))
-                entry = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "source_row_count": count, "block_count": blocks}
+                entry = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "source_row_count": count, "block_count": case["n"]}
                 if case["n"] < args.n_min:
                     rows.append({**entry, "partition": None, "sample_ordinal": None, "sample_seed": None, "status": "excluded_n_min"}); continue
                 partition = split_for_id(iid, args.heldout_mod); seed = _sample_seed(args.seed, iid, 0)
