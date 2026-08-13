@@ -2333,6 +2333,17 @@ def _task4_spooled_replay_record(source_path, source_row_index):
     }
 
 
+def _task4_trusted_shard_summary(source_path):
+    """Verified-ingestion facts replay must use, never candidate-row metadata."""
+    return {
+        "worker": 2,
+        "layout": 0,
+        "relative_path": "worker_2/layouts_0.th",
+        "file_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "source_row_count": 2,
+    }
+
+
 def _task4_spooled_replay_leaves(record):
     receipt = record["receipt"]
     return {
@@ -2354,27 +2365,24 @@ def _task4_spooled_replay_leaves(record):
 
 
 def _task4_normalized_spooled_validation(value):
-    """The real validator may return a pair or an equivalent tiny record."""
-    if isinstance(value, tuple) and len(value) == 2:
-        case, receipt = value
-    elif isinstance(value, collections.abc.Mapping):
-        case, receipt = value["case"], value["receipt"]
-    else:
-        case, receipt = value.case, value.receipt
+    """Replay consumes the validator's compact, explicit (case, receipt) result."""
+    assert isinstance(value, tuple) and len(value) == 2
+    case, receipt = value
     assert isinstance(case, collections.abc.Mapping)
     assert type(receipt) is CorpusSourceReceipt
     return case, receipt
 
 
-def _task4_semantic_record_value(record, name):
-    return record[name] if isinstance(record, collections.abc.Mapping) else getattr(record, name)
+def _task4_semantic_value(value, name):
+    return value[name] if isinstance(value, collections.abc.Mapping) else getattr(value, name)
 
 
 @pytest.mark.parametrize("poison, changed_leaf", [
     ("worker", "worker"),
     ("layout", "layout"),
     ("relative_path", "relative_path"),
-    ("source_row_index", "source_row_index"),
+    ("source_row_index_in_range", "source_row_index"),
+    ("source_row_index_out_of_range", "source_row_index"),
     ("source_row_count", "source_row_count"),
     ("fingerprint", "fingerprint"),
     ("receipt_fingerprint", "receipt.fingerprint"),
@@ -2397,10 +2405,12 @@ def test_teacher_spooled_row_validator_rejects_spoofed_semantic_metadata(
     validator = getattr(t, "_validate_spooled_case_row", None)
     assert callable(validator), "missing real _validate_spooled_case_row semantic replay seam"
     source_path = _task4_shard(tmp_path / "floorset_lite")
+    summary = _task4_trusted_shard_summary(source_path)
     pristine_records = [_task4_spooled_replay_record(source_path, index) for index in range(2)]
     for pristine in pristine_records:
         assert pristine["case_json"].isascii()
-        assert _task4_normalized_spooled_validation(validator(copy.deepcopy(pristine))) == (
+        assert _task4_normalized_spooled_validation(
+            validator(copy.deepcopy(pristine), copy.deepcopy(summary))) == (
             pristine["case"], pristine["receipt"]
         )
     pristine = pristine_records[0]
@@ -2411,7 +2421,9 @@ def test_teacher_spooled_row_validator_rejects_spoofed_semantic_metadata(
         spoofed["layout"] = 7
     elif poison == "relative_path":
         spoofed["relative_path"] = "worker_2/layouts_7.th"
-    elif poison == "source_row_index":
+    elif poison == "source_row_index_in_range":
+        spoofed["source_row_index"] = 1
+    elif poison == "source_row_index_out_of_range":
         spoofed["source_row_index"] = 2
     elif poison == "source_row_count":
         # Row zero remains in range, but its sealed source has two rows.
@@ -2449,7 +2461,7 @@ def test_teacher_spooled_row_validator_rejects_spoofed_semantic_metadata(
     assert [name for name, value in _task4_spooled_replay_leaves(pristine).items()
             if value != _task4_spooled_replay_leaves(spoofed)[name]] == [changed_leaf]
     with pytest.raises(ValueError):
-        validator(spoofed)
+        validator(spoofed, copy.deepcopy(summary))
 
 
 def test_teacher_replay_uses_real_spooled_row_validator_immediately_before_runtime(
@@ -2460,12 +2472,18 @@ def test_teacher_replay_uses_real_spooled_row_validator_immediately_before_runti
     assert callable(validator), "missing real _validate_spooled_case_row semantic replay seam"
     root = tmp_path / "floorset_lite"; source_path = _task4_shard(root); out = tmp_path / "out"
     expected = [_task4_spooled_replay_record(source_path, index) for index in range(2)]
+    expected_summary = _task4_trusted_shard_summary(source_path)
     events = []; calls = []
 
-    def wrapped_validator(record):
-        result = validator(record)
+    def wrapped_validator(record, shard_summary):
+        summary = {name: _task4_semantic_value(shard_summary, name)
+                   for name in expected_summary}
+        assert summary == expected_summary
+        for name, value in summary.items():
+            assert _task4_semantic_value(record, name) == value
+        result = validator(record, shard_summary)
         normalized = _task4_normalized_spooled_validation(result)
-        events.append(("validate", _task4_semantic_record_value(record, "instance_id"),
+        events.append(("validate", _task4_semantic_value(record, "instance_id"), summary,
                        copy.deepcopy(normalized[0]), normalized[1]))
         return result
 
@@ -2482,15 +2500,17 @@ def test_teacher_replay_uses_real_spooled_row_validator_immediately_before_runti
     monkeypatch.setattr(t, "_runtime_hooks",
                         lambda: dataclasses.replace(runtime, process_case=wrapped_process_case))
     t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
-    assert [(kind, instance_id) for kind, instance_id, _case, _receipt in events] == [
+    assert [(event[0], event[1]) for event in events] == [
         (kind, expected[index]["instance_id"])
         for index in range(2) for kind in ("validate", "process")
     ]
     assert len(calls) == len(expected)
     for index, expected_record in enumerate(expected):
         validate_event, process_event = events[2 * index:2 * index + 2]
-        assert validate_event[2:] == (expected_record["case"], expected_record["receipt"])
-        assert process_event[2:] == validate_event[2:]
+        assert validate_event[2:] == (
+            expected_summary, expected_record["case"], expected_record["receipt"]
+        )
+        assert process_event[2:] == validate_event[3:]
 
 
 def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
