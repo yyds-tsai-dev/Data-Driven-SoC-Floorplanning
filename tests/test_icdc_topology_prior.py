@@ -5,6 +5,7 @@ import hashlib
 import io
 import importlib
 import importlib.util
+import os
 import sys
 import json
 import math
@@ -1165,6 +1166,63 @@ def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destina
     with pytest.raises(_Task4PublishFailure, match="publish failure"):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert inspected == {"ok": True} and not out.exists()
+
+
+def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path, monkeypatch):
+    """The six support streams must be append-only and numerically ordered."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root, relative_path="worker_0/layouts_0.th")
+    _task4_shard(root, relative_path="worker_0/layouts_2.th", metric_delta=2)
+    _task4_shard(root, relative_path="worker_0/layouts_10.th", metric_delta=10)
+    _task4_fake_runtime(t, monkeypatch)
+    created = []; reads = 0
+    real_new_staging = t._new_staging
+
+    def new_staging(destination):
+        stage = real_new_staging(destination); created.append(stage); return stage
+
+    real_read = t._read_verified_shard
+
+    def read(root_path, worker, layout):
+        nonlocal reads
+        if reads:
+            assert created, "staging must exist before the next shard is loaded"
+            stage = created[-1]
+            assert all((stage / name).exists() for name in _TASK4_JSONL)
+            assert all((stage / name).read_bytes().endswith(b"\n") for name in _TASK4_JSONL)
+        reads += 1
+        return real_read(root_path, worker, layout)
+
+    monkeypatch.setattr(t, "_new_staging", new_staging)
+    monkeypatch.setattr(t, "_read_verified_shard", read)
+    with pytest.raises(AssertionError, match="staging must exist"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+
+
+def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
+    tree = ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())
+    teacher = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "teacher_main")
+    forbidden = {"train_c", "held_c", "train_l", "held_l", "proposals", "rejections", "population"}
+    assert not ({node.id for node in ast.walk(teacher) if isinstance(node, ast.Name)} & forbidden)
+    assert not ({node.id for node in ast.walk(teacher) if isinstance(node, ast.arg)} & forbidden)
+
+
+def test_teacher_streaming_b1_durability_precedes_publish(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root, relative_path="worker_0/layouts_0.th")
+    _task4_fake_runtime(t, monkeypatch)
+    fsync_paths = []; published = []
+    real_fsync = t.os.fsync
+
+    def fsync(fd):
+        fsync_paths.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(t.os, "fsync", fsync)
+    monkeypatch.setattr(t, "_publish_staging", lambda *args: published.append(args))
+    t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert len(fsync_paths) >= len(_TASK4_JSONL) + 3
+    assert published
 
 
 def test_teacher_excluded_rows_publish_empty_non_authorizing_terminal_evidence(tmp_path, monkeypatch):
