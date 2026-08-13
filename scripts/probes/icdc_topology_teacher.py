@@ -17,14 +17,20 @@ import stat
 import shutil
 import sys
 import tempfile
+import inspect
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Optional
 
 _REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_REPO / "partner"))
+for _path in (_REPO / "FloorSet" / "iccad2026contest", _REPO / "FloorSet", _REPO / "scripts", _REPO / "partner"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+import shapely
+import iccad2026_evaluate as _EVALUATOR
 
 import torch
 from icdc.topology_data import CorpusSourceReceipt, fingerprint_case, split_for_id
@@ -62,9 +68,62 @@ class _TeacherRuntime:
     authorizing: bool
 
 def _runtime_hooks() -> _TeacherRuntime:
-    def fail(*_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError("teacher runtime not implemented")
-    return _TeacherRuntime(fail, fail, False)
+    trusted: dict[str, Any] = {}
+
+    def preflight(policy: TeacherTrustPolicy, checkpoint: Path) -> Mapping[str, Any]:
+        verified_scorer = _verify_frozen_scorer_contract(policy)
+        payload, identity = _load_verified_checkpoint_bytes(checkpoint, policy)
+        value = {"trust_ok": True, "input_ok": True, "scorer_ok": True,
+                 "checkpoint_sha256": identity["checkpoint_sha256"],
+                 "model_identity": dict(policy.allowed_model_identity),
+                 "scorer_sha256": verified_scorer["scorer_sha256"],
+                 "scorer_contract": verified_scorer["scorer_contract"],
+                 "shapely_version": verified_scorer["shapely_version"]}
+        trusted.update({"payload": payload, "scorer": _EVALUATOR, "trust": value})
+        return value
+
+    def process_case(_case: _CaseInput) -> _CaseOutcome:
+        if not trusted:
+            raise RuntimeError("teacher process runtime not implemented")
+        raise RuntimeError("teacher process runtime not implemented")
+
+    return _TeacherRuntime(preflight, process_case, False)
+
+
+def _verify_frozen_scorer_contract(policy: TeacherTrustPolicy) -> Mapping[str, str]:
+    scorer_path = (_REPO / "scripts" / "iccad2026_evaluate.py").resolve()
+    origin = Path(getattr(_EVALUATOR, "__file__", "")).resolve()
+    if origin != scorer_path or not scorer_path.is_file() or scorer_path.is_symlink():
+        raise ValueError("scorer_sha256")
+    actual = hashlib.sha256(scorer_path.read_bytes()).hexdigest()
+    if actual != policy.expected_scorer_sha256 or actual != _SCORER_SHA256:
+        raise ValueError("scorer_sha256")
+    if policy.scorer_contract != "iccad2026_evaluate_cost_no_runtime_v1":
+        raise ValueError("scorer_contract")
+    if getattr(_EVALUATOR, "SHAPELY_AVAILABLE", None) is not True:
+        raise ValueError("shapely_available")
+    if getattr(shapely, "__version__", None) != policy.shapely_version:
+        raise ValueError("shapely_version")
+    expected = ["solution", "baseline_metrics", "target_constraints", "b2b_connectivity", "p2b_connectivity", "pins_pos", "target_areas", "target_positions", "median_runtime"]
+    try:
+        params = list(inspect.signature(_EVALUATOR.evaluate_solution).parameters.values())
+        if len(params) != 9 or [p.name for p in params] != expected or any(p.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params) or any(p.default is not inspect.Parameter.empty for p in params[:7]) or params[7].default is not None or params[8].default != 1.0:
+            raise ValueError
+    except Exception as exc:
+        raise ValueError("evaluate_solution_signature") from exc
+    if not any(f.name == "cost_no_runtime" for f in fields(_EVALUATOR.SolutionMetrics)):
+        raise ValueError("cost_no_runtime")
+    counts = [7, 19, 43]
+    costs = [1.25, 2.5, 4.75]
+    weights = [math.exp(n / 12) for n in counts]
+    expected_score = sum(c * w for c, w in zip(costs, weights)) / sum(weights)
+    try:
+        actual_score = _EVALUATOR.compute_total_score(costs, counts)
+        if not math.isfinite(actual_score) or not math.isclose(actual_score, expected_score, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError
+    except Exception as exc:
+        raise ValueError("compute_total_score_weighting") from exc
+    return {"scorer_sha256": actual, "scorer_contract": policy.scorer_contract, "shapely_version": policy.shapely_version}
 
 _CHECKPOINT_SHA256 = "508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659"
 _SCORER_SHA256 = "7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1"
