@@ -1927,6 +1927,62 @@ def _policy_for(root):
     return t.TeacherTrustPolicy(root, "a" * 64, identity, "b" * 64, "contract", "2.0")
 
 
+def _task4_verified_checkpoint(t, root):
+    """Create the smallest canonical checkpoint and bind policy to its bytes."""
+    checkpoint = {
+        "model": {"weight": torch.tensor([1.0])},
+        "ema": {"weight": torch.tensor([1.0])},
+        "model_config": {"hidden": 1},
+    }
+    path = root / "unused.th"
+    torch.save(checkpoint, path)
+    identity = t._checkpoint_identity(checkpoint)
+    policy = t.TeacherTrustPolicy(
+        root, hashlib.sha256(path.read_bytes()).hexdigest(), identity,
+        hashlib.sha256(Path("scripts/iccad2026_evaluate.py").read_bytes()).hexdigest(),
+        "iccad2026_evaluate_cost_no_runtime_v1", "2.0.5",
+    )
+    return path, policy
+
+
+def test_teacher_runtime_preflight_binds_verified_checkpoint_and_literal_scorer_contract(tmp_path):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
+    checkpoint, policy = _task4_verified_checkpoint(t, root)
+    runtime = t._runtime_hooks()
+    assert runtime.authorizing is False
+    assert runtime.preflight(policy, checkpoint) == _task4_expected_trust(policy)
+    with pytest.raises(RuntimeError, match=r"process.*not implemented"):
+        runtime.process_case(None)
+
+
+@pytest.mark.parametrize("broken", [
+    "sha", "shapely_available", "shapely_version", "signature",
+    "metrics", "weights",
+])
+def test_teacher_runtime_preflight_rejects_broken_literal_scorer_contract(tmp_path, monkeypatch, broken):
+    t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
+    checkpoint, policy = _task4_verified_checkpoint(t, root)
+    evaluator = getattr(t, "_EVALUATOR", type("Evaluator", (), {})())
+    monkeypatch.setattr(t, "_EVALUATOR", evaluator, raising=False)
+    if broken == "shapely_version":
+        import shapely
+        monkeypatch.setattr(t, "shapely", shapely, raising=False)
+    if broken == "sha":
+        policy = dataclasses.replace(policy, expected_scorer_sha256="0" * 64)
+    elif broken == "shapely_available":
+        monkeypatch.setattr(evaluator, "SHAPELY_AVAILABLE", False, raising=False)
+    elif broken == "shapely_version":
+        monkeypatch.setattr(t.shapely, "__version__", "0.0.0", raising=False)
+    elif broken == "signature":
+        monkeypatch.setattr(evaluator, "evaluate_solution", lambda bad: bad, raising=False)
+    elif broken == "metrics":
+        monkeypatch.setattr(evaluator, "SolutionMetrics", object, raising=False)
+    else:
+        monkeypatch.setattr(evaluator, "compute_total_score", lambda costs, counts: sum(costs), raising=False)
+    with pytest.raises(ValueError, match=r"(scorer|shapely|signature|weight|contract)"):
+        t._runtime_hooks().preflight(policy, checkpoint)
+
+
 @pytest.mark.parametrize("root_kind", ["other", "lexical", "symlink"])
 def test_teacher_rejects_noncanonical_and_symlink_roots_before_pipeline(tmp_path, root_kind):
     t = _teacher(); canonical = tmp_path / "canonical"; canonical.mkdir()
@@ -1941,13 +1997,13 @@ def test_teacher_rejects_noncanonical_and_symlink_roots_before_pipeline(tmp_path
     with pytest.raises(ValueError): t.teacher_main(args, _trust_policy=_policy_for(canonical))
 
 
-def test_teacher_valid_canonical_root_reaches_explicit_unimplemented_without_load(tmp_path, monkeypatch):
+def test_teacher_valid_canonical_root_reaches_explicit_unimplemented_after_preflight(tmp_path):
     t = _teacher(); root = tmp_path / "canonical"; root.mkdir(); out = tmp_path / "out"
-    monkeypatch.setattr(torch, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
-    args = ["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"),
-            "--checkpoint", str(tmp_path / "missing.th")]
+    _task4_shard(root); _checkpoint, policy = _task4_verified_checkpoint(t, root)
+    args = _task4_args(root, out)
     with pytest.raises(RuntimeError, match="not implemented"):
-        t.teacher_main(args, _trust_policy=_policy_for(root))
+        t.teacher_main(args, _trust_policy=policy)
+    assert not out.exists()
 
 
 def test_teacher_default_policy_binds_frozen_production_inputs():
@@ -1977,16 +2033,9 @@ def test_teacher_production_identity_is_immutable_and_stable():
     assert second.allowed_model_identity["ema_state_sha256"] == "92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb"
 
 
-def test_teacher_default_relative_root_and_bounded_flags_reach_unimplemented(monkeypatch, tmp_path):
-    t = _teacher(); out = tmp_path / "out"
-    monkeypatch.setattr(torch, "load", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
-    args = ["--data-root", "FloorSet/floorset_lite", "--out-dir", str(out),
-            "--index-out", str(out / "training_index.json"),
-            "--checkpoint", "partner/checkpoints/direct_v2_cont/eval_step1p2M.pt",
-            "--seed", "20260813", "--heldout-mod", "10", "--n-min", "100",
-            "--max-files", "1"]
-    with pytest.raises(RuntimeError, match="not implemented"):
-        t.teacher_main(args)
+def test_teacher_default_runtime_is_non_authorizing_until_process_slice():
+    runtime = _teacher()._runtime_hooks()
+    assert runtime.authorizing is False
 
 
 @pytest.mark.parametrize("bad", ["--scorer", "--unknown"])
