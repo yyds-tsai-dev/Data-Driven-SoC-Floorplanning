@@ -474,6 +474,8 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
         assert kw["weights_only"].value is True and kw["map_location"].value == "cpu"
 
 def _task4_static_forbidden(source, *, require_exact_loads=False):
+    if _task4_dynamic_forbidden(source):
+        return False
     tree = ast.parse(source); aliases = {}
     def resolve(n):
         if isinstance(n, ast.Name): return aliases.get(n.id, n.id)
@@ -530,8 +532,51 @@ def _task4_static_forbidden(source, *, require_exact_loads=False):
     if require_exact_loads and len(loads) != 2: return False
     return True
 
+
+def _task4_dynamic_forbidden(source):
+    """Reject dynamic execution/import calls while allowing model.eval()."""
+    tree = ast.parse(source)
+    aliases = {}
+
+    def resolve(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            base = resolve(node.value)
+            return f"{base}.{node.attr}" if base else f".{node.attr}"
+        return ""
+
+    for _ in range(len(tree.body) + 2):
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            value = node.value
+            resolved = resolve(value)
+            if resolved and aliases.get(target.id) != resolved:
+                aliases[target.id] = resolved
+                changed = True
+        if not changed:
+            break
+
+    bare = {"eval", "exec", "__import__", "getattr", "importlib.import_module"}
+    qualified_suffixes = {"exec", "__import__", "getattr", "import_module"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = resolve(node.func)
+        if name in bare or any(name.endswith("." + suffix) for suffix in qualified_suffixes):
+            return True
+    return False
+
 def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
     assert _task4_static_forbidden(Path("scripts/probes/icdc_topology_teacher.py").read_text(), require_exact_loads=True)
+    assert _task4_dynamic_forbidden("eval('1')")
+    assert _task4_dynamic_forbidden("danger = eval\ndanger('1')")
+    assert not _task4_dynamic_forbidden("model.eval()")
     assert not _task4_static_forbidden("import icdc.engine as e\nx=e\ny=x\nz=y\na=z\nb=a\ngetattr(b, 'load_model')()")
     assert not _task4_static_forbidden("case={'golden': 1}\ncase.get('golden')\ne.sample_bank()")
     assert not _task4_static_forbidden("from icdc import tfdl as q\nq(x)")
@@ -713,6 +758,127 @@ def test_task4_teacher_batch_adapter_accepts_empty_relation_tails():
     assert direct["p2b"].dtype is torch.float32 and diagnostic["p2b"].dtype is torch.float64
     assert direct["pins"].dtype is torch.float32 and diagnostic["pins"].dtype is torch.float64
     assert direct["node_feat"].shape[-1] == state.cfg.node_feat_dim
+
+
+def test_task4_teacher_batch_adapter_rejects_float32_scale_overflow():
+    t = _teacher(); state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
+    case = dict(_task4_case_input(t).case, n=2, area=[3e38, 3e38],
+                cons=[[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+                tp=[[-1.0] * 4, [-1.0] * 4], b2b=[], p2b=[], pins=[])
+    case = t._sanitize_case(case, artifact=True)
+    with pytest.raises(ValueError):
+        t._build_teacher_batches(case, torch.device("cpu"), state.cfg)
+
+
+def _task4_condition_case(t):
+    state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
+    case = t._sanitize_case(_task4_case_input(t).case, artifact=True)
+    _, _, condition = t._build_teacher_batches(case, torch.device("cpu"), state.cfg)
+    return state, case, condition
+
+
+@pytest.mark.parametrize("kind", [
+    "missing", "extra", "non_tensor",
+    "node_shape", "adj_shape", "mask_shape", "scale_shape", "rel_shape",
+    "node_dtype", "adj_dtype", "mask_dtype", "scale_dtype", "rel_dtype",
+    "node_nan", "adj_inf", "scale_inf", "rel_nan", "scale_different",
+])
+def test_task4_teacher_batch_adapter_rejects_malformed_condition(kind, monkeypatch):
+    t = _teacher(); state, case, valid = _task4_condition_case(t)
+    condition = {key: value.clone() for key, value in valid.items()}
+    n = case["n"]
+    if kind == "missing":
+        condition.pop("node_feat")
+    elif kind == "extra":
+        condition["extra"] = torch.zeros(1)
+    elif kind == "non_tensor":
+        condition["node_feat"] = object()
+    elif kind == "node_shape":
+        condition["node_feat"] = torch.zeros((1, n, state.cfg.node_feat_dim + 1), dtype=torch.float32)
+    elif kind == "adj_shape":
+        condition["adj"] = torch.zeros((1, n, n + 1), dtype=torch.float32)
+    elif kind == "mask_shape":
+        condition["mask"] = torch.zeros((1, n, 1), dtype=torch.bool)
+    elif kind == "scale_shape":
+        condition["scale"] = torch.zeros((2,), dtype=torch.float32)
+    elif kind == "rel_shape":
+        condition["rel_feat"] = torch.zeros((1, n, n, state.cfg.relation_feat_dim + 1), dtype=torch.float32)
+    elif kind == "node_dtype":
+        condition["node_feat"] = condition["node_feat"].double()
+    elif kind == "adj_dtype":
+        condition["adj"] = condition["adj"].double()
+    elif kind == "mask_dtype":
+        condition["mask"] = condition["mask"].to(torch.float32)
+    elif kind == "scale_dtype":
+        condition["scale"] = condition["scale"].double()
+    elif kind == "rel_dtype":
+        condition["rel_feat"] = condition["rel_feat"].double()
+    elif kind == "node_nan":
+        condition["node_feat"][0, 0, 0] = float("nan")
+    elif kind == "adj_inf":
+        condition["adj"][0, 0, 0] = float("inf")
+    elif kind == "scale_inf":
+        condition["scale"].fill_(float("inf"))
+    elif kind == "rel_nan":
+        condition["rel_feat"][0, 0, 0, 0] = float("nan")
+    elif kind == "scale_different":
+        condition["scale"] = condition["scale"] + 1.0
+    monkeypatch.setattr(t._ENGINE, "build_cond", lambda direct, cfg: condition)
+    with pytest.raises(ValueError):
+        t._build_teacher_batches(case, torch.device("cpu"), state.cfg)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_task4_teacher_batch_adapter_rejects_condition_wrong_device(monkeypatch):
+    t = _teacher(); payload = _task4_teacher_payload(); state = t._materialize_teacher_model(payload, torch.device("cuda"))
+    case = t._sanitize_case(_task4_case_input(t).case, artifact=True)
+    _, _, valid = t._build_teacher_batches(case, state.device, state.cfg)
+    condition = {key: value.clone() for key, value in valid.items()}
+    condition["node_feat"] = condition["node_feat"].to("cpu")
+    monkeypatch.setattr(t._ENGINE, "build_cond", lambda direct, cfg: condition)
+    with pytest.raises(ValueError):
+        t._build_teacher_batches(case, state.device, state.cfg)
+
+
+@pytest.mark.parametrize("kind", [
+    "not_pair", "arity", "z_shape", "mask_shape", "z_dtype", "z_nonfinite",
+    "z_device", "mask_dtype", "mask_device",
+])
+def test_task4_sample_rejects_malformed_known_channels_before_sampler(kind, monkeypatch):
+    t = _teacher(); state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
+    case = t._sanitize_case(_task4_case_input(t).case, artifact=True)
+    z = torch.zeros((1, 3, 4), dtype=torch.float32)
+    mask = torch.zeros((1, 3, 4), dtype=torch.bool)
+    if kind == "not_pair":
+        malformed = {"z": z, "mask": mask}
+    elif kind == "arity":
+        malformed = (z,)
+    else:
+        if kind == "z_shape":
+            z = torch.zeros((1, 3, 3), dtype=torch.float32)
+        elif kind == "mask_shape":
+            mask = torch.zeros((1, 3), dtype=torch.bool)
+        elif kind == "z_dtype":
+            z = z.double()
+        elif kind == "z_nonfinite":
+            z[0, 0, 0] = float("nan")
+        elif kind == "z_device":
+            if not torch.cuda.is_available():
+                pytest.skip("CUDA unavailable")
+            z = z.to("cuda")
+        elif kind == "mask_dtype":
+            mask = mask.to(torch.float32)
+        elif kind == "mask_device":
+            pytest.skip("CUDA unavailable")
+        malformed = (z, mask)
+    if kind == "mask_device":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        malformed = (z, mask.to("cuda"))
+    monkeypatch.setattr(t._ENGINE, "known_channels", lambda direct: malformed)
+    monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", lambda *args, **kwargs: pytest.fail("sampler invoked"), raising=False)
+    with pytest.raises(ValueError):
+        t._sample_direct_once(state, case, 9)
 
 
 def test_task4_sample_uses_materialized_cfg_condition_once(monkeypatch):
