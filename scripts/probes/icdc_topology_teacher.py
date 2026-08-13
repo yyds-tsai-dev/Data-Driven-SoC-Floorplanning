@@ -4,25 +4,28 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import io
 import json
 import math
 import numbers
 import os
+import stat
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Optional
-
-import torch
-from icdc.topology_data import CorpusSourceReceipt, fingerprint_case, split_for_id
-
+from typing import Any, Callable, Optional
 
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "partner"))
+
+import torch
+from icdc.topology_data import CorpusSourceReceipt, fingerprint_case, split_for_id
 
 from icdc.checkpoint_identity import (  # noqa: E402
     IDENTITY_SCHEMA,
@@ -51,8 +54,8 @@ class _CaseOutcome:
 
 @dataclass(frozen=True)
 class _TeacherRuntime:
-    preflight: Any
-    process_case: Any
+    preflight: Callable[[TeacherTrustPolicy, Path], Mapping[str, Any]]
+    process_case: Callable[[_CaseInput], _CaseOutcome]
     authorizing: bool
 
 def _runtime_hooks() -> _TeacherRuntime:
@@ -542,7 +545,93 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 def _publish_staging(staging: Path, destination: Path) -> None:
-    os.rename(staging, destination)
+    if staging.is_symlink() or not staging.is_dir():
+        raise ValueError("invalid staging")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    flags = 1  # RENAME_NOREPLACE
+    result = renameat2(-100, os.fsencode(str(staging)), -100,
+                       os.fsencode(str(destination)), flags)
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in (errno.EEXIST, errno.ENOTEMPTY):
+        raise ValueError("existing output directory")
+    raise OSError(error, os.strerror(error))
+
+
+def _new_staging(destination: Path) -> Path:
+    parent = destination.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    path = Path(tempfile.mkdtemp(prefix=f".{destination.name}.staging.", dir=parent))
+    return path
+
+
+def _iter_approved_shards(root: Path) -> list[tuple[int, int, Path]]:
+    found: list[tuple[int, int, Path]] = []
+    for worker in root.iterdir():
+        if worker.is_symlink() or not worker.is_dir() or not worker.name.startswith("worker_"):
+            continue
+        try: wid = int(worker.name[7:])
+        except ValueError: continue
+        for shard in worker.iterdir():
+            if shard.is_symlink() or not shard.is_file() or not shard.name.startswith("layouts_") or not shard.name.endswith(".th"):
+                continue
+            try: lid = int(shard.name[8:-3])
+            except ValueError: continue
+            found.append((wid, lid, shard))
+    return sorted(found, key=lambda x: (x[0], x[1]))
+
+
+def _read_verified_shard(root: Path, worker: int, layout: int) -> tuple[bytes, Any]:
+    wname, sname = f"worker_{worker}", f"layouts_{layout}.th"
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        wfd = os.open(wname, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            fd = os.open(sname, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=wfd)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError("shard is not regular")
+                chunks = []
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk: break
+                    chunks.append(chunk)
+            finally: os.close(fd)
+        finally: os.close(wfd)
+    finally: os.close(root_fd)
+    raw = b"".join(chunks)
+    return raw, torch.load(io.BytesIO(raw), weights_only=True, map_location="cpu")
+
+
+def _validate_source_shard(source: Any) -> tuple[int, int]:
+    if not isinstance(source, (tuple, list)) or len(source) != 7:
+        raise ValueError("source schema")
+    if any(not isinstance(t, torch.Tensor) or t.dtype == torch.bool or not t.is_floating_point() or not bool(torch.isfinite(t).all()) for t in source):
+        raise ValueError("source tensors")
+    inp, b2b, p2b, pins, tree, fp, metrics = source
+    if inp.ndim != 3 or inp.shape[2] != 6 or b2b.ndim != 3 or b2b.shape[2] != 3 or p2b.ndim != 3 or p2b.shape[2] != 3 or pins.ndim != 3 or pins.shape[2] != 2 or tree.ndim != 3 or tree.shape[2] != 3 or fp.ndim != 3 or fp.shape[2] != 4 or metrics.ndim != 2 or metrics.shape[1] != 8:
+        raise ValueError("source shapes")
+    b, n = inp.shape[:2]
+    if b < 1 or n < 1 or any(t.shape[0] != b for t in source[1:]):
+        raise ValueError("source batch")
+    if tree.shape[1] not in (n - 1,): raise ValueError("source tree")
+    for row in inp:
+        seen_pad = False
+        for item in row:
+            pad = float(item[0]) == -1.0
+            if pad: seen_pad = True
+            elif seen_pad or float(item[0]) <= 0: raise ValueError("area padding")
+    for tensor, width in ((b2b, 3), (p2b, 3), (pins, 2)):
+        for row in tensor.reshape(-1, width):
+            pads = [float(x) == -1.0 for x in row]
+            if any(pads) and not all(pads): raise ValueError("partial padding")
+    return int(b), int(n)
 
 def _dump_json(path: Path, value: Any) -> None:
     path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n")
@@ -584,17 +673,12 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     train_l: list[Any] = []; held_l: list[Any] = []; proposals: list[Any] = []; rejections: list[Any] = []
     population: list[dict[str, Any]] = []; legal = covered = True; processed = 0
     try:
-        files = []
-        for worker in root.glob("worker_[0-9]*"):
-            if worker.is_dir() and worker.name[7:].isdigit():
-                files.extend((int(worker.name[7:]), p) for p in worker.glob("layouts_[0-9]*.th") if p.is_file() and p.stem[8:].isdigit())
-        files.sort(key=lambda x: (x[0], int(x[1].stem[8:])))
+        files = _iter_approved_shards(root)
         if args.max_files is not None: files = files[:args.max_files]
-        for _worker, path in files:
-            raw = path.read_bytes(); digest = hashlib.sha256(raw).hexdigest()
-            source = torch.load(io.BytesIO(raw), weights_only=True, map_location="cpu")
-            if not isinstance(source, (tuple, list)) or len(source) != 7: raise ValueError("source schema")
-            count = int(source[0].shape[0]); blocks = int(source[0].shape[1]); rel = path.relative_to(root).as_posix()
+        for _worker, _layout, path in files:
+            raw, source = _read_verified_shard(root, _worker, _layout); digest = hashlib.sha256(raw).hexdigest()
+            count, blocks = _validate_source_shard(source)
+            rel = path.relative_to(root).as_posix()
             for index in range(count):
                 iid = f"{rel}#{index}"; case = _source_case(source, index, iid)
                 receipt = CorpusSourceReceipt(rel, digest, index, fingerprint_case(case))
@@ -618,8 +702,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         authorized = runtime.authorizing and state == "TARGET_GAIN_MET" and args.max_files is None
         if not processed: state = "KILLED_LEGALITY_OR_COVERAGE"; authorized = False
         manifest = {"schema":"icdc_topology_teacher_g0_v1","status":"complete","state":state,"secondary_reasons":[],"training_authorized":authorized,"bounded_max_files":args.max_files is not None,"trust":trust,"population":pop,"coverage":coverage}
-        staging = destination.parent / (destination.name + ".staging")
-        staging.mkdir()
+        staging = _new_staging(destination)
         outputs = {"train_corpus.jsonl":train_c,"heldout_corpus.jsonl":held_c,"train_labels.jsonl":train_l,"heldout_labels.jsonl":held_l,"proposals.jsonl":proposals,"rejections.jsonl":rejections}
         for name, vals in outputs.items():
             ordered = sorted(vals, key=lambda x: (x.get("instance_id", ""), x.get("proposal_ordinal", 0)))
@@ -629,8 +712,8 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         _publish_staging(staging, destination)
         return 0 if authorized else 1
     except Exception:
-        staging = destination.parent / (destination.name + ".staging")
-        if staging.exists(): import shutil; shutil.rmtree(staging)
+        if 'staging' in locals() and staging.exists():
+            import shutil; shutil.rmtree(staging)
         raise
 
 def dataclass_to_dict(value: Any) -> dict[str, Any]:
