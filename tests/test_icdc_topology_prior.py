@@ -278,124 +278,474 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     assert not any(any(x == suffix or x.endswith("." + suffix) for suffix in forbidden_suffixes) for x in calls)
 
 
-def _task4_shard(root):
-    path = root / "worker_2" / "layouts_0.th"
-    path.parent.mkdir(parents=True)
-    tensors = (
-        torch.tensor([[[4, 0, 0, 0, 0, 0], [6, 1, 0, 0, 0, 0], [9, 0, 1, 0, 2, 5]],
-                      [[5, 0, 0, 0, 0, 0], [20, 1, 0, 0, 0, 0], [20, 0, 1, 0, 2, 5]]], dtype=torch.float32),
-        torch.zeros((2, 0, 3)), torch.zeros((2, 0, 3)), torch.zeros((2, 0, 2)),
-        torch.zeros((2, 2, 3)),
-        torch.tensor([[[71, 73, 701, 703], [2, 3, 401, 403], [3, 3, 10, 11]],
-                      [[79, 83, 709, 719], [5, 4, 809, 811], [4, 5, 20, 21]]], dtype=torch.float32),
-        torch.tensor([[100, 0, 0, 0, 0, 0, 2, 3], [200, 0, 0, 0, 0, 0, 5, 7]], dtype=torch.float32),
+_TASK4_FILES = (
+    "train_corpus.jsonl", "heldout_corpus.jsonl", "train_labels.jsonl",
+    "heldout_labels.jsonl", "proposals.jsonl", "rejections.jsonl",
+    "training_index.json", "g0_manifest.json",
+)
+_TASK4_JSONL = _TASK4_FILES[:6]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Task4CaseInput:
+    case: collections.abc.Mapping
+    receipt: CorpusSourceReceipt
+    partition: str
+    sample_seed: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _Task4CaseOutcome:
+    label_row: collections.abc.Mapping
+    proposal_rows: collections.abc.Sequence
+    rejection_rows: collections.abc.Sequence
+    base_cost: float
+    teacher_cost: float
+    legal: bool
+    covered: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _Task4Runtime:
+    preflight: object
+    process_case: object
+    authorizing: bool
+
+
+class _Task4ProcessFailure(RuntimeError):
+    pass
+
+
+class _Task4PublishFailure(RuntimeError):
+    pass
+
+
+def _task4_tensors(*, soft_delta=0, metric_delta=0):
+    input_data = torch.tensor(
+        [[[4, 0, 0, 0, 0, 0], [6, 1, 0, 0, 0, 0], [9, 0, 1, 0, 2, 5]],
+         [[5, 0, 0, 0, 0, 0], [20, 1, 0, 0, 0, 0], [20, 0, 1, 0, 2, 5]]],
+        dtype=torch.float32,
     )
-    torch.save(tensors, path)
+    fp = torch.tensor(
+        [[[71, 73, 701, 703], [2, 3, 401, 403], [3, 3, 10, 11]],
+         [[79, 83, 709, 719], [5, 4, 809, 811], [4, 5, 20, 21]]],
+        dtype=torch.float32,
+    )
+    if soft_delta:
+        fp[0, 0, 2:] += soft_delta
+        fp[0, 1, :2] += soft_delta
+        fp[1, 0, 2:] += soft_delta
+        fp[1, 1, :2] += soft_delta
+    metrics = torch.tensor(
+        [[100 + metric_delta, 0, 0, 0, 0, 0, 2, 3],
+         [200 + metric_delta, 0, 0, 0, 0, 0, 5, 7]],
+        dtype=torch.float32,
+    )
+    return (
+        input_data,
+        torch.zeros((2, 0, 3), dtype=torch.float32),
+        torch.zeros((2, 0, 3), dtype=torch.float32),
+        torch.zeros((2, 0, 2), dtype=torch.float32),
+        torch.zeros((2, 2, 3), dtype=torch.float32),
+        fp,
+        metrics,
+    )
+
+
+def _task4_shard(root, *, soft_delta=0, metric_delta=0,
+                 relative_path="worker_2/layouts_0.th"):
+    path = root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(_task4_tensors(soft_delta=soft_delta, metric_delta=metric_delta), path)
     return path
 
 
-def test_teacher_source_transaction_publishes_verified_two_row_corpus(tmp_path, monkeypatch):
-    """RED: the real source adapter must own loading, sanitizing, and publication."""
-    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+def _task4_single_shard(root, relative_path, *, metric_delta=0):
+    path = root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tensors = _task4_tensors(metric_delta=metric_delta)
+    torch.save(tuple(array[:1] for array in tensors), path)
+    return path
+
+
+def _task4_expected_case(index):
+    if index == 0:
+        return {
+            "instance_id": "worker_2/layouts_0.th#0", "n": 3,
+            "area": [4.0, 6.0, 9.0],
+            "cons": [[0, 0, 0, 0, 0], [1, 0, 0, 0, 0], [0, 1, 0, 2, 5]],
+            "tp": [[-1.0, -1.0, -1.0, -1.0], [-1.0, -1.0, 2.0, 3.0], [10.0, 11.0, 3.0, 3.0]],
+            "b2b": [], "p2b": [], "pins": [], "hpwl_ref": 5.0, "area_ref": 100.0,
+        }
+    return {
+        "instance_id": "worker_2/layouts_0.th#1", "n": 3,
+        "area": [5.0, 20.0, 20.0],
+        "cons": [[0, 0, 0, 0, 0], [1, 0, 0, 0, 0], [0, 1, 0, 2, 5]],
+        "tp": [[-1.0, -1.0, -1.0, -1.0], [-1.0, -1.0, 5.0, 4.0], [20.0, 21.0, 4.0, 5.0]],
+        "b2b": [], "p2b": [], "pins": [], "hpwl_ref": 12.0, "area_ref": 200.0,
+    }
+
+
+def _task4_fake_runtime(t, monkeypatch, *, calls=None, fail_at=None):
+    calls = [] if calls is None else calls
+
+    def preflight(policy, checkpoint):
+        return {
+            "trust_ok": True, "input_ok": True, "scorer_ok": True,
+            "checkpoint_sha256": policy.expected_checkpoint_sha256,
+            "model_identity": dict(policy.allowed_model_identity),
+            "scorer_sha256": policy.expected_scorer_sha256,
+            "scorer_contract": policy.scorer_contract,
+            "shapely_version": policy.shapely_version,
+        }
+
+    def process_case(case_input):
+        calls.append(case_input)
+        if fail_at is not None and len(calls) - 1 == fail_at:
+            raise _Task4ProcessFailure(f"process failure at {fail_at}")
+        return _Task4CaseOutcome(
+            label_row={"edges": [], "contacts": [], "pin_paths": []},
+            proposal_rows=({
+                "ordinal": 0, "name": "base", "intended_intent": "base",
+                "admission_status": "admitted", "admission_reason": "fixture",
+                "drift": {"max_abs": 0.0}, "hard": {"legal": True},
+                "diagnostic_energy": 0.0, "official_cost": 1.0,
+                "feasible": True, "winner": True, "status": "winner",
+            },),
+            rejection_rows=(), base_cost=1.10, teacher_cost=1.00,
+            legal=True, covered=True,
+        )
+
+    monkeypatch.setattr(
+        t, "_runtime_hooks", lambda: _Task4Runtime(preflight, process_case, True),
+        raising=False,
+    )
+    return calls
+
+
+def _task4_args(root, out, *, n_min=1, heldout_mod=2, max_files=None):
+    args = ["--data-root", str(root), "--out-dir", str(out),
+            "--index-out", str(out / "training_index.json"),
+            "--checkpoint", str(root / "unused.th"), "--seed", "20260813",
+            "--heldout-mod", str(heldout_mod), "--n-min", str(n_min)]
+    if max_files is not None:
+        args.extend(["--max-files", str(max_files)])
+    return args
+
+
+def _task4_run(tmp_path, monkeypatch, *, n_min=1, max_files=None,
+               soft_delta=0, relative_path="worker_2/layouts_0.th", fail_at=None):
+    t = _teacher()
+    root = tmp_path / "floorset_lite"
+    _task4_shard(root, soft_delta=soft_delta, relative_path=relative_path)
     out = tmp_path / "out"
-    policy = _policy_for(root)
+    calls = _task4_fake_runtime(t, monkeypatch, fail_at=fail_at)
+    result = t.teacher_main(
+        _task4_args(root, out, n_min=n_min, max_files=max_files),
+        _trust_policy=_policy_for(root),
+    )
+    return t, root, out, calls, result
 
-    result = t.teacher_main(["--data-root", str(root), "--out-dir", str(out),
-                             "--index-out", str(out / "training_index.json"),
-                             "--checkpoint", str(tmp_path / "unused.th"),
-                             "--heldout-mod", "2", "--n-min", "1"],
-                            _trust_policy=policy)
+
+def _task4_jsonl(path):
+    raw = path.read_bytes()
+    if not raw:
+        return []
+    assert raw.endswith(b"\n")
+    return [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+
+
+def _task4_canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("utf-8")
+
+
+def _task4_receipt(path, index, case):
+    return dataclasses.asdict(CorpusSourceReceipt(
+        relative_path="worker_2/layouts_0.th",
+        file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        layout_index=index, fingerprint=fingerprint_case(case),
+    ))
+
+
+def _task4_envelope(case, receipt, partition, sample_seed):
+    return {"receipt": receipt, "instance_id": case["instance_id"],
+            "partition": partition, "sample_seed": sample_seed, "n": case["n"]}
+
+
+def _task4_normalize(value, *, manifest=False):
+    if isinstance(value, dict):
+        value = {key: _task4_normalize(item, manifest=manifest)
+                 for key, item in value.items()}
+        if "file_sha256" in value:
+            value["file_sha256"] = "SOURCE_SHA_SENTINEL"
+        if manifest:
+            value.pop("support_hashes", None)
+            value.pop("self_sha256", None)
+        return value
+    if isinstance(value, list):
+        return [_task4_normalize(item, manifest=manifest) for item in value]
+    return value
+
+
+def _task4_artifact_projection(out):
+    projection = {}
+    for name in _TASK4_FILES:
+        path = out / name
+        if name in _TASK4_JSONL:
+            projection[name] = _task4_normalize(_task4_jsonl(path))
+        else:
+            projection[name] = _task4_normalize(
+                json.loads(path.read_text()), manifest=name == "g0_manifest.json"
+            )
+    return projection
+
+
+def test_teacher_source_transaction_publishes_exact_sanitized_evidence(tmp_path, monkeypatch):
+    t, root, out, calls, result = _task4_run(tmp_path, monkeypatch)
     assert result == 0
-    assert sorted(p.name for p in out.iterdir()) == [
-        "g0_manifest.json", "heldout_corpus.jsonl", "heldout_labels.jsonl",
-        "proposals.jsonl", "rejections.jsonl", "train_corpus.jsonl",
-        "train_labels.jsonl", "training_index.json"]
-    blobs = b"".join(p.read_bytes() for p in out.iterdir())
-    assert not any(str(secret).encode() in blobs for secret in (701, 703, 401, 403, 709, 719, 809, 811))
+    assert sorted(path.name for path in out.iterdir()) == sorted(_TASK4_FILES)
+    assert [item.receipt.relative_path for item in calls] == ["worker_2/layouts_0.th"] * 2
+    assert [source_instance_id(item.receipt) for item in calls] == [
+        "worker_2/layouts_0.th#0", "worker_2/layouts_0.th#1"]
+    assert [item.partition for item in calls] == ["train", "heldout"]
+    assert all(item.sample_seed == t._sample_seed(20260813, source_instance_id(item.receipt), 0)
+               for item in calls)
 
+    expected_cases = [_task4_expected_case(0), _task4_expected_case(1)]
+    train_rows = _task4_jsonl(out / "train_corpus.jsonl")
+    heldout_rows = _task4_jsonl(out / "heldout_corpus.jsonl")
+    assert train_rows == [expected_cases[0]]
+    assert heldout_rows == [expected_cases[1]]
+    assert (out / "train_corpus.jsonl").read_bytes() == _task4_canonical_json(train_rows[0]) + b"\n"
+    assert (out / "heldout_corpus.jsonl").read_bytes() == _task4_canonical_json(heldout_rows[0]) + b"\n"
 
-def _task4_run(tmp_path, *, n_min="1", extra=()):
-    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
-    out = tmp_path / "out"
-    return t, root, out, t.teacher_main(
-        ["--data-root", str(root), "--out-dir", str(out),
-         "--index-out", str(out / "training_index.json"),
-         "--checkpoint", str(tmp_path / "unused.th"), "--heldout-mod", "2",
-         "--n-min", n_min, *extra], _trust_policy=_policy_for(root))
-
-
-def test_teacher_source_receipts_index_partitions_and_manifest_are_canonical(tmp_path):
-    t, root, out, result = _task4_run(tmp_path)
-    assert result == 0
+    expected_receipts = [_task4_receipt(root / "worker_2/layouts_0.th", i, expected_cases[i])
+                         for i in range(2)]
     index = json.loads((out / "training_index.json").read_text())
-    assert [r["relative_path"] for r in index["rows"]] == ["worker_2/layouts_0.th"] * 2
-    assert {r["partition"] for r in index["rows"]} == {"train", "heldout"}
-    assert all(len(r["source_sha256"]) == 64 and r["layout_index"] == 0 for r in index["rows"])
-    assert json.loads((out / "g0_manifest.json").read_text())["status"] == "complete"
+    assert index["schema"] == "icdc_topology_training_index_v1"
+    assert index["rows"] == [
+        {"receipt": expected_receipts[i], "instance_id": expected_cases[i]["instance_id"],
+         "source_row_count": 2, "block_count": 3, "partition": ("train" if i == 0 else "heldout"),
+         "sample_ordinal": 0,
+         "sample_seed": t._sample_seed(20260813, expected_cases[i]["instance_id"], 0),
+         "status": "processed"}
+        for i in range(2)]
+    for partition, index in (("train", 0), ("heldout", 1)):
+        label_rows = _task4_jsonl(out / f"{partition}_labels.jsonl")
+        proposal_rows = _task4_jsonl(out / "proposals.jsonl")
+        assert len(label_rows) == 1
+        assert label_rows[0] == {
+            **_task4_envelope(expected_cases[index], expected_receipts[index], partition,
+                              t._sample_seed(20260813, expected_cases[index]["instance_id"], 0)),
+            "proposal_ordinal": 0, "proposal_name": "base", "base_cost": 1.1,
+            "teacher_cost": 1.0, "record_weight": 1.1,
+            "edges": [], "contacts": [], "pin_paths": [],
+        }
+        assert any(row["instance_id"] == expected_cases[index]["instance_id"] for row in proposal_rows)
+    assert _task4_jsonl(out / "rejections.jsonl") == []
+
+    manifest = json.loads((out / "g0_manifest.json").read_text())
+    assert manifest["schema"] == "icdc_topology_teacher_g0_v1"
+    assert manifest["status"] == "complete"
+    assert manifest["state"] == "TARGET_GAIN_MET"
+    assert manifest["training_authorized"] is True
+    assert manifest["bounded_max_files"] is False
+    assert set(manifest["support_hashes"]) == set(_TASK4_FILES) - {"g0_manifest.json"}
+    assert manifest["support_hashes"] == {
+        name: hashlib.sha256((out / name).read_bytes()).hexdigest()
+        for name in _TASK4_FILES if name != "g0_manifest.json"
+    }
+    assert manifest["self_sha256"] == t._manifest_self_sha256(manifest)
+    blobs = b"".join((out / name).read_bytes() for name in _TASK4_FILES)
+    assert not any(str(secret).encode() in blobs for secret in (701, 703, 401, 403, 709, 719, 809, 811))
+    assert b"timestamp" not in blobs and str(root).encode() not in blobs
 
 
-def test_teacher_source_loads_each_shard_once_from_verified_bytesio(tmp_path, monkeypatch):
-    t, root, out = _teacher(), tmp_path / "floorset_lite", tmp_path / "out"
-    _task4_shard(root); seen = []
-    original = torch.load
-    def load_once(source, **kwargs):
+def test_teacher_source_reads_each_file_once_from_same_bytesio_under_path_swap(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; path = _task4_shard(root)
+    out = tmp_path / "out"; calls = _task4_fake_runtime(t, monkeypatch)
+    original_bytes = path.read_bytes(); seen = []
+    real_load = torch.load
+
+    def load_from_verified_bytes(source, **kwargs):
         assert isinstance(source, io.BytesIO)
         assert kwargs == {"weights_only": True, "map_location": "cpu"}
         seen.append(source.getvalue())
-        return original(source, **kwargs)
-    monkeypatch.setattr(torch, "load", load_once)
-    t.teacher_main(["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"), "--checkpoint", str(tmp_path / "unused.th"), "--heldout-mod", "2", "--n-min", "1"], _trust_policy=_policy_for(root))
-    assert len(seen) == 1
+        path.write_bytes(b"replaced-after-read")
+        return real_load(source, **kwargs)
+
+    monkeypatch.setattr(torch, "load", load_from_verified_bytes)
+    result = t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert result == 0 and seen == [original_bytes] and len(calls) == 2
+    expected_sha = hashlib.sha256(original_bytes).hexdigest()
+    index = json.loads((out / "training_index.json").read_text())
+    assert {row["receipt"]["file_sha256"] for row in index["rows"]} == {expected_sha}
 
 
-def test_teacher_masks_unauthorized_soft_fp_coordinates(tmp_path):
-    t, root, out, result = _task4_run(tmp_path)
-    assert result == 0
-    assert b"701" not in (out / "train_corpus.jsonl").read_bytes()
-    assert b"809" not in (out / "heldout_corpus.jsonl").read_bytes()
+@pytest.mark.parametrize("soft_delta", [1000, 2000])
+def test_teacher_soft_fp_variants_only_change_narrow_source_hashes(tmp_path, monkeypatch, soft_delta):
+    base_dir = tmp_path / "base"; soft_dir = tmp_path / "soft"
+    base_root = base_dir / "floorset_lite"; soft_root = soft_dir / "floorset_lite"
+    base_path = _task4_shard(base_root); soft_path = _task4_shard(soft_root, soft_delta=soft_delta)
+    assert hashlib.sha256(base_path.read_bytes()).hexdigest() != hashlib.sha256(soft_path.read_bytes()).hexdigest()
+    t = _teacher(); base_out = base_dir / "out"; soft_out = soft_dir / "out"
+    _task4_fake_runtime(t, monkeypatch)
+    assert t.teacher_main(_task4_args(base_root, base_out), _trust_policy=_policy_for(base_root)) == 0
+    _task4_fake_runtime(t, monkeypatch)
+    assert t.teacher_main(_task4_args(soft_root, soft_out), _trust_policy=_policy_for(soft_root)) == 0
+    assert _task4_artifact_projection(base_out) == _task4_artifact_projection(soft_out)
+    changed = (701 + soft_delta, 703 + soft_delta, 401 + soft_delta,
+               403 + soft_delta, 709 + soft_delta, 719 + soft_delta,
+               809 + soft_delta, 811 + soft_delta)
+    blobs = b"".join((soft_out / name).read_bytes() for name in _TASK4_FILES)
+    assert not any(str(secret).encode() in blobs for secret in changed)
 
 
-def test_teacher_is_deterministic_and_never_replaces_existing_output(tmp_path):
-    t, root, out, result = _task4_run(tmp_path)
-    assert result == 0
-    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in out.iterdir()}
-    with pytest.raises((FileExistsError, ValueError, RuntimeError)):
-        t.teacher_main(["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"), "--checkpoint", str(tmp_path / "unused.th"), "--heldout-mod", "2", "--n-min", "1"], _trust_policy=_policy_for(root))
-    assert before == {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in out.iterdir()}
+def test_teacher_fresh_outputs_are_byte_identical_and_existing_output_is_untouched(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    first, second = tmp_path / "first", tmp_path / "second"
+    _task4_fake_runtime(t, monkeypatch)
+    assert t.teacher_main(_task4_args(root, first), _trust_policy=_policy_for(root)) == 0
+    _task4_fake_runtime(t, monkeypatch)
+    assert t.teacher_main(_task4_args(root, second), _trust_policy=_policy_for(root)) == 0
+    assert {name: (first / name).read_bytes() for name in _TASK4_FILES} == {
+        name: (second / name).read_bytes() for name in _TASK4_FILES}
+    before = {name: hashlib.sha256((first / name).read_bytes()).hexdigest() for name in _TASK4_FILES}
+    calls = _task4_fake_runtime(t, monkeypatch)
+    with pytest.raises(ValueError, match="existing output"):
+        t.teacher_main(_task4_args(root, first), _trust_policy=_policy_for(root))
+    assert calls == []
+    assert before == {name: hashlib.sha256((first / name).read_bytes()).hexdigest() for name in _TASK4_FILES}
 
 
-def test_teacher_process_failure_leaves_no_final_output(tmp_path):
-    _task4_run(tmp_path)
-    assert not (tmp_path / "out").exists()
+@pytest.mark.parametrize("fail_at", [0, 1])
+def test_teacher_process_failure_is_transactional_for_each_eligible_row(tmp_path, monkeypatch, fail_at):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    _task4_fake_runtime(t, monkeypatch, fail_at=fail_at)
+    with pytest.raises(_Task4ProcessFailure, match=rf"process failure at {fail_at}"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert not out.exists()
 
 
-def test_teacher_publish_failure_leaves_staging_only_until_atomic_commit(tmp_path):
-    _task4_run(tmp_path)
-    assert not (tmp_path / "out").exists()
+def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    _task4_fake_runtime(t, monkeypatch)
+    inspected = {}
+
+    def fail_publish(staging, destination):
+        assert destination == out and staging.is_dir()
+        assert sorted(path.name for path in staging.iterdir()) == sorted(_TASK4_FILES)
+        manifest = json.loads((staging / "g0_manifest.json").read_text())
+        assert manifest["status"] == "complete"
+        inspected["ok"] = True
+        raise _Task4PublishFailure("publish failure")
+
+    monkeypatch.setattr(t, "_publish_staging", fail_publish, raising=False)
+    with pytest.raises(_Task4PublishFailure, match="publish failure"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert inspected == {"ok": True} and not out.exists()
 
 
-def test_teacher_excluded_rows_publish_terminal_non_authorizing_evidence(tmp_path):
-    t, root, out, result = _task4_run(tmp_path, n_min="4")
+def test_teacher_excluded_rows_publish_empty_non_authorizing_terminal_evidence(tmp_path, monkeypatch):
+    t, root, out, calls, result = _task4_run(tmp_path, monkeypatch, n_min=4)
+    assert result != 0 and calls == []
+    assert sorted(path.name for path in out.iterdir()) == sorted(_TASK4_FILES)
+    index = json.loads((out / "training_index.json").read_text())
+    assert [row["instance_id"] for row in index["rows"]] == [
+        "worker_2/layouts_0.th#0", "worker_2/layouts_0.th#1"]
+    assert all(row["status"] == "excluded_n_min" for row in index["rows"])
+    assert all(row["partition"] is None and row["sample_ordinal"] is None and row["sample_seed"] is None
+               for row in index["rows"])
+    assert all((out / name).read_bytes() == b"" for name in _TASK4_JSONL)
+    manifest = json.loads((out / "g0_manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["state"] == "KILLED_LEGALITY_OR_COVERAGE"
+    assert manifest["training_authorized"] is False
+
+
+def test_teacher_bounded_max_files_is_non_authorizing_even_with_positive_fake_gain(tmp_path, monkeypatch):
+    t, root, out, calls, result = _task4_run(tmp_path, monkeypatch, max_files=1)
     assert result != 0
     manifest = json.loads((out / "g0_manifest.json").read_text())
+    assert manifest["bounded_max_files"] is True
     assert manifest["training_authorized"] is False
-    assert manifest["state"] == "KILLED_LEGALITY_OR_COVERAGE"
-    assert all(not (out / name).read_bytes() for name in ("train_corpus.jsonl", "heldout_corpus.jsonl", "proposals.jsonl", "rejections.jsonl"))
 
 
-def test_teacher_ast_dataflow_forbids_validation_golden_and_path_source_loads():
+def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"
+    _task4_shard(root)
+    _task4_single_shard(root, "worker_2/layouts_2.th", metric_delta=2)
+    _task4_single_shard(root, "worker_2/layouts_10.th", metric_delta=3)
+    _task4_single_shard(root, "worker_10/layouts_0.th", metric_delta=4)
+    decoy_a = root / "worker_2" / "layouts_bad.th"; decoy_a.write_bytes(b"bad")
+    decoy_b = root / "worker_bad" / "layouts_0.th"; decoy_b.parent.mkdir(); decoy_b.write_bytes(b"bad")
+    calls = _task4_fake_runtime(t, monkeypatch)
+    loaded = []
+    real_load = torch.load
+
+    def count_load(source, **kwargs):
+        loaded.append(source.getvalue())
+        return real_load(source, **kwargs)
+
+    monkeypatch.setattr(torch, "load", count_load)
+    out = tmp_path / "out"
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert [item.receipt.relative_path for item in calls] == [
+        "worker_2/layouts_0.th", "worker_2/layouts_0.th",
+        "worker_2/layouts_2.th", "worker_2/layouts_10.th",
+        "worker_10/layouts_0.th"]
+    assert len(loaded) == 4
+
+
+def test_teacher_ast_guard_resolves_imports_aliases_and_bytesio_source_load_contract():
     tree = ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())
-    calls = []
-    def dotted(n):
-        if isinstance(n, ast.Name): return n.id
-        if isinstance(n, ast.Attribute):
-            p = dotted(n.value); return f"{p}.{n.attr}" if p else n.attr
+    aliases = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                aliases[item.asname or item.name.split(".")[0]] = item.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for item in node.names:
+                aliases[item.asname or item.name] = f"{node.module}.{item.name}"
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id in aliases:
+                aliases[node.targets[0].id] = aliases[value.id]
+            elif isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id in aliases:
+                aliases[node.targets[0].id] = f"{aliases[value.value.id]}.{value.attr}"
+
+    def resolve(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            base = resolve(node.value)
+            return f"{base}.{node.attr}"
         return ""
+
+    loads = []
+    banned = ("load_test_cases", "FloorplanDatasetLiteTest", "BandFileSampler._instance",
+              "golden", "validation")
+    dynamic = {"__import__", "importlib.import_module", "getattr", "eval", "exec"}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call): calls.append((dotted(node.func), node))
-    forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "golden", "validation", "BandFileSampler._instance")
-    assert not any(any(name == bad or name.endswith("." + bad) for bad in forbidden) for name, _ in calls)
-    assert not any(name == "torch.load" and node.args and isinstance(node.args[0], ast.Name) for name, node in calls)
+        if not isinstance(node, ast.Call):
+            continue
+        name = resolve(node.func)
+        assert name not in dynamic
+        assert not any(name == item or name.endswith("." + item) for item in banned)
+        if name == "torch.load":
+            loads.append(node)
+            assert len(node.args) == 1
+            source = node.args[0]
+            assert isinstance(source, ast.Call) and resolve(source.func) == "io.BytesIO"
+            assert len(source.args) == 1
+            keyword_values = {
+                keyword.arg: keyword.value.value
+                for keyword in node.keywords
+                if keyword.arg is not None and isinstance(keyword.value, ast.Constant)
+            }
+            assert keyword_values == {"weights_only": True, "map_location": "cpu"}
+    assert loads
 
 
 def test_teacher_g0_state_precedence_literals():
