@@ -1195,6 +1195,64 @@ def _task4_lifecycle_registry_sizes(module):
     }
 
 
+def _task4_install_public_removal_attack(
+        t, monkeypatch, *, target, moved, directory, foreign_bytes=None):
+    """Swap only when destructive removal still names the public target.
+
+    This is deliberately outside the ownership-validation hook.  A direct
+    public unlink/rmdir observes the replacement and is unsafe; an atomic
+    rename-to-private-claim implementation never invokes this attack because
+    its destructive name is the private claim rather than `target`.
+    """
+    real_unlink = t.os.unlink
+    real_rmdir = t.os.rmdir
+    attack = {}
+
+    def public_path(path, kwargs):
+        candidate = Path(path)
+        dir_fd = kwargs.get("dir_fd")
+        if dir_fd is not None and not candidate.is_absolute():
+            try:
+                candidate = Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / candidate
+            except OSError:
+                return None
+        return candidate
+
+    def replace_if_public(path, kwargs, operation):
+        candidate = public_path(path, kwargs)
+        current_target = target() if callable(target) else target
+        if candidate != current_target or attack:
+            return
+        current_target.rename(moved)
+        if directory:
+            # An empty foreign directory makes a direct rmdir destructive;
+            # its replacement inode is the sentinel we require to survive.
+            current_target.mkdir()
+        else:
+            current_target.write_bytes(foreign_bytes or b"foreign-public-removal")
+        info = current_target.stat()
+        attack.update(operation=operation, identity=(info.st_dev, info.st_ino))
+
+    def unlink(path, *args, **kwargs):
+        replace_if_public(path, kwargs, "unlink")
+        return real_unlink(path, *args, **kwargs)
+
+    def rmdir(path, *args, **kwargs):
+        replace_if_public(path, kwargs, "rmdir")
+        return real_rmdir(path, *args, **kwargs)
+
+    if directory:
+        monkeypatch.setattr(t.os, "rmdir", rmdir)
+    else:
+        monkeypatch.setattr(t.os, "unlink", unlink)
+    return attack
+
+
+def _task4_assert_closed_sqlite_connection(module, connection):
+    with pytest.raises(module.sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+
+
 @dataclasses.dataclass(frozen=True)
 class _Task4CaseInput:
     case: collections.abc.Mapping
@@ -2813,6 +2871,31 @@ def test_population_abort_refuses_main_replacement_after_ownership_check(tmp_pat
             db_path.unlink(missing_ok=True)
 
 
+def test_population_main_public_removal_never_deletes_replacement(tmp_path, monkeypatch):
+    t = _teacher(); acc = t._PopulationAccumulator(); main = Path(acc._db_path)
+    moved = tmp_path / "moved-owned-population-main"
+    attack = _task4_install_public_removal_attack(
+        t, monkeypatch, target=main, moved=moved, directory=False,
+        foreign_bytes=b"foreign-population-at-public-removal",
+    )
+    error = None
+    try:
+        acc._close_spool()
+    except BaseException as exc:
+        error = exc
+    try:
+        assert acc._db is None
+        if attack:
+            assert error is not None
+            assert main.read_bytes() == b"foreign-population-at-public-removal"
+            assert (main.stat().st_dev, main.stat().st_ino) == attack["identity"]
+            assert moved.exists()
+        else:
+            assert error is None and not main.exists()
+    finally:
+        main.unlink(missing_ok=True); moved.unlink(missing_ok=True)
+
+
 def test_population_abort_closes_active_connection_before_preserving_foreign_journal():
     t = _teacher(); acc = t._PopulationAccumulator(); db = acc._db
     assert db is not None
@@ -2861,6 +2944,94 @@ def test_population_ownership_metadata_is_torn_down_before_object_id_reuse():
             pass
         gc.collect()
     assert all(reference() is None for reference in references)
+
+
+def test_population_abort_preserves_replaced_captured_journal_identity(tmp_path):
+    t = _teacher(); acc = t._PopulationAccumulator(); db = acc._db
+    assert db is not None
+    main = Path(acc._db_path); journal = Path(f"{main}-journal")
+    moved = tmp_path / "captured-owned-journal"
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) "
+               "VALUES (?,?,?,?,NULL,NULL,?)",
+               ("worker_2/layouts_0.th", 0, "active", 1, 1.0))
+    # MEMORY-journal implementations may not materialize a sidecar.  The
+    # external file keeps this identity test valid for those designs too.
+    if not journal.exists():
+        journal.write_bytes(b"owned-journal-probe")
+    capture = getattr(acc, "_capture_sidecars", None)
+    if callable(capture):
+        capture()
+    journal.rename(moved)
+    journal.write_bytes(b"foreign-replaced-captured-journal")
+    foreign = journal.stat()
+    try:
+        acc.abort()
+        _task4_assert_closed_sqlite_connection(t, db)
+        assert not main.exists()
+        assert journal.read_bytes() == b"foreign-replaced-captured-journal"
+        assert (journal.stat().st_dev, journal.stat().st_ino) == (foreign.st_dev, foreign.st_ino)
+        assert not _task4_path_fd_targets(main)
+        assert not _task4_path_fd_targets(journal)
+    finally:
+        try:
+            db.close()
+        except t.sqlite3.ProgrammingError:
+            pass
+        main.unlink(missing_ok=True); journal.unlink(missing_ok=True); moved.unlink(missing_ok=True)
+
+
+def test_population_abort_preserves_dangling_foreign_journal_symlink(tmp_path):
+    t = _teacher(); acc = t._PopulationAccumulator(); db = acc._db
+    assert db is not None
+    main = Path(acc._db_path); journal = Path(f"{main}-journal")
+    missing_target = tmp_path / "missing-foreign-journal-target"
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) "
+               "VALUES (?,?,?,?,NULL,NULL,?)",
+               ("worker_2/layouts_0.th", 0, "active", 1, 1.0))
+    journal.unlink(missing_ok=True)
+    journal.symlink_to(missing_target)
+    link = journal.lstat()
+    try:
+        acc.abort()
+        _task4_assert_closed_sqlite_connection(t, db)
+        assert journal.is_symlink()
+        assert os.readlink(journal) == str(missing_target)
+        assert journal.lstat().st_ino == link.st_ino
+        assert not _task4_path_fd_targets(main)
+        assert not _task4_path_fd_targets(journal)
+    finally:
+        try:
+            db.close()
+        except t.sqlite3.ProgrammingError:
+            pass
+        main.unlink(missing_ok=True); journal.unlink(missing_ok=True)
+
+
+def test_population_close_failure_retains_main_and_releases_lifecycle_state(tmp_path):
+    t = _teacher(); baseline = _task4_lifecycle_registry_sizes(t)
+    acc = t._PopulationAccumulator(); connection = acc._db
+    assert connection is not None
+    main = Path(acc._db_path); identity = (main.stat().st_dev, main.stat().st_ino)
+    connection.close()
+    marker = RuntimeError("injected population close failure")
+
+    class FailingClose:
+        def close(self):
+            raise marker
+
+    acc._db = FailingClose()
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            acc._close_spool()
+        assert exc.value is marker
+        assert acc._db is None
+        assert main.exists() and (main.stat().st_dev, main.stat().st_ino) == identity
+        assert _task4_lifecycle_registry_sizes(t) == baseline
+        assert not _task4_path_fd_targets(main)
+    finally:
+        main.unlink(missing_ok=True)
 
 
 def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
@@ -2954,6 +3125,60 @@ def test_cleanup_owned_staging_refuses_root_replacement_after_ownership_validati
     assert result is False and foreign and moved.is_dir() and owned.is_dir()
     assert (owned / "keep").read_bytes() == b"foreign-directory-sentinel"
     assert (owned.stat().st_dev, owned.stat().st_ino) == foreign["identity"]
+
+
+def test_cleanup_owned_staging_leaf_public_removal_never_deletes_replacement(
+        tmp_path, monkeypatch):
+    t = _teacher(); stage = tmp_path / "stage"; stage.mkdir()
+    leaf = stage / "owned-leaf"; leaf.write_bytes(b"owned")
+    moved = tmp_path / "moved-owned-leaf"; lease = t._new_staging_lease(stage)
+    attack = _task4_install_public_removal_attack(
+        t, monkeypatch, target=leaf, moved=moved, directory=False,
+        foreign_bytes=b"foreign-leaf-at-public-removal",
+    )
+    result = t._cleanup_owned_staging(lease)
+    if attack:
+        assert result is False
+        assert leaf.read_bytes() == b"foreign-leaf-at-public-removal"
+        assert (leaf.stat().st_dev, leaf.stat().st_ino) == attack["identity"]
+        assert moved.read_bytes() == b"owned"
+    else:
+        # Atomic claim/quarantine removes a private name, never the public
+        # target, and therefore legitimately avoids the injected attack.
+        assert result is True and not leaf.exists() and not stage.exists()
+
+
+def test_cleanup_owned_staging_child_public_removal_never_deletes_replacement(
+        tmp_path, monkeypatch):
+    t = _teacher(); stage = tmp_path / "stage"; child = stage / "owned-child"
+    child.mkdir(parents=True); moved = tmp_path / "moved-owned-child"
+    lease = t._new_staging_lease(stage)
+    attack = _task4_install_public_removal_attack(
+        t, monkeypatch, target=child, moved=moved, directory=True,
+    )
+    result = t._cleanup_owned_staging(lease)
+    if attack:
+        assert result is False
+        assert child.is_dir() and (child.stat().st_dev, child.stat().st_ino) == attack["identity"]
+        assert moved.is_dir()
+    else:
+        assert result is True and not child.exists() and not stage.exists()
+
+
+def test_cleanup_owned_staging_root_public_removal_never_deletes_replacement(
+        tmp_path, monkeypatch):
+    t = _teacher(); stage = tmp_path / "stage"; stage.mkdir()
+    moved = tmp_path / "moved-owned-stage"; lease = t._new_staging_lease(stage)
+    attack = _task4_install_public_removal_attack(
+        t, monkeypatch, target=stage, moved=moved, directory=True,
+    )
+    result = t._cleanup_owned_staging(lease)
+    if attack:
+        assert result is False
+        assert stage.is_dir() and (stage.stat().st_dev, stage.stat().st_ino) == attack["identity"]
+        assert moved.is_dir()
+    else:
+        assert result is True and not stage.exists()
 
 
 def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monkeypatch):
@@ -3081,6 +3306,41 @@ def test_teacher_normal_case_spool_close_refuses_post_check_replacement(
     assert [path for kind, path in observed_targets if kind == "case_spool"] == [replacement]
     assert moved.exists() and replacement.read_bytes() == b"foreign-after-case-spool-validation"
     assert (replacement.stat().st_dev, replacement.stat().st_ino) == foreign["identity"]
+
+
+def test_teacher_case_spool_public_removal_never_deletes_replacement(
+        tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"; stages = []; moved = tmp_path / "moved-owned-case-spool"
+    _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
+    real_staging = t._new_staging; published = []
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+    attack = _task4_install_public_removal_attack(
+        t, monkeypatch, target=lambda: stages[-1] / "case_spool.sqlite",
+        moved=moved, directory=False,
+        foreign_bytes=b"foreign-case-spool-at-public-removal",
+    )
+    monkeypatch.setattr(t, "_publish_staging",
+                        lambda *args: published.append(args))
+    error = None
+    try:
+        result = t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    except BaseException as exc:
+        error = exc
+        result = None
+    public_spool = stages[-1] / "case_spool.sqlite"
+    if attack:
+        assert error is not None
+        assert not published and not out.exists()
+        assert public_spool.read_bytes() == b"foreign-case-spool-at-public-removal"
+        assert (public_spool.stat().st_dev, public_spool.stat().st_ino) == attack["identity"]
+        assert moved.exists()
+    else:
+        assert error is None and result == 0 and len(published) == 1
+        assert not public_spool.exists()
 
 
 @pytest.mark.parametrize("suffix", ["", "-journal", "-wal", "-shm"])
