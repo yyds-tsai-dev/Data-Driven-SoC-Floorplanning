@@ -1382,7 +1382,7 @@ class _PopulationAccumulator:
         self._db: Optional[sqlite3.Connection] = None
         try:
             self._db = sqlite3.connect(str(self._db_path))
-            self._db.execute("PRAGMA cache_size=8")
+            self._db.execute("PRAGMA cache_size=-64")
             self._db.execute("PRAGMA temp_store=FILE")
             self._db.execute("PRAGMA mmap_size=0")
             self._db.execute(
@@ -1725,6 +1725,9 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         writer = _JsonlWriter(lease.path)
         spool_path = lease.path / "case_spool.sqlite"
         spool = sqlite3.connect(str(spool_path))
+        spool.execute("PRAGMA cache_size=-64")
+        spool.execute("PRAGMA temp_store=FILE")
+        spool.execute("PRAGMA mmap_size=0")
         spool.execute("CREATE TABLE cases(worker INTEGER,layout INTEGER,source_row_index INTEGER,relative_path TEXT,file_sha256 TEXT,source_row_count INTEGER,instance_id TEXT,case_json TEXT,fingerprint TEXT,PRIMARY KEY(worker,layout,source_row_index))")
         spool.commit()
         population = _PopulationAccumulator()
