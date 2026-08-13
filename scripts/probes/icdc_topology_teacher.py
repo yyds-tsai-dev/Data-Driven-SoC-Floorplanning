@@ -346,6 +346,14 @@ class _CaseOutcome:
     covered: bool
     case_status: str
 
+    def __eq__(self, other: Any) -> bool:
+        if not hasattr(other, "__dataclass_fields__"):
+            return NotImplemented
+        names = tuple(self.__dataclass_fields__)
+        if tuple(other.__dataclass_fields__) != names:
+            return False
+        return all(getattr(self, n) == getattr(other, n) for n in names)
+
 @dataclass(frozen=True)
 class _TeacherRuntime:
     preflight: Callable[[TeacherTrustPolicy, Path], Mapping[str, Any]]
@@ -1474,7 +1482,7 @@ class _PopulationAccumulator:
             self._finished = result; self._close_spool(); return dict(result)
         try:
             if not self.count:
-                result = {"denominator": 0.0, "B_H": 0.0, "T_H": 0.0, "Delta_H": 0.0,
+                result = {"eligible_count": 0, "scored_winner_count": 0, "scored_denominator": 0.0, "denominator": 0.0, "B_H": None, "T_H": None, "Delta_H": None,
                           "population_sha256": hashlib.sha256(b"[]").hexdigest()}
             else:
                 population_hash = hashlib.sha256(b"[")
@@ -1510,7 +1518,7 @@ class _PopulationAccumulator:
                 if not all(math.isfinite(value) for value in (base_mean, teacher_mean, delta)):
                     raise ValueError("weighted population result")
                 population_hash.update(b"]")
-                result = {"denominator": denominator, "B_H": base_mean, "T_H": teacher_mean,
+                result = {"eligible_count": self.count, "scored_winner_count": self.count, "scored_denominator": denominator, "denominator": denominator, "B_H": base_mean, "T_H": teacher_mean,
                           "Delta_H": delta, "population_sha256": population_hash.hexdigest()}
             self._finished = result
             self.denominator = result["denominator"]
@@ -1599,7 +1607,8 @@ def _outcome_from_lifecycle(case_input: _CaseInput, raw_rects: torch.Tensor, lif
         terminal = status if winner is r else ("base_unavailable" if not base_ok and r.official_cost is not None else ("not_selected" if r.official_cost is not None and reason == "" else "rejected"))
         row = {"ordinal":r.ordinal,"name":r.name,"intended_intent":r.name,"raw_topology_fingerprint":_topology_sha(raw_rects,case_input.case),"intended_topology_fingerprint":_topology_sha(r.original,case_input.case),"realized_topology_fingerprint":_topology_sha(r.legal,case_input.case),"admission_status":admission,"admission_reason":(None if admission == "admitted" else "admission_failed"),"drift":(dict(r.drift) if r.drift else None),"hard":(dict(r.hard) if r.hard else None),"hard_status":hard_status,"intent_status":intent_status,"official_cost":r.official_cost,"feasible":(True if r.official_cost is not None else (False if reason == "official_infeasible" else None)),"official_status":official_status,"diagnostic_energy":r.diagnostic_energy,"energy_status":r.energy_status,"winner":winner is r,"status":terminal}
         rows.append(row)
-        if reason and reason != "not_selected":
+        if r.rejection_reason and r.rejection_reason != "not_selected":
+            reason = r.rejection_reason
             stage = {"admission_failed":"admission","hard_audit_failed":"hard","intent_not_survived":"intent","official_infeasible":"official","official_invalid_cost":"official","official_evaluator_error":"official","base_unavailable":"selection"}.get(reason,"selection")
             rejects.append({"ordinal":r.ordinal,"name":r.name,"stage":stage,"reason":reason})
     label = None; bc = tc = None
