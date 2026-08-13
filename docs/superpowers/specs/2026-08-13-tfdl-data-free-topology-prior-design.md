@@ -37,30 +37,34 @@ checkpoint selection; after freeze, full100 G1 cannot feed back. Dense fp
 coordinates are never serialized, entered into the student, used in a
 coordinate/value loss, used to seed proposals, or used at inference.
 
-Outside the transient, receipt-verified conversion of training `fp_sol` to
+Outside transient receipt-verified conversion of training `fp_sol` to
 `fp_topology_v1`, `fp_sol` is read only to derive input-authorized
 fixed/preplaced geometry; it is never serialized as dense data or used as a
-coordinate target. The sparse exception is exact-TFDL winner topology:
-`fp_topology_v1` contains only the receipt/input fingerprint, `axis_edges`,
-`contacts`, and `topology_sha256`; it must not contain origin, width, height,
-gap, overlap magnitude, dense rectangles, or dense fp fields. TopologyLabel is a
-separate winner-derived record: its `fp_topology_sha256` links to this sparse
-record, while `winner_proposal_identity`, `winner_ordinal`, `winner_name`, and
-`winner_cost_no_runtime`, plus `pin_paths`, margins, and `record_weight`, exist
-only on TopologyLabel.
+coordinate target. Training `fp_sol` transiently produces only the sparse
+realizer-input `fp_topology_v1`; that record is distinct from the
+winner-derived `TopologyLabel`. The realizer consumes `fp_topology_v1`, a base
+seed, and sanitized input; it never receives fp rectangles. After exact TFDL
+and scoring, `TopologyLabel` links the originating `fp_topology_sha256` and
+alone carries winner-only margins, `pin_paths`, proposal identity, ordinal,
+name, cost, and record weight. `fp_topology_v1` contains only the receipt/input
+fingerprint, `axis_edges`, `contacts`, and `topology_sha256`; it must not
+contain origin, width, height, gap, overlap magnitude, dense rectangles, or
+dense fp fields.
 
 The canonical `fp_topology_v1` record has these logical fields, in this order:
 `schema` (string, exactly `fp_topology_v1`), `version` (integer, exactly 1),
 `receipt` (object with `relative_path` string, `source_sha256` lowercase
 64-hex string, and `row` nonnegative integer equal to the source layout row),
 `instance_id` (nonempty string), `input_fingerprint` (lowercase 64-hex
-string), `axis_edges` (list of
-integer objects `{src,dst,axis}`), `contacts` (list of objects
-`{a,b,axis,a_before_b}` with integer `a,b,axis` and boolean `a_before_b`),
-and `topology_sha256` (lowercase 64-hex string). `axis_edges` are sorted by
-`(axis,src,dst)` and contacts by `(axis,a,b,a_before_b)`; no other fields are
-permitted. To hash, omit `topology_sha256`, serialize the remaining payload
-as UTF-8 with `json.dumps(..., sort_keys=True, ensure_ascii=True,
+string), `axis_edges` (list of integer objects `{src,dst,axis}`), `contacts`
+(list of objects `{a,b,axis,a_before_b}` with integer `a,b,axis` and boolean
+`a_before_b`), and `topology_sha256` (lowercase 64-hex string). Validators
+require `0<=src,dst,a,b<N`, `src!=dst`, `a<b`, and `axis in {0,1}`; they define
+`a_before_b` relative to canonical contact endpoints `a,b`, reject invalid or
+noncanonical records, and reject duplicate relations. `axis_edges` are sorted
+by `(axis,src,dst)` and contacts by `(axis,a,b,a_before_b)`; no other fields
+are permitted. To hash, omit `topology_sha256`, serialize the remaining
+payload as UTF-8 with `json.dumps(..., sort_keys=True, ensure_ascii=True,
 separators=(",", ":"), allow_nan=False)`, and SHA256 those exact bytes. Add
 the digest and apply the same canonical serializer to the complete record.
 
@@ -72,29 +76,33 @@ the lower ID before the higher ID. Axis is encoded `0=x`, `1=y`, and each
 directed edge is `{src,dst,axis}`. Transitive reduction is applied separately
 to each axis DAG, then edges are sorted as specified above.
 
-Contacts consider only pairs declared in the same nonzero group. Detection
-uses literal extraction epsilon `1e-9` for absolute face gap and requires
-strictly positive perpendicular overlap. The current exact TFDL implementation
-requires bit-equal face abutment at realization/admission; epsilon is therefore
-only detection tolerance, never a relaxation of candidate legality. Candidate
-contacts are selected by maximum-overlap Kruskal with exact tie key
-`(axis,min_id,max_id)`; duplicate contacts are removed. Axis topology is
-translation-invariant and invariant under positive uniform scaling. Contact
-classification has that invariance only when the scaling leaves the
-`1e-9` detection classification unchanged; realized contacts still require
-bit-equal face coordinates.
+Contacts consider only pairs declared in the same nonzero group. Let
+`S=sqrt(sum(input_area_i for every valid input block i))`, evaluated on CPU
+float64, and set `contact_eps = 1e-9*S`. Detection requires absolute face gap
+`<= contact_eps` and strictly positive perpendicular overlap. The current
+exact TFDL implementation requires bit-equal face abutment at
+realization/admission; `contact_eps` is therefore detection tolerance only,
+never a relaxation of candidate legality. Candidate contacts are selected by
+maximum-overlap Kruskal with exact tie key `(axis,min_id,max_id)`; duplicate
+contacts are removed. The extractor asserts full-topology invariance under
+translation and positive uniform scaling: both geometry and `S` scale
+together, so normalized contact detection is unchanged. Realized contacts
+still require bit-equal face coordinates. The manifest binds the `S` formula,
+normalized coefficient `1e-9`, and CPU-float64 dtype in
+`extractor_config_sha256`.
 
 The canonical flow is: verified training shard → transient canonical fp →
-SHA-pinned provided/local contest-evaluator hard audit (soft V is accepted and
-recorded) → sparse topology → realize from Direct/base seed and input only
-(the realizer never receives fp rectangles) → exact TFDL with no shelf
-fallback → hard audit → SHA-pinned provided/local contest-evaluator
-no-runtime scorer → deterministic winner → sparse label/student. Task 3 has
+sparse realizer-input `fp_topology_v1` → realize from `fp_topology_v1`, Direct/base
+seed, and sanitized input → SHA-pinned provided/local contest-evaluator hard
+audit (soft V is accepted and recorded) → exact TFDL with no shelf fallback →
+hard audit → SHA-pinned provided/local contest-evaluator no-runtime scorer →
+deterministic winner → winner-linked TopologyLabel/student. Task 3 has
 six fixed ordinal slots, never renumbered: `0=base`, `1=fp-axis`,
 `2=existing axis`, `3=pin`, `4=fp-contact`, `5=existing contact`. Every slot
-emits one candidate or one recorded rejection. A duplicate fingerprint records
-`duplicate_of` the earliest ordinal and does not alter later ordinals. Task 3
-does not score candidates or emit labels; Task 4 selects the winner by
+records exactly one status: `candidate`, `rejected`, or `duplicate`; duplicate
+fingerprints record `duplicate_of` the earliest ordinal and do not alter later
+ordinals. Task 3 does not score candidates or emit labels; Task 4 evaluates
+each candidate exactly once and selects the winner by
 `(cost_no_runtime, ordinal, name)`. Soft grouping, MIB, and boundary violations
 are scoreable, not rejection; preplaced hard constraints override boundary
 soft constraints. Symmetric area tolerance is inclusive `±1%`; outside it is a
@@ -269,18 +277,22 @@ same-shape student.
 Task 3 is intentionally narrower than teacher scoring. Its generator consumes
 a CPU floating `[N,4]` coordinate seed and emits CPU float64 `[N,4]`
 proposals. It has exactly six fixed ordinal slots: `0=base`, `1=fp-axis`,
-`2=existing axis`, `3=pin`, `4=fp-contact`, and `5=existing contact`.
-Each slot emits one candidate or one recorded rejection; later slots retain
-their ordinals even when an earlier slot rejects. Every candidate must realize
-its topology through public TFDL recomputation; there is no hidden graph
-override. A duplicate realized fingerprint records `duplicate_of` the
-earliest ordinal and is not emitted as a second candidate. Axis/order
-mutations move only unpinned origins across the selected pair threshold. Pin
-repairs set every preplaced origin and repair the reverse incoming relation
-through the unpinned peer. Contact mutations bridge components only with exact
-face abutment and positive perpendicular overlap; dimensions and preplaced
-geometry remain fixed. Task 3 performs no scoring and emits no labels; Task 4
-scores all admitted slots and selects `(cost_no_runtime, ordinal, name)`.
+`2=existing axis`, `3=pin`, `4=fp-contact`, and `5=existing contact`. Each slot
+has exactly one status: `candidate`, `rejected`, or `duplicate`. A
+`candidate` is an admitted realization; `rejected` records the deterministic
+reason and emits no candidate; `duplicate` retains its ordinal and records
+`duplicate_of` the earliest ordinal with the same canonical fingerprint. A
+duplicate receives no second evaluator call and is excluded from winner
+selection. Later slots retain their ordinals regardless of earlier status.
+Every candidate must realize its topology through public TFDL recomputation;
+there is no hidden graph override. Axis/order mutations move only unpinned
+origins across the selected pair threshold. Pin repairs set every preplaced
+origin and repair the reverse incoming relation through the unpinned peer.
+Contact mutations bridge components only with exact face abutment and positive
+perpendicular overlap; dimensions and preplaced geometry remain fixed. Task 3
+performs no scoring and emits no labels. Task 4 evaluates every candidate
+exactly once and selects only among candidates by
+`(cost_no_runtime, ordinal, name)`.
 
 The Task 3 case adapter consumes the full sanitized case schema:
 `cons[:,0]=fixed`, `cons[:,1]=preplaced`, `cons[:,2]=MIB`,
@@ -301,7 +313,9 @@ boundary/group/MIB semantics. The public TFDL path does not call
 hard legality and contact intent only. It does not recompute group/boundary/MIB
 soft relations, call energy, or call `extract_sparse_label`; every
 `ProposalResult` has `cost=None` and `label=None`. Task 4 recomputes the
-evaluator-faithful soft profile/cost before extracting labels.
+evaluator-faithful soft profile/cost exactly once per `candidate` status before
+extracting the winner-linked TopologyLabel; `rejected` and `duplicate` slots
+are never scored.
 
 Monitor constraint satisfaction, drift, hard legality, energy/ranking gain,
 collapse (loss diversity and output variance), and proposal/student diversity.
@@ -385,10 +399,12 @@ diagnostic kill only.  Between hard and target, stop with no training
 authority; only the target permits Task 5.  G1 remains the sole causal
 transfer proof.
 
-For every generated proposal (base and mutations) that passes exact admission
-and named-intent survival, call the SHA-pinned provided/local contest
-evaluator `evaluate_solution({"positions": ..., "runtime": 1.0}, ...,
-median_runtime=1.0).cost_no_runtime`;
+For every fixed slot with status `candidate` (base or mutation) that passes
+exact admission and named-intent survival, call the SHA-pinned provided/local
+contest evaluator exactly once:
+`evaluate_solution({"positions": ..., "runtime": 1.0}, ...,
+median_runtime=1.0).cost_no_runtime`. `rejected` and `duplicate` slots receive
+no evaluator call.
 `EN.energy` is called only after exact legal admission, recorded diagnostically,
 and never shortlists or filters. Select by deterministic
 `(cost_no_runtime, ordinal, name)`, always including baseline; `B_H`, `T_H`,
@@ -532,9 +548,11 @@ Task 4 emits exactly eight canonical files: `train_corpus.jsonl`,
 `heldout_corpus.jsonl`, `train_labels.jsonl`, `heldout_labels.jsonl`,
 `proposals.jsonl`, `rejections.jsonl`, `training_index.json`, and
 `g0_manifest.json`. Every proposal envelope binds receipt/partition/instance,
-seed/ordinal/name, intended/seed/realized fingerprint or named intent,
-admission status/reason, available drift/hard evidence, diagnostic energy,
-provided/local scorer result and feasibility, and winner/status. The manifest hashes exactly the
+seed/ordinal/name, fixed-slot status (`candidate`, `rejected`, or `duplicate`),
+`duplicate_of` when applicable, intended/seed/realized fingerprint or named
+intent, admission status/reason, available drift/hard evidence, diagnostic
+energy, provided/local scorer result and feasibility, and winner/status. The
+manifest hashes exactly the
 seven support artifacts by fixed relative basename, excluding itself. It stores
 `self_sha256 = SHA256(canonical g0_manifest JSON with the self_sha256 field
 omitted)`; an external freeze may later hash final manifest bytes. No absolute
@@ -548,9 +566,10 @@ The manifest has concrete, non-optional digest fields:
 `source_receipt_set_sha256` is SHA256 of the canonical UTF-8 stream of the
 ordered complete receipt records (sorted by `relative_path`, then `row`);
 `extractor_source_sha256` hashes the exact extractor source bytes and
-`extractor_config_sha256` hashes canonical JSON for CPU `float64`, extraction
-epsilon `1e-9`, axis/direction ties, transitive reduction, and contact Kruskal
-rules; `exact_tfdl_source_sha256` hashes the exact TFDL source bytes and
+`extractor_config_sha256` hashes canonical JSON for CPU `float64`,
+`S=sqrt(sum(valid input_area_i))`, normalized contact coefficient `1e-9`,
+`contact_eps=1e-9*S`, axis/direction ties, transitive reduction, and contact
+Kruskal rules; `exact_tfdl_source_sha256` hashes the exact TFDL source bytes and
 `exact_tfdl_config_sha256` hashes canonical JSON including CPU `float64`,
 bit-equal face mode, and `shelf_fallback=false`; and
 `scorer_source_sha256` plus `scorer_contract_sha256` bind the exact scorer
