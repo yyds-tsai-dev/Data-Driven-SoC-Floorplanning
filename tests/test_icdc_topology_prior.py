@@ -2042,6 +2042,121 @@ def test_teacher_process_failure_is_transactional_for_each_eligible_row(tmp_path
     assert not out.exists()
 
 
+def test_teacher_late_invalid_shard_aborts_ingestion_before_runtime_or_destination(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root, relative_path="worker_2/layouts_0.th")
+    invalid = root / "worker_2/layouts_2.th"
+    torch.save(_task4_tensors()[:-1], invalid)
+    calls = []; _task4_fake_runtime(t, monkeypatch, calls=calls)
+    stages = []; real_staging = t._new_staging
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+    with pytest.raises(ValueError, match="source schema"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert calls == [] and not out.exists()
+    assert stages and not stages[-1].exists()
+
+
+def test_teacher_duplicate_discovery_entry_aborts_ingestion_before_runtime_or_destination(
+        tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    calls = []; _task4_fake_runtime(t, monkeypatch, calls=calls)
+    discovered = t._iter_approved_shards(root)
+    assert len(discovered) == 1
+    monkeypatch.setattr(t, "_iter_approved_shards", lambda _root: [*discovered, *discovered])
+    stages = []; real_staging = t._new_staging
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert calls == [] and not out.exists()
+    assert stages and not stages[-1].exists()
+
+
+def test_teacher_private_case_spool_is_staged_during_replay_and_absent_at_publish(
+        tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    calls = []; _task4_fake_runtime(t, monkeypatch, calls=calls,
+                                    outcome_factory=_task4_p1c_mutation_outcome)
+    stages = []; real_staging = t._new_staging
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+    observed_spool_paths = []
+
+    def private_entries():
+        assert stages
+        entries = [path for path in stages[-1].iterdir() if path.name not in _TASK4_JSONL]
+        observed_spool_paths.extend(entries)
+        return entries
+
+    runtime = t._runtime_hooks(); real_process = runtime.process_case
+    def process(case_input):
+        assert private_entries(), "the sanitized case spool must remain staged through replay"
+        return real_process(case_input)
+    monkeypatch.setattr(t, "_runtime_hooks", lambda: dataclasses.replace(runtime, process_case=process))
+
+    real_write = t._JsonlWriter.write
+    def write(writer, name, value):
+        assert private_entries(), "the sanitized case spool vanished before replay output"
+        return real_write(writer, name, value)
+    monkeypatch.setattr(t._JsonlWriter, "write", write)
+
+    published = []
+    def publish(lease, destination):
+        stage = Path(getattr(lease, "path", lease))
+        assert sorted(path.name for path in stage.iterdir()) == sorted(_TASK4_FILES)
+        published.append((stage, destination))
+    monkeypatch.setattr(t, "_publish_staging", publish)
+
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert len(calls) == 2 and len(published) == 1
+    assert observed_spool_paths and all(not path.exists() for path in observed_spool_paths)
+
+
+@pytest.mark.parametrize("seam", ("runtime", "writer"))
+def test_teacher_staged_case_spool_failure_is_transactional(tmp_path, monkeypatch, seam):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
+    stages = []; real_staging = t._new_staging
+    monkeypatch.setattr(
+        t, "_new_staging",
+        lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
+    )
+    sentinel = RuntimeError(f"{seam} replay failure")
+    observed_spool_paths = []
+
+    def has_private_spool():
+        assert stages
+        entries = [path for path in stages[-1].iterdir() if path.name not in _TASK4_JSONL]
+        observed_spool_paths.extend(entries)
+        return bool(entries)
+
+    if seam == "runtime":
+        runtime = t._runtime_hooks()
+        def process(_case_input):
+            assert has_private_spool(), "the sanitized case spool must exist before runtime replay"
+            raise sentinel
+        monkeypatch.setattr(t, "_runtime_hooks", lambda: dataclasses.replace(runtime, process_case=process))
+    else:
+        real_write = t._JsonlWriter.write
+        def write(writer, name, value):
+            assert has_private_spool(), "the sanitized case spool must exist during writer replay"
+            real_write(writer, name, value)
+            raise sentinel
+        monkeypatch.setattr(t._JsonlWriter, "write", write)
+
+    with pytest.raises(RuntimeError, match=rf"{seam} replay failure"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert not out.exists() and stages and not stages[-1].exists()
+    assert observed_spool_paths and all(not path.exists() for path in observed_spool_paths)
+
+
 def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
     policy = _policy_for(root); calls = []; preflight_calls = []
@@ -2061,60 +2176,73 @@ def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destina
     assert inspected == {"ok": True} and not out.exists()
 
 
-def test_teacher_streaming_b1_emits_each_shard_before_reading_the_next(tmp_path, monkeypatch):
-    """The six support streams must be append-only and numerically ordered."""
+def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path, monkeypatch):
+    """P1-C globally registers before replaying one spooled case at a time."""
     t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
     _task4_shard(root, relative_path="worker_2/layouts_0.th")
     _task4_shard(root, relative_path="worker_2/layouts_2.th", metric_delta=2)
     _task4_shard(root, relative_path="worker_2/layouts_10.th", metric_delta=10)
-    calls = []; _task4_fake_runtime(t, monkeypatch, calls=calls)
-    runtime = t._runtime_hooks()
-    original_process = runtime.process_case
-    def process(case_input):
-        original_process(case_input)
-        raw = _task4_p1c_raw(case_input.case); mutation = _task4_p1c_mutation(raw)
-        base = _task4_p1c_record(
-            t, 0, "base", raw, raw, cost=1.1, energy=0.0,
-            energy_status="recorded", hard={"hard_audit": True}, drift={"max_abs": 0.0},
-        )
-        rejected = _task4_p1c_record(
-            t, 1, "axis:0:1:0:0", mutation, mutation,
-            reason="official_invalid_cost", hard={"hard_audit": True},
-            drift={"max_abs": 0.0},
-        )
-        return _task4_p1c_outcome(
-            case_input, raw, t._CandidateLifecycle((base, rejected), 0, 1.1, 1.1)
-        )
-    monkeypatch.setattr(t, "_runtime_hooks", lambda: dataclasses.replace(runtime, process_case=process))
-    created = []; reads = 0
+    calls = []; events = []
+    _task4_fake_runtime(
+        t, monkeypatch, calls=calls, events=events,
+        outcome_factory=_task4_p1c_mutation_outcome,
+    )
+    created = []
     real_new_staging = t._new_staging
 
     def new_staging(destination):
         stage = real_new_staging(destination); created.append(stage); return stage
 
-    real_read = t._read_verified_shard
-
-    def read(root_path, worker, layout):
-        nonlocal reads
+    real_load = torch.load
+    def load(source, **kwargs):
+        assert isinstance(source, io.BytesIO)
+        assert kwargs == {"weights_only": True, "map_location": "cpu"}
         assert created, "staging must exist before any shard is loaded"
         stage = created[-1]
         assert all((stage / name).exists() for name in _TASK4_JSONL)
-        if reads:
-            assert all((stage / name).read_bytes().endswith(b"\n") and
-                       (stage / name).read_bytes() for name in _TASK4_JSONL)
-        reads += 1
-        return real_read(root_path, worker, layout)
+        assert not any(event[0] in {"process", "write"} for event in events)
+        events.append(("load", source.getvalue()))
+        return real_load(source, **kwargs)
+
+    real_register = t._PopulationAccumulator.register
+    def register(population, row):
+        events.append(("register", row["instance_id"]))
+        return real_register(population, row)
+
+    real_write = t._JsonlWriter.write
+    def write(writer, name, value):
+        events.append(("write", name, value.get("instance_id")))
+        return real_write(writer, name, value)
 
     monkeypatch.setattr(t, "_new_staging", new_staging)
-    monkeypatch.setattr(t, "_read_verified_shard", read)
-    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 1
-    assert reads == 3
+    monkeypatch.setattr(torch, "load", load)
+    monkeypatch.setattr(t._PopulationAccumulator, "register", register)
+    monkeypatch.setattr(t._JsonlWriter, "write", write)
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+
+    expected_paths = ["worker_2/layouts_0.th", "worker_2/layouts_2.th",
+                      "worker_2/layouts_10.th"]
+    assert [event[1] for event in events if event[0] == "load"] == [
+        (root / relative_path).read_bytes() for relative_path in expected_paths]
+    heldout_ids = [f"{relative_path}#1" for relative_path in expected_paths]
+    assert [event[1] for event in events if event[0] == "register"] == heldout_ids
+    first_process = next(index for index, event in enumerate(events) if event[0] == "process")
+    assert all(index < first_process for index, event in enumerate(events)
+               if event[0] in {"load", "register"})
+    first_write = next(index for index, event in enumerate(events) if event[0] == "write")
+    assert first_process < first_write
+
+    expected_all = [
+        f"worker_2/layouts_0.th#{index}" for index in range(2)
+    ] + [
+        f"{relative_path}#0" for relative_path in expected_paths[1:]
+    ]
+    assert [case.case["instance_id"] for case in calls] == expected_all
     for name in _TASK4_JSONL:
         rows = _task4_jsonl(out / name)
         assert (out / name).read_bytes() == b"".join(_task4_canonical_json(row) + b"\n" for row in rows)
     assert sum(len(_task4_jsonl(out / "proposals.jsonl")) for _ in [0]) == 2 * len(calls)
     assert sum(len(_task4_jsonl(out / "rejections.jsonl")) for _ in [0]) == len(calls)
-    expected_all = [c.case["instance_id"] for c in calls]
     train_ids = [c.case["instance_id"] for c in calls if c.partition == "train"]
     held_ids = [c.case["instance_id"] for c in calls if c.partition == "heldout"]
     assert [r["instance_id"] for r in _task4_jsonl(out / "train_corpus.jsonl")] == train_ids
@@ -2170,6 +2298,9 @@ def test_teacher_streaming_b1_durability_precedes_publish(tmp_path, monkeypatch)
         stage = staging_paths[-1]
         if stat.S_ISDIR(mode):
             manifest_exists = (path / "g0_manifest.json").exists()
+            if not manifest_exists:
+                assert sorted(child.name for child in path.iterdir()) == sorted(
+                    set(_TASK4_FILES) - {"g0_manifest.json"})
             events.append(("dir", path.resolve(), manifest_exists))
         else:
             events.append((path.name, path.parent.resolve()))
@@ -2226,28 +2357,31 @@ def test_teacher_streaming_b1_review_population_is_bounded_exact_and_ordered():
         {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "worker_2/layouts_0.th#0", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25},
         {"relative_path": "worker_10/layouts_0.th", "layout_index": 0, "instance_id": "worker_10/layouts_0.th#0", "n": 12, "base_cost": 3.5, "teacher_cost": 2.25},
     ]
-    expected = t._weighted_population(rows)
+    expected = _task4_p1c_canonical_population(rows)
     acc = t._PopulationAccumulator()
     for row in rows:
-        acc.add(row)
+        acc.register({key: row[key] for key in ("relative_path", "layout_index", "instance_id", "n")})
+        acc.record_winner(row["instance_id"], row["base_cost"], row["teacher_cost"])
     assert acc.finish() == expected
     reversed_acc = t._PopulationAccumulator()
     for row in reversed(rows):
-        reversed_acc.add(row)
+        reversed_acc.register({key: row[key] for key in ("relative_path", "layout_index", "instance_id", "n")})
+        reversed_acc.record_winner(row["instance_id"], row["base_cost"], row["teacher_cost"])
     assert reversed_acc.finish() == expected
     tracemalloc.start()
     try:
         bounded = t._PopulationAccumulator()
-        bounded.add({**rows[0], "instance_id": "warmup"})
+        bounded.register({**{key: rows[0][key] for key in ("relative_path", "layout_index", "instance_id", "n")}, "instance_id": "warmup"})
         tracemalloc.reset_peak()
         baseline = tracemalloc.get_traced_memory()[0]
         for index in range(2000):
-            bounded.add({"relative_path": "worker_2/layouts_0.th", "layout_index": index + 1,
-                         "instance_id": f"worker_2/layouts_0.th#{index}-" + ("x" * 4096),
-                         "n": 4, "base_cost": 8.5, "teacher_cost": 7.25})
+            bounded.register({"relative_path": "worker_2/layouts_0.th", "layout_index": index + 1,
+                              "instance_id": f"worker_2/layouts_0.th#{index}-" + ("x" * 4096),
+                              "n": 4})
         gc.collect()
         assert tracemalloc.get_traced_memory()[0] - baseline < 2 * 1024 * 1024
     finally:
+        bounded.abort()
         tracemalloc.stop()
 
 
@@ -2256,31 +2390,51 @@ def test_teacher_streaming_b1_review_population_is_bounded_exact_and_ordered():
     lambda r: {**r, "layout_index": -1}, lambda r: {**r, "layout_index": True},
     lambda r: {**r, "instance_id": ""},
     lambda r: {**r, "n": -1}, lambda r: {**r, "n": True},
-    lambda r: {**r, "base_cost": float("nan")}, lambda r: {**r, "base_cost": float("inf")},
-    lambda r: {**r, "teacher_cost": float("nan")}, lambda r: {**r, "teacher_cost": float("inf")},
-    lambda r: {**r, "n": 10000}, lambda r: {**r, "base_cost": 1e308, "n": 10000},
 ])
-def test_teacher_streaming_b1_review_population_rejects_malformed_rows(mutate):
+def test_teacher_streaming_b1_review_population_register_rejects_noncanonical_identity(mutate):
     t = _teacher()
-    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "worker_2/layouts_0.th#0", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25}
+    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+           "instance_id": "worker_2/layouts_0.th#0", "n": 4}
     with pytest.raises(ValueError):
-        t._PopulationAccumulator().add(mutate(row))
+        t._PopulationAccumulator().register(mutate(row))
+
+
+@pytest.mark.parametrize("n,base_cost,teacher_cost", [
+    (10000, 8.5, 7.25), (4, float("nan"), 7.25), (4, float("inf"), 7.25),
+    (4, 8.5, float("nan")), (4, 8.5, float("inf")), (7, 1e308, 7.25),
+])
+def test_teacher_streaming_b1_review_population_record_winner_rejects_overflow_and_nonfinite(
+        n, base_cost, teacher_cost):
+    t = _teacher(); acc = t._PopulationAccumulator()
+    identity = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+                "instance_id": "a", "n": n}
+    acc.register(identity)
+    with pytest.raises(ValueError):
+        acc.record_winner("a", base_cost, teacher_cost)
+    acc.abort()
 
 
 def test_teacher_streaming_b1_review_population_rejects_duplicate_source_layout():
     t = _teacher(); acc = t._PopulationAccumulator()
-    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "a", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25}
-    acc.add(row)
+    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "a", "n": 4}
+    acc.register(row)
     with pytest.raises(ValueError):
-        acc.add({**row, "instance_id": "b"})
+        acc.register({**row, "instance_id": "b"})
+    acc.abort()
 
 
 def test_teacher_streaming_b1_review_population_rejects_duplicate_instance():
     t = _teacher(); acc = t._PopulationAccumulator()
-    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "a", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25}
-    acc.add(row)
+    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "a", "n": 4}
+    acc.register(row)
     with pytest.raises(ValueError):
-        acc.add({**row, "relative_path": "worker_2/layouts_1.th", "layout_index": 1})
+        acc.register({**row, "relative_path": "worker_2/layouts_1.th", "layout_index": 1})
+    with pytest.raises(ValueError):
+        acc.record_winner("unknown", 8.5, 7.25)
+    acc.record_winner("a", 8.5, 7.25)
+    with pytest.raises(ValueError):
+        acc.record_winner("a", 8.5, 7.25)
+    acc.abort()
 
 
 def test_teacher_streaming_b1_cleanup_population_spool_connect_failure_removes_all_artifacts(tmp_path, monkeypatch):
@@ -2509,10 +2663,12 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
     assert len(loaded) == 4
     expected_paths = ["worker_2/layouts_0.th", "worker_2/layouts_2.th",
                       "worker_2/layouts_10.th", "worker_10/layouts_0.th"]
-    expected_events = []
+    expected_events = [
+        ("load", (root / relative_path).read_bytes(),
+         {"weights_only": True, "map_location": "cpu"})
+        for relative_path in expected_paths
+    ]
     for relative_path in expected_paths:
-        expected_events.append(("load", (root / relative_path).read_bytes(),
-                                {"weights_only": True, "map_location": "cpu"}))
         expected_events.extend(
             ("process", relative_path, index)
             for index in ([0, 1] if relative_path == "worker_2/layouts_0.th" else [0])
