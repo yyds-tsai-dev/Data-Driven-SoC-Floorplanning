@@ -449,10 +449,17 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
             p = dotted(n.value); return f"{p}.{n.attr}" if p else n.attr
         return ""
     calls = [dotted(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
-    forbidden_suffixes = ("load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance")
+    forbidden_suffixes = ("load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance", "sample_bank")
     assert not any(any(x == suffix or x.endswith("." + suffix) for suffix in forbidden_suffixes) for x in calls)
     assert "engine.load_model" not in calls
     assert not any(x.endswith(".collate") or x == "collate" for x in calls)
+    loads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and dotted(n.func) == "torch.load"]
+    assert len(loads) == 2
+    for node in loads:
+        assert node.args and isinstance(node.args[0], ast.Call) and dotted(node.args[0].func) == "io.BytesIO"
+        kw = {k.arg: k.value for k in node.keywords}
+        assert isinstance(kw.get("weights_only"), ast.Constant) and kw["weights_only"].value is True
+        assert isinstance(kw.get("map_location"), ast.Constant) and kw["map_location"].value == "cpu"
 
 
 def _task4_teacher_payload():
@@ -473,7 +480,7 @@ def _task4_teacher_payload():
 def _task4_case_input(t, seed=17):
     case = {"instance_id": "x.jsonl#0", "n": 3,
             "area": [1.0, 1.0, 1.0000001],
-            "cons": [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+            "cons": [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
             "tp": [[-1.0] * 4] * 3,
             "b2b": [[0, 1, 1.5]], "p2b": [[0, 2, 2.0]],
             "pins": [[.25, .75]], "hpwl_ref": 4.0, "area_ref": 4.0}
@@ -496,10 +503,27 @@ def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
     assert all(p.dtype == torch.float32 for p in state.model.parameters())
 
 
-@pytest.mark.parametrize("bad", [{}, {"ema": {}}, {"model_config": {"z_dim": 3}},
-                                  {"model_config": {"z_dim": 4, "z_repr": "bad"}},
-                                  {"model_config": dataclasses.asdict(__import__("direct_diffusion_model", fromlist=["DirectModelConfig"]).DirectModelConfig(z_dim=4, z_repr="xyaspect")), "ema": {"x": torch.ones(1)}}])
-def test_task4_materializer_rejects_malformed_payload(bad):
+@pytest.mark.parametrize("kind", ["nonmapping", "missing_model", "model_nonmapping", "model_empty",
+    "missing_ema", "ema_nonmapping", "ema_empty", "key_mismatch", "extra_ema", "shape",
+    "nontensor", "inf", "zdim", "zrepr", "unknown"])
+def test_task4_materializer_rejects_malformed_payload(kind):
+    bad = _task4_teacher_payload()
+    if kind == "nonmapping": bad = []
+    elif kind == "missing_model": bad.pop("model")
+    elif kind == "model_nonmapping": bad["model"] = []
+    elif kind == "model_empty": bad["model"] = {}
+    elif kind == "missing_ema": bad.pop("ema")
+    elif kind == "ema_nonmapping": bad["ema"] = []
+    elif kind == "ema_empty": bad["ema"] = {}
+    elif kind == "key_mismatch": bad["ema"].pop(next(iter(bad["ema"])))
+    elif kind == "extra_ema": bad["ema"]["extra"] = torch.ones(1)
+    elif kind == "shape":
+        k = next(iter(bad["ema"])); bad["ema"][k] = bad["ema"][k].flatten()
+    elif kind == "nontensor": bad["ema"][next(iter(bad["ema"]))] = 1
+    elif kind == "inf": bad["ema"][next(iter(bad["ema"]))].fill_(float("inf"))
+    elif kind == "zdim": bad["model_config"]["z_dim"] = 3
+    elif kind == "zrepr": bad["model_config"]["z_repr"] = "bad"
+    elif kind == "unknown": bad["model_config"]["unknown"] = 1
     with pytest.raises(ValueError):
         _teacher()._materialize_teacher_model(bad, torch.device("cpu"))
 
@@ -520,19 +544,28 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
 
 def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch):
     t = _teacher(); payload = _task4_teacher_payload(); state = t._materialize_teacher_model(payload, torch.device("cpu"))
-    calls = {}; z = torch.full((1, 3, 4), 0.25)
+    calls = {"sample": [], "decode": []}
     def sampler(*args, **kwargs):
-        calls["sample"] = (args, kwargs, kwargs["generator"].initial_seed()); return z
+        calls["sample"].append((args, kwargs, kwargs["generator"].initial_seed()))
+        return torch.rand((1, 3, 4), generator=kwargs["generator"])
     def decoder(raw, area, cons, tp, scale):
-        calls["decode"] = (raw, area, cons, tp, scale); return torch.ones((1, 3, 4), dtype=torch.float64)
+        calls["decode"].append((raw, area, cons, tp, scale)); return raw.squeeze(0).double()
     monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", sampler, raising=False)
     monkeypatch.setattr(t, "_DECODE_RECTS", decoder, raising=False)
-    out = t._sample_direct_once(state, _task4_case_input(t).case, 31)
-    assert out.shape == (3, 4) and out.dtype == torch.float64 and torch.isfinite(out).all()
-    assert calls["sample"][1]["steps"] == 2 and calls["sample"][1]["z_known"] is not None
-    assert calls["sample"][1]["known_mask"] is not None
-    assert len(calls["sample"][0]) == 3 and calls["sample"][2] == 31
-    assert all(x.dtype == torch.float64 and x.device.type == "cpu" for x in calls["decode"])
+    case = _task4_case_input(t).case
+    out1 = t._sample_direct_once(state, case, 31)
+    out2 = t._sample_direct_once(state, case, 31)
+    out3 = t._sample_direct_once(state, case, 32)
+    assert out1.shape == (3, 4) and out1.dtype == torch.float64 and torch.isfinite(out1).all()
+    assert torch.equal(out1, out2) and not torch.equal(out1, out3)
+    assert len(calls["sample"]) == len(calls["decode"]) == 3
+    assert [x[2] for x in calls["sample"]] == [31, 31, 32]
+    for args, kwargs, _ in calls["sample"]:
+        assert len(args) == 3 and args[0] is state.model and args[2] is state.schedule
+        assert set(kwargs) == {"steps", "generator", "z_known", "known_mask"} and kwargs["steps"] == 2
+        assert kwargs["z_known"].shape == (1, 3, 4) and kwargs["known_mask"].shape == (1, 3, 4)
+    for decoded in calls["decode"]:
+        assert all(x.dtype == torch.float64 and x.device.type == "cpu" for x in decoded)
 
 
 def test_task4_runtime_materializes_lazily_caches_and_never_reopens(monkeypatch):
