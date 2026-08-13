@@ -79,6 +79,21 @@ def _admit_identity(proposal: torch.Tensor, _case: dict):
     return proposal.clone(), torch.zeros((proposal.shape[0], 2), dtype=torch.float64)
 
 
+def _admit_base_then_reject_teacher():
+    calls = 0
+
+    def admit(proposal: torch.Tensor, _case: dict):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return proposal.clone(), torch.zeros(
+                (proposal.shape[0], 2), dtype=torch.float64
+            )
+        return None
+
+    return admit
+
+
 def _rects(offset: float = 0.0) -> torch.Tensor:
     return torch.tensor(
         [[0.0, 0.0, 2.0, 2.0], [2.0 + offset, 0.0, 2.0, 2.0]],
@@ -139,7 +154,7 @@ def test_nonimproving_or_rejected_teacher_retains_base(
     teacher_cost, admitted, status
 ):
     scorer = _Scorer([1.25] + ([] if teacher_cost is None else [teacher_cost]))
-    admit = _admit_identity if admitted else lambda proposal, case: None
+    admit = _admit_identity if admitted else _admit_base_then_reject_teacher()
     out = evaluate_case(
         _rects(1.0), _rects(), _case(), scorer, sample_seed=17, admit=admit
     )
@@ -156,7 +171,12 @@ def test_shifted_preplaced_transient_fp_is_rejected_before_scoring():
     candidate = _rects()
     candidate[0, 0] = 0.25
     out = evaluate_case(
-        _rects(), candidate, _case(preplaced=True), scorer, sample_seed=17
+        _rects(), candidate, _case(preplaced=True), scorer, sample_seed=17,
+        admit=lambda proposal, case: (
+            _admit_identity(proposal, case)
+            if torch.equal(proposal, _rects())
+            else None
+        ),
     )
     assert out.winner == "production-base"
     assert out.teacher_status == "admission_failed"
@@ -170,12 +190,36 @@ def test_base_with_soft_group_v_retains_sparse_label():
         _case(soft_group=True),
         _Scorer([1.2]),
         sample_seed=17,
-        admit=lambda proposal, case: None,
+        admit=_admit_base_then_reject_teacher(),
     )
     assert out.winner == "production-base"
     assert out.teacher_status == "admission_failed"
     assert out.sparse_label is not None
     assert out.sparse_label.instance_id == _case()["instance_id"]
+
+
+def test_production_base_is_exactly_admitted_before_hard_audit_and_scoring():
+    raw_base = torch.tensor(
+        [[0.0, 0.0, 2.0, 2.0], [1.0, 0.0, 2.0, 2.0]],
+        dtype=torch.float64,
+    )
+    legal_base = _rects()
+    calls = []
+
+    def admit(proposal, case):
+        calls.append(proposal.clone())
+        legal = legal_base if len(calls) == 1 else proposal
+        return legal.clone(), torch.zeros((2, 2), dtype=torch.float64)
+
+    scorer = _Scorer([1.2, 1.3])
+    out = evaluate_case(
+        raw_base, _rects(1.0), _case(), scorer, sample_seed=17, admit=admit
+    )
+    assert len(calls) == 2
+    assert torch.equal(calls[0], raw_base)
+    assert torch.equal(calls[1], _rects(1.0))
+    assert scorer.calls[0]["solution"]["positions"] == legal_base.tolist()
+    assert out.winner == "production-base"
 
 
 def test_case_result_and_canonical_json_contain_no_dense_coordinates():
@@ -453,6 +497,106 @@ def test_runner_streams_numeric_shards_once_and_publishes_only_sparse_evidence(
             b"9.0", b"8.0",
         ):
             assert forbidden not in payload
+
+
+def test_runner_parts_are_disjoint_and_merge_to_one_authorizing_population(tmp_path):
+    runner = _runner_module()
+
+    def iter_shards(_root):
+        return [
+            (0, 2, tmp_path / "worker_0/layouts_2.th"),
+            (1, 10, tmp_path / "worker_1/layouts_10.th"),
+        ]
+
+    def read_shard(_root, worker, layout):
+        return f"raw-{worker}-{layout}".encode(), [torch.ones((1, 1, 6))]
+
+    def make_row(_source, relative_path, digest, index):
+        iid = f"{relative_path}#{index}"
+        case = {
+            "instance_id": iid,
+            "n": 1,
+            "area": [4.0],
+            "cons": [[0, 0, 0, 0, 0]],
+            "tp": [[-1.0, -1.0, -1.0, -1.0]],
+            "b2b": [],
+            "p2b": [],
+            "pins": [],
+            "hpwl_ref": 1.0,
+            "area_ref": 4.0,
+        }
+        return runner.TrainingRow(
+            CorpusSourceReceipt(relative_path, digest, index, fingerprint_case(case)),
+            case,
+            torch.tensor([[0.0, 0.0, 2.0, 2.0]], dtype=torch.float64),
+        )
+
+    portfolio = {
+        "pool_ready": True,
+        "requested_k": 6,
+        "raw_candidate_count": 6,
+        "direct_count": 3,
+        "flow_count": 3,
+        "oversample": False,
+        "flow_exception": None,
+        "fallback": False,
+    }
+
+    def solve_base(_optimizer, row):
+        return runner.BaseSolveResult(
+            torch.tensor([[0.0, 0.0, 2.0, 2.0]], dtype=torch.float64), portfolio
+        )
+
+    def evaluate(base, fp_seed, case, scorer, *, sample_seed):
+        label = TopologyLabel(
+            case["instance_id"], 1, sample_seed, 1.0, 1.2, 1.2, (), (), ()
+        )
+        return G0CaseResult(
+            case["instance_id"], 1, sample_seed, 1.2, 1.0, 1.0,
+            "transient-fp-exact-tfdl", "winner", label,
+            {"ok": True}, {"ok": True},
+        )
+
+    deps = runner.RuntimeDependencies(
+        iter_shards=iter_shards,
+        read_shard=read_shard,
+        validate_source=lambda source: (1, 1),
+        make_row=make_row,
+        build_optimizer=lambda: object(),
+        solve_base=solve_base,
+        scorer=object(),
+        evaluate=evaluate,
+        bindings=lambda: {"test_binding": "a" * 64},
+    )
+    parts = [tmp_path / "part0", tmp_path / "part1"]
+    for index, destination in enumerate(parts):
+        summary = runner.run_g0(
+            tmp_path,
+            destination,
+            n_min=1,
+            heldout_mod=1,
+            shard_count=2,
+            shard_index=index,
+            deps=deps,
+        )
+        assert summary.authorizing is False
+        assert summary.terminal_state == "NON_AUTHORIZING_PART"
+        manifest = json.loads((destination / "manifest.json").read_text())
+        assert manifest["partition"] == {"count": 2, "index": index}
+
+    merged = tmp_path / "merged"
+    summary = runner.merge_g0_parts(parts, merged)
+    assert summary.authorizing is True
+    assert summary.terminal_state == "TARGET_GAIN_MET"
+    rows = [json.loads(line) for line in (merged / "cases.jsonl").read_text().splitlines()]
+    assert [row["result"]["instance_id"] for row in rows] == [
+        "worker_0/layouts_2.th#0",
+        "worker_1/layouts_10.th#0",
+    ]
+    assert json.loads((merged / "manifest.json").read_text())["partition"] == {
+        "count": 2,
+        "merged": True,
+    }
 
 
 def _legacy_separation_edges(rects, n):

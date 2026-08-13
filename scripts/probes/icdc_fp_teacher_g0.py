@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import heapq
 import importlib.util
 import io
 import json
@@ -14,6 +15,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
@@ -509,6 +511,8 @@ def run_g0(
     n_min: int = 100,
     heldout_mod: int = 10,
     max_files: Optional[int] = None,
+    shard_count: int = 1,
+    shard_index: int = 0,
     deps: Optional[RuntimeDependencies] = None,
 ) -> G0Summary:
     if type(n_min) is not int or n_min < 0:
@@ -517,6 +521,10 @@ def run_g0(
         raise ValueError("heldout_mod")
     if max_files is not None and (type(max_files) is not int or max_files <= 0):
         raise ValueError("max_files")
+    if type(shard_count) is not int or shard_count <= 0:
+        raise ValueError("shard_count")
+    if type(shard_index) is not int or not 0 <= shard_index < shard_count:
+        raise ValueError("shard_index")
     root = Path(data_root)
     destination = Path(out_dir)
     if destination.exists() or destination.is_symlink():
@@ -530,15 +538,30 @@ def run_g0(
     )
     cases_path = stage / "cases.jsonl"
     labels_path = stage / "labels.jsonl"
-    authorizing = max_files is None
+    authorizing = max_files is None and shard_count == 1
     population = PopulationAccumulator(authorizing=authorizing)
     positive_gain = teacher_admitted = 0
     try:
         shards = sorted(runtime.iter_shards(root), key=lambda item: (item[0], item[1]))
         if max_files is not None:
             shards = shards[:max_files]
+        discovery_payload = [
+            [int(worker), int(layout)] for worker, layout, _path in shards
+        ]
+        discovery_sha256 = hashlib.sha256(
+            json.dumps(
+                discovery_payload,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("ascii")
+        ).hexdigest()
+        selected_shards = [
+            item for ordinal, item in enumerate(shards)
+            if ordinal % shard_count == shard_index
+        ]
         with cases_path.open("wb") as cases_fd, labels_path.open("wb") as labels_fd:
-            for worker, layout, _path in shards:
+            for worker, layout, _path in selected_shards:
                 relative_path = f"worker_{worker}/layouts_{layout}.th"
                 raw, source = runtime.read_shard(root, worker, layout)
                 digest = hashlib.sha256(raw).hexdigest()
@@ -583,6 +606,12 @@ def run_g0(
                 handle.flush()
                 os.fsync(handle.fileno())
         summary = population.finish(complete=True)
+        if shard_count > 1:
+            summary = dataclasses.replace(
+                summary,
+                authorizing=False,
+                terminal_state="NON_AUTHORIZING_PART",
+            )
         population_payload = {
             **dataclasses.asdict(summary),
             "positive_gain_count": positive_gain,
@@ -601,6 +630,10 @@ def run_g0(
             "n_min": n_min,
             "heldout_mod": heldout_mod,
             "max_files": max_files,
+            "partition": {"count": shard_count, "index": shard_index},
+            "discovered_shards": len(shards),
+            "selected_shards": len(selected_shards),
+            "discovery_sha256": discovery_sha256,
             "bindings": bindings,
             "support_sha256": support_hashes,
         }
@@ -625,6 +658,207 @@ def run_g0(
         raise
 
 
+_SHARD_PATH = re.compile(r"^worker_([0-9]+)/layouts_([0-9]+)\.th$")
+
+
+def _record_key(row: Mapping[str, Any]) -> tuple[int, int, int]:
+    try:
+        receipt = row["receipt"]
+        relative_path = receipt["relative_path"]
+        index = receipt["layout_index"]
+        match = _SHARD_PATH.fullmatch(relative_path)
+        if match is None or type(index) is not int or index < 0:
+            raise ValueError
+        if row["result"]["instance_id"] != f"{relative_path}#{index}":
+            raise ValueError
+        return int(match.group(1)), int(match.group(2)), index
+    except Exception as exc:
+        raise ValueError("part record") from exc
+
+
+def _verified_part(path: Path) -> Mapping[str, Any]:
+    manifest_path = path / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+    except Exception as exc:
+        raise ValueError("part manifest") from exc
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("schema") != "icdc_g0_v2.transient_fp.v1"
+        or manifest.get("status") != "complete"
+        or manifest.get("authorizing") is not False
+        or manifest.get("terminal_state") != "NON_AUTHORIZING_PART"
+    ):
+        raise ValueError("part manifest")
+    hashes = manifest.get("support_sha256")
+    if not isinstance(hashes, Mapping) or set(hashes) != {
+        "cases.jsonl", "labels.jsonl", "population.json"
+    }:
+        raise ValueError("part hashes")
+    for name, expected in hashes.items():
+        if not isinstance(expected, str) or _sha256(path / name) != expected:
+            raise ValueError("part hashes")
+    return manifest
+
+
+def _part_rows(path: Path):
+    with (path / "cases.jsonl").open("rb") as cases_fd, (
+        path / "labels.jsonl"
+    ).open("rb") as labels_fd:
+        previous = None
+        while case_line := cases_fd.readline():
+            label_line = labels_fd.readline()
+            if not label_line:
+                raise ValueError("part label coverage")
+            try:
+                case = json.loads(case_line)
+                label = json.loads(label_line)
+            except Exception as exc:
+                raise ValueError("part json") from exc
+            key = _record_key(case)
+            if previous is not None and key <= previous:
+                raise ValueError("part order")
+            if label.get("receipt") != case.get("receipt"):
+                raise ValueError("part label binding")
+            previous = key
+            yield key, case, case_line, label_line
+        if labels_fd.readline():
+            raise ValueError("part label coverage")
+
+
+def merge_g0_parts(part_dirs: Sequence[Path], out_dir: Path) -> G0Summary:
+    parts = [Path(path) for path in part_dirs]
+    destination = Path(out_dir)
+    if not parts or destination.exists() or destination.is_symlink():
+        raise ValueError("merge output")
+    manifests = [_verified_part(path) for path in parts]
+    try:
+        count = manifests[0]["partition"]["count"]
+        indices = {manifest["partition"]["index"] for manifest in manifests}
+    except Exception as exc:
+        raise ValueError("part partition") from exc
+    if (
+        type(count) is not int
+        or count <= 1
+        or len(parts) != count
+        or indices != set(range(count))
+    ):
+        raise ValueError("part partition")
+    shared_fields = (
+        "n_min", "heldout_mod", "max_files", "bindings",
+        "discovered_shards", "discovery_sha256",
+    )
+    for field in shared_fields:
+        if any(manifest.get(field) != manifests[0].get(field) for manifest in manifests):
+            raise ValueError("part mismatch")
+    if manifests[0].get("max_files") is not None:
+        raise ValueError("part tracer")
+    if sum(int(manifest.get("selected_shards", -1)) for manifest in manifests) != int(
+        manifests[0].get("discovered_shards", -2)
+    ):
+        raise ValueError("part shard coverage")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.staging.", dir=destination.parent)
+    )
+    population = PopulationAccumulator(authorizing=True)
+    positive_gain = teacher_admitted = 0
+    try:
+        iterators = [iter(_part_rows(path)) for path in parts]
+        heap: list[tuple[tuple[int, int, int], int, Mapping[str, Any], bytes, bytes]] = []
+        for ordinal, iterator in enumerate(iterators):
+            try:
+                key, row, case_line, label_line = next(iterator)
+            except StopIteration:
+                continue
+            heapq.heappush(heap, (key, ordinal, row, case_line, label_line))
+        previous = None
+        with (stage / "cases.jsonl").open("wb") as cases_fd, (
+            stage / "labels.jsonl"
+        ).open("wb") as labels_fd:
+            while heap:
+                key, ordinal, row, case_line, label_line = heapq.heappop(heap)
+                if previous is not None and key <= previous:
+                    raise ValueError("merged order")
+                result = row["result"]
+                instance_id = result["instance_id"]
+                n = result["n"]
+                population.register(instance_id, n)
+                reconstructed = G0CaseResult(
+                    instance_id=instance_id,
+                    n=n,
+                    sample_seed=result["sample_seed"],
+                    base_cost=result["base_cost"],
+                    teacher_cost=result["teacher_cost"],
+                    teacher_candidate_cost=result["teacher_candidate_cost"],
+                    winner=result["winner"],
+                    teacher_status=result["teacher_status"],
+                    sparse_label=None,
+                    base_hard_audit=result["base_hard_audit"],
+                    teacher_hard_audit=result["teacher_hard_audit"],
+                )
+                population.add(reconstructed)
+                positive_gain += int(reconstructed.teacher_cost < reconstructed.base_cost)
+                teacher_admitted += int(reconstructed.teacher_candidate_cost is not None)
+                cases_fd.write(case_line)
+                labels_fd.write(label_line)
+                previous = key
+                try:
+                    next_key, next_row, next_case, next_label = next(iterators[ordinal])
+                except StopIteration:
+                    continue
+                heapq.heappush(
+                    heap,
+                    (next_key, ordinal, next_row, next_case, next_label),
+                )
+            for handle in (cases_fd, labels_fd):
+                handle.flush()
+                os.fsync(handle.fileno())
+        summary = population.finish(complete=True)
+        population_payload = {
+            **dataclasses.asdict(summary),
+            "positive_gain_count": positive_gain,
+            "teacher_admitted_count": teacher_admitted,
+        }
+        _write_fsync(stage / "population.json", _json_bytes(population_payload))
+        support_hashes = {
+            name: _sha256(stage / name)
+            for name in ("cases.jsonl", "labels.jsonl", "population.json")
+        }
+        manifest = {
+            "schema": "icdc_g0_v2.transient_fp.v1",
+            "status": "complete",
+            "authorizing": True,
+            "terminal_state": summary.terminal_state,
+            "n_min": manifests[0]["n_min"],
+            "heldout_mod": manifests[0]["heldout_mod"],
+            "max_files": None,
+            "partition": {"count": count, "merged": True},
+            "discovered_shards": manifests[0]["discovered_shards"],
+            "selected_shards": manifests[0]["discovered_shards"],
+            "discovery_sha256": manifests[0]["discovery_sha256"],
+            "bindings": manifests[0]["bindings"],
+            "support_sha256": support_hashes,
+            "part_manifest_sha256": {
+                str(index): _sha256(parts[index] / "manifest.json")
+                for index in range(count)
+            },
+        }
+        _write_fsync(stage / "manifest.json", _json_bytes(manifest))
+        directory_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        os.rename(stage, destination)
+        return summary
+    except BaseException:
+        if stage.exists() and not stage.is_symlink():
+            shutil.rmtree(stage)
+        raise
+
+
 def _validate_production_root(path: str) -> Path:
     supplied = Path(path)
     if supplied.is_symlink() or supplied.resolve() != _CANONICAL_DATA_ROOT:
@@ -639,12 +873,25 @@ def _validate_production_root(path: str) -> Path:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--data-root")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--n-min", type=int, default=100)
     parser.add_argument("--heldout-mod", type=int, default=10)
     parser.add_argument("--max-files", type=int)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--merge-part", action="append", default=[])
     args = parser.parse_args(argv)
+    if args.merge_part:
+        if args.data_root is not None or args.max_files is not None:
+            parser.error("--merge-part cannot be combined with source-run options")
+        summary = merge_g0_parts(
+            [Path(value) for value in args.merge_part], Path(args.out_dir)
+        )
+        print(json.dumps(dataclasses.asdict(summary), sort_keys=True, allow_nan=False))
+        return 0 if summary.terminal_state == "TARGET_GAIN_MET" else 2
+    if args.data_root is None:
+        parser.error("--data-root is required unless --merge-part is used")
     root = _validate_production_root(args.data_root)
     summary = run_g0(
         root,
@@ -652,6 +899,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         n_min=args.n_min,
         heldout_mod=args.heldout_mod,
         max_files=args.max_files,
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
     )
     print(json.dumps(dataclasses.asdict(summary), sort_keys=True, allow_nan=False))
     if not summary.authorizing:

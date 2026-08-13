@@ -149,7 +149,10 @@ unchanged.
   as every other candidate. Soft V in `fp_sol` is not a rejection condition.
 - The G0 candidate set is exactly two logical slots: `0=production-base` and
   `1=transient-fp-exact-tfdl`. The historical 25 blind axis/pin/contact
-  mutations are excluded. Each eligible case retains the base when the fp
+  mutations are excluded. Both seeds pass the same nonexact-then-exact TFDL,
+  zero-drift, and hard-audit admission before official scoring; the
+  production-base slot means the exact-TFDL realization seeded by the frozen
+  production portfolio. Each eligible case retains that base when the fp
   candidate is rejected, unavailable, or does not improve official
   `cost_no_runtime`.
 - Dense fp coordinates exist only inside the per-case offline teacher call.

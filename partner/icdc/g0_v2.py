@@ -218,11 +218,34 @@ def evaluate_case(
     base_rects = _rects(base, n, "base")
     teacher_seed = _rects(fp_seed, n, "fp seed")
 
-    base_hard = _hard_audit(base_rects, area, cons, tp)
+    def exact_admit(seed: torch.Tensor, field: str) -> Optional[torch.Tensor]:
+        try:
+            admitted = admit(seed.clone(), case)
+            if not isinstance(admitted, (tuple, list)) or len(admitted) != 2:
+                return None
+            legal_value, drift_value = admitted
+            legal = _rects(legal_value, n, field)
+            drift = torch.as_tensor(
+                drift_value, dtype=torch.float64, device="cpu"
+            )
+            if (
+                drift.shape != (n, 2)
+                or not bool(torch.isfinite(drift).all())
+                or int(torch.count_nonzero(drift).item()) != 0
+            ):
+                return None
+            return legal
+        except Exception:
+            return None
+
+    base_legal = exact_admit(base_rects, "base legal")
+    if base_legal is None:
+        raise ValueError("base admission")
+    base_hard = _hard_audit(base_legal, area, cons, tp)
     if not all(base_hard.values()):
         raise ValueError("base hard audit")
     base_feasible, base_cost = _official_cost(
-        scorer, base_rects, case, area, cons, tp, b2b, p2b, pins
+        scorer, base_legal, case, area, cons, tp, b2b, p2b, pins
     )
     if not base_feasible or base_cost is None:
         raise ValueError("base unavailable")
@@ -231,21 +254,9 @@ def evaluate_case(
     teacher_hard: dict[str, bool] = {}
     teacher_candidate_cost: Optional[float] = None
     teacher_status = "admission_failed"
-    try:
-        admitted = admit(teacher_seed.clone(), case)
-    except Exception:
-        admitted = None
-    if isinstance(admitted, (tuple, list)) and len(admitted) == 2:
-        legal_value, drift_value = admitted
+    legal = exact_admit(teacher_seed, "teacher legal")
+    if legal is not None:
         try:
-            legal = _rects(legal_value, n, "teacher legal")
-            drift = torch.as_tensor(
-                drift_value, dtype=torch.float64, device="cpu"
-            )
-            if drift.shape != (n, 2) or not bool(torch.isfinite(drift).all()):
-                raise ValueError("teacher drift")
-            if int(torch.count_nonzero(drift).item()) != 0:
-                raise ValueError("teacher drift")
             teacher_hard = _hard_audit(legal, area, cons, tp)
             if not all(teacher_hard.values()):
                 teacher_status = "hard_audit_failed"
@@ -266,7 +277,7 @@ def evaluate_case(
                 teacher_status = "hard_audit_failed"
 
     winner = "production-base"
-    winner_rects = base_rects
+    winner_rects = base_legal
     teacher_cost = base_cost
     if (
         teacher_legal is not None
