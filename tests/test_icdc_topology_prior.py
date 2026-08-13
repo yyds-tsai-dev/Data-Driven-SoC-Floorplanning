@@ -1078,6 +1078,40 @@ _TASK4_FILES = (
     "training_index.json", "g0_manifest.json",
 )
 _TASK4_JSONL = _TASK4_FILES[:6]
+_TASK4_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _task4_private_case_spool(stage, expected_identity=None):
+    """Return the sole lease-owned SQLite spool, excluding every public artifact."""
+    stage = Path(stage)
+    private_entries = [entry for entry in stage.iterdir()
+                       if entry.name not in _TASK4_FILES]
+    sqlite_mains = []
+    for entry in private_entries:
+        mode = entry.lstat().st_mode
+        assert not stat.S_ISLNK(mode), f"private spool entry must not be a symlink: {entry.name}"
+        assert stat.S_ISREG(mode), f"private spool entry must be a regular file: {entry.name}"
+        with entry.open("rb") as handle:
+            header = handle.read(len(_TASK4_SQLITE_MAGIC))
+        if header == _TASK4_SQLITE_MAGIC:
+            sqlite_mains.append(entry)
+    assert len(sqlite_mains) == 1, (
+        "replay requires exactly one unambiguous private SQLite case spool; "
+        f"found {[entry.name for entry in sqlite_mains]} among {[entry.name for entry in private_entries]}"
+    )
+    spool = sqlite_mains[0]
+    assert spool.parent == stage
+    allowed_private_names = {
+        f"{spool.name}{suffix}" for suffix in ("", "-journal", "-wal", "-shm")
+    }
+    assert {entry.name for entry in private_entries} <= allowed_private_names, (
+        "only the private case spool and its SQLite sidecars may share the lease: "
+        f"{[entry.name for entry in private_entries]}"
+    )
+    identity = (spool, spool.stat().st_dev, spool.stat().st_ino)
+    if expected_identity is not None:
+        assert identity == expected_identity, "the private SQLite spool changed during replay"
+    return identity, tuple(private_entries)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2095,39 +2129,104 @@ def test_teacher_private_case_spool_is_staged_during_replay_and_absent_at_publis
         t, "_new_staging",
         lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
     )
-    observed_spool_paths = []
+    spool_identity = None
+    observed_spool_paths = set()
 
-    def private_entries():
+    def private_spool():
+        nonlocal spool_identity
         assert stages
-        entries = [path for path in stages[-1].iterdir() if path.name not in _TASK4_JSONL]
-        observed_spool_paths.extend(entries)
-        return entries
+        spool_identity, entries = _task4_private_case_spool(stages[-1], spool_identity)
+        observed_spool_paths.update(entries)
+        return spool_identity
 
     runtime = t._runtime_hooks(); real_process = runtime.process_case
     def process(case_input):
-        assert private_entries(), "the sanitized case spool must remain staged through replay"
+        private_spool()
         return real_process(case_input)
     monkeypatch.setattr(t, "_runtime_hooks", lambda: dataclasses.replace(runtime, process_case=process))
 
     real_write = t._JsonlWriter.write
     def write(writer, name, value):
-        assert private_entries(), "the sanitized case spool vanished before replay output"
+        private_spool()
         return real_write(writer, name, value)
     monkeypatch.setattr(t._JsonlWriter, "write", write)
+
+    import builtins
+    real_open = builtins.open
+
+    class IndexWriterSpy:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def write(self, data):
+            private_spool()
+            return self._handle.write(data)
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+    def spool_aware_open(path, mode="r", *args, **kwargs):
+        handle = real_open(path, mode, *args, **kwargs)
+        if "w" in mode and Path(path).name == "training_index.json":
+            return IndexWriterSpy(handle)
+        return handle
+
+    monkeypatch.setattr(t, "open", spool_aware_open, raising=False)
+    real_fsync = t.os.fsync
+    real_sha256 = hashlib.sha256
+    support_hash_checks = 0
+
+    def fsync(fd):
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if stat.S_ISDIR(t.os.fstat(fd).st_mode) and path == stages[-1]:
+            if not (path / "g0_manifest.json").exists():
+                assert not [entry for entry in path.iterdir() if entry.name not in _TASK4_FILES]
+                assert spool_identity is not None
+                assert all(not entry.exists() for entry in observed_spool_paths)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(t.os, "fsync", fsync)
+
+    def sha256(data=b"", *args, **kwargs):
+        nonlocal support_hash_checks
+        if stages and stages[-1].exists() and not (stages[-1] / "g0_manifest.json").exists():
+            support_payloads = [
+                (stages[-1] / name).read_bytes()
+                for name in _TASK4_FILES if name != "g0_manifest.json"
+                and (stages[-1] / name).exists()
+            ]
+            if data in support_payloads:
+                support_hash_checks += 1
+                assert not [entry for entry in stages[-1].iterdir()
+                            if entry.name not in _TASK4_FILES]
+                assert all(not entry.exists() for entry in observed_spool_paths)
+        return real_sha256(data, *args, **kwargs)
+
+    monkeypatch.setattr(t.hashlib, "sha256", sha256)
 
     published = []
     def publish(lease, destination):
         stage = Path(getattr(lease, "path", lease))
         assert sorted(path.name for path in stage.iterdir()) == sorted(_TASK4_FILES)
+        assert spool_identity is not None
+        assert all(not entry.exists() for entry in observed_spool_paths)
         published.append((stage, destination))
     monkeypatch.setattr(t, "_publish_staging", publish)
 
     assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
     assert len(calls) == 2 and len(published) == 1
+    assert support_hash_checks == len(_TASK4_FILES) - 1
     assert observed_spool_paths and all(not path.exists() for path in observed_spool_paths)
 
 
-@pytest.mark.parametrize("seam", ("runtime", "writer"))
+@pytest.mark.parametrize("seam", ("runtime", "writer", "index"))
 def test_teacher_staged_case_spool_failure_is_transactional(tmp_path, monkeypatch, seam):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
     _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
@@ -2137,31 +2236,63 @@ def test_teacher_staged_case_spool_failure_is_transactional(tmp_path, monkeypatc
         lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
     )
     sentinel = RuntimeError(f"{seam} replay failure")
-    observed_spool_paths = []
+    spool_identity = None
+    observed_spool_paths = set()
 
-    def has_private_spool():
+    def private_spool():
+        nonlocal spool_identity
         assert stages
-        entries = [path for path in stages[-1].iterdir() if path.name not in _TASK4_JSONL]
-        observed_spool_paths.extend(entries)
-        return bool(entries)
+        spool_identity, entries = _task4_private_case_spool(stages[-1], spool_identity)
+        observed_spool_paths.update(entries)
 
     if seam == "runtime":
         runtime = t._runtime_hooks()
         def process(_case_input):
-            assert has_private_spool(), "the sanitized case spool must exist before runtime replay"
+            private_spool()
             raise sentinel
         monkeypatch.setattr(t, "_runtime_hooks", lambda: dataclasses.replace(runtime, process_case=process))
-    else:
+    elif seam == "writer":
         real_write = t._JsonlWriter.write
         def write(writer, name, value):
-            assert has_private_spool(), "the sanitized case spool must exist during writer replay"
+            private_spool()
             real_write(writer, name, value)
             raise sentinel
         monkeypatch.setattr(t._JsonlWriter, "write", write)
+    else:
+        import builtins
+        real_open = builtins.open
+
+        class FailingIndexWriter:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def write(self, data):
+                private_spool()
+                self._handle.write(data)
+                raise sentinel
+
+            def __enter__(self):
+                self._handle.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._handle.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+        def failing_index_open(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            if "w" in mode and Path(path).name == "training_index.json":
+                return FailingIndexWriter(handle)
+            return handle
+
+        monkeypatch.setattr(t, "open", failing_index_open, raising=False)
 
     with pytest.raises(RuntimeError, match=rf"{seam} replay failure"):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert not out.exists() and stages and not stages[-1].exists()
+    assert spool_identity is not None
     assert observed_spool_paths and all(not path.exists() for path in observed_spool_paths)
 
 
@@ -2307,19 +2438,34 @@ def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
         if isinstance(expression, (ast.List, ast.Dict, ast.Set,
                                    ast.ListComp, ast.DictComp, ast.SetComp)):
             return True
-        return (isinstance(expression, ast.Call)
-                and isinstance(expression.func, ast.Name)
-                and expression.func.id in {"list", "dict", "set"})
+        if not isinstance(expression, ast.Call):
+            return False
+        if isinstance(expression.func, ast.Name):
+            return expression.func.id in {"list", "dict", "set", "defaultdict", "deque"}
+        return (isinstance(expression.func, ast.Attribute)
+                and expression.func.attr in {"defaultdict", "deque"})
 
     def annotation_is_mutable_container(annotation):
         return any(isinstance(node, ast.Name) and node.id in {"list", "dict", "set",
                                                                "List", "Dict", "Set"}
                    for node in ast.walk(annotation))
 
-    accumulator_fragments = ("row", "corpus", "index")
-    immediate_case_containers = {"mutation_rows", "proposal_rows", "rejection_rows"}
-    mutable_accumulators = []
+    replay_candidates = [
+        node for node in ast.walk(teacher) if isinstance(node, ast.For)
+        and any(isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "process_case" for child in ast.walk(node))
+    ]
+    replay_loops = [
+        node for node in replay_candidates
+        if not any(node is not child and isinstance(child, ast.For)
+                   and child in replay_candidates for child in ast.walk(node))
+    ]
+    assert len(replay_loops) == 1
+    replay_nodes = {id(node) for node in ast.walk(replay_loops[0])}
+    persistent_mutables = {}
     for node in ast.walk(teacher):
+        if id(node) in replay_nodes:
+            continue
         if isinstance(node, ast.AnnAssign):
             names = assigned_names(node.target)
             is_mutable = (annotation_is_mutable_container(node.annotation)
@@ -2329,26 +2475,37 @@ def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
             is_mutable = is_mutable_container(node.value)
         else:
             continue
-        mutable_accumulators.extend(
-            name for name in names
-            if is_mutable and any(fragment in name.lower()
-                                  for fragment in accumulator_fragments)
-            and name not in immediate_case_containers
-        )
-    assert not mutable_accumulators, (
-        "teacher_main may retain only selected file paths and the immediate case; "
-        f"not mutable corpus/index rows: {mutable_accumulators}"
+        if is_mutable:
+            persistent_mutables.update({name: node.lineno for name in names})
+    allowed_persistent_mutables = {"files", "rejection_counts", "coverage", "manifest"}
+    assert set(persistent_mutables) <= allowed_persistent_mutables, (
+        "teacher_main may not retain a mutable corpus/index container across replay; "
+        f"found {persistent_mutables}"
     )
 
-    row_appends = []
-    for node in ast.walk(teacher):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"append", "extend"}
-                and isinstance(node.func.value, ast.Name)):
+    def mutable_receiver(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            return node.value.id
+        return None
+
+    replay_mutations = []
+    for node in ast.walk(replay_loops[0]):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"append", "extend", "add", "update", "setdefault"}):
+            name = mutable_receiver(node.func.value)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            target = node.target if not isinstance(node, ast.Assign) else node.targets[0]
+            name = mutable_receiver(target) if isinstance(target, ast.Subscript) else None
+        else:
             continue
-        if any(fragment in node.func.value.id.lower() for fragment in accumulator_fragments):
-            row_appends.append(node.func.value.id)
-    assert not row_appends, f"teacher_main must stream rows, not append them: {row_appends}"
+        if name is not None and name != "rejection_counts":
+            replay_mutations.append((name, node.lineno))
+    assert not replay_mutations, (
+        "replay may write only sinks and fixed counters, not grow a local container: "
+        f"{replay_mutations}"
+    )
 
 
 def test_teacher_streaming_b1_index_rows_are_emitted_during_replay(tmp_path, monkeypatch):
@@ -2391,9 +2548,20 @@ def test_teacher_streaming_b1_index_rows_are_emitted_during_replay(tmp_path, mon
 
     def process(case_input):
         if calls:
-            first_id = b'"instance_id":"worker_2/layouts_0.th#0"'
-            assert first_id in b"".join(index_writes), (
-                "the first completed case must reach the streaming index before replay continues"
+            first = calls[0]
+            first_index_row = {
+                "receipt": dataclasses.asdict(first.receipt),
+                "instance_id": first.case["instance_id"],
+                "source_row_count": 2,
+                "block_count": first.case["n"],
+                "partition": first.partition,
+                "sample_ordinal": 0,
+                "sample_seed": first.sample_seed,
+                "status": "winner_mutation",
+            }
+            assert _task4_canonical_json(first_index_row) in b"".join(index_writes), (
+                "the complete canonical first row must reach the streaming index "
+                "before replay continues"
             )
         return real_process(case_input)
 
@@ -2402,6 +2570,52 @@ def test_teacher_streaming_b1_index_rows_are_emitted_during_replay(tmp_path, mon
     assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
     assert index_writes
     assert json.loads((out / "training_index.json").read_text())["rows"]
+
+
+def test_teacher_streaming_b1_large_replay_does_not_retain_index_rows(tmp_path, monkeypatch):
+    """Large source identities make any retained corpus/index roster observable in RAM."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; root.mkdir(); out = tmp_path / "out"
+    source = _task4_tensors()
+    files = []
+    for index in range(256):
+        worker_text = f"{index + 1:04000d}"
+        files.append((int(worker_text), 0,
+                      root / f"worker_{worker_text}" / "layouts_0.th"))
+    monkeypatch.setattr(t, "_iter_approved_shards", lambda _root: files)
+    monkeypatch.setattr(t, "_read_verified_shard", lambda *_args: (b"verified", source))
+    processed = 0
+    observed_delta = None
+
+    def preflight(policy, checkpoint):
+        return {
+            "trust_ok": True, "input_ok": True, "scorer_ok": True,
+            "checkpoint_sha256": policy.expected_checkpoint_sha256,
+            "model_identity": dict(policy.allowed_model_identity),
+            "scorer_sha256": policy.expected_scorer_sha256,
+            "scorer_contract": policy.scorer_contract,
+            "shapely_version": policy.shapely_version,
+        }
+
+    def process(case_input):
+        nonlocal processed, observed_delta
+        processed += 1
+        if processed == 384:
+            gc.collect()
+            observed_delta = tracemalloc.get_traced_memory()[0] - baseline
+        return _task4_good_outcome(t, case_input)
+
+    runtime_type = getattr(t, "_TeacherRuntime", _Task4Runtime)
+    monkeypatch.setattr(
+        t, "_runtime_hooks", lambda: runtime_type(preflight, process, True), raising=False,
+    )
+    tracemalloc.start()
+    try:
+        baseline = tracemalloc.get_traced_memory()[0]
+        assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) in (0, 1)
+        assert processed == 2 * len(files)
+        assert observed_delta is not None and observed_delta < 2 * 1024 * 1024
+    finally:
+        tracemalloc.stop()
 
 
 def test_teacher_streaming_b1_durability_precedes_publish(tmp_path, monkeypatch):
@@ -2514,46 +2728,108 @@ def test_teacher_streaming_b1_population_roster_is_sqlite_only():
                       if isinstance(node, ast.ClassDef)
                       and node.name == "_PopulationAccumulator")
 
-    retained_identity_registries = {
-        node.attr for node in ast.walk(population)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-        and node.value.id == "self"
-        and node.attr.lower() in {"_registered", "_resolved", "_identities", "_roster"}
-    }
-    assert not retained_identity_registries, (
-        "the population roster must remain SQLite-only, not retained in Python: "
-        f"{sorted(retained_identity_registries)}"
-    )
+    def self_attribute(node):
+        return (node.attr if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name) and node.value.id == "self" else None)
 
     def mutable_annotation(annotation):
         return any(isinstance(child, ast.Name)
                    and child.id in {"list", "dict", "set", "List", "Dict", "Set"}
                    for child in ast.walk(annotation))
 
-    mutable_registry_fields = []
+    def mutable_allocation(value):
+        if isinstance(value, (ast.List, ast.Dict, ast.Set,
+                              ast.ListComp, ast.DictComp, ast.SetComp)):
+            return True
+        if not isinstance(value, ast.Call):
+            return False
+        if isinstance(value.func, ast.Name):
+            return value.func.id in {"list", "dict", "set", "defaultdict", "deque"}
+        return (isinstance(value.func, ast.Attribute)
+                and value.func.attr in {"defaultdict", "deque"})
+
+    mutable_roster_fields = []
+    bounded_snapshot_fields = {"_finished"}
     for node in ast.walk(population):
-        target = node.target if isinstance(node, ast.AnnAssign) else None
-        if not (isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name) and target.value.id == "self"):
+        if isinstance(node, ast.AnnAssign):
+            attr = self_attribute(node.target)
+            mutable = (mutable_annotation(node.annotation)
+                       or (node.value is not None and mutable_allocation(node.value)))
+        elif isinstance(node, ast.Assign):
+            attrs = [self_attribute(target) for target in node.targets]
+            attr = next((value for value in attrs if value is not None), None)
+            mutable = mutable_allocation(node.value)
+        else:
             continue
-        if any(fragment in target.attr.lower()
-               for fragment in ("register", "resolv", "identit", "roster")):
-            if mutable_annotation(node.annotation):
-                mutable_registry_fields.append(target.attr)
-    assert not mutable_registry_fields, (
-        "identity/resolution registries must not be retained as mutable fields: "
-        f"{sorted(mutable_registry_fields)}"
+        if attr is not None and mutable and attr not in bounded_snapshot_fields:
+            mutable_roster_fields.append(attr)
+    assert not mutable_roster_fields, (
+        "the population roster must remain SQLite-only, not retained in Python: "
+        f"mutable self collections {sorted(mutable_roster_fields)}"
+    )
+
+    collection_mutations = []
+    for node in ast.walk(population):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"add", "append", "extend", "update", "setdefault"}):
+            receiver = node.func.value
+            attr = self_attribute(receiver)
+            if attr is None and isinstance(receiver, ast.Subscript):
+                attr = self_attribute(receiver.value)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            target = node.target if not isinstance(node, ast.Assign) else node.targets[0]
+            attr = self_attribute(target.value) if isinstance(target, ast.Subscript) else None
+        else:
+            continue
+        if attr is not None:
+            collection_mutations.append((attr, node.lineno))
+    assert not collection_mutations, (
+        "population identity/resolution state must be SQLite rows, not mutable self collections: "
+        f"{collection_mutations}"
     )
 
     methods = {node.name: node for node in population.body
                if isinstance(node, ast.FunctionDef)}
-    for name in ("register", "record_winner", "finish"):
+    expected_sql = {
+        "register": "insert", "record_winner": "update", "finish": "select",
+    }
+    for name, operation in expected_sql.items():
         assert name in methods
-        assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                   and node.func.attr == "execute"
-                   for node in ast.walk(methods[name])), (
-            f"{name} must use SQLite execute-backed roster state"
+        statements = [
+            node.args[0].value.lower() for node in ast.walk(methods[name])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "execute" and node.args
+            and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+        ]
+        assert any(operation in statement and "population" in statement for statement in statements), (
+            f"{name} must {operation} canonical population SQLite rows, not issue a dummy query"
         )
+
+
+def test_teacher_streaming_b1_population_roster_register_and_winner_are_sqlite_rows():
+    t = _teacher(); acc = t._PopulationAccumulator()
+    identity = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+                "instance_id": "worker_2/layouts_0.th#0", "n": 4}
+    try:
+        acc.register(identity)
+        assert acc._db is not None
+        registered = acc._db.execute(
+            "SELECT relative_path, layout_index, instance_id, n "
+            "FROM population WHERE instance_id = ?", (identity["instance_id"],)
+        ).fetchone()
+        assert registered is not None
+        assert (registered[0], int(registered[1]), registered[2], int(registered[3])) == (
+            identity["relative_path"], identity["layout_index"],
+            identity["instance_id"], identity["n"],
+        )
+        acc.record_winner(identity["instance_id"], 8.5, 7.25)
+        winner = acc._db.execute(
+            "SELECT base_cost, teacher_cost FROM population WHERE instance_id = ?",
+            (identity["instance_id"],),
+        ).fetchone()
+        assert winner == (8.5, 7.25)
+    finally:
+        acc.abort()
 
 
 @pytest.mark.parametrize("mutate", [
