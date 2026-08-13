@@ -246,9 +246,11 @@ lower block ID. Duplicate separation and pin edges intentionally remain and
 therefore add weight. The fixed batch schema has no separate pin loss.
 
 Record weight is frozen as `base_cost / teacher_cost`, finite and positive;
-extraction rejects `teacher_cost > base_cost`. Proposal identity remains the
-teacher JSONL envelope/manifest keyed by `instance_id` and `sample_seed`, not
-frozen `TopologyLabel` fields.
+extraction rejects `teacher_cost > base_cost`. The canonical proposal
+envelope/manifest is the provenance authority keyed by `instance_id` and
+`sample_seed`; winner-linked `TopologyLabel` retains `fp_topology_sha256`,
+winner proposal identity, ordinal, name, and `cost_no_runtime` as immutable
+linkage metadata, never student input or a loss target.
 
 Run three samples from the production-aligned differentiable two-step sampler
 before computing the student losses (this Task 5 trajectory count is unrelated
@@ -293,6 +295,12 @@ perpendicular overlap; dimensions and preplaced geometry remain fixed. Task 3
 performs no scoring and emits no labels. Task 4 evaluates every candidate
 exactly once and selects only among candidates by
 `(cost_no_runtime, ordinal, name)`.
+
+Base lifecycle is mandatory: slot 0 (`base`) must be an admitted
+`candidate`. A rejected or duplicate base kills the case/run with
+`KILLED_LEGALITY_OR_COVERAGE` before Task 4 scoring. Every valid selection
+contains base exactly once; when no mutation improves on base, selection is
+the base candidate with explicit no-improvement status.
 
 The Task 3 case adapter consumes the full sanitized case schema:
 `cons[:,0]=fixed`, `cons[:,1]=preplaced`, `cons[:,2]=MIB`,
@@ -407,10 +415,10 @@ median_runtime=1.0).cost_no_runtime`. `rejected` and `duplicate` slots receive
 no evaluator call.
 `EN.energy` is called only after exact legal admission, recorded diagnostically,
 and never shortlists or filters. Select by deterministic
-`(cost_no_runtime, ordinal, name)`, always including baseline; `B_H`, `T_H`,
-labels, and record weights use `cost_no_runtime`. If no proposal
-improves, select baseline with `teacher_cost == base_cost`, explicit
-no-improvement status, and retained label/evidence (`record_weight=1`).  The
+`(cost_no_runtime, ordinal, name)` among candidates, with base present exactly
+once; `B_H`, `T_H`, labels, and record weights use `cost_no_runtime`. If no
+proposal improves, select the base candidate with `teacher_cost == base_cost`,
+explicit no-improvement status, and retained label/evidence (`record_weight=1`). The
 coverage denominator is every eligible held-out case and exactly one
 provided/local-evaluator-scored winner per case; separately report mutation
 admission, intent survival, and positive-gain weighted coverage.
