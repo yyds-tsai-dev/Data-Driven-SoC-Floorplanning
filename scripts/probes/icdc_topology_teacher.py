@@ -1384,7 +1384,7 @@ class _PopulationAccumulator:
             self._db = sqlite3.connect(str(self._db_path))
             self._db.execute(
                 "CREATE TABLE population ("
-                "relative_path TEXT NOT NULL, layout_index TEXT NOT NULL, "
+                "relative_path TEXT NOT NULL, layout_index INTEGER NOT NULL, "
                 "instance_id TEXT NOT NULL, n INTEGER NOT NULL, base_cost REAL, "
                 "teacher_cost REAL, weight REAL NOT NULL, "
                 "UNIQUE(relative_path, layout_index), UNIQUE(instance_id))"
@@ -1406,10 +1406,9 @@ class _PopulationAccumulator:
         if not isinstance(iid,str) or not iid or "\0" in iid: raise ValueError("instance_id")
         rel = _canonical_relative_path(row["relative_path"])
         if type(row["layout_index"]) is not int or row["layout_index"] < 0 or type(row["n"]) is not int or row["n"] < 0: raise ValueError("population identity")
-        try: weight = math.exp(row["n"] / 12)
-        except (OverflowError, ValueError) as exc: raise ValueError("weight") from exc
-        if not math.isfinite(weight): raise ValueError("weight")
         assert self._db is not None
+        try: weight = math.exp(row["n"] / 12)
+        except (OverflowError, ValueError): weight = None
         try:
             self._db.execute("INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) VALUES (?,?,?,?,NULL,NULL,?)", (rel,row["layout_index"],iid,row["n"],weight)); self._db.commit()
         except sqlite3.IntegrityError as exc: raise ValueError("duplicate population identity") from exc
@@ -1419,7 +1418,12 @@ class _PopulationAccumulator:
         base_cost = _finite_number(base_cost,"base_cost"); teacher_cost = _finite_number(teacher_cost,"teacher_cost")
         if base_cost <= 0 or teacher_cost <= 0: raise ValueError("cost")
         assert self._db is not None
-        cur = self._db.execute("UPDATE population SET base_cost=?,teacher_cost=? WHERE instance_id=? AND base_cost IS NULL", (base_cost,teacher_cost,instance_id)); self._db.commit()
+        row = self._db.execute("SELECT n FROM population WHERE instance_id=? AND base_cost IS NULL", (instance_id,)).fetchone()
+        if row is None: raise ValueError("unknown or duplicate winner")
+        try: weight = math.exp(int(row[0]) / 12)
+        except (OverflowError, ValueError) as exc: raise ValueError("weight") from exc
+        if not math.isfinite(weight) or not math.isfinite(weight*base_cost) or not math.isfinite(weight*teacher_cost): raise ValueError("weighted cost")
+        cur = self._db.execute("UPDATE population SET weight=?,base_cost=?,teacher_cost=? WHERE instance_id=? AND base_cost IS NULL", (weight,base_cost,teacher_cost,instance_id)); self._db.commit()
         if cur.rowcount != 1: raise ValueError("unknown or duplicate winner")
 
     def _legacy_add(self, row: Mapping[str, Any]) -> None:
@@ -1470,10 +1474,11 @@ class _PopulationAccumulator:
         try:
             rows = list(self._db.execute("SELECT relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight FROM population ORDER BY relative_path,layout_index"))
             enc = b"[" + b",".join(json.dumps({"relative_path":r[0],"layout_index":r[1],"instance_id":r[2],"n":r[3],"weight":r[6]},sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode() for r in rows) + b"]"
+            rows = [(r[0],int(r[1]),r[2],int(r[3]),r[4],r[5], (r[6] if r[6] is not None else math.exp(int(r[3])/12))) for r in rows]
             denominator = sum(r[6] for r in rows); scored = [r for r in rows if r[4] is not None and r[5] is not None]
             sden = sum(r[6] for r in scored); base_total = sum(r[6]*r[4] for r in scored); teacher_total = sum(r[6]*r[5] for r in scored)
             complete = bool(rows) and len(scored) == len(rows) and denominator > 0
-            result = {"eligible_count":len(rows),"scored_winner_count":len(scored),"denominator":denominator,"scored_denominator":sden,"B_H":base_total/denominator if complete else None,"T_H":teacher_total/denominator if complete else None,"Delta_H":(base_total-teacher_total)/denominator if complete else None,"population_sha256":hashlib.sha256(enc).hexdigest()}
+            result = {"eligible_count":len(rows),"scored_winner_count":len(scored),"denominator":denominator,"scored_denominator":sden,"B_H":base_total/denominator if complete else None,"T_H":teacher_total/denominator if complete else None,"Delta_H":(base_total/denominator-teacher_total/denominator) if complete else None,"population_sha256":hashlib.sha256(enc).hexdigest()}
             self._finished = result
             self.denominator = denominator; self.base_total = base_total; self.teacher_total = teacher_total
             return dict(result)
