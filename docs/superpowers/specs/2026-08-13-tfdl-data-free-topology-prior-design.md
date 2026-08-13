@@ -319,9 +319,17 @@ are:
   `508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659`;
 - C0 submission Direct file:
   `2b9ce827aed93443e442a002d178e8e6282cb4c6148818c9122a6ff0411c8a02`;
-- source EMA and C0 model/EMA canonical state:
-  `0efb3c706d627f6230e6f550d83e88741dc1f5a95e6c3450d7ed1e4a882a4d87`;
-  and
+- source EMA and C0 model/EMA canonical state: schema
+  `icdc_canonical_state_v1`, config
+  `4c6a1e19f0574af348efa81a758c05524522ad3501d46f18e839774fa933971b`, model
+  keyset `79a51975d9b9f583143259198d244554c8a4e97122fc5e5cf150ec64f4429ba7`,
+  EMA keyset `79a51975d9b9f583143259198d244554c8a4e97122fc5e5cf150ec64f4429ba7`,
+  and EMA state
+  `92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb`.
+  The pretraining equality is exact:
+  `canonical_state_sha256(source['ema']) == canonical_state_sha256(c0['model']) == canonical_state_sha256(c0['ema']) == 92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb`.
+  This supersedes the unproven pre-v1 literal; no alternative identity is
+  accepted.
 - frozen Flow file:
   `110c1d84d74ee88d94cf8d3be9ac464602747db8c301d95b3ca69a2cb8bd2f09`.
 
@@ -376,8 +384,10 @@ second encoder. Its API is `IDENTITY_SCHEMA="icdc_canonical_state_v1"`,
 Configuration is compact sorted-key JSON (`ensure_ascii=True`,
 `allow_nan=False`). For every sorted state key, the header is UTF-8 key, NUL,
 dtype text without the `torch.` prefix, NUL, compact JSON shape, NUL.
-Keyset hashing concatenates headers; state hashing concatenates each header
-and detached CPU-contiguous raw tensor bytes. Reject empty/non-mapping model
+Keyset hashing concatenates headers; state hashing updates incrementally per
+tensor with each header and detached CPU-contiguous raw tensor bytes, keeping
+only one tensor in memory and never concatenating the whole state. This must
+not change canonical bytes or digests. Reject empty/non-mapping model
 or EMA state, non-tensors, non-finite values, unsupported layouts or
 quantized tensors, and noncanonical configuration.
 

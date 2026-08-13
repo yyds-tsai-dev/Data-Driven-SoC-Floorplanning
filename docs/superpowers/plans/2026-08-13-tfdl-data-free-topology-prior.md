@@ -294,8 +294,10 @@ def test_group_contact_requires_exact_abutment_and_positive_overlap():
   Configuration is compact sorted-key JSON with `ensure_ascii=True` and
   `allow_nan=False`. For each sorted state key hash UTF-8 key + NUL + dtype
   text without `torch.` + NUL + compact JSON shape + NUL; keysets concatenate
-  headers, while states concatenate headers and detached CPU-contiguous raw
-  bytes. Reject empty/nonmapping model or EMA, non-tensors/nonfinite values,
+  headers, while states update incrementally one tensor at a time with headers
+  and detached CPU-contiguous raw bytes, using bounded memory and never
+  concatenating the whole state. Bytes and digests must remain unchanged.
+  Reject empty/nonmapping model or EMA, non-tensors/nonfinite values,
   unsupported layouts/quantized tensors, and noncanonical config. Identity is
   exactly `identity_schema`, `model_config_sha256`, `model_keyset_sha256`,
   `ema_keyset_sha256`, `ema_state_sha256`. Task 4 requires equal model/EMA
@@ -545,14 +547,19 @@ def test_source_contract_rejects_c0_that_is_not_source_ema():
   coordinates or import/load validation.
 - [ ] Before training, write `source_contract.json` and stop unless the shared
   codec's `canonical_state_sha256` values prove
-  `source.ema_state_sha256 == c0.model_state_sha256 == c0.ema_state_sha256`.
+  `canonical_state_sha256(source['ema']) == canonical_state_sha256(c0['model']) == canonical_state_sha256(c0['ema']) == 92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb`.
   Bind these known file identities: source training checkpoint
   `508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659`,
   C0 submission Direct
   `2b9ce827aed93443e442a002d178e8e6282cb4c6148818c9122a6ff0411c8a02`,
-  their canonical EMA/model state
-  `0efb3c706d627f6230e6f550d83e88741dc1f5a95e6c3450d7ed1e4a882a4d87`,
-  and Flow file
+  schema `icdc_canonical_state_v1`, config
+  `4c6a1e19f0574af348efa81a758c05524522ad3501d46f18e839774fa933971b`, model
+  and EMA keysets both
+  `79a51975d9b9f583143259198d244554c8a4e97122fc5e5cf150ec64f4429ba7`, and
+  EMA state `92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb`.
+  This supersedes the unproven pre-v1 literal; no alternative identity is
+  accepted.
+  Frozen Flow file
   `110c1d84d74ee88d94cf8d3be9ac464602747db8c301d95b3ca69a2cb8bd2f09`.
 - [ ] Run exact CLI:
 ```bash
