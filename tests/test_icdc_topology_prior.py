@@ -1148,6 +1148,53 @@ def _task4_path_fd_targets(path):
     return targets
 
 
+def _task4_install_post_ownership_replacement(
+        t, monkeypatch, *, operation, target, moved, foreign_bytes=None,
+        foreign_sentinel=None):
+    """Inject a path swap after semantic ownership validation, before removal.
+
+    The production seam is deliberately independent of stat/open/rename choices:
+    `_after_ownership_validation(operation, target)` is a no-op outside tests.
+    A caller invokes it only after proving ownership and immediately before its
+    destructive claim.  `target` is the target's pathlib-compatible location;
+    the hook does not prescribe how production obtained or will claim it.
+    """
+    calls = []
+    observed_targets = []
+    foreign = {}
+
+    def after_ownership_validation(observed_operation, observed_target):
+        calls.append(observed_operation)
+        observed_targets.append((observed_operation, Path(observed_target)))
+        if observed_operation != operation or foreign:
+            return
+        target.rename(moved)
+        if foreign_bytes is None:
+            target.mkdir()
+            if foreign_sentinel is not None:
+                (target / foreign_sentinel).write_bytes(b"foreign-directory-sentinel")
+        else:
+            target.write_bytes(foreign_bytes)
+        info = target.stat()
+        foreign.update(identity=(info.st_dev, info.st_ino))
+
+    monkeypatch.setattr(t, "_after_ownership_validation",
+                        after_ownership_validation, raising=False)
+    return calls, foreign, observed_targets
+
+
+def _task4_lifecycle_registry_sizes(module):
+    """Bounded observable ownership state, without assuming its representation."""
+    tokens = ("owner", "sidecar", "lease", "lifecycle")
+    return {
+        name: len(value)
+        for name, value in vars(module).items()
+        if any(token in name.lower() for token in tokens)
+        and not isinstance(value, type)
+        and hasattr(value, "__len__")
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class _Task4CaseInput:
     case: collections.abc.Mapping
@@ -2745,29 +2792,19 @@ def test_population_abort_preserves_untracked_foreign_sidecar(tmp_path, suffix):
 
 def test_population_abort_refuses_main_replacement_after_ownership_check(tmp_path, monkeypatch):
     t = _teacher(); acc = t._PopulationAccumulator(); db_path = Path(acc._db_path)
-    moved = tmp_path / "moved-owned-population"; real_stat = t.os.stat; attacked = {}
-
-    def stat_then_replace(path, *args, **kwargs):
-        result = real_stat(path, *args, **kwargs)
-        candidate = Path(path)
-        if candidate == db_path and not attacked:
-            original = result
-            candidate.rename(moved)
-            candidate.write_bytes(b"foreign-after-population-check")
-            foreign = real_stat(candidate)
-            attacked.update(
-                original=(original.st_dev, original.st_ino),
-                foreign=(foreign.st_dev, foreign.st_ino),
-            )
-        return result
-
-    monkeypatch.setattr(t.os, "stat", stat_then_replace)
+    moved = tmp_path / "moved-owned-population"
+    calls, foreign, observed_targets = _task4_install_post_ownership_replacement(
+        t, monkeypatch, operation="population_main", target=db_path, moved=moved,
+        foreign_bytes=b"foreign-after-population-check",
+    )
     try:
         acc.abort()
-        assert attacked and moved.exists()
+        assert calls.count("population_main") == 1
+        assert [path for kind, path in observed_targets if kind == "population_main"] == [db_path]
+        assert foreign and moved.exists()
         assert db_path.exists(), "post-check replacement must remain at its original path"
         assert db_path.read_bytes() == b"foreign-after-population-check"
-        assert (db_path.stat().st_dev, db_path.stat().st_ino) == attacked["foreign"]
+        assert (db_path.stat().st_dev, db_path.stat().st_ino) == foreign["identity"]
     finally:
         try:
             if acc._db is not None:
@@ -2780,15 +2817,11 @@ def test_population_abort_closes_active_connection_before_preserving_foreign_jou
     t = _teacher(); acc = t._PopulationAccumulator(); db = acc._db
     assert db is not None
     main = Path(acc._db_path); journal = Path(f"{main}-journal")
-    db.execute(
-        "INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) "
-        "VALUES (?,?,?,?,NULL,NULL,?)",
-        ("worker_2/layouts_0.th", 0, "active", 1, 1.0),
-    )
-    # This direct write intentionally leaves SQLite's transaction active.  The
-    # replacement journal was never captured as an owned sidecar.
-    assert journal.is_file()
-    assert "-journal" not in t._POP_SIDECARS.get(id(acc), {})
+    db.execute("BEGIN")
+    db.execute("CREATE TABLE active_transaction_probe(value INTEGER)")
+    db.execute("INSERT INTO active_transaction_probe VALUES (1)")
+    # The sidecar is hostile external state, independently created after the
+    # active transaction.  This works with disk, memory, and WAL journaling.
     journal.unlink(missing_ok=True)
     journal.write_bytes(b"foreign-untracked-journal")
     foreign = journal.stat()
@@ -2811,28 +2844,23 @@ def test_population_abort_closes_active_connection_before_preserving_foreign_jou
 
 def test_population_ownership_metadata_is_torn_down_before_object_id_reuse():
     t = _teacher()
-    owners = getattr(t, "_POP_OWNERS", None)
-    sidecars = getattr(t, "_POP_SIDECARS", None)
-    assert isinstance(owners, dict) and isinstance(sidecars, dict)
-    before_owners = {key: set(value) for key, value in owners.items()}
-    before_sidecars = {key: dict(value) for key, value in sidecars.items()}
-    retained = []
+    baseline = _task4_lifecycle_registry_sizes(t)
+    retained = [t._PopulationAccumulator() for _ in range(16)]
+    references = [weakref.ref(acc) for acc in retained]
     try:
-        for _ in range(16):
-            acc = t._PopulationAccumulator(); object_id = id(acc)
+        for acc in retained:
             acc.abort()
-            assert object_id not in owners and object_id not in sidecars
-            retained.append(weakref.ref(acc))
-            del acc
-        gc.collect()
-        assert all(reference() is None for reference in retained)
-        assert {key: set(value) for key, value in owners.items()} == before_owners
-        assert {key: dict(value) for key, value in sidecars.items()} == before_sidecars
+        # Keep aborted objects live: registry cleanup must not depend on GC, so
+        # a later CPython id reuse cannot inherit their ownership.
+        assert _task4_lifecycle_registry_sizes(t) == baseline
     finally:
-        # A failing implementation may have leaked bookkeeping only; release
-        # all Python objects so the following tests cannot observe this test's
-        # allocator state.
+        retained.clear()
+        try:
+            del acc
+        except UnboundLocalError:
+            pass
         gc.collect()
+    assert all(reference() is None for reference in references)
 
 
 def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
@@ -2878,71 +2906,54 @@ def test_cleanup_owned_staging_closes_root_fd_when_content_removal_raises(tmp_pa
     )
 
 
-def test_cleanup_owned_staging_refuses_leaf_replacement_after_initial_stat(
+def test_cleanup_owned_staging_refuses_leaf_replacement_after_ownership_validation(
         tmp_path, monkeypatch):
     t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
     leaf = owned / "owned-leaf"; leaf.write_bytes(b"owned")
     moved = tmp_path / "moved-owned-leaf"; lease = t._new_staging_lease(owned)
-    real_stat = t.os.stat; attacked = {}
-
-    def stat_then_replace(path, *args, **kwargs):
-        result = real_stat(path, *args, **kwargs)
-        if (path == leaf.name and kwargs.get("dir_fd") is not None
-                and kwargs.get("follow_symlinks") is False and not attacked):
-            leaf.rename(moved)
-            leaf.write_bytes(b"foreign-after-stat")
-            foreign = leaf.stat()
-            attacked.update(identity=(foreign.st_dev, foreign.st_ino))
-        return result
-
-    monkeypatch.setattr(t.os, "stat", stat_then_replace)
-    assert t._cleanup_owned_staging(lease) is False
-    assert attacked and moved.read_bytes() == b"owned"
-    assert leaf.read_bytes() == b"foreign-after-stat"
-    assert (leaf.stat().st_dev, leaf.stat().st_ino) == attacked["identity"]
+    calls, foreign, observed_targets = _task4_install_post_ownership_replacement(
+        t, monkeypatch, operation="staging_leaf", target=leaf, moved=moved,
+        foreign_bytes=b"foreign-after-validation",
+    )
+    result = t._cleanup_owned_staging(lease)
+    assert calls.count("staging_leaf") == 1
+    assert [path for kind, path in observed_targets if kind == "staging_leaf"] == [leaf]
+    assert result is False and foreign and moved.read_bytes() == b"owned"
+    assert leaf.read_bytes() == b"foreign-after-validation"
+    assert (leaf.stat().st_dev, leaf.stat().st_ino) == foreign["identity"]
 
 
-def test_cleanup_owned_staging_refuses_child_directory_replacement_after_fstat(
+def test_cleanup_owned_staging_refuses_child_directory_replacement_after_ownership_validation(
         tmp_path, monkeypatch):
     t = _teacher(); owned = tmp_path / "stage"; child = owned / "owned-child"
     child.mkdir(parents=True); moved = tmp_path / "moved-owned-child"
-    lease = t._new_staging_lease(owned); child_identity = (child.stat().st_dev, child.stat().st_ino)
-    real_fstat = t.os.fstat; attacked = {}
-
-    def fstat_then_replace(fd):
-        result = real_fstat(fd)
-        if ((result.st_dev, result.st_ino) == child_identity and not attacked):
-            child.rename(moved)
-            child.mkdir()
-            foreign = child.stat()
-            attacked.update(identity=(foreign.st_dev, foreign.st_ino))
-        return result
-
-    monkeypatch.setattr(t.os, "fstat", fstat_then_replace)
-    assert t._cleanup_owned_staging(lease) is False
-    assert attacked and moved.is_dir() and child.is_dir()
-    assert (child.stat().st_dev, child.stat().st_ino) == attacked["identity"]
+    lease = t._new_staging_lease(owned)
+    calls, foreign, observed_targets = _task4_install_post_ownership_replacement(
+        t, monkeypatch, operation="staging_child", target=child, moved=moved,
+        foreign_sentinel="keep",
+    )
+    result = t._cleanup_owned_staging(lease)
+    assert calls.count("staging_child") == 1
+    assert [path for kind, path in observed_targets if kind == "staging_child"] == [child]
+    assert result is False and foreign and moved.is_dir() and child.is_dir()
+    assert (child / "keep").read_bytes() == b"foreign-directory-sentinel"
+    assert (child.stat().st_dev, child.stat().st_ino) == foreign["identity"]
 
 
-def test_cleanup_owned_staging_refuses_root_replacement_after_final_identity_check(
+def test_cleanup_owned_staging_refuses_root_replacement_after_ownership_validation(
         tmp_path, monkeypatch):
     t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
     lease = t._new_staging_lease(owned); moved = tmp_path / "moved-owned-stage"
-    real_matches = t._path_matches_lease; attacked = {}
-
-    def match_then_replace(path, candidate_lease):
-        result = real_matches(path, candidate_lease)
-        if result and Path(path) == owned and not attacked:
-            owned.rename(moved)
-            owned.mkdir()
-            foreign = owned.stat()
-            attacked.update(identity=(foreign.st_dev, foreign.st_ino))
-        return result
-
-    monkeypatch.setattr(t, "_path_matches_lease", match_then_replace)
-    assert t._cleanup_owned_staging(lease) is False
-    assert attacked and moved.is_dir() and owned.is_dir()
-    assert (owned.stat().st_dev, owned.stat().st_ino) == attacked["identity"]
+    calls, foreign, observed_targets = _task4_install_post_ownership_replacement(
+        t, monkeypatch, operation="staging_root", target=owned, moved=moved,
+        foreign_sentinel="keep",
+    )
+    result = t._cleanup_owned_staging(lease)
+    assert calls.count("staging_root") == 1
+    assert [path for kind, path in observed_targets if kind == "staging_root"] == [owned]
+    assert result is False and foreign and moved.is_dir() and owned.is_dir()
+    assert (owned / "keep").read_bytes() == b"foreign-directory-sentinel"
+    assert (owned.stat().st_dev, owned.stat().st_ino) == foreign["identity"]
 
 
 def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monkeypatch):
@@ -3036,46 +3047,40 @@ def test_teacher_normal_case_spool_close_rejects_foreign_replacement(
 
 def test_teacher_normal_case_spool_close_refuses_post_check_replacement(
         tmp_path, monkeypatch):
-    """A normal spool close must not unlink a replacement after its stat check."""
+    """A normal spool close must fail closed after validated-ownership swaps."""
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
     out = tmp_path / "out"; stages = []; moved = tmp_path / "moved-owned-case-spool"
     _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
-    real_staging = t._new_staging; real_stat = t.os.stat; attacked = {}; published = []
-    spool_stat_count = 0
+    real_staging = t._new_staging; published = []
     monkeypatch.setattr(
         t, "_new_staging",
         lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
     )
+    calls = []; observed_targets = []; foreign = {}
 
-    def stat_then_replace(path, *args, **kwargs):
-        nonlocal spool_stat_count
-        result = real_stat(path, *args, **kwargs)
-        candidate = Path(path)
-        if candidate.name == "case_spool.sqlite":
-            spool_stat_count += 1
-        # The creation identity reads dev and ino separately; the third stat
-        # is the normal close-to-remove ownership observation.
-        if candidate.name == "case_spool.sqlite" and spool_stat_count == 3 and not attacked:
-            original = result
-            candidate.rename(moved)
-            candidate.write_bytes(b"foreign-after-case-spool-check")
-            foreign = real_stat(candidate)
-            attacked.update(
-                path=candidate,
-                original=(original.st_dev, original.st_ino),
-                foreign=(foreign.st_dev, foreign.st_ino),
-            )
-        return result
+    def after_ownership_validation(operation, target):
+        calls.append(operation)
+        observed_targets.append((operation, Path(target)))
+        if operation != "case_spool" or foreign:
+            return
+        candidate = Path(target)
+        candidate.rename(moved)
+        candidate.write_bytes(b"foreign-after-case-spool-validation")
+        info = candidate.stat()
+        foreign.update(path=candidate, identity=(info.st_dev, info.st_ino))
 
-    monkeypatch.setattr(t.os, "stat", stat_then_replace)
+    monkeypatch.setattr(t, "_after_ownership_validation",
+                        after_ownership_validation, raising=False)
     monkeypatch.setattr(t, "_publish_staging",
                         lambda *args: published.append(args))
     with pytest.raises(ValueError):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
-    assert attacked and not published and not out.exists()
-    replacement = Path(attacked["path"])
-    assert moved.exists() and replacement.read_bytes() == b"foreign-after-case-spool-check"
-    assert (replacement.stat().st_dev, replacement.stat().st_ino) == attacked["foreign"]
+    assert calls.count("case_spool") == 1
+    assert foreign and not published and not out.exists()
+    replacement = Path(foreign["path"])
+    assert [path for kind, path in observed_targets if kind == "case_spool"] == [replacement]
+    assert moved.exists() and replacement.read_bytes() == b"foreign-after-case-spool-validation"
+    assert (replacement.stat().st_dev, replacement.stat().st_ino) == foreign["identity"]
 
 
 @pytest.mark.parametrize("suffix", ["", "-journal", "-wal", "-shm"])
