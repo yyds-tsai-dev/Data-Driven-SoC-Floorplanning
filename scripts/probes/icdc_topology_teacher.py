@@ -1061,13 +1061,6 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         try:
             lease = _new_staging_lease(staging)
         except BaseException:
-            # The freshly-created directory is still cleaned only by identity.
-            try:
-                info = os.lstat(staging)
-                if stat.S_ISDIR(info.st_mode):
-                    _cleanup_owned_staging(_StagingLease(staging, info.st_dev, info.st_ino))
-            except BaseException:
-                pass
             raise
         writer = _JsonlWriter(lease.path)
         rows: list[dict[str, Any]] = []
