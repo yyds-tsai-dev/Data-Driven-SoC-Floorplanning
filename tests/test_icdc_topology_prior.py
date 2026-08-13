@@ -517,7 +517,7 @@ def _task4_static_forbidden(source, *, require_exact_loads=False):
         if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and forbidden_literal(n.slice.value): return False
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and n.args and isinstance(n.args[0], ast.Constant) and forbidden_literal(n.args[0].value): return False
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"process_case", "_sample_direct_once", "_build_teacher_batches"}:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"_sample_direct_once", "_build_teacher_batches"}:
             if any(
                 isinstance(x, ast.Call)
                 and not (node.name == "_sample_direct_once" and resolve(x.func) == "icdc.energy.decode_rects")
@@ -604,7 +604,9 @@ def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
     assert not _task4_static_forbidden("import icdc.engine as e\nx=e\ny=x\nz=y\na=z\nb=a\ngetattr(b, 'load_model')()")
     assert not _task4_static_forbidden("case={'golden': 1}\ncase.get('golden')\ne.sample_bank()")
     assert not _task4_static_forbidden("from icdc import tfdl as q\nq(x)")
-    assert not _task4_static_forbidden("def process_case(x):\n  fake_admission(x)\n  fake_tfdl(x)\n  official_score(x)")
+    assert _task4_static_forbidden("def process_case(x):\n  fake_admission(x)\n  official_score(x)")
+    assert not _task4_static_forbidden("def _sample_direct_once(x):\n  fake_admission(x)")
+    assert not _task4_static_forbidden("def _build_teacher_batches(x):\n  official_score(x)")
     assert _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu')", require_exact_loads=True)
     assert not _task4_static_forbidden("import io, torch\na='x'; b='y'; c='z'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu'); torch_alias=torch; getattr(torch_alias, 'load')(io.BytesIO(c), weights_only=True, map_location='cpu')", require_exact_loads=True)
     assert not _task4_static_forbidden("import io, torch\na='x'; b='y'; c='z'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu'); torch_alias=torch; loader=getattr(torch_alias, 'load'); loader(io.BytesIO(c), weights_only=True, map_location='cpu')", require_exact_loads=True)
