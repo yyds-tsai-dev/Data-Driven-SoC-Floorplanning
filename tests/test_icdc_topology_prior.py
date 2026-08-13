@@ -869,12 +869,10 @@ def test_task4_sample_rejects_malformed_known_channels_before_sampler(kind, monk
         elif kind == "mask_dtype":
             mask = mask.to(torch.float32)
         elif kind == "mask_device":
-            pytest.skip("CUDA unavailable")
+            if not torch.cuda.is_available():
+                pytest.skip("CUDA unavailable")
+            mask = mask.to("cuda")
         malformed = (z, mask)
-    if kind == "mask_device":
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA unavailable")
-        malformed = (z, mask.to("cuda"))
     monkeypatch.setattr(t._ENGINE, "known_channels", lambda direct: malformed)
     monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", lambda *args, **kwargs: pytest.fail("sampler invoked"), raising=False)
     with pytest.raises(ValueError):
