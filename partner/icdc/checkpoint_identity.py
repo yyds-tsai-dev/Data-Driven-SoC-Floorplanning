@@ -1,40 +1,121 @@
-"""Canonical, fail-closed checkpoint identity codec."""
-import hashlib, json, math
-from collections.abc import Mapping
+"""Canonical, fail-closed identities for checkpoint state dictionaries."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Iterator, Mapping
+from typing import Any
+
 import torch
 
+
 IDENTITY_SCHEMA = "icdc_canonical_state_v1"
-_enc = lambda x: json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
-def _config(c):
-    if not isinstance(c, Mapping) or not c: raise ValueError("configuration")
-    try: return _enc(dict(c))
-    except Exception as e: raise ValueError("configuration") from e
-def canonical_config_sha256(config): return hashlib.sha256(_config(config)).hexdigest()
-def _state(s):
-    if not isinstance(s, Mapping) or not s: raise ValueError("state")
-    out=[]
-    for k in sorted(s):
-        if not isinstance(k,str) or not k or "\0" in k: raise ValueError("key")
-        t=s[k]
-        if not isinstance(t,torch.Tensor) or t.is_meta or t.is_quantized or t.layout is not torch.strided: raise ValueError("tensor")
-        if not torch.is_floating_point(t) and not torch.is_complex(t):
-            pass
-        elif not bool(torch.isfinite(t).all()): raise ValueError("nonfinite")
-        try: c=t.detach().cpu().contiguous(); dtype=str(c.dtype).removeprefix("torch."); shape=_enc(list(c.shape))
-        except Exception as e: raise ValueError("tensor") from e
-        h=k.encode()+b"\0"+dtype.encode()+b"\0"+shape+b"\0"
-        out.append((h,c))
-    return out
-def canonical_keyset_sha256(state): return hashlib.sha256(b"".join(h for h,_ in _state(state))).hexdigest()
-def canonical_state_sha256(state):
-    chunks=[]
-    for h,t in _state(state):
-        try: chunks += [h,t.view(torch.uint8).numpy().tobytes()]
-        except Exception as e: raise ValueError("tensor") from e
-    return hashlib.sha256(b"".join(chunks)).hexdigest()
-def canonical_checkpoint_identity(checkpoint):
-    if not isinstance(checkpoint,Mapping): raise ValueError("checkpoint")
-    model,ema=checkpoint.get("model"),checkpoint.get("ema")
-    if not isinstance(model,Mapping) or not model or not isinstance(ema,Mapping) or not ema: raise ValueError("model/ema")
-    mk=canonical_keyset_sha256(model); ek=canonical_keyset_sha256(ema)
-    return {"identity_schema":IDENTITY_SCHEMA,"model_config_sha256":canonical_config_sha256(checkpoint.get("model_config")),"model_keyset_sha256":mk,"ema_keyset_sha256":ek,"ema_state_sha256":canonical_state_sha256(ema)}
+
+_IDENTITY_FIELDS = (
+    "identity_schema",
+    "model_config_sha256",
+    "model_keyset_sha256",
+    "ema_keyset_sha256",
+    "ema_state_sha256",
+)
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("value is not canonical JSON") from exc
+
+
+def canonical_config_sha256(config: Mapping[str, Any]) -> str:
+    """Hash one canonical JSON configuration mapping."""
+
+    if not isinstance(config, Mapping):
+        raise ValueError("model_config must be a mapping")
+    return hashlib.sha256(_canonical_json_bytes(dict(config))).hexdigest()
+
+
+def _validate_tensor(key: str, tensor: Any) -> None:
+    if not isinstance(key, str) or not key or "\0" in key:
+        raise ValueError("state keys must be non-empty strings without NUL")
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError(f"state value for {key!r} is not a tensor")
+    if tensor.is_meta:
+        raise ValueError("meta tensors are not supported")
+    if tensor.is_quantized:
+        raise ValueError("quantized tensors are not supported")
+    if tensor.layout is not torch.strided:
+        raise ValueError("only strided tensors are supported")
+    try:
+        finite = torch.isfinite(tensor).all().item()
+    except Exception as exc:
+        raise ValueError("tensor finiteness could not be checked") from exc
+    if not bool(finite):
+        raise ValueError("state tensors must be finite")
+
+
+def _state_entries(state: Mapping[str, Any]) -> Iterator[tuple[bytes, torch.Tensor]]:
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError("state must be a non-empty mapping")
+    for key in sorted(state):
+        tensor = state[key]
+        _validate_tensor(key, tensor)
+        dtype = str(tensor.dtype).removeprefix("torch.")
+        shape = _canonical_json_bytes(list(tensor.shape))
+        header = key.encode("utf-8") + b"\0" + dtype.encode("ascii") + b"\0" + shape + b"\0"
+        yield header, tensor
+
+
+def canonical_keyset_sha256(state: Mapping[str, Any]) -> str:
+    """Hash sorted state headers without copying tensor values to CPU."""
+
+    digest = hashlib.sha256()
+    for header, _tensor in _state_entries(state):
+        digest.update(header)
+    return digest.hexdigest()
+
+
+def canonical_state_sha256(state: Mapping[str, Any]) -> str:
+    """Hash sorted headers and one detached, contiguous tensor at a time."""
+
+    digest = hashlib.sha256()
+    for header, tensor in _state_entries(state):
+        digest.update(header)
+        try:
+            contiguous = tensor.detach().cpu().contiguous()
+            raw = memoryview(contiguous.view(torch.uint8).numpy())
+            digest.update(raw)
+        except Exception as exc:
+            raise ValueError("tensor bytes could not be encoded") from exc
+    return digest.hexdigest()
+
+
+def canonical_checkpoint_identity(checkpoint: Mapping[str, Any]) -> dict[str, str]:
+    """Return the exact five-field identity for a model/EMA checkpoint."""
+
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("checkpoint must be a mapping")
+    model = checkpoint.get("model")
+    ema = checkpoint.get("ema")
+    if not isinstance(model, Mapping) or not model:
+        raise ValueError("checkpoint model must be a non-empty mapping")
+    if not isinstance(ema, Mapping) or not ema:
+        raise ValueError("checkpoint EMA must be a non-empty mapping")
+
+    identity = {
+        "identity_schema": IDENTITY_SCHEMA,
+        "model_config_sha256": canonical_config_sha256(checkpoint.get("model_config")),
+        "model_keyset_sha256": canonical_keyset_sha256(model),
+        "ema_keyset_sha256": canonical_keyset_sha256(ema),
+        "ema_state_sha256": canonical_state_sha256(ema),
+    }
+    if tuple(identity) != _IDENTITY_FIELDS:
+        raise ValueError("invalid checkpoint identity schema")
+    return identity
