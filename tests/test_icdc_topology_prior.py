@@ -662,7 +662,9 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
         assert diagnostic[key].dtype == torch.float64 and diagnostic[key].device.type == "cpu"
     assert diagnostic["cons"].dtype == torch.int64 and diagnostic["cons"].device.type == "cpu"
     assert diagnostic["scale"].item() == direct["scale"].double().item()
-    assert diagnostic["hpwl_ref"].item() == 4.0 and diagnostic["area_ref"].item() == 4.0
+    for key, value in (("hpwl_ref", 4.0), ("area_ref", 4.0)):
+        assert diagnostic[key].shape == (1,) and diagnostic[key].dtype == torch.float64 and diagnostic[key].device.type == "cpu"
+        assert diagnostic[key].item() == value
     for batch in (direct, diagnostic):
         assert batch["area"].shape == (1, 3) and batch["tp"].shape == (1, 3, 4)
         assert batch["cons"].shape == (1, 3, 5) and batch["scale"].shape == (1,)
@@ -701,7 +703,9 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
     if cuda_before is not None: assert all(torch.equal(a, b) for a, b in zip(cuda_before, torch.cuda.get_rng_state_all()))
     out2 = t._sample_direct_once(state, case, 31)
     out3 = t._sample_direct_once(state, case, 32)
-    assert out1.shape == (3, 4) and out1.dtype == torch.float64 and torch.isfinite(out1).all()
+    for out in (out1, out2, out3):
+        assert out.shape == (3, 4) and out.dtype == torch.float64 and out.device.type == "cpu"
+        assert torch.isfinite(out).all() and (out[..., 2:] > 0).all()
     assert torch.equal(out1, out2) and not torch.equal(out1, out3)
     assert len(calls["sample"]) == len(calls["decode"]) == 3
     assert [x[2] for x in calls["sample"]] == [31, 31, 32]
@@ -739,6 +743,7 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
         assert all(x.device.type == "cpu" for x in (raw, area, cons, tp, scale))
 
 @pytest.mark.parametrize("bad", [torch.zeros((1, 3, 4, 1)), torch.zeros((2, 3, 4)),
+    torch.tensor([[[0., 0., 1., 1.]] * 3], dtype=torch.float32),
     torch.zeros((1, 2, 4)), torch.full((1, 3, 4), float("nan")),
     torch.full((1, 3, 4), float("inf")), torch.tensor([[[0., 0., 0., 1.]] * 3]),
     torch.tensor([[[0., 0., 1., -1.]] * 3])])
@@ -746,6 +751,14 @@ def test_task4_sample_rejects_malformed_decoder_results(monkeypatch, bad):
     t = _teacher(); state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
     monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", lambda *a, **k: torch.zeros((1, 3, 4)), raising=False)
     monkeypatch.setattr(t, "_DECODE_RECTS", lambda *a, **k: bad, raising=False)
+    with pytest.raises(ValueError):
+        t._sample_direct_once(state, _task4_anchored_case_input(t).case, 9)
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_task4_sample_rejects_cuda_decoder_result(monkeypatch):
+    t = _teacher(); state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
+    monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", lambda *a, **k: torch.zeros((1, 3, 4)), raising=False)
+    monkeypatch.setattr(t, "_DECODE_RECTS", lambda *a, **k: torch.tensor([[[0., 0., 1., 1.]] * 3], dtype=torch.float64, device="cuda"), raising=False)
     with pytest.raises(ValueError):
         t._sample_direct_once(state, _task4_anchored_case_input(t).case, 9)
 
