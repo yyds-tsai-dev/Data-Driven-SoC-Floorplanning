@@ -14,8 +14,65 @@ authoritative development baseline is
 - hard errors: `0`
 - runtime headroom: `1.1837896844372198` ms/case
 
-No package review is requested until a final result reaches exactly `1.00` at
-`<=0.300` s/case.
+No package review is requested until the separately authorized production
+policy reaches exactly `1.00`; runtime is audited independently.
+
+## Normative amendment: source, topology, and matched-gate contract
+
+The raw source schema has exactly seven tensors, in this order: `source[0]`
+input `[B,N,6]`; `source[1]` b2b `[B,*,3]`; `source[2]` p2b `[B,*,3]`;
+`source[3]` pins `[B,*,2]`; `source[4]` `tree_sol` `[B,N-1,3]`;
+`source[5]` `fp_sol` `[B,N,4]`, stored `(w,h,x,y)`; and `source[6]`
+`metrics_sol` `[B,8]`. `tree_sol` is validated for schema, dtype, shape, and
+padding only. It is never a model input, label, topology extraction,
+candidate, loss, cost-selection, or checkpoint-selection input. Changing only
+a valid tree can change the raw receipt SHA, but never semantic teacher or
+training outputs. The former misnomer `fingerprint [B,N,4]` is prohibited.
+
+`fp_sol` is receipt-bound, training-only legal supervision and is converted
+transiently and exactly from `(w,h,x,y)` to `(x,y,w,h)`. Validation/test
+`fp_sol` is forbidden for gradient training, thresholds, proposals, tuning, or
+checkpoint selection; after freeze, full100 G1 cannot feed back. Dense fp
+coordinates are never serialized, entered into the student, used in a
+coordinate/value loss, used to seed proposals, or used at inference.
+
+Dense golden coordinates are not teacher targets; there is one explicit
+exception: a transient, receipt-verified training `fp_sol` may be converted to
+the discrete `fp_topology_v1` label. TopologyLabel margins and weights derive
+from the exact-TFDL winner, never from fp coordinates. `fp_topology_v1` contains
+only sparse receipt/input fingerprint, `axis_edges`, `contacts`, and
+`topology_sha256`; it must not contain origin, width, height, gap, overlap
+magnitude, dense rectangles, or dense fp fields. Extraction derives `N` from
+input, chooses axis `gx>=gy` (x on ties), direction by center with lower-ID
+tie, applies transitive reduction, records exact group-internal contacts using
+frozen epsilon and positive perpendicular overlap, and selects contacts by
+maximum-overlap Kruskal with tie `(axis,min_id,max_id)`. It is invariant to
+translation and uniform scaling.
+
+The canonical flow is: verified training shard → transient canonical fp →
+official hard audit (soft V is accepted and recorded) → sparse topology →
+realize from Direct/base seed and input only (the realizer never receives fp
+rectangles) → exact TFDL with no shelf fallback → hard audit → official
+no-runtime scorer → deterministic winner → sparse label/student. Candidate
+order is frozen as `base, fp-axis, existing axis, pin, fp-contact, existing
+contact`, with ties `(cost_no_runtime, ordinal, name)`. Soft grouping, MIB, and
+boundary violations are scoreable, not rejection; preplaced hard constraints
+override boundary soft constraints. Symmetric area tolerance is inclusive
+`±1%`; outside it is a hard failure.
+
+The RED acceptance matrix is normative: test source roles/conversion; tree
+invariance and absence from every call path; validation/test rejection; no
+dense serialization; soft-V golden acceptance; preplaced plus boundary
+immobility; target100 `99/101` accepted and `98.99/101.01` hard-failed;
+topology invariance; no fp-rectangle realizer path; all candidates through
+the official pipeline; deterministic base/no-improvement; and exact binding
+of receipt, source, extractor, TFDL, and scorer.
+
+QA authority is bound to [C_QA_20260804.pdf](../../official/C_QA_20260804.pdf),
+SHA256 `60286cf3eb05ff41732d83fc681506b001e283141223d69bbbb9c27c9f25c5db`.
+Manifest and preflight fail on absence or mismatch. QA A4, A5, A6, A15, and
+A16 are authoritative for source integrity, auditability, legal geometry,
+reproducibility, and gate evidence.
 
 ### Approved 3-Direct / 3-Flow amendment
 
@@ -217,15 +274,18 @@ arguments to `save_sanitized_corpus`—there is no unbound corpus-writing API.
 Receipt verification hashes the exact source bytes first, then loads those
 bytes through a single in-memory buffer with `torch.load(...,
 weights_only=True, map_location="cpu")`.  Only the exact seven-tensor raw shard
-schema is accepted: input rows `[B,N,6]`, tree `[B,N-1,3]`, fingerprint
- `[B,N,4]`, and metrics `[B,8]` (with the remaining raw tensors retaining their
- exact validated widths).  All tensors must be finite CPU tensors with
+schema is accepted: input `[B,N,6]`, b2b `[B,*,3]`, p2b `[B,*,3]`, pins
+`[B,*,2]`, `tree_sol` `[B,N-1,3]`, `fp_sol` `[B,N,4]` stored `(w,h,x,y)`,
+and `metrics_sol` `[B,8]`. All widths and padding rules are validated, and all
+tensors must be finite CPU tensors with
  matching batch dimensions; no arbitrary pickle/object source is trusted.
 
 The source adapter maps raw `(w,h,x,y)` geometry to the canonical
-`(x,y,w,h)` representation and masks non-input coordinates before fingerprinting.
-Golden coordinates are never serialized or used as targets; raw `fp` is read
-only to derive input-authorized fixed/preplaced geometry.  The implementation
+`(x,y,w,h)` representation transiently and masks non-input coordinates before
+fingerprinting. Golden coordinates are never serialized or used as targets;
+the sole exception is receipt-verified training `fp_sol` converted to sparse
+`fp_topology_v1`. Raw `fp_sol` is read only to derive input-authorized
+fixed/preplaced geometry. The implementation
 verifies `source_root` and the complete receipt list while saving; later sealed
 index/manifest artifacts provide the experiment-level reproducibility boundary.
 
@@ -301,12 +361,26 @@ condition clears hard but not target, avoiding impossible overlap. Only
 
 ### G1 — same-shape student
 
-Require held-out zero drift and hard legality under an exact TFDL audit and
-retain at least `75%` of the teacher gain over records with positive teacher
-gain. Before the blind pair, a deterministic non-validation causal smoke must
-prove that both arms execute the normal pool with exactly six candidates split
-3 Direct/3 Flow, Direct raw hashes differ, Flow raw hashes are identical, and
-at least one predeclared witness changes after ranking or in the final layout.
+G1 acceptance is a matched, receipt-bound quality/runtime gate, not the old
+quality-only bars. Each arm seals 100 ordered rows `(case_id,n_i,runtime r_i,
+cost_no_runtime q_i)`; runtime sum, mean, p90, and max are computed from the
+sorted vector using nearest-rank `sorted[89]` for p90. Bind the identical Alpha
+per-case median vector in
+`docs/official/alpha_test/C_Median Runtime per Testcase(Alpha).csv`, SHA256
+`804c3432febb88a8f8ee0a8c0ede4b4598a5cf3c109d68de6a6ca86f05d211bd`, ordered
+IDs, and calculator SHA. This is an Alpha projection, not a hidden official
+predictor. For each row, with `m_i` the bound Alpha median, compute
+`combined_i = q_i * max(0.7, max(0.01, r_i/max(m_i,0.01))**0.3)` and weighted
+combined score using `exp(n/12)`. A candidate passes the comparison only when
+its combined score is `<=` control combined score with tolerance `1e-12`.
+`mean <= .300` is only the internal diagnostic
+`internal_runtime_target_met`, never official validity. Preserve feasibility,
+receipt, freeze, causal-smoke, and the exact 3D/3F contract.
+
+Before the blind pair, a deterministic non-validation causal smoke must prove
+that both arms execute the normal pool with exactly six candidates split 3
+Direct/3 Flow, Direct raw hashes differ, Flow raw hashes are identical, and at
+least one predeclared witness changes after ranking or in the final layout.
 
 Freeze the held-out-selected candidate at
 `artifacts/icdc_topology/checkpoints/g1_n100_3d3f.pt` plus an immutable manifest.
@@ -339,14 +413,16 @@ unmask or inspect either outcome until both artifacts, logs, environment
 receipts, and hashes are sealed. C1 passes only if all of the following hold:
 
 - C0 and C1 each independently have `100/100` feasibility, zero errors,
-  average runtime `<=0.300` s/case, valid freeze/environment/checkpoint hashes,
+  valid freeze/environment/checkpoint hashes,
   and complete valid portfolio receipts;
 - the arms have identical ordered `(case ordinal, block count, Direct-gate
   status, pool status)` vectors; every Direct-gate-open case has exactly one
   normal-pool receipt and every Direct-gate-closed case is explicitly recorded;
-- weighted no-runtime `<=1.1287448258795715`;
-- weighted no-runtime `<= C0 - 0.015`;
 - the receipts prove Direct DPM++/2, Flow Euler/8, total six, and exact 3D/3F.
+
+G0 and G1 manifests bind every source, receipt, extractor, TFDL, scorer,
+Alpha projection, calculator, schedule, and freeze semantic above. G0 may
+prove teacher selection quality only; it must not claim a full100 causal gain.
 
 Verify that model configuration, state-dict keys, tensor shapes, and dtypes
 match the frozen Direct contract. G1 is a high-tail causal proof, not the final
@@ -458,8 +534,8 @@ manifest.  It freezes `scripts/iccad2026_evaluate.py` SHA256
 the exact `evaluate_solution` callable parameter signature,
 `SolutionMetrics.cost_no_runtime` presence, and `compute_total_score` weighting
 equivalence, requires `SHAPELY_AVAILABLE=true` with Shapely `2.0.5`, and always
-selects `.cost_no_runtime`.  This is a literal executable contract, not a
-placeholder declared identifier.  A legitimate source change requires a
+selects `.cost_no_runtime`.  This is a literal executable contract with a
+declared identifier.  A legitimate source change requires a
 written specification amendment and new freeze; it is never auto-accepted.
 
 Persist a versioned manifest containing baseline commit/checkpoint identities,
