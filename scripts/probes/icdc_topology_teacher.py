@@ -67,7 +67,6 @@ from icdc.topology_data import (
     fingerprint_case,
     split_for_id,
     validate_raw_source,
-    verified_training_fp_row,
 )
 from icdc.topology_data import _sanitize as _sanitize_case
 
@@ -2186,17 +2185,10 @@ def _source_case(source: Sequence[torch.Tensor], index: int, instance_id: str) -
             "area_ref": float(metric[0])}
 
 def _source_case_from_shard(source: Sequence[torch.Tensor], index: int, instance_id: str) -> dict[str, Any]:
-    marker = "#"
-    if marker not in instance_id:
-        raise ValueError("source instance")
-    relative_path, encoded_index = instance_id.rsplit(marker, 1)
-    if encoded_index != str(index):
-        raise ValueError("source instance")
-    receipt = CorpusSourceReceipt(relative_path, "0" * 64, index, "0" * 64)
-    row = verified_training_fp_row(source, receipt)
-    if row.instance_id != instance_id:
-        raise ValueError("source instance")
-    return dict(row.case)
+    # The complete shard has already passed ``validate_raw_source`` and the
+    # stricter transaction validator.  Row extraction must stay O(N), not
+    # rescan all 112 layouts for every row.
+    return _sanitize_case(_source_case(source, index, instance_id))
 
 _TRUST_FIELDS = ("trust_ok", "input_ok", "scorer_ok", "checkpoint_sha256", "model_identity", "scorer_sha256", "scorer_contract", "shapely_version")
 _PROTECTED = {"receipt", "instance_id", "partition", "sample_seed", "n", "base_cost", "teacher_cost", "record_weight"}
