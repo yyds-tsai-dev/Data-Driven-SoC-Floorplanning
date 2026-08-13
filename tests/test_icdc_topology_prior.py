@@ -442,7 +442,7 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     path = Path("scripts/probes/icdc_topology_teacher.py")
     t = _teacher(); tree = ast.parse(path.read_text())
     text = path.read_text()
-    forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "BandFileSampler._instance", "shelf_fallback", "golden", "validation")
+    forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "BandFileSampler._instance", "shelf_fallback", "golden", "validation", "sample_bank")
     def dotted(n):
         if isinstance(n, ast.Name): return n.id
         if isinstance(n, ast.Attribute):
@@ -451,6 +451,107 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     calls = [dotted(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
     forbidden_suffixes = ("load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance")
     assert not any(any(x == suffix or x.endswith("." + suffix) for suffix in forbidden_suffixes) for x in calls)
+    assert "engine.load_model" not in calls
+    assert not any(x.endswith(".collate") or x == "collate" for x in calls)
+
+
+def _task4_teacher_payload():
+    """Small in-memory checkpoint with deliberately different EMA weights."""
+    # The repository test configuration exposes partner/; keep this helper
+    # free of permanent interpreter-path mutation.
+    from direct_diffusion_model import DirectDenoiser, DirectModelConfig
+    cfg = DirectModelConfig(node_feat_dim=26, relation_feat_dim=9, z_dim=4,
+                            z_repr="xyaspect", d_model=8, layers=1, heads=1,
+                            dropout=0.0, timesteps=8, self_conditioning=True)
+    model = DirectDenoiser(cfg)
+    model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    ema_state = {k: v.detach().clone().add(1.0) for k, v in model_state.items()}
+    return {"model_config": dataclasses.asdict(cfg), "model": model_state,
+            "ema": ema_state}
+
+
+def _task4_case_input(t, seed=17):
+    case = {"instance_id": "x.jsonl#0", "n": 3,
+            "area": [1.0, 1.0, 1.0000001],
+            "cons": [[0, 1, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
+            "tp": [[-1.0] * 4] * 3,
+            "b2b": [[0, 1, 1.5]], "p2b": [[0, 2, 2.0]],
+            "pins": [[.25, .75]], "hpwl_ref": 4.0, "area_ref": 4.0}
+    ci = getattr(t, "_CaseInput", _Task4CaseInput)
+    receipt = CorpusSourceReceipt(relative_path="x.jsonl", file_sha256="0" * 64,
+                                  layout_index=0, fingerprint="1" * 64)
+    return ci(case, receipt, "train", seed)
+
+
+def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
+    t = _teacher(); payload = _task4_teacher_payload()
+    monkeypatch.setattr(torch, "load", lambda *a, **k: pytest.fail("reopened checkpoint"))
+    state = t._materialize_teacher_model(payload, torch.device("cpu"))
+    assert isinstance(state, t._TeacherModelState)
+    assert state.model.training is False and state.schedule.timesteps == 8
+    assert all(not p.requires_grad for p in state.model.parameters())
+    assert list(state.model.state_dict()) == list(payload["ema"])
+    assert all(torch.equal(state.model.state_dict()[k], payload["ema"][k]) for k in payload["ema"])
+    assert any(not torch.equal(payload["model"][k], payload["ema"][k]) for k in payload["ema"])
+    assert all(p.dtype == torch.float32 for p in state.model.parameters())
+
+
+@pytest.mark.parametrize("bad", [{}, {"ema": {}}, {"model_config": {"z_dim": 3}},
+                                  {"model_config": {"z_dim": 4, "z_repr": "bad"}},
+                                  {"model_config": dataclasses.asdict(__import__("direct_diffusion_model", fromlist=["DirectModelConfig"]).DirectModelConfig(z_dim=4, z_repr="xyaspect")), "ema": {"x": torch.ones(1)}}])
+def test_task4_materializer_rejects_malformed_payload(bad):
+    with pytest.raises(ValueError):
+        _teacher()._materialize_teacher_model(bad, torch.device("cpu"))
+
+
+def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
+    t = _teacher(); direct, diagnostic = t._build_teacher_batches(_task4_case_input(t).case, torch.device("cpu"))
+    for key in ("area", "tp", "b2b", "p2b", "pins", "scale"):
+        assert direct[key].dtype == torch.float32 and direct[key].device.type == "cpu"
+    assert direct["cons"].dtype == torch.int64 and direct["cons"].shape[0] == 1
+    assert direct["b2b"].shape == (1, 1, 3) and direct["p2b"].shape == (1, 1, 3)
+    assert direct["pins"].shape == (1, 1, 2)
+    assert diagnostic["area"].dtype == torch.float64 and diagnostic["cons"].dtype == torch.int64
+    assert diagnostic["scale"].item() == direct["scale"].double().item()
+    assert diagnostic["hpwl_ref"].item() == 4.0 and diagnostic["area_ref"].item() == 4.0
+    f64_scale = torch.sqrt(torch.tensor(_task4_case_input(t).case["area"], dtype=torch.float64).sum())
+    assert diagnostic["scale"].item() != f64_scale.item()
+
+
+def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch):
+    t = _teacher(); payload = _task4_teacher_payload(); state = t._materialize_teacher_model(payload, torch.device("cpu"))
+    calls = {}; z = torch.full((1, 3, 4), 0.25)
+    def sampler(*args, **kwargs):
+        calls["sample"] = (args, kwargs, kwargs["generator"].initial_seed()); return z
+    def decoder(raw, area, cons, tp, scale):
+        calls["decode"] = (raw, area, cons, tp, scale); return torch.ones((1, 3, 4), dtype=torch.float64)
+    monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", sampler, raising=False)
+    monkeypatch.setattr(t, "_DECODE_RECTS", decoder, raising=False)
+    out = t._sample_direct_once(state, _task4_case_input(t).case, 31)
+    assert out.shape == (3, 4) and out.dtype == torch.float64 and torch.isfinite(out).all()
+    assert calls["sample"][1]["steps"] == 2 and calls["sample"][1]["z_known"] is not None
+    assert calls["sample"][1]["known_mask"] is not None
+    assert len(calls["sample"][0]) == 3 and calls["sample"][2] == 31
+    assert all(x.dtype == torch.float64 and x.device.type == "cpu" for x in calls["decode"])
+
+
+def test_task4_runtime_materializes_lazily_caches_and_never_reopens(monkeypatch):
+    t = _teacher(); runtime = t._runtime_hooks(); assert runtime.authorizing is False
+    payload = _task4_teacher_payload(); materialized = object(); calls = []
+    monkeypatch.setattr(t, "_materialize_teacher_model",
+                        lambda payload, device: calls.append((payload, device)) or materialized,
+                        raising=False)
+    monkeypatch.setattr(t, "_sample_direct_once",
+                        lambda state, case, seed: calls.append(("sample", state, seed)) or torch.ones((2, 4), dtype=torch.float64),
+                        raising=False)
+    monkeypatch.setattr(torch, "load", lambda *a, **k: pytest.fail("reopened checkpoint"))
+    ci1 = _task4_case_input(t, 101); ci2 = _task4_case_input(t, 202)
+    with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
+        runtime.process_case(ci1)
+    with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
+        runtime.process_case(ci2)
+    assert len([x for x in calls if isinstance(x, tuple) and x and x[0] == "sample"]) == 2
+    assert len([x for x in calls if isinstance(x, tuple) and x and x[0] != "sample"]) == 1
 
 
 _TASK4_FILES = (
