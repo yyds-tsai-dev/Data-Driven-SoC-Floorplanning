@@ -511,7 +511,7 @@ def _task4_static_forbidden(source, *, require_exact_loads=False):
         is_load = path == "torch.load" or (isinstance(n.func, ast.Call) and isinstance(n.func.func, ast.Name) and n.func.func.id == "getattr" and len(n.func.args) >= 2 and isinstance(n.func.args[1], ast.Constant) and n.func.args[1].value == "load" and resolve(n.func.args[0]) == "torch")
         if is_load:
             loads.append(n)
-            if len(n.args) != 1 or not isinstance(n.args[0], ast.Call) or resolve(n.args[0].func) != "io.BytesIO" or len(n.args[0].args) != 1 or not isinstance(n.args[0].args[0], ast.Name): return False
+            if len(n.args) != 1 or not isinstance(n.args[0], ast.Call) or resolve(n.args[0].func) != "io.BytesIO" or len(n.args[0].args) != 1 or n.args[0].keywords or not isinstance(n.args[0].args[0], ast.Name): return False
             kw = {k.arg: k.value for k in n.keywords}
             if set(kw) != {"weights_only", "map_location"} or not isinstance(kw["weights_only"], ast.Constant) or kw["weights_only"].value is not True or not isinstance(kw["map_location"], ast.Constant) or kw["map_location"].value != "cpu": return False
     if require_exact_loads and len(loads) != 2: return False
@@ -525,6 +525,7 @@ def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
     assert not _task4_static_forbidden("def process_case(x):\n  fake_admission(x)\n  fake_tfdl(x)\n  official_score(x)")
     assert _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu')", require_exact_loads=True)
     assert not _task4_static_forbidden("import io, torch\na='x'; b='y'; c='z'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu'); torch_alias=torch; getattr(torch_alias, 'load')(io.BytesIO(c), weights_only=True, map_location='cpu')", require_exact_loads=True)
+    assert not _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a, extra=True), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu')", require_exact_loads=True)
 
 
 def _task4_teacher_payload():
@@ -648,7 +649,7 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
     for batch in (direct, diagnostic):
         assert batch["area"].shape == (1, 3) and batch["tp"].shape == (1, 3, 4)
         assert batch["cons"].shape == (1, 3, 5) and batch["scale"].shape == (1,)
-        for key in ("area", "tp", "b2b", "p2b", "pins"):
+        for key in ("area", "cons", "tp", "b2b", "p2b", "pins"):
             expected = torch.as_tensor(case[key], dtype=batch[key].dtype).unsqueeze(0)
             if key in ("b2b", "p2b", "pins"): expected = expected.reshape(batch[key].shape)
             assert torch.equal(batch[key], expected)
@@ -773,7 +774,7 @@ def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_cl
         token = Token(); refs.append(weakref.ref(token)); return token
     monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"), raising=False)
     monkeypatch.setattr(t, "_materialize_teacher_model", materialize, raising=False)
-    monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sampled.append((s, seed)) or torch.ones((3, 4), dtype=torch.float64), raising=False)
+    monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sampled.append(seed) or torch.ones((3, 4), dtype=torch.float64), raising=False)
     for name in ("_run_candidate_lifecycle", "_admit_candidate", "_score_official_candidate"):
         monkeypatch.setattr(t, name, lambda *a, _name=name, **k: pytest.fail(_name), raising=False)
     import icdc.engine as engine
@@ -806,7 +807,7 @@ def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_cl
         runtime.process_case(_task4_case_input(t, 303))
     runtime.preflight(policy(paths[2], p3), paths[2]); process_with_seams(303); assert refs[2]() is not None
     assert [id(x) for x in materialized] == [id(p1), id(p2), id(p3)]
-    assert [seed for _, seed in sampled] == [101, 202, 303]
+    assert sampled == [101, 202, 303]
 
 
 _TASK4_FILES = (
