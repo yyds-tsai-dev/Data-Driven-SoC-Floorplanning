@@ -585,6 +585,67 @@ def _task4_expected_trust(policy):
     }
 
 
+# Task 4 source-fix A: explicit RED probes for the remaining evidence boundary.
+def test_teacher_evidence_a_cli_help_exposes_data_root():
+    import subprocess
+    proc = subprocess.run([sys.executable, "scripts/probes/icdc_topology_teacher.py", "--help"],
+                          cwd=Path(__file__).parents[1], capture_output=True, text=True)
+    assert proc.returncode == 0
+    assert "--data-root" in proc.stdout
+
+
+def test_teacher_evidence_a_padded_connectivity_is_retained_and_fingerprinted():
+    t = _teacher()
+    source = list(_task4_tensors())
+    source[0] = torch.tensor([[[4, 0, 0, 0, 0, 0], [6, 1, 0, 0, 0, 0], [9, 0, 1, 0, 2, 5], [-1, 0, 0, 0, 0, 0]],
+                              [[5, 0, 0, 0, 0, 0], [20, 1, 0, 0, 0, 0], [20, 0, 1, 0, 2, 5], [-1, 0, 0, 0, 0, 0]]], dtype=torch.float32)
+    source[1] = torch.tensor([[[0, 1, 1.5], [-1, -1, -1]], [[1, 2, 2.5], [-1, -1, -1]]])
+    source[2] = torch.tensor([[[0, 2, 3], [-1, -1, -1]], [[0, 0, 4], [-1, -1, -1]]])
+    source[3] = torch.tensor([[[1.25, 2.5], [-1, -1]], [[3.5, 4.5], [-1, -1]]])
+    source[4] = torch.tensor([[[2, 3, 3]], [[2, 3, 3]]], dtype=torch.float32)
+    assert t._validate_source_shard(tuple(source)) == (2, 4)
+    cases = [t._source_case_from_shard(tuple(source), i, f"x#{i}") for i in range(2)]
+    assert all(c["n"] == 3 and all(-1 not in row for row in c[k]) for c in cases for k in ("b2b", "p2b", "pins"))
+    assert [fingerprint_case(c) for c in cases] == [fingerprint_case(c) for c in cases]
+
+
+@pytest.mark.parametrize("mutator", [
+    lambda s: s.__setitem__(0, s[0].clone().requires_grad_()),
+    lambda s: s.__setitem__(1, s[1][..., :2]),
+    lambda s: s.__setitem__(4, s[4][:, :-1]),
+    lambda s: s.__setitem__(0, torch.cat([s[0], s[0][:, :1]], dim=1)),
+    lambda s: s.__setitem__(1, torch.zeros((2, 1, 2))),
+])
+def test_teacher_evidence_a_source_shard_malformed_transaction(mutator):
+    t = _teacher(); source = list(_task4_tensors()); mutator(source)
+    with pytest.raises(ValueError): t._validate_source_shard(tuple(source))
+
+
+def test_teacher_evidence_a_preflight_is_exact_and_boolean():
+    t = _teacher(); policy = _policy_for(Path("/tmp/canonical"))
+    good = _task4_expected_trust(policy)
+    for key in ("trust_ok", "input_ok", "scorer_ok"):
+        bad = dict(good); bad[key] = 1
+        with pytest.raises(ValueError): t._validate_preflight(bad, policy)
+    bad = dict(good); bad.pop("trust_ok")
+    with pytest.raises(ValueError): t._validate_preflight(bad, policy)
+
+
+def test_teacher_evidence_a_outcome_rejects_nan_and_ratio_overflow():
+    t = _teacher(); base = _Task4CaseOutcome({"edges": [], "contacts": [], "pin_paths": []},
+        ({"ordinal": 0, "name": "base", "status": "winner", "feasible": True, "winner": True,
+          "official_cost": 1.0},), (), 1.0, 1.0, True, True)
+    for bad in (dataclasses.replace(base, base_cost=float("nan")),
+                dataclasses.replace(base, teacher_cost=float("inf")),
+                dataclasses.replace(base, base_cost=1e308, teacher_cost=1e-308)):
+        with pytest.raises(ValueError): t._validate_outcome(bad)
+
+
+def test_teacher_evidence_a_canonical_serialization_rejects_infinity():
+    with pytest.raises((ValueError, TypeError, OverflowError)):
+        _task4_canonical_json({"bad": float("inf")})
+
+
 def _task4_assert_success_artifacts(t, root, out, calls, policy,
                                     preflight_calls, *, bounded=False,
                                     training_authorized=True,
