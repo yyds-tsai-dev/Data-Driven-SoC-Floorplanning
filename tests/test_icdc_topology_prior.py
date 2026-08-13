@@ -2391,7 +2391,26 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
         rows = _task4_jsonl(out / name)
         assert (out / name).read_bytes() == b"".join(_task4_canonical_json(row) + b"\n" for row in rows)
     assert sum(len(_task4_jsonl(out / "proposals.jsonl")) for _ in [0]) == 2 * len(calls)
-    assert sum(len(_task4_jsonl(out / "rejections.jsonl")) for _ in [0]) == len(calls)
+    expected_outcomes = [_task4_p1c_mutation_outcome(t, case_input) for case_input in calls]
+    expected_rejections = [
+        {
+            **_task4_envelope(
+                case_input.case, dataclasses.asdict(case_input.receipt),
+                case_input.partition, case_input.sample_seed,
+            ),
+            **dict(rejection),
+        }
+        for case_input, outcome in zip(calls, expected_outcomes)
+        for rejection in sorted(
+            outcome.rejection_rows,
+            key=lambda row: (row.get("ordinal", 0), row.get("name", "")),
+        )
+    ]
+    actual_rejections = _task4_jsonl(out / "rejections.jsonl")
+    assert actual_rejections == expected_rejections
+    assert len(actual_rejections) == sum(
+        len(outcome.rejection_rows) for outcome in expected_outcomes
+    )
     train_ids = [c.case["instance_id"] for c in calls if c.partition == "train"]
     held_ids = [c.case["instance_id"] for c in calls if c.partition == "heldout"]
     assert [r["instance_id"] for r in _task4_jsonl(out / "train_corpus.jsonl")] == train_ids
@@ -2399,9 +2418,11 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
     assert [r["instance_id"] for r in _task4_jsonl(out / "train_labels.jsonl")] == train_ids
     assert [r["instance_id"] for r in _task4_jsonl(out / "heldout_labels.jsonl")] == held_ids
     assert [r["instance_id"] for r in _task4_jsonl(out / "proposals.jsonl")] == expected_all
-    assert [r["instance_id"] for r in _task4_jsonl(out / "rejections.jsonl")] == expected_all
+    assert [r["instance_id"] for r in actual_rejections] == [
+        row["instance_id"] for row in expected_rejections
+    ]
     assert len(_task4_jsonl(out / "proposals.jsonl")) == 2 * len(calls)
-    assert len(_task4_jsonl(out / "rejections.jsonl")) == len(calls)
+    assert len(actual_rejections) == len(expected_rejections)
 
 
 def test_teacher_streaming_b1_releases_prior_source_before_next_shard(tmp_path, monkeypatch):
@@ -3008,16 +3029,20 @@ def test_teacher_streaming_b1_review_population_register_rejects_noncanonical_id
         t._PopulationAccumulator().register(mutate(row))
 
 
-@pytest.mark.parametrize("n,base_cost,teacher_cost", [
-    (10000, 8.5, 7.25), (4, float("nan"), 7.25), (4, float("inf"), 7.25),
-    (4, 8.5, float("nan")), (4, 8.5, float("inf")), (7, 1e308, 7.25),
+@pytest.mark.parametrize("n,base_cost,teacher_cost,weighted_product_overflows", [
+    (10000, 8.5, 7.25, False), (4, float("nan"), 7.25, False),
+    (4, float("inf"), 7.25, False), (4, 8.5, float("nan"), False),
+    (4, 8.5, float("inf"), False), (8, 1e308, 7.25, True),
 ])
 def test_teacher_streaming_b1_review_population_record_winner_rejects_overflow_and_nonfinite(
-        n, base_cost, teacher_cost):
+        n, base_cost, teacher_cost, weighted_product_overflows):
     t = _teacher(); acc = t._PopulationAccumulator()
     identity = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
                 "instance_id": "a", "n": n}
     acc.register(identity)
+    if weighted_product_overflows:
+        assert math.isfinite(math.exp(n / 12))
+        assert not math.isfinite(math.exp(n / 12) * base_cost)
     with pytest.raises(ValueError):
         acc.record_winner("a", base_cost, teacher_cost)
     acc.abort()
