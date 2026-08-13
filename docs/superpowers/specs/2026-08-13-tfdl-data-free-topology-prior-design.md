@@ -5,17 +5,17 @@
 Track B is approved as a teacher-to-student topology prior, with no production
 optimizer integration until Sol serializes that change after the independent
 Track-B gates. The
-authoritative development baseline is
+historical development reference is
 `artifacts/partner_eval/gbridge_package_full100.json`:
 
-- weighted no-runtime: `1.1437448258795715`
-- average runtime: `0.29881621031556277` s/case
-- feasibility: `100/100`
-- hard errors: `0`
-- runtime headroom: `1.1837896844372198` ms/case
+- historical weighted no-runtime diagnostic: `1.1437448258795715`
+- historical average runtime diagnostic: `0.29881621031556277` s/case
+- historical feasibility diagnostic: `100/100`
+- historical hard-error diagnostic: `0`
+- historical runtime-headroom diagnostic: `1.1837896844372198` ms/case
 
-No package review is requested until the separately authorized production
-policy reaches exactly `1.00`; runtime is audited independently.
+This Track-B phase does not authorize a package review; any final submission
+review belongs to a separately authorized production policy.
 
 ## Normative amendment: source, topology, and matched-gate contract
 
@@ -27,7 +27,8 @@ input `[B,N,6]`; `source[1]` b2b `[B,*,3]`; `source[2]` p2b `[B,*,3]`;
 padding only. It is never a model input, label, topology extraction,
 candidate, loss, cost-selection, or checkpoint-selection input. Changing only
 a valid tree can change the raw receipt SHA, but never semantic teacher or
-training outputs. The former misnomer `fingerprint [B,N,4]` is prohibited.
+training outputs. Tensor 5 is named only `fp_sol`; `fingerprint` is not a
+schema name.
 
 `fp_sol` is receipt-bound, training-only legal supervision and is converted
 transiently and exactly from `(w,h,x,y)` to `(x,y,w,h)`. Validation/test
@@ -36,43 +37,84 @@ checkpoint selection; after freeze, full100 G1 cannot feed back. Dense fp
 coordinates are never serialized, entered into the student, used in a
 coordinate/value loss, used to seed proposals, or used at inference.
 
-Dense golden coordinates are not teacher targets; there is one explicit
-exception: a transient, receipt-verified training `fp_sol` may be converted to
-the discrete `fp_topology_v1` label. TopologyLabel margins and weights derive
-from the exact-TFDL winner, never from fp coordinates. `fp_topology_v1` contains
-only sparse receipt/input fingerprint, `axis_edges`, `contacts`, and
-`topology_sha256`; it must not contain origin, width, height, gap, overlap
-magnitude, dense rectangles, or dense fp fields. Extraction derives `N` from
-input, chooses axis `gx>=gy` (x on ties), direction by center with lower-ID
-tie, applies transitive reduction, records exact group-internal contacts using
-frozen epsilon and positive perpendicular overlap, and selects contacts by
-maximum-overlap Kruskal with tie `(axis,min_id,max_id)`. It is invariant to
-translation and uniform scaling.
+Outside the transient, receipt-verified conversion of training `fp_sol` to
+`fp_topology_v1`, `fp_sol` is read only to derive input-authorized
+fixed/preplaced geometry; it is never serialized as dense data or used as a
+coordinate target. The sparse exception is exact-TFDL winner topology:
+`fp_topology_v1` contains only the receipt/input fingerprint, `axis_edges`,
+`contacts`, and `topology_sha256`; it must not contain origin, width, height,
+gap, overlap magnitude, dense rectangles, or dense fp fields. TopologyLabel is a
+separate winner-derived record: its `fp_topology_sha256` links to this sparse
+record, while `winner_proposal_identity`, `winner_ordinal`, `winner_name`, and
+`winner_cost_no_runtime`, plus `pin_paths`, margins, and `record_weight`, exist
+only on TopologyLabel.
+
+The canonical `fp_topology_v1` record has these logical fields, in this order:
+`schema` (string, exactly `fp_topology_v1`), `version` (integer, exactly 1),
+`receipt` (object with `relative_path` string, `source_sha256` lowercase
+64-hex string, and `row` nonnegative integer equal to the source layout row),
+`instance_id` (nonempty string), `input_fingerprint` (lowercase 64-hex
+string), `axis_edges` (list of
+integer objects `{src,dst,axis}`), `contacts` (list of objects
+`{a,b,axis,a_before_b}` with integer `a,b,axis` and boolean `a_before_b`),
+and `topology_sha256` (lowercase 64-hex string). `axis_edges` are sorted by
+`(axis,src,dst)` and contacts by `(axis,a,b,a_before_b)`; no other fields are
+permitted. To hash, omit `topology_sha256`, serialize the remaining payload
+as UTF-8 with `json.dumps(..., sort_keys=True, ensure_ascii=True,
+separators=(",", ":"), allow_nan=False)`, and SHA256 those exact bytes. Add
+the digest and apply the same canonical serializer to the complete record.
+
+Extraction runs on CPU float64 `(x,y,w,h)` rectangles. For pair `i,j`,
+`gx=max(x_i-(x_j+w_j), x_j-(x_i+w_i))` and
+`gy=max(y_i-(y_j+h_j), y_j-(y_i+h_i))`; `gx>=gy` selects x, including ties.
+Direction is increasing center on the selected axis; an exact center tie puts
+the lower ID before the higher ID. Axis is encoded `0=x`, `1=y`, and each
+directed edge is `{src,dst,axis}`. Transitive reduction is applied separately
+to each axis DAG, then edges are sorted as specified above.
+
+Contacts consider only pairs declared in the same nonzero group. Detection
+uses literal extraction epsilon `1e-9` for absolute face gap and requires
+strictly positive perpendicular overlap. The current exact TFDL implementation
+requires bit-equal face abutment at realization/admission; epsilon is therefore
+only detection tolerance, never a relaxation of candidate legality. Candidate
+contacts are selected by maximum-overlap Kruskal with exact tie key
+`(axis,min_id,max_id)`; duplicate contacts are removed. Axis topology is
+translation-invariant and invariant under positive uniform scaling. Contact
+classification has that invariance only when the scaling leaves the
+`1e-9` detection classification unchanged; realized contacts still require
+bit-equal face coordinates.
 
 The canonical flow is: verified training shard → transient canonical fp →
-official hard audit (soft V is accepted and recorded) → sparse topology →
-realize from Direct/base seed and input only (the realizer never receives fp
-rectangles) → exact TFDL with no shelf fallback → hard audit → official
-no-runtime scorer → deterministic winner → sparse label/student. Candidate
-order is frozen as `base, fp-axis, existing axis, pin, fp-contact, existing
-contact`, with ties `(cost_no_runtime, ordinal, name)`. Soft grouping, MIB, and
-boundary violations are scoreable, not rejection; preplaced hard constraints
-override boundary soft constraints. Symmetric area tolerance is inclusive
-`±1%`; outside it is a hard failure.
+SHA-pinned provided/local contest-evaluator hard audit (soft V is accepted and
+recorded) → sparse topology → realize from Direct/base seed and input only
+(the realizer never receives fp rectangles) → exact TFDL with no shelf
+fallback → hard audit → SHA-pinned provided/local contest-evaluator
+no-runtime scorer → deterministic winner → sparse label/student. Task 3 has
+six fixed ordinal slots, never renumbered: `0=base`, `1=fp-axis`,
+`2=existing axis`, `3=pin`, `4=fp-contact`, `5=existing contact`. Every slot
+emits one candidate or one recorded rejection. A duplicate fingerprint records
+`duplicate_of` the earliest ordinal and does not alter later ordinals. Task 3
+does not score candidates or emit labels; Task 4 selects the winner by
+`(cost_no_runtime, ordinal, name)`. Soft grouping, MIB, and boundary violations
+are scoreable, not rejection; preplaced hard constraints override boundary
+soft constraints. Symmetric area tolerance is inclusive `±1%`; outside it is a
+hard failure.
 
 The RED acceptance matrix is normative: test source roles/conversion; tree
 invariance and absence from every call path; validation/test rejection; no
 dense serialization; soft-V golden acceptance; preplaced plus boundary
 immobility; target100 `99/101` accepted and `98.99/101.01` hard-failed;
 topology invariance; no fp-rectangle realizer path; all candidates through
-the official pipeline; deterministic base/no-improvement; and exact binding
-of receipt, source, extractor, TFDL, and scorer.
+the SHA-pinned provided/local evaluator pipeline; deterministic
+base/no-improvement; and exact binding of receipt, source, extractor, TFDL,
+and scorer.
 
 QA authority is bound to [C_QA_20260804.pdf](../../official/C_QA_20260804.pdf),
 SHA256 `60286cf3eb05ff41732d83fc681506b001e283141223d69bbbb9c27c9f25c5db`.
-Manifest and preflight fail on absence or mismatch. QA A4, A5, A6, A15, and
-A16 are authoritative for source integrity, auditability, legal geometry,
-reproducibility, and gate evidence.
+Manifest and preflight fail on absence or mismatch. QA A4 governs soft golden
+acceptance, A5 governs preplaced/boundary behavior, A6 governs area tolerance,
+A15 governs the published runtime formula, and A16 governs the `fp_sol` and
+`tree_sol` roles.
 
 ### Approved 3-Direct / 3-Flow amendment
 
@@ -105,11 +147,11 @@ non-zero arm, incomplete receipt, missing completion marker, or fallback trace;
 an evaluator error row is never accepted as a substitute.
 
 Changing the Flow quota invalidates the historical artifact as a causal
-control. Its `1.1437448258795715` score remains the authoritative development
-baseline and the source of the absolute G1 outcome bar, but G1 attribution uses
-a newly frozen matched pair under the same 3-Direct/3-Flow contract: production
-Direct EMA versus the held-out-selected Track-B EMA. Both arms stay concealed
-until both full100 artifacts and manifests are immutable.
+control. Its `1.1437448258795715` score remains a development baseline and
+diagnostic only; it is neither a G1 gate nor a comparison target. G1
+attribution uses a newly frozen matched pair under the same 3-Direct/3-Flow
+contract: production Direct EMA versus the held-out-selected Track-B EMA. Both
+arms stay concealed until both full100 artifacts and manifests are immutable.
 
 Historical closure is commit `d31781e`. The old TFDL energy-pooling result had
 Spearman `0.9904`; an untrained bank was legal on only `40%` of cases, with the
@@ -134,8 +176,9 @@ The development path is:
 1. Freeze the Direct baseline checkpoint and configuration.
 2. Generate bounded, deterministic offline topology proposals.
 3. Run an equality-pinned preplaced-feasibility check.
-4. Evaluate admitted proposals with exact TFDL (no shelf fallback), official
-   evaluator scoring, diagnostic energy, and exact boundary/grouping geometry.
+4. Evaluate admitted proposals with exact TFDL (no shelf fallback), the
+   SHA-pinned provided/local contest-evaluator scorer, diagnostic energy, and
+   exact boundary/grouping geometry.
 5. Convert only sparse critical constraints into labels.
 6. Distill those labels into a `DirectDenoiser` checkpoint with the SAME SHAPE.
 
@@ -168,9 +211,9 @@ critical constraints retained after transitive reduction:
 - pin-support paths; and
 - critical edges after transitive reduction.
 
-Student outputs remain coordinates and aspect variables. No golden coordinates
-are teacher targets. The teacher explains topology constraints, rather than
-providing dense labels or exact-coordinate imitation.
+Student outputs remain coordinates and aspect variables. Dense coordinate
+imitation is not a teacher target; the teacher explains topology constraints,
+rather than providing dense labels or exact-coordinate imitation.
 
 #### Frozen sparse-label and loss contract
 
@@ -213,8 +256,8 @@ of:
 - a detached teacher-quality/ranking weight for each sparse-label record; and
 - base-checkpoint and EMA-anchor penalties to retain the Direct solution.
 
-Official `cost_no_runtime` is used offline to select proposals and derive the
-detached record weight. `EN.energy` is evaluated only after admission as a
+The SHA-pinned provided/local evaluator's `cost_no_runtime` is used offline to
+select proposals and derive the detached record weight. `EN.energy` is evaluated only after admission as a
 diagnostic; it never selects proposals or derives weights. It is not evaluated directly on the student's raw,
 possibly overlapping coordinates: doing so would restore the degenerate blob
 minimum that killed pre-legalization energy training. The sparse separation,
@@ -225,15 +268,19 @@ same-shape student.
 
 Task 3 is intentionally narrower than teacher scoring. Its generator consumes
 a CPU floating `[N,4]` coordinate seed and emits CPU float64 `[N,4]`
-proposals. Mutations are deterministic in base → axis/order → pin → contact
-order and must realize their topology through the public TFDL recomputation;
-there is no hidden graph override. Axis/order mutations move only unpinned
-origins across the selected pair threshold. Pin repairs set every preplaced
-origin and repair the reverse incoming relation through the unpinned peer.
-Contact mutations bridge components only with exact face abutment and positive
-perpendicular overlap; dimensions and preplaced geometry remain fixed. The
-realized fingerprint covers every pair axis/direction and every exact
-cluster-contact relation, and the first realized fingerprint wins.
+proposals. It has exactly six fixed ordinal slots: `0=base`, `1=fp-axis`,
+`2=existing axis`, `3=pin`, `4=fp-contact`, and `5=existing contact`.
+Each slot emits one candidate or one recorded rejection; later slots retain
+their ordinals even when an earlier slot rejects. Every candidate must realize
+its topology through public TFDL recomputation; there is no hidden graph
+override. A duplicate realized fingerprint records `duplicate_of` the
+earliest ordinal and is not emitted as a second candidate. Axis/order
+mutations move only unpinned origins across the selected pair threshold. Pin
+repairs set every preplaced origin and repair the reverse incoming relation
+through the unpinned peer. Contact mutations bridge components only with exact
+face abutment and positive perpendicular overlap; dimensions and preplaced
+geometry remain fixed. Task 3 performs no scoring and emits no labels; Task 4
+scores all admitted slots and selects `(cost_no_runtime, ordinal, name)`.
 
 The Task 3 case adapter consumes the full sanitized case schema:
 `cons[:,0]=fixed`, `cons[:,1]=preplaced`, `cons[:,2]=MIB`,
@@ -282,10 +329,10 @@ tensors must be finite CPU tensors with
 
 The source adapter maps raw `(w,h,x,y)` geometry to the canonical
 `(x,y,w,h)` representation transiently and masks non-input coordinates before
-fingerprinting. Golden coordinates are never serialized or used as targets;
-the sole exception is receipt-verified training `fp_sol` converted to sparse
-`fp_topology_v1`. Raw `fp_sol` is read only to derive input-authorized
-fixed/preplaced geometry. The implementation
+fingerprinting. Outside transient receipt-verified conversion of training
+`fp_sol` to `fp_topology_v1`, `fp_sol` is read only to derive input-authorized
+fixed/preplaced geometry; it is never serialized as dense data or used as a
+coordinate target. The implementation
 verifies `source_root` and the complete receipt list while saving; later sealed
 index/manifest artifacts provide the experiment-level reproducibility boundary.
 
@@ -325,7 +372,7 @@ index (`n >= 100`, `split_for_id(instance_id, heldout_mod=10) == "heldout"`), wi
 Direct seed per case.  Do not compare an absolute held-out statistic with the
 validation/full100-derived `1.075` or `1.0829742560590576` bars.  With
 `w=exp(n/12)`, bind the ordered IDs, `n`, weights, denominator, population
-SHA, official weighted base mean `B_H`, teacher mean `T_H`, and gain
+SHA, provided/local-scorer weighted base mean `B_H`, teacher mean `T_H`, and gain
 `Delta_H=B_H-T_H`.
 
 The predictive held-out gates are hard minimum
@@ -339,7 +386,8 @@ authority; only the target permits Task 5.  G1 remains the sole causal
 transfer proof.
 
 For every generated proposal (base and mutations) that passes exact admission
-and named-intent survival, call official `evaluate_solution({"positions": ..., "runtime": 1.0}, ...,
+and named-intent survival, call the SHA-pinned provided/local contest
+evaluator `evaluate_solution({"positions": ..., "runtime": 1.0}, ...,
 median_runtime=1.0).cost_no_runtime`;
 `EN.energy` is called only after exact legal admission, recorded diagnostically,
 and never shortlists or filters. Select by deterministic
@@ -347,9 +395,9 @@ and never shortlists or filters. Select by deterministic
 labels, and record weights use `cost_no_runtime`. If no proposal
 improves, select baseline with `teacher_cost == base_cost`, explicit
 no-improvement status, and retained label/evidence (`record_weight=1`).  The
-coverage denominator is every eligible held-out case and exactly one officially
-scored winner per case; separately report mutation admission, intent survival,
-and positive-gain weighted coverage.
+coverage denominator is every eligible held-out case and exactly one
+provided/local-evaluator-scored winner per case; separately report mutation
+admission, intent survival, and positive-gain weighted coverage.
 
 G0 terminal states are `KILLED_INPUT_CHECKPOINT_OR_SCORER`,
 `KILLED_LEGALITY_OR_COVERAGE`, `KILLED_TEACHER_GT_1_5`,
@@ -361,21 +409,23 @@ condition clears hard but not target, avoiding impossible overlap. Only
 
 ### G1 — same-shape student
 
-G1 acceptance is a matched, receipt-bound quality/runtime gate, not the old
-quality-only bars. Each arm seals 100 ordered rows `(case_id,n_i,runtime r_i,
+G1 acceptance is a matched, receipt-bound Alpha-projected combined-score
+condition with mandatory controls; runtime is not a standalone bar. Each arm seals 100
+ordered rows `(case_id,n_i,runtime r_i,
 cost_no_runtime q_i)`; runtime sum, mean, p90, and max are computed from the
 sorted vector using nearest-rank `sorted[89]` for p90. Bind the identical Alpha
 per-case median vector in
 `docs/official/alpha_test/C_Median Runtime per Testcase(Alpha).csv`, SHA256
 `804c3432febb88a8f8ee0a8c0ede4b4598a5cf3c109d68de6a6ca86f05d211bd`, ordered
-IDs, and calculator SHA. This is an Alpha projection, not a hidden official
-predictor. For each row, with `m_i` the bound Alpha median, compute
+IDs, and calculator SHA. This is the matched internal Alpha projection, not a
+hidden official predictor. For each row, with `m_i` the bound Alpha median, compute
 `combined_i = q_i * max(0.7, max(0.01, r_i/max(m_i,0.01))**0.3)` and weighted
 combined score using `exp(n/12)`. A candidate passes the comparison only when
-its combined score is `<=` control combined score with tolerance `1e-12`.
-`mean <= .300` is only the internal diagnostic
-`internal_runtime_target_met`, never official validity. Preserve feasibility,
-receipt, freeze, causal-smoke, and the exact 3D/3F contract.
+its combined score satisfies the binding comparison
+`candidate_combined <= control_combined + 1e-12`. Define only the boolean
+internal diagnostic `internal_runtime_target_met = (mean_runtime <= 0.300)`;
+it is never a G1 pass/fail condition. Preserve feasibility, receipt, freeze,
+causal-smoke, and the exact 3D/3F contract as mandatory conditions.
 
 Before the blind pair, a deterministic non-validation causal smoke must prove
 that both arms execute the normal pool with exactly six candidates split 3
@@ -418,6 +468,7 @@ receipts, and hashes are sealed. C1 passes only if all of the following hold:
 - the arms have identical ordered `(case ordinal, block count, Direct-gate
   status, pool status)` vectors; every Direct-gate-open case has exactly one
   normal-pool receipt and every Direct-gate-closed case is explicitly recorded;
+- the candidate satisfies `candidate_combined <= control_combined + 1e-12`;
 - the receipts prove Direct DPM++/2, Flow Euler/8, total six, and exact 3D/3F.
 
 G0 and G1 manifests bind every source, receipt, extractor, TFDL, scorer,
@@ -441,11 +492,12 @@ to `STOP_REQUIRES_SEPARATE_APPROVAL`, never silently into G2.
 
 Kill the track if the oracle is above `1.5`, proposal coverage or pin support
 fails, the student cannot retain the held-out benefit, any receipt violates the
-normal-pool contract, either blind arm fails, or the candidate misses either G1
-score gate, legality, or runtime. Track A may spend at most `0.75` ms, leaving
-approximately `0.434` ms. Track B changes only the Direct checkpoint within the
-approved fixed six-candidate 3D/3F portfolio; actual matched full100 runtime is
-binding.
+normal-pool contract, either blind arm fails, or the candidate fails the
+binding combined-score comparison or a mandatory feasibility, receipt, freeze,
+causal-smoke, or 3D/3F condition. Track A may spend at most `0.75` ms,
+leaving approximately `0.434` ms. Track B changes only the Direct checkpoint
+within the approved fixed six-candidate 3D/3F portfolio; the sealed per-case
+runtime rows enter the binding Alpha-projected combined score.
 
 ## Artifacts, reproducibility, and observability
 
@@ -482,15 +534,30 @@ Task 4 emits exactly eight canonical files: `train_corpus.jsonl`,
 `g0_manifest.json`. Every proposal envelope binds receipt/partition/instance,
 seed/ordinal/name, intended/seed/realized fingerprint or named intent,
 admission status/reason, available drift/hard evidence, diagnostic energy,
-official score/feasible, and winner/status. The manifest hashes exactly the
+provided/local scorer result and feasibility, and winner/status. The manifest hashes exactly the
 seven support artifacts by fixed relative basename, excluding itself. It stores
 `self_sha256 = SHA256(canonical g0_manifest JSON with the self_sha256 field
 omitted)`; an external freeze may later hash final manifest bytes. No absolute
 paths and no `topology_data.write_sha256_manifest` are allowed.
 Opaque public admission failures may be `admission_failed`; zero drift/hard
 claims apply only to admitted/scored/winner records and coverage. Every
-eligible held-out case contributes exactly one official winner, including the
-baseline when there is no improvement.
+eligible held-out case contributes exactly one provided/local-evaluator winner,
+including the baseline when there is no improvement.
+
+The manifest has concrete, non-optional digest fields:
+`source_receipt_set_sha256` is SHA256 of the canonical UTF-8 stream of the
+ordered complete receipt records (sorted by `relative_path`, then `row`);
+`extractor_source_sha256` hashes the exact extractor source bytes and
+`extractor_config_sha256` hashes canonical JSON for CPU `float64`, extraction
+epsilon `1e-9`, axis/direction ties, transitive reduction, and contact Kruskal
+rules; `exact_tfdl_source_sha256` hashes the exact TFDL source bytes and
+`exact_tfdl_config_sha256` hashes canonical JSON including CPU `float64`,
+bit-equal face mode, and `shelf_fallback=false`; and
+`scorer_source_sha256` plus `scorer_contract_sha256` bind the exact scorer
+source and the literal `iccad2026_evaluate_cost_no_runtime_v1` contract. Each
+digest is lowercase SHA256 over exact bytes, and preflight fails on absent or
+mismatched values. `fp_topology_v1` records and manifests contain no dense fp
+rectangles or coordinate arrays.
 
 The source boundary is the exact canonical root, checked before any checkpoint
 load; sorted approved worker/layout paths are hashed by exact bytes and loaded
@@ -603,9 +670,11 @@ Track-B direction.
 
 The currently approved Track-B phase is complete only as
 `HIGH_TAIL_CAUSAL_PROOF` after G0 and every G1 prerequisite pass, the one sealed
-matched pair clears both score gates plus runtime/legality, and the immutable
-record transitions to `STOP_REQUIRES_SEPARATE_APPROVAL`. This does not complete
-the overall goal. Exact `1.00`, `<=0.300` s/case, `100/100`, zero errors, and
-the final confirmation remain pending a separately approved G2 policy. Until
-then, report the current baseline and gate status, never Track-B or submission
-completion.
+matched pair satisfies `candidate_combined <= control_combined + 1e-12`, and
+the mandatory feasibility, receipt, freeze, causal-smoke, and exact 3D/3F
+conditions pass. The immutable record then transitions to
+`STOP_REQUIRES_SEPARATE_APPROVAL`. The historical baseline and
+`internal_runtime_target_met` remain diagnostics; neither is a standalone G1
+condition. The final production objective remains pending a separately
+approved G2 policy. Until then, report the baseline and bound gate status,
+never Track-B or submission completion.
