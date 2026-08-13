@@ -14,6 +14,7 @@ import numbers
 import os
 import sqlite3
 import stat
+import shutil
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -553,9 +554,37 @@ def _nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be nonnegative")
     return parsed
 
-def _publish_staging(staging: Path, destination: Path) -> None:
-    if staging.is_symlink() or not staging.is_dir():
+@dataclass(frozen=True)
+class _StagingLease:
+    path: Path
+    st_dev: int
+    st_ino: int
+
+
+def _new_staging_lease(path: Path) -> _StagingLease:
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
         raise ValueError("invalid staging")
+    path = Path(path)
+    return _StagingLease(path, info.st_dev, info.st_ino)
+
+
+def _path_matches_lease(path: Path, lease: _StagingLease) -> bool:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_dev == lease.st_dev and info.st_ino == lease.st_ino
+
+
+def _cleanup_owned_staging(lease: _StagingLease) -> bool:
+    if not _path_matches_lease(lease.path, lease):
+        return False
+    shutil.rmtree(lease.path)
+    return True
+
+
+def _renameat2_noreplace(source: Path, destination: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     try:
         renameat2 = libc.renameat2
@@ -564,14 +593,43 @@ def _publish_staging(staging: Path, destination: Path) -> None:
     renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     renameat2.restype = ctypes.c_int
     flags = 1  # RENAME_NOREPLACE
-    result = renameat2(-100, os.fsencode(str(staging)), -100,
+    result = renameat2(-100, os.fsencode(str(source)), -100,
                        os.fsencode(str(destination)), flags)
     if result == 0:
         return
     error = ctypes.get_errno()
-    if error in (errno.EEXIST, errno.ENOTEMPTY):
-        raise ValueError("existing output directory")
     raise OSError(error, os.strerror(error))
+
+
+def _publish_staging(lease: _StagingLease, destination: Path) -> None:
+    if not _path_matches_lease(lease.path, lease):
+        raise ValueError("invalid staging")
+    try:
+        _renameat2_noreplace(lease.path, destination)
+        return
+    except OSError as exc:
+        if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+            raise ValueError("existing output directory") from exc
+        if exc.errno != errno.EINTR:
+            raise
+        source_present = _path_matches_lease(lease.path, lease)
+        try:
+            destination_info = os.lstat(destination)
+        except OSError:
+            destination_info = None
+        destination_present = destination_info is not None
+        if (not source_present and destination_present
+                and stat.S_ISDIR(destination_info.st_mode)
+                and destination_info.st_dev == lease.st_dev
+                and destination_info.st_ino == lease.st_ino):
+            return
+        if source_present and not destination_present:
+            raise
+        raise _PublishAmbiguousError("ambiguous publish outcome") from exc
+
+
+class _PublishAmbiguousError(RuntimeError):
+    pass
 
 
 def _new_staging(destination: Path) -> Path:
@@ -995,11 +1053,23 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     runtime = _runtime_hooks()
     trust = _validate_preflight(runtime.preflight(policy, Path(args.checkpoint)), policy)
     staging: Optional[Path] = None
+    lease: Optional[_StagingLease] = None
     writer: Optional[_JsonlWriter] = None
     population: Optional[_PopulationAccumulator] = None
     try:
         staging = _new_staging(destination)
-        writer = _JsonlWriter(staging)
+        try:
+            lease = _new_staging_lease(staging)
+        except BaseException:
+            # The freshly-created directory is still cleaned only by identity.
+            try:
+                info = os.lstat(staging)
+                if stat.S_ISDIR(info.st_mode):
+                    _cleanup_owned_staging(_StagingLease(staging, info.st_dev, info.st_ino))
+            except BaseException:
+                pass
+            raise
+        writer = _JsonlWriter(lease.path)
         rows: list[dict[str, Any]] = []
         population = _PopulationAccumulator()
         train_count = held_count = heldout_winners = 0
@@ -1038,10 +1108,10 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         if not processed: state = "KILLED_LEGALITY_OR_COVERAGE"; authorized = False
         manifest = {"schema":"icdc_topology_teacher_g0_v1","status":"complete","state":state,"secondary_reasons":[],"training_authorized":authorized,"bounded_max_files":args.max_files is not None,"trust":trust,"population":pop,"coverage":coverage}
         writer.close()
-        with open(staging / "training_index.json", "wb") as fd:
+        with open(lease.path / "training_index.json", "wb") as fd:
             fd.write(json.dumps({"schema":"icdc_topology_training_index_v1","rows":rows}, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n"); fd.flush(); os.fsync(fd.fileno())
         def _fsync_dir() -> None:
-            fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+            fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY)
             primary: Optional[BaseException] = None
             try:
                 os.fsync(fd)
@@ -1055,17 +1125,20 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
             if primary is not None:
                 raise primary
         _fsync_dir()
-        manifest["support_hashes"] = {n: hashlib.sha256((staging/n).read_bytes()).hexdigest() for n in (*_TASK4_JSONL,"training_index.json")}; manifest["self_sha256"] = _manifest_self_sha256(manifest); _write_json_fsync(staging/"g0_manifest.json", manifest)
+        manifest["support_hashes"] = {n: hashlib.sha256((lease.path/n).read_bytes()).hexdigest() for n in (*_TASK4_JSONL,"training_index.json")}; manifest["self_sha256"] = _manifest_self_sha256(manifest); _write_json_fsync(lease.path/"g0_manifest.json", manifest)
         _fsync_dir()
-        _publish_staging(staging, destination)
+        _publish_staging(lease, destination)
         return 0 if authorized else 1
     except BaseException:
         if population is not None:
             population.abort()
         if writer is not None:
             writer.abort()
-        if staging is not None and staging.exists():
-            import shutil; shutil.rmtree(staging)
+        if lease is not None:
+            try:
+                _cleanup_owned_staging(lease)
+            except BaseException:
+                pass
         raise
 
 def dataclass_to_dict(value: Any) -> dict[str, Any]:
