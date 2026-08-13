@@ -136,7 +136,7 @@ for G0 and overrides only conflicting sparse-only teacher-oracle language
 above; student, persistence, validation/test, and inference prohibitions remain
 unchanged.
 
-- The G0 base is the frozen production hard-legal portfolio, with exactly six
+- The G0 base starts from the frozen production portfolio winner, with exactly six
   candidates split as `3` Direct DPM++/2 and `3` Flow Euler/8. The same wrapper,
   checkpoints, seeds, ranker, repair policy, environment, and official scorer
   are bound in the G0 receipt. `PARTNER_OVERSAMPLE=1` is mandatory so the raw
@@ -149,11 +149,11 @@ unchanged.
   as every other candidate. Soft V in `fp_sol` is not a rejection condition.
 - The G0 candidate set is exactly two logical slots: `0=production-base` and
   `1=transient-fp-exact-tfdl`. The historical 25 blind axis/pin/contact
-  mutations are excluded. The frozen production-base output passes the
-  official hard audit directly; it is not reprojected through a different
-  topology. The transient-fp slot alone passes nonexact-then-exact TFDL,
-  zero-drift, and the official hard audit before scoring. Each eligible case
-  retains the production base when the fp
+  mutations are excluded. The raw frozen production winner and the
+  transient-fp seed each pass the same deterministic pin-feasible exact-TFDL
+  admission, zero-drift check, and official hard audit before scoring. A base
+  admission failure kills coverage; no alternate candidate may substitute for
+  it. Each eligible case retains the admitted production base when the fp
   candidate is rejected, unavailable, or does not improve official
   `cost_no_runtime`.
 - Dense fp coordinates exist only inside the per-case offline teacher call.
@@ -465,7 +465,9 @@ diagnostic kill only.  Between hard and target, stop with no training
 authority; only the target permits Task 5.  G1 remains the sole causal
 transfer proof.
 
-Score the hard-legal production base exactly once. Score the transient-fp slot
+Pass the raw production winner through deterministic pin-feasible exact-TFDL
+once, require zero drift and a successful official hard audit, then score that
+admitted production base exactly once. Score the transient-fp slot
 exactly once only after exact admission and hard audit, using the SHA-pinned
 provided/local contest evaluator:
 `evaluate_solution({"positions": ..., "runtime": 1.0}, ...,

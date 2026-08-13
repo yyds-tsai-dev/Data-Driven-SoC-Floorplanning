@@ -208,7 +208,7 @@ def evaluate_case(
         pin_feasible_then_exact_tfdl
     ),
 ) -> G0CaseResult:
-    """Evaluate the frozen production base and one transient-fp teacher slot."""
+    """Exactly admit and evaluate the production and transient-fp slots."""
     if type(sample_seed) is not int or isinstance(sample_seed, bool):
         raise ValueError("sample seed")
     instance_id = case.get("instance_id") if isinstance(case, Mapping) else None
@@ -238,11 +238,14 @@ def evaluate_case(
         except Exception:
             return None
 
-    base_hard = _hard_audit(base_rects, area, cons, tp)
+    base_legal = exact_admit(base_rects, "base legal")
+    if base_legal is None:
+        raise ValueError("base admission")
+    base_hard = _hard_audit(base_legal, area, cons, tp)
     if not all(base_hard.values()):
         raise ValueError("base hard audit")
     base_feasible, base_cost = _official_cost(
-        scorer, base_rects, case, area, cons, tp, b2b, p2b, pins
+        scorer, base_legal, case, area, cons, tp, b2b, p2b, pins
     )
     if not base_feasible or base_cost is None:
         raise ValueError("base unavailable")
@@ -274,7 +277,7 @@ def evaluate_case(
                 teacher_status = "hard_audit_failed"
 
     winner = "production-base"
-    winner_rects = base_rects
+    winner_rects = base_legal
     teacher_cost = base_cost
     if (
         teacher_legal is not None

@@ -97,7 +97,7 @@ The injected call trace must prove both layouts use official `cost_no_runtime`, 
 
 - [ ] **Step 5: Implement minimal two-slot evaluation and sparse extraction**
 
-Use `pin_feasible_then_exact_tfdl`, `engine.verify_hard_legal`, and `extract_sparse_label`. Score the base once; score the teacher only if admitted and hard legal. Select by `(cost_no_runtime, ordinal, name)`. Convert results immediately to scalar audit data plus `TopologyLabel`, then delete local dense tensors before returning.
+Use `pin_feasible_then_exact_tfdl`, `engine.verify_hard_legal`, and `extract_sparse_label`. Exactly admit and hard-audit the raw production winner before scoring the base once; a failed base admission kills coverage. Score the teacher only if independently admitted and hard legal. Select by `(cost_no_runtime, ordinal, name)`. Convert results immediately to scalar audit data plus `TopologyLabel`, then delete local dense tensors before returning.
 
 - [ ] **Step 6: Add RED population accounting tests**
 
@@ -183,7 +183,7 @@ labels.write(canonical_sparse_label(result.sparse_label))
 population.add(result)
 ```
 
-The real implementation must normalize exact tensor shapes/dtypes and verify the optimizer portfolio trace before accepting `base`.
+The real implementation must normalize exact tensor shapes/dtypes, verify the optimizer portfolio trace, and run the raw production winner through deterministic pin-feasible exact-TFDL admission before accepting `base`.
 
 - [ ] **Step 6: Implement atomic evidence publication and gate exit codes**
 
