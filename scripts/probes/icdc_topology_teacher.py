@@ -1653,8 +1653,32 @@ def _validate_outcome(value: Any) -> _CaseOutcome:
     if any(not isinstance(n, str) or not n.strip() for n in names) or any(type(o) is not int or o < 0 for o in ords): raise ValueError("proposal identity")
     expected = {"ordinal","name","intended_intent","raw_topology_fingerprint","intended_topology_fingerprint","realized_topology_fingerprint","admission_status","admission_reason","drift","hard","hard_status","intent_status","official_cost","feasible","official_status","diagnostic_energy","energy_status","winner","status"}
     if any(set(r) != expected for r in rows): raise ValueError("proposal schema")
+    if value.case_status != "base_unavailable":
+        base_row = next((r for r in rows if r.get("name") == "base"), None)
+        if base_row is None or base_row.get("official_cost") != value.base_cost: raise ValueError("base")
+    def _num(x: Any, *, positive: bool = False) -> bool:
+        return isinstance(x, numbers.Real) and not isinstance(x, bool) and math.isfinite(float(x)) and (not positive or float(x) > 0)
+    def _label_payload(label: Mapping[str, Any]) -> None:
+        keys = {"edges", "contacts", "pin_paths", "proposal_ordinal", "proposal_name", "base_cost", "teacher_cost", "record_weight"}
+        if set(label) != keys or any(k in label for k in (_PROTECTED - keys)): raise ValueError("label schema")
+        if type(label["proposal_ordinal"]) is not int or label["proposal_ordinal"] < 0 or not isinstance(label["proposal_name"], str) or not label["proposal_name"].strip(): raise ValueError("label schema")
+        if not all(_num(label[k], positive=True) for k in ("base_cost", "teacher_cost", "record_weight")): raise ValueError("label schema")
+        if not isinstance(label["edges"], (list, tuple)) or not isinstance(label["contacts"], (list, tuple)) or not isinstance(label["pin_paths"], (list, tuple)): raise ValueError("label schema")
+        edge_keys = {"src", "dst", "axis", "margin", "kind", "weight"}; contact_keys = {"a", "b", "axis", "a_before_b", "perp_margin", "weight"}
+        for e in label["edges"]:
+            if not isinstance(e, Mapping) or set(e) != edge_keys or any(k in e for k in _PROTECTED): raise ValueError("label schema")
+            if any(type(e[k]) is not int or e[k] < 0 for k in ("src", "dst", "axis")) or not isinstance(e["kind"], str) or not e["kind"] or not _num(e["margin"]) or not _num(e["weight"], positive=True): raise ValueError("label schema")
+        for c in label["contacts"]:
+            if not isinstance(c, Mapping) or set(c) != contact_keys or any(k in c for k in _PROTECTED): raise ValueError("label schema")
+            if any(type(c[k]) is not int or c[k] < 0 for k in ("a", "b", "axis")) or type(c["a_before_b"]) is not bool or not _num(c["perp_margin"]) or not _num(c["weight"], positive=True): raise ValueError("label schema")
+        for path in label["pin_paths"]:
+            if not isinstance(path, (list, tuple)) or not path or any(type(x) is not int or x < 0 for x in path): raise ValueError("label schema")
     for row in rows:
-        if row["diagnostic_energy"] is not None and (not isinstance(row["diagnostic_energy"], numbers.Real) or not math.isfinite(float(row["diagnostic_energy"]))): raise ValueError("diagnostic_energy")
+        if row["diagnostic_energy"] is not None and not _num(row["diagnostic_energy"]): raise ValueError("diagnostic_energy")
+        if row["drift"] is not None:
+            if not isinstance(row["drift"], Mapping) or not row["drift"] or any(not isinstance(k, str) or not _num(v) or float(v) < 0 for k, v in row["drift"].items()) or "max_abs" not in row["drift"] or row["drift"]["max_abs"] != max(row["drift"].values()): raise ValueError("drift")
+        if row["hard"] is not None:
+            if not isinstance(row["hard"], Mapping) or not row["hard"] or any(not isinstance(k, str) or type(v) is not bool for k, v in row["hard"].items()): raise ValueError("hard")
     if len(names) != len(set(names)) or len(ords) != len(set(ords)) or ords != list(range(len(rows))) or any(k in r for r in rows for k in _PROTECTED): raise ValueError("proposal provenance")
     if any(r["intended_intent"] != r["name"] or type(r["intended_intent"]) is not str for r in rows): raise ValueError("intended_intent")
     allowed_status = {"admitted", "failed"}; allowed_hard = {"passed", "failed", "not_reached"}
@@ -1662,6 +1686,20 @@ def _validate_outcome(value: Any) -> _CaseOutcome:
         if r["admission_status"] not in allowed_status or r["hard_status"] not in allowed_hard or r["intent_status"] not in {"passed", "failed", "not_reached"}: raise ValueError("stage")
         if r["admission_status"] == "failed" and any(r[k] is not None for k in ("drift", "hard", "official_cost", "feasible", "diagnostic_energy")): raise ValueError("stage null")
         if r["admission_status"] == "failed" and r["official_status"] != "not_reached": raise ValueError("stage")
+        if r["admission_status"] == "admitted":
+            if r["drift"] is None or r["hard"] is None: raise ValueError("stage")
+            expected_hard = "passed" if all(r["hard"].values()) else "failed"
+            if r["hard_status"] != expected_hard: raise ValueError("hard status")
+            if r["hard_status"] == "failed" and r["intent_status"] != "not_reached": raise ValueError("stage")
+            if r["hard_status"] == "passed" and r["intent_status"] not in {"passed", "failed"}: raise ValueError("stage")
+        if r["official_status"] == "scored":
+            if r["official_cost"] is None or not _num(r["official_cost"], positive=True) or r["feasible"] is not True: raise ValueError("official")
+        elif r["official_status"] == "infeasible":
+            if r["feasible"] is not False or r["official_cost"] is not None: raise ValueError("official")
+        elif r["official_status"] in {"invalid_cost", "error", "not_reached"} and r["feasible"] is not None: raise ValueError("official")
+    if value.case_status != "base_unavailable":
+        base_row = next((r for r in rows if r["name"] == "base"), None)
+        if base_row is None or base_row["official_cost"] != value.base_cost: raise ValueError("base")
     winners = [r for r in rows if r.get("winner") is True]
     if value.case_status != "base_unavailable" and len(winners) != 1: raise ValueError("runtime winner count")
     if value.case_status == "base_unavailable" and winners: raise ValueError("runtime winner count")
@@ -1671,10 +1709,20 @@ def _validate_outcome(value: Any) -> _CaseOutcome:
         if value.label_row["proposal_ordinal"] != winner["ordinal"] or value.label_row["proposal_name"] != winner["name"]: raise ValueError("label mismatch")
         if value.label_row["base_cost"] != value.base_cost or value.label_row["teacher_cost"] != value.teacher_cost: raise ValueError("label costs")
         if value.label_row["record_weight"] != value.base_cost / value.teacher_cost: raise ValueError("label record weight")
+        _label_payload(value.label_row)
         if any(edge.get("weight") != 1.0 for edge in value.label_row.get("edges", ())) or any(c.get("weight") != 1.0 for c in value.label_row.get("contacts", ())): raise ValueError("label sparse payload")
         if value.case_status != winner["status"]: raise ValueError("case status")
     if len({(r.get("ordinal"), r.get("name")) for r in value.rejection_rows}) != len(value.rejection_rows): raise ValueError("rejection duplicate")
     if any(k in r for r in value.rejection_rows for k in _PROTECTED): raise ValueError("rejection provenance")
+    for r in value.rejection_rows:
+        if not isinstance(r, Mapping) or set(r) != {"ordinal", "name", "stage", "reason"}: raise ValueError("rejection schema")
+        if type(r["ordinal"]) is not int or r["ordinal"] < 0 or not isinstance(r["name"], str) or not r["name"].strip() or not isinstance(r["stage"], str) or not isinstance(r["reason"], str): raise ValueError("rejection schema")
+    if value.case_status != "base_unavailable":
+        for r in rows:
+            if r["winner"] is True and r["status"] != value.case_status: raise ValueError("winner status")
+            if r["winner"] is not True and r["status"] in {"winner_base_no_improvement", "winner_mutation"}: raise ValueError("winner status")
+    if value.label_row is not None:
+        _label_payload(value.label_row)
     for row in [value.label_row, *rows, *value.rejection_rows]: _finite_json(row)
     return value
 
