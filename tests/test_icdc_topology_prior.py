@@ -2001,14 +2001,22 @@ def test_teacher_scorer_source_seam_is_frozen_before_static_evaluator_import():
         and node.name == "_verify_scorer_source_file"
     ]
     assert len(helper_defs) == 1
-    helper_calls = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        and node.func.id == "_verify_scorer_source_file"
+    module_validation_calls = [
+        node.value for node in tree.body
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
     ]
-    assert helper_calls
+    assert any(
+        isinstance(node.func, ast.Name)
+        and node.func.id == "_verify_scorer_source_file"
+        and len(node.args) == 2
+        and all(isinstance(arg, ast.Name) for arg in node.args)
+        and [arg.id for arg in node.args] == ["_SCORER_PATH", "_SCORER_SHA256"]
+        for node in module_validation_calls
+    )
     assert all(line < evaluator_line for line in (*assignments.values(), helper_defs[0].lineno,
-                                                    *(node.lineno for node in helper_calls)))
+                                                    *(node.lineno for node in module_validation_calls
+                                                      if isinstance(node.func, ast.Name)
+                                                      and node.func.id == "_verify_scorer_source_file")))
     dynamic_imports = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
@@ -2018,17 +2026,26 @@ def test_teacher_scorer_source_seam_is_frozen_before_static_evaluator_import():
     assert not dynamic_imports
 
 
-def test_teacher_runtime_preflight_rejects_boolean_median_runtime_signature(tmp_path, monkeypatch):
+@pytest.mark.parametrize("bad_kind", ["bool", "int"])
+def test_teacher_runtime_preflight_rejects_boolean_median_runtime_signature(tmp_path, monkeypatch, bad_kind):
     t = _teacher(); root = tmp_path / "canonical"; root.mkdir()
     checkpoint, policy = _task4_verified_checkpoint(t, root)
     evaluator = t._EVALUATOR
 
-    def bad_evaluate_solution(
-        solution, baseline_metrics, target_constraints, b2b_connectivity,
-        p2b_connectivity, pins_pos, target_areas, target_positions=None,
-        median_runtime=True,
-    ):
-        return None
+    if bad_kind == "bool":
+        def bad_evaluate_solution(
+            solution, baseline_metrics, target_constraints, b2b_connectivity,
+            p2b_connectivity, pins_pos, target_areas, target_positions=None,
+            median_runtime=True,
+        ):
+            return None
+    else:
+        def bad_evaluate_solution(
+            solution, baseline_metrics, target_constraints, b2b_connectivity,
+            p2b_connectivity, pins_pos, target_areas, target_positions=None,
+            median_runtime=1,
+        ):
+            return None
 
     monkeypatch.setattr(evaluator, "evaluate_solution", bad_evaluate_solution)
     with pytest.raises(ValueError, match="evaluate_solution_signature"):
