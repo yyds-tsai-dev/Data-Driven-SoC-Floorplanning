@@ -2193,7 +2193,10 @@ def _outcome_from_lifecycle(case_input: _CaseInput, raw_rects: torch.Tensor, lif
     rejects = []
     base = next((r for r in lifecycle.candidates if r.name == "base"), None)
     winner = next((r for r in lifecycle.candidates if r.ordinal == lifecycle.winner_ordinal), None)
-    base_ok = base is not None and base.official_cost is not None and base.rejection_reason is None
+    # A successfully scored base remains the required baseline even when a
+    # mutation wins and lifecycle selection marks that base ``not_selected``.
+    base_ok = (base is not None and base.official_cost is not None
+               and base.rejection_reason in (None, "not_selected"))
     status = "base_unavailable"
     if base_ok and winner is not None:
         status = "winner_mutation" if winner.name != "base" else "winner_base_no_improvement"

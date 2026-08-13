@@ -8800,6 +8800,30 @@ def test_task4_p1c_compiler_tie_or_worse_keeps_base_and_omits_scored_loser_rejec
     assert outcome.rejection_rows == ()
 
 
+def test_task4_p1c_compiler_mutation_winner_keeps_scored_not_selected_base_available():
+    t = _teacher(); case_input = _task4_p1c_case_input(t); raw = _task4_p1c_raw(case_input.case)
+    base = _task4_p1c_record(
+        t, 0, "base", raw, raw, cost=10.0, energy=20.0,
+        energy_status="recorded", reason="not_selected",
+        hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    mutation = _task4_p1c_mutation(raw)
+    winner = _task4_p1c_record(
+        t, 1, "axis:0:1:0:0", mutation, mutation, cost=8.0, energy=-20.0,
+        energy_status="recorded", hard={"hard_audit": True}, drift={"max_abs": 0.0},
+    )
+    lifecycle = t._CandidateLifecycle((base, winner), 1, 10.0, 8.0)
+
+    outcome = t._outcome_from_lifecycle(case_input, raw, lifecycle)
+
+    assert outcome.case_status == "winner_mutation"
+    assert outcome.legal is True and outcome.covered is True
+    assert outcome.base_cost == 10.0 and outcome.teacher_cost == 8.0
+    assert [row["winner"] for row in outcome.proposal_rows] == [False, True]
+    assert outcome.label_row["proposal_name"] == "axis:0:1:0:0"
+    assert t._validate_outcome(outcome) is outcome
+
+
 @pytest.mark.parametrize("reason", ["admission_failed", "hard_audit_failed", "intent_not_survived",
                                      "official_infeasible", "official_invalid_cost", "official_evaluator_error"])
 def test_task4_p1c_compiler_stage_matrix_serializes_exact_nulls_and_rejection_bijection(reason):
