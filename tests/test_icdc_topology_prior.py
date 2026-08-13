@@ -2553,9 +2553,9 @@ def test_teacher_verified_shard_summary_binds_raw_source_and_numeric_coordinates
         )
 
 
-def test_teacher_replay_rejects_builder_returned_count_not_matching_spooled_row(
+def test_teacher_ingestion_rejects_builder_count_not_matching_verified_source(
         tmp_path, monkeypatch):
-    """A replaceable summary cannot rewrite an independently decoded replay record."""
+    """A replaceable summary is rejected before it can reach the replay spool."""
     t = _teacher()
     builder = getattr(t, "_verified_shard_summary", None)
     validator = getattr(t, "_validate_spooled_case_row", None)
@@ -2591,14 +2591,12 @@ def test_teacher_replay_rejects_builder_returned_count_not_matching_spooled_row(
     monkeypatch.setattr(t, "_validate_spooled_case_row", validate_record)
     with pytest.raises(ValueError):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
-    assert len(returned_summaries) == len(validation_calls) == 1
+    assert len(returned_summaries) == 1
+    assert validation_calls == []
     pristine_summary, changed_summary = returned_summaries[0]
     assert _task4_summary_values(pristine_summary) == expected_summary
     assert [name for name, value in _task4_summary_values(pristine_summary).items()
             if value != _task4_summary_values(changed_summary)[name]] == ["source_row_count"]
-    record, passed_summary = validation_calls[0]
-    assert _task4_semantic_value(record, "source_row_count") == 2
-    assert _task4_summary_values(passed_summary) == _task4_summary_values(changed_summary)
     assert calls == []
     assert not out.exists() and stages and not stages[-1].exists()
 
