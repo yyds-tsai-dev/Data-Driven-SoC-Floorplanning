@@ -118,83 +118,95 @@ def validate_raw_source(source: Sequence[torch.Tensor]) -> tuple[int, int]:
         (3, 4),
         (2, 8),
     )
-    for tensor, (rank, width) in zip(source, expected):
+    for tensor in source:
         if (
             not isinstance(tensor, torch.Tensor)
             or tensor.device.type != "cpu"
             or tensor.requires_grad
             or tensor.layout != torch.strided
             or not tensor.is_floating_point()
-            or tensor.ndim != rank
-            or tensor.shape[-1] != width
-            or not bool(torch.isfinite(tensor).all())
         ):
             raise ValueError("source tensors")
-    batch, n = int(source[0].shape[0]), int(source[0].shape[1])
-    if (
-        batch < 1
-        or n < 1
-        or int(source[4].shape[1]) != n - 1
-        or int(source[5].shape[1]) != n
+    if any(
+        tensor.ndim != rank or tensor.shape[-1] != width
+        for tensor, (rank, width) in zip(source, expected)
     ):
-        raise ValueError("source shape")
+        raise ValueError("source shapes")
+    batch, n = int(source[0].shape[0]), int(source[0].shape[1])
+    if batch < 1 or n < 1 or int(source[5].shape[1]) != n:
+        raise ValueError("source shapes")
     if any(int(t.shape[0]) != batch for t in source[1:]):
         raise ValueError("source batch")
-    inp, b2b, p2b, pins, _tree_sol, fp_sol, _metrics_sol = source
-    for batch_index in range(batch):
-        actual_n = 0
-        seen_padding = False
-        for row in inp[batch_index]:
-            is_padding = float(row[0]) == -1.0
-            if is_padding:
-                seen_padding = True
-                continue
-            if seen_padding or float(row[0]) <= 0:
-                raise ValueError("area padding")
-            if any(float(value) != int(float(value)) for value in row[1:]):
-                raise ValueError("constraint")
-            actual_n += 1
-        if actual_n < 1:
-            raise ValueError("area padding")
+    if int(source[4].shape[1]) != n - 1:
+        raise ValueError("source tree")
+    if any(not bool(torch.isfinite(tensor).all()) for tensor in source):
+        raise ValueError("source tensors")
 
-        relation_counts: dict[str, int] = {}
-        for name, tensor, width in (
-            ("b2b", b2b, 3),
-            ("p2b", p2b, 3),
-            ("pins", pins, 2),
-        ):
-            count = 0
-            seen_padding = False
-            for row in tensor[batch_index]:
-                values = [float(item) for item in row]
-                is_padding = all(value == -1.0 for value in values)
-                if any(value == -1.0 for value in values) and not is_padding:
-                    raise ValueError("partial padding")
-                if is_padding:
-                    seen_padding = True
-                    continue
-                if seen_padding:
-                    raise ValueError("noncontiguous padding")
-                if width == 3:
-                    if values[0] != int(values[0]) or values[1] != int(values[1]):
-                        raise ValueError("edge endpoint")
-                    if values[2] < 0:
-                        raise ValueError(f"{name} weight")
-                count += 1
-            relation_counts[name] = count
-        for row in b2b[batch_index, : relation_counts["b2b"]]:
-            first, second = int(row[0]), int(row[1])
-            if not (0 <= first < actual_n and 0 <= second < actual_n):
-                raise ValueError("b2b endpoint")
-        for row in p2b[batch_index, : relation_counts["p2b"]]:
-            pin_index, block_index = int(row[0]), int(row[1])
-            if not (
-                0 <= pin_index < relation_counts["pins"]
-                and 0 <= block_index < actual_n
-            ):
-                raise ValueError("p2b endpoint")
-        if not bool((fp_sol[batch_index, :actual_n, :2] > 0).all()):
-            raise ValueError("fp dimensions")
+    inp, b2b, p2b, pins, _tree_sol, fp_sol, _metrics_sol = source
+    valid_blocks = inp[..., 0].ne(-1)
+    padding_seen = (~valid_blocks).to(torch.int64).cumsum(dim=1).gt(0)
+    if (
+        bool((valid_blocks & inp[..., 0].le(0)).any())
+        or bool((valid_blocks & padding_seen).any())
+        or bool(valid_blocks.sum(dim=1).eq(0).any())
+    ):
+        raise ValueError("area padding")
+    constraint_values = inp[..., 1:]
+    if bool(
+        (valid_blocks.unsqueeze(-1) & constraint_values.ne(constraint_values.round())).any()
+    ):
+        raise ValueError("constraint")
+
+    relation_valid: dict[str, torch.Tensor] = {}
+    for name, tensor in (("b2b", b2b), ("p2b", p2b), ("pins", pins)):
+        pad_cells = tensor.eq(-1)
+        pad_rows = pad_cells.all(dim=-1)
+        if bool((pad_cells.any(dim=-1) & ~pad_rows).any()):
+            raise ValueError("partial padding")
+        valid_rows = ~pad_rows
+        relation_valid[name] = valid_rows
+        pad_seen = pad_rows.to(torch.int64).cumsum(dim=1).gt(0)
+        if bool((valid_rows & pad_seen).any()):
+            raise ValueError("noncontiguous padding")
+
+    for name, tensor in (("b2b", b2b), ("p2b", p2b)):
+        valid = relation_valid[name]
+        endpoints = tensor[..., :2]
+        if bool((valid.unsqueeze(-1) & endpoints.ne(endpoints.round())).any()):
+            raise ValueError("edge endpoint")
+        if bool((valid & tensor[..., 2].lt(0)).any()):
+            raise ValueError(f"{name} weight")
+
+    block_counts = valid_blocks.sum(dim=1)
+    pin_counts = relation_valid["pins"].sum(dim=1)
+    b2b_valid = relation_valid["b2b"]
+    if bool(
+        (
+            b2b_valid
+            & (
+                b2b[..., 0].lt(0)
+                | b2b[..., 1].lt(0)
+                | b2b[..., 0].ge(block_counts[:, None])
+                | b2b[..., 1].ge(block_counts[:, None])
+            )
+        ).any()
+    ):
+        raise ValueError("b2b endpoint")
+    p2b_valid = relation_valid["p2b"]
+    if bool(
+        (
+            p2b_valid
+            & (
+                p2b[..., 0].lt(0)
+                | p2b[..., 1].lt(0)
+                | p2b[..., 0].ge(pin_counts[:, None])
+                | p2b[..., 1].ge(block_counts[:, None])
+            )
+        ).any()
+    ):
+        raise ValueError("p2b endpoint")
+    if bool((valid_blocks.unsqueeze(-1) & fp_sol[..., :2].le(0)).any()):
+        raise ValueError("fp dimensions")
     return batch, n
 
 

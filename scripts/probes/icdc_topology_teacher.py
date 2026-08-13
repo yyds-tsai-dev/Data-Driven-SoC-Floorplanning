@@ -1688,50 +1688,7 @@ def _read_verified_shard(root: Path, worker: int, layout: int) -> tuple[bytes, A
 
 
 def _validate_source_shard(source: Any) -> tuple[int, int]:
-    if not isinstance(source, (tuple, list)) or len(source) != 7:
-        raise ValueError("source schema")
-    if any(not isinstance(t, torch.Tensor) or t.device.type != "cpu" or t.requires_grad or t.layout != torch.strided or t.dtype == torch.bool or not t.is_floating_point() for t in source):
-        raise ValueError("source tensors")
-    inp, b2b, p2b, pins, tree, fp, metrics = source
-    if inp.ndim != 3 or inp.shape[2] != 6 or b2b.ndim != 3 or b2b.shape[2] != 3 or p2b.ndim != 3 or p2b.shape[2] != 3 or pins.ndim != 3 or pins.shape[2] != 2 or tree.ndim != 3 or tree.shape[2] != 3 or fp.ndim != 3 or fp.shape[2] != 4 or metrics.ndim != 2 or metrics.shape[1] != 8:
-        raise ValueError("source shapes")
-    b, n = inp.shape[:2]
-    if b < 1 or n < 1 or any(t.shape[0] != b for t in source[1:]):
-        raise ValueError("source batch")
-    if tree.shape[1] != n - 1: raise ValueError("source tree")
-    public_shape = validate_raw_source(source)
-    for tensor in source:
-        if not bool(torch.isfinite(tensor).all()):
-            raise ValueError("source tensors")
-    for row in inp:
-        seen_pad = False
-        for item in row:
-            pad = float(item[0]) == -1.0
-            if pad: seen_pad = True
-            elif seen_pad or float(item[0]) <= 0: raise ValueError("area padding")
-            elif any(not _is_integral(x) for x in item[1:]): raise ValueError("constraint")
-    for tensor, width, kind in ((b2b, 3, "b2b"), (p2b, 3, "p2b"), (pins, 2, "pin")):
-        for batch in tensor:
-            padded = False
-            for row in batch:
-                is_pad = all(float(v) == -1.0 for v in row)
-                if is_pad: padded = True
-                elif padded: raise ValueError("noncontiguous padding")
-        for row in tensor.reshape(-1, width):
-            pads = [float(x) == -1.0 for x in row]
-            if any(pads) and not all(pads): raise ValueError("partial padding")
-            if not any(pads):
-                if width == 3:
-                    if not all(_is_integral(x) for x in row[:2]): raise ValueError("edge endpoint")
-                    if kind == "b2b" and (float(row[0]) < 0 or float(row[0]) >= n or float(row[1]) < 0 or float(row[1]) >= n): raise ValueError("b2b endpoint")
-                    if kind == "p2b" and (float(row[1]) < 0 or float(row[1]) >= n or float(row[0]) < 0): raise ValueError("p2b endpoint")
-                    if float(row[2]) < 0: raise ValueError(f"{kind} weight")
-                elif any(not math.isfinite(float(x)) for x in row):
-                    raise ValueError("pin value")
-    result = (int(b), int(n))
-    if result != public_shape:
-        raise ValueError("source schema disagreement")
-    return result
+    return validate_raw_source(source)
 
 def _trim_rows(tensor: torch.Tensor, width: int, index: int) -> list[list[float]]:
     out = []
