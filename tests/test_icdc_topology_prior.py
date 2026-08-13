@@ -280,11 +280,18 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
 
 def test_teacher_g0_state_precedence_literals():
     t = _teacher()
-    base = {"trust_ok": True, "scorer_ok": True, "input_ok": True, "legal": True, "coverage": True, "delta": 0}
+    base = {"trust_ok": True, "scorer_ok": True, "input_ok": True, "legal": True, "coverage": True,
+            "teacher_mean": 0.0, "delta": 0}
     expected = ["KILLED_INPUT_CHECKPOINT_OR_SCORER", "KILLED_LEGALITY_OR_COVERAGE", "KILLED_TEACHER_GT_1_5", "STOP_HARD_GAIN_MISSED", "TARGET_GAIN_MISSED_NO_TRAINING_AUTHORITY", "TARGET_GAIN_MET"]
     cases = [{**base, "trust_ok": False}, {**base, "legal": False}, {**base, "teacher_mean": 2}, {**base, "delta": 0.01}, {**base, "delta": 0.0181504738793652}, {**base, "delta": 0.0261247299384228}]
     assert [t._g0_state(c) for c in cases] == expected
     assert t._g0_state({**base, "trust_ok": False, "legal": False, "teacher_mean": 2, "delta": .03}) == "KILLED_INPUT_CHECKPOINT_OR_SCORER"
+
+
+def test_teacher_g0_requires_teacher_mean_after_all_boolean_gates_pass():
+    with pytest.raises(ValueError):
+        _teacher()._g0_state({"trust_ok": True, "scorer_ok": True, "input_ok": True,
+                              "legal": True, "coverage": True, "delta": 0.03})
 
 
 # Additional Task 4 fail-closed review contracts.  These deliberately exercise
@@ -413,6 +420,7 @@ def test_teacher_g0_failures_precede_missing_metrics():
 
 @pytest.mark.parametrize("bad", [{"relative_path": "../x"}, {"relative_path": "/x"}, {"relative_path": ""},
                                   {"relative_path": "a\\b"}, {"layout_index": -1}, {"n": -1},
+                                  {"n": 12.0}, {"n": True}, {"n": "12"},
                                   {"base_cost": "x"}, {"teacher_cost": float("nan")}, {"extra": 1}])
 def test_teacher_weighted_population_rejects_untrusted_rows(bad):
     t = _teacher(); row = {"relative_path": "a.json", "layout_index": 0, "instance_id": "a", "n": 1,

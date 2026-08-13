@@ -293,7 +293,7 @@ def _weighted_population(rows: Sequence[Mapping[str, Any]]) -> dict[str, float |
         instance_id = row["instance_id"]
         if not isinstance(instance_id, str) or not instance_id or "\0" in instance_id:
             raise ValueError("instance_id")
-        if not _is_integral(row["n"]) or int(row["n"]) < 0:
+        if type(row["n"]) is not int or row["n"] < 0:
             raise ValueError("n")
         base_cost = _finite_number(row["base_cost"], "base_cost")
         teacher_cost = _finite_number(row["teacher_cost"], "teacher_cost")
@@ -401,7 +401,7 @@ def _g0_state(values: Mapping[str, Any]) -> str:
             raise ValueError(field)
         if not value:
             return "KILLED_LEGALITY_OR_COVERAGE"
-    teacher_value = values.get("teacher_mean", 0.0)
+    teacher_value = values.get("teacher_mean")
     teacher_mean = _finite_number(teacher_value, "teacher_mean")
     delta = _finite_number(values.get("delta"), "delta")
     if teacher_mean > 1.5:
