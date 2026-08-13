@@ -1282,15 +1282,35 @@ def _restore_private_claim(claim_dir_fd: int, claim_name: str,
     return True
 
 
+def _restore_outstanding_private_claims(
+        claims: list[tuple[int, str, int, str]]) -> bool:
+    """Return every still-owned private claim to its original public name.
+
+    A claim is removed from ``claims`` only after ``RENAME_NOREPLACE`` succeeds.
+    Thus an attacker-created public replacement never causes the quarantined
+    inode to be discarded or confused with that replacement.
+    """
+    restored = True
+    for claim in tuple(reversed(claims)):
+        claim_dir_fd, claim_name, public_dir_fd, public_name = claim
+        if _restore_private_claim(claim_dir_fd, claim_name,
+                                  public_dir_fd, public_name):
+            claims.remove(claim)
+        else:
+            restored = False
+    return restored
+
+
 def _claim_to_private_quarantine(
         public_dir_fd: int, public_name: str, expected: tuple[int, int, int],
         quarantine_fd: int, *, operation: Optional[str] = None,
-        public_target: Optional[Path] = None) -> Optional[str]:
+        public_target: Optional[Path] = None,
+        on_claim: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Claim an exact lstat identity, returning its private name on success.
 
-    A caller only ever removes the returned private name.  If the entry changes
-    in the hook-to-rename window, the different identity is restored with
-    RENAME_NOREPLACE and is never destructively touched.
+    ``on_claim`` is invoked immediately after a successful atomic move.  It
+    lets the owning lifecycle retain a rollback record even when the subsequent
+    identity check sees a different entry or cannot be performed.
     """
     public_name = _safe_component(public_name)
     try:
@@ -1311,14 +1331,18 @@ def _claim_to_private_quarantine(
             continue
         except OSError:
             return None
+        # Registration happens immediately after the atomic move, before an
+        # lstat can fail or reveal a swapped identity.  Every successful move
+        # therefore remains in an enclosing cleanup ledger until deletion or
+        # no-replace restoration actually succeeds.
+        if on_claim is not None:
+            on_claim(claim_name)
         try:
             claimed = _lstat_identity_at(quarantine_fd, claim_name)
         except OSError:
             return None
         if _identity_matches(claimed, expected):
             return claim_name
-        _restore_private_claim(quarantine_fd, claim_name,
-                               public_dir_fd, public_name)
         return None
     return None
 
@@ -1330,6 +1354,9 @@ def _remove_owned_staging_contents_at(owned_fd: int, public_root: Path) -> None:
     """Remove a descriptor-bound staging tree through private atomic claims."""
     quarantine_name = None
     quarantine_fd = None
+    claims: list[tuple[int, str, int, str]] = []
+    primary: Optional[BaseException] = None
+    cleanup_error: Optional[BaseException] = None
     try:
         quarantine_name, quarantine_fd = _new_private_quarantine(owned_fd, "staging-q")
         for name in os.listdir(owned_fd):
@@ -1341,9 +1368,12 @@ def _remove_owned_staging_contents_at(owned_fd: int, public_root: Path) -> None:
                 claimed_name = _claim_to_private_quarantine(
                     owned_fd, name, expected, quarantine_fd,
                     operation="staging_child", public_target=target,
+                    on_claim=lambda claim_name, name=name: claims.append(
+                        (quarantine_fd, claim_name, owned_fd, name)),
                 )
                 if claimed_name is None:
                     raise OSError(errno.ESTALE, "staging child ownership mismatch")
+                claim = (quarantine_fd, claimed_name, owned_fd, name)
                 child_fd = None
                 try:
                     child_fd = os.open(
@@ -1357,10 +1387,7 @@ def _remove_owned_staging_contents_at(owned_fd: int, public_root: Path) -> None:
                         raise OSError(errno.ESTALE, "claimed staging child mismatch")
                     _remove_owned_staging_contents_at(child_fd, target)
                     os.rmdir(claimed_name, dir_fd=quarantine_fd)
-                except BaseException:
-                    _restore_private_claim(quarantine_fd, claimed_name,
-                                           owned_fd, name)
-                    raise
+                    claims.remove(claim)
                 finally:
                     if child_fd is not None:
                         os.close(child_fd)
@@ -1368,15 +1395,36 @@ def _remove_owned_staging_contents_at(owned_fd: int, public_root: Path) -> None:
                 claimed_name = _claim_to_private_quarantine(
                     owned_fd, name, expected, quarantine_fd,
                     operation="staging_leaf", public_target=target,
+                    on_claim=lambda claim_name, name=name: claims.append(
+                        (quarantine_fd, claim_name, owned_fd, name)),
                 )
                 if claimed_name is None:
                     raise OSError(errno.ESTALE, "staging leaf ownership mismatch")
+                claim = (quarantine_fd, claimed_name, owned_fd, name)
                 os.unlink(claimed_name, dir_fd=quarantine_fd)
-        os.close(quarantine_fd); quarantine_fd = None
-        os.rmdir(quarantine_name, dir_fd=owned_fd)
+                claims.remove(claim)
+    except BaseException as exc:
+        primary = exc
     finally:
         if quarantine_fd is not None:
-            os.close(quarantine_fd)
+            if claims and not _restore_outstanding_private_claims(claims):
+                cleanup_error = ValueError("staging claim restore mismatch")
+            try:
+                os.close(quarantine_fd)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            quarantine_fd = None
+        if quarantine_name is not None:
+            try:
+                os.rmdir(quarantine_name, dir_fd=owned_fd)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+    if primary is not None:
+        raise primary
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def _remove_owned_staging_contents_fd(owned_fd: int) -> None:
@@ -1391,6 +1439,9 @@ def _remove_owned_staging_contents_fd(owned_fd: int) -> None:
 def _cleanup_owned_staging(lease: _StagingLease) -> bool:
     parent_fd = root_fd = quarantine_fd = None
     quarantine_name = None
+    root_claim: Optional[tuple[int, str, int, str]] = None
+    primary: Optional[BaseException] = None
+    cleanup_error: Optional[BaseException] = None
     root_name = lease.path.name
     try:
         parent_fd = os.open(lease.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -1413,19 +1464,20 @@ def _cleanup_owned_staging(lease: _StagingLease) -> bool:
         expected = _lstat_identity_at(parent_fd, root_name)
         if expected != (lease.st_dev, lease.st_ino, stat.S_IFDIR):
             return False
+        def track_root_claim(claim_name: str) -> None:
+            nonlocal root_claim
+            root_claim = (quarantine_fd, claim_name, parent_fd, root_name)
         claimed_name = _claim_to_private_quarantine(
             parent_fd, root_name, expected, quarantine_fd,
             operation="staging_root", public_target=lease.path,
+            on_claim=track_root_claim,
         )
         if claimed_name is None:
             return False
         os.rmdir(claimed_name, dir_fd=quarantine_fd)
-        os.close(quarantine_fd); quarantine_fd = None
-        os.rmdir(quarantine_name, dir_fd=parent_fd)
-        quarantine_name = None
-        return True
-    except OSError:
-        return False
+        root_claim = None
+    except BaseException as exc:
+        primary = exc
     finally:
         if root_fd is not None:
             _STAGING_CLEANUP_PATHS.pop(root_fd, None)
@@ -1434,20 +1486,32 @@ def _cleanup_owned_staging(lease: _StagingLease) -> bool:
             except OSError:
                 pass
         if quarantine_fd is not None:
+            if root_claim is not None:
+                if not _restore_private_claim(*root_claim):
+                    cleanup_error = ValueError("staging root restore mismatch")
+                else:
+                    root_claim = None
             try:
                 os.close(quarantine_fd)
-            except OSError:
-                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            quarantine_fd = None
         if quarantine_name is not None and parent_fd is not None:
             try:
                 os.rmdir(quarantine_name, dir_fd=parent_fd)
-            except OSError:
-                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if parent_fd is not None:
             try:
                 os.close(parent_fd)
-            except OSError:
-                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+    if primary is not None or cleanup_error is not None:
+        return False
+    return True
 
 
 def _renameat2_noreplace(source: Path, destination: Path) -> None:
@@ -1472,6 +1536,9 @@ def _remove_owned_case_spool(lease: _StagingLease, spool_path: Path,
     """Delete the closed case spool only after atomically claiming its inode."""
     root_fd = quarantine_fd = None
     quarantine_name = None
+    claim: Optional[tuple[int, str, int, str]] = None
+    primary: Optional[BaseException] = None
+    cleanup_error: Optional[BaseException] = None
     try:
         if spool_path.parent != lease.path:
             raise ValueError("case spool location")
@@ -1481,32 +1548,49 @@ def _remove_owned_case_spool(lease: _StagingLease, spool_path: Path,
             raise ValueError("case spool staging mismatch")
         quarantine_name, quarantine_fd = _new_private_quarantine(root_fd, "case-spool-q")
         expected = (spool_identity[0], spool_identity[1], stat.S_IFREG)
+        def track_case_claim(claim_name: str) -> None:
+            nonlocal claim
+            claim = (quarantine_fd, claim_name, root_fd, spool_path.name)
         claimed_name = _claim_to_private_quarantine(
             root_fd, spool_path.name, expected, quarantine_fd,
             operation="case_spool", public_target=spool_path,
+            on_claim=track_case_claim,
         )
         if claimed_name is None:
             raise ValueError("case spool ownership mismatch")
         os.unlink(claimed_name, dir_fd=quarantine_fd)
-        os.close(quarantine_fd); quarantine_fd = None
-        os.rmdir(quarantine_name, dir_fd=root_fd)
-        quarantine_name = None
+        claim = None
+    except BaseException as exc:
+        primary = exc
     finally:
         if quarantine_fd is not None:
+            if claim is not None:
+                if not _restore_private_claim(*claim):
+                    cleanup_error = ValueError("case spool restore mismatch")
+                else:
+                    claim = None
             try:
                 os.close(quarantine_fd)
-            except OSError:
-                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            quarantine_fd = None
         if quarantine_name is not None and root_fd is not None:
             try:
                 os.rmdir(quarantine_name, dir_fd=root_fd)
-            except OSError:
-                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         if root_fd is not None:
             try:
                 os.close(root_fd)
-            except OSError:
-                pass
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+    if primary is not None:
+        raise primary
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def _publish_staging(lease: _StagingLease, destination: Path) -> None:
@@ -1665,6 +1749,56 @@ _TASK4_JSONL = ("train_corpus.jsonl", "heldout_corpus.jsonl", "train_labels.json
                 "heldout_labels.jsonl", "proposals.jsonl", "rejections.jsonl")
 _POP_OWNERS: dict[int, tuple[int, int, int]] = {}
 _POP_SIDECARS: dict[int, dict[str, tuple[int, int, int]]] = {}
+_SQLITE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
+
+
+def _assert_no_case_spool_sidecars(lease: _StagingLease, spool_path: Path) -> None:
+    """Reject every post-close SQLite sidecar without touching its identity."""
+    root_fd = None
+    try:
+        if spool_path.parent != lease.path:
+            raise ValueError("case spool location")
+        root_fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root = os.fstat(root_fd)
+        if (root.st_dev, root.st_ino) != (lease.st_dev, lease.st_ino):
+            raise ValueError("case spool staging mismatch")
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            name = _safe_component(f"{spool_path.name}{suffix}")
+            try:
+                _lstat_identity_at(root_fd, name)
+            except FileNotFoundError:
+                continue
+            raise ValueError("residual case spool sidecar")
+    finally:
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+
+
+def _assert_staging_support_artifacts(lease: _StagingLease,
+                                      expected_names: Sequence[str]) -> None:
+    """Require that the publishable stage contains only hashed regular support."""
+    root_fd = None
+    try:
+        root_fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root = os.fstat(root_fd)
+        if (root.st_dev, root.st_ino) != (lease.st_dev, lease.st_ino):
+            raise ValueError("staging support mismatch")
+        expected = {_safe_component(name) for name in expected_names}
+        if set(os.listdir(root_fd)) != expected:
+            raise ValueError("unexpected staging artifact")
+        for name in expected:
+            identity = _lstat_identity_at(root_fd, name)
+            if not stat.S_ISREG(identity[2]):
+                raise ValueError("invalid staging support artifact")
+    finally:
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
 
 
 class _JsonlWriter:
@@ -1759,7 +1893,7 @@ class _PopulationAccumulator:
         return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
 
     def _capture_sidecars(self) -> None:
-        for suffix in ("-journal", "-wal", "-shm"):
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
             path = Path(f"{self._db_path}{suffix}")
             try:
                 identity = self._path_identity(path)
@@ -1842,6 +1976,9 @@ class _PopulationAccumulator:
             return dict(self._finished)
         if self._db is None:
             raise RuntimeError("population spool closed")
+        result: Optional[dict[str, float | str]] = None
+        denominator = base_total = teacher_total = 0.0
+        primary: Optional[BaseException] = None
         try:
             hasher = hashlib.sha256(); hasher.update(b"[")
             total = scored = 0; denominator = sden = base_total = teacher_total = 0.0
@@ -1866,21 +2003,30 @@ class _PopulationAccumulator:
             if complete and not all(math.isfinite(v) for v in (base_total/denominator, teacher_total/denominator, base_total/denominator-teacher_total/denominator)):
                 raise ValueError("nonfinite aggregate")
             result = {"eligible_count":total,"scored_winner_count":scored,"denominator":denominator,"scored_denominator":sden,"B_H":base_total/denominator if complete else None,"T_H":teacher_total/denominator if complete else None,"Delta_H":(base_total/denominator-teacher_total/denominator) if complete else None,"population_sha256":hasher.hexdigest()}
-            self._finished = result
-            self.denominator = denominator; self.base_total = base_total; self.teacher_total = teacher_total
-            return dict(result)
-        finally:
+        except BaseException as exc:
+            primary = exc
+        try:
             self._close_spool()
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+        if primary is not None:
+            raise primary
+        if result is None:
+            raise RuntimeError("population result missing")
+        self._finished = result
+        self.denominator = denominator; self.base_total = base_total; self.teacher_total = teacher_total
+        return dict(result)
 
     def _close_spool(self) -> None:
         """Detach SQLite, protect sidecars, then remove only our claimed main."""
         db, self._db = self._db, None
         parent_fd = quarantine_fd = None
         quarantine_name = None
-        claimed_sidecars: list[tuple[str, str, bool]] = []
+        claimed_sidecars: list[tuple[int, str, int, str, bool]] = []
+        main_claim: Optional[tuple[int, str, int, str]] = None
         primary: Optional[BaseException] = None
         db_close_attempted = False
-        sidecars_finalized = False
         main_identity = _POP_OWNERS.get(id(self))
         sidecar_identities = _POP_SIDECARS.get(id(self), {})
         try:
@@ -1890,7 +2036,7 @@ class _PopulationAccumulator:
             # The quarantine is reserved before observation so every sidecar
             # check is immediately followed by an atomic move away from SQLite.
             quarantine_name, quarantine_fd = _new_private_quarantine(parent_fd, "population-q")
-            for suffix in ("-journal", "-wal", "-shm"):
+            for suffix in _SQLITE_SIDECAR_SUFFIXES:
                 name = _safe_component(f"{main_name}{suffix}")
                 try:
                     observed = _lstat_identity_at(parent_fd, name)
@@ -1900,10 +2046,12 @@ class _PopulationAccumulator:
                          and stat.S_ISREG(observed[2]))
                 claimed_name = _claim_to_private_quarantine(
                     parent_fd, name, observed, quarantine_fd,
+                    on_claim=lambda claim_name, name=name, owned=owned:
+                    claimed_sidecars.append(
+                        (quarantine_fd, claim_name, parent_fd, name, owned)),
                 )
                 if claimed_name is None:
                     raise ValueError("population sidecar ownership mismatch")
-                claimed_sidecars.append((name, claimed_name, owned))
 
             if db is not None:
                 try:
@@ -1915,31 +2063,41 @@ class _PopulationAccumulator:
 
             # SQLite is now detached.  Foreign (and any failure-path) claims
             # return through no-replace; a public replacement is never touched.
-            for name, claimed_name, owned in claimed_sidecars:
+            for claim_dir_fd, claimed_name, public_dir_fd, name, owned in tuple(claimed_sidecars):
                 if primary is not None or not owned:
-                    if not _restore_private_claim(quarantine_fd, claimed_name,
-                                                  parent_fd, name) and primary is None:
+                    if _restore_private_claim(claim_dir_fd, claimed_name,
+                                              public_dir_fd, name):
+                        claimed_sidecars.remove((claim_dir_fd, claimed_name,
+                                                 public_dir_fd, name, owned))
+                    elif primary is None:
                         primary = ValueError("population sidecar restore mismatch")
                 else:
                     try:
-                        os.unlink(claimed_name, dir_fd=quarantine_fd)
-                    except OSError as exc:
+                        os.unlink(claimed_name, dir_fd=claim_dir_fd)
+                    except BaseException as exc:
                         if primary is None:
                             primary = exc
-            sidecars_finalized = True
-
+                    else:
+                        claimed_sidecars.remove((claim_dir_fd, claimed_name,
+                                                 public_dir_fd, name, owned))
             if primary is None and main_identity is not None:
+                def track_main_claim(claim_name: str) -> None:
+                    nonlocal main_claim
+                    main_claim = (quarantine_fd, claim_name, parent_fd, main_name)
                 claimed_name = _claim_to_private_quarantine(
                     parent_fd, main_name, main_identity, quarantine_fd,
                     operation="population_main", public_target=self._db_path,
+                    on_claim=track_main_claim,
                 )
                 if claimed_name is None:
                     primary = ValueError("population main ownership mismatch")
                 else:
                     try:
                         os.unlink(claimed_name, dir_fd=quarantine_fd)
-                    except OSError as exc:
+                    except BaseException as exc:
                         primary = exc
+                    else:
+                        main_claim = None
         except BaseException as exc:
             if primary is None:
                 primary = exc
@@ -1956,12 +2114,19 @@ class _PopulationAccumulator:
                     db_close_attempted = True
             # A partially prepared close is a failure path: every claimed
             # sidecar is restored, including an owned one, rather than deleted.
-            if (not sidecars_finalized and quarantine_fd is not None
-                    and parent_fd is not None):
-                for name, claimed_name, _owned in claimed_sidecars:
-                    if not _restore_private_claim(quarantine_fd, claimed_name,
-                                                  parent_fd, name) and primary is None:
-                        primary = ValueError("population sidecar restore mismatch")
+            if claimed_sidecars and quarantine_fd is not None and parent_fd is not None:
+                claims = [(claim_dir_fd, claimed_name, public_dir_fd, name)
+                          for claim_dir_fd, claimed_name, public_dir_fd, name,
+                          _owned in claimed_sidecars]
+                if _restore_outstanding_private_claims(claims):
+                    claimed_sidecars.clear()
+                elif primary is None:
+                    primary = ValueError("population sidecar restore mismatch")
+            if main_claim is not None and quarantine_fd is not None and parent_fd is not None:
+                if _restore_private_claim(*main_claim):
+                    main_claim = None
+                elif primary is None:
+                    primary = ValueError("population main restore mismatch")
             _POP_OWNERS.pop(id(self), None)
             _POP_SIDECARS.pop(id(self), None)
             if quarantine_fd is not None:
@@ -2312,8 +2477,12 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         try:
             if lease is None or spool_identity is None:
                 raise ValueError("case spool ownership mismatch")
+            _assert_no_case_spool_sidecars(lease, spool_path)
             _remove_owned_case_spool(lease, spool_path, spool_identity)
         except BaseException:
+            # A close-time sidecar or a failed private deletion is forensic
+            # evidence.  Leave the whole stage intact rather than letting the
+            # generic stage reaper mistake it for owned support output.
             spool_mismatch = True
             raise
         pop = population.finish()
@@ -2342,9 +2511,32 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                     raise
             if primary is not None:
                 raise primary
+        support_names = (*_TASK4_JSONL, "training_index.json")
+        try:
+            _assert_staging_support_artifacts(lease, support_names)
+        except BaseException:
+            spool_mismatch = True
+            raise
         _fsync_dir()
-        manifest["support_hashes"] = {n: hashlib.sha256((lease.path/n).read_bytes()).hexdigest() for n in (*_TASK4_JSONL,"training_index.json")}; manifest["self_sha256"] = _manifest_self_sha256(manifest); _write_json_fsync(lease.path/"g0_manifest.json", manifest)
+        manifest["support_hashes"] = {
+            n: hashlib.sha256((lease.path / n).read_bytes()).hexdigest()
+            for n in support_names
+        }
+        manifest["self_sha256"] = _manifest_self_sha256(manifest)
+        _write_json_fsync(lease.path / "g0_manifest.json", manifest)
+        try:
+            _assert_staging_support_artifacts(
+                lease, (*support_names, "g0_manifest.json"))
+        except BaseException:
+            spool_mismatch = True
+            raise
         _fsync_dir()
+        try:
+            _assert_staging_support_artifacts(
+                lease, (*support_names, "g0_manifest.json"))
+        except BaseException:
+            spool_mismatch = True
+            raise
         _publish_staging(lease, destination)
         return 0 if authorized else 1
     except BaseException:
@@ -2359,7 +2551,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 spool.close()
         except BaseException:
             pass
-        if spool_identity is not None:
+        if spool_identity is not None and not spool_mismatch:
             try:
                 info = os.stat(lease.path / "case_spool.sqlite") if lease is not None else None
                 spool_mismatch = info is not None and (info.st_dev, info.st_ino) != spool_identity
