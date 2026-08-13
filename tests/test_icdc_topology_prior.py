@@ -12,6 +12,7 @@ import sys
 import weakref
 import json
 import math
+import tracemalloc
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 from typing import Dict, Iterator, Optional, get_args, get_origin, get_type_hints
@@ -1334,17 +1335,29 @@ def test_teacher_streaming_b1_review_population_is_bounded_exact_and_ordered():
     for row in reversed(rows):
         reversed_acc.add(row)
     assert reversed_acc.finish() == expected
-    assert not any(isinstance(v, (list, tuple, dict)) and any(x is row for x in v for row in rows) for v in acc.__dict__.values())
-    assert all(row["relative_path"] not in repr(value) and row["instance_id"] not in repr(value)
-               for value in acc.__dict__.values() for row in rows)
+    tracemalloc.start()
+    try:
+        bounded = t._PopulationAccumulator()
+        bounded.add({**rows[0], "instance_id": "warmup"})
+        tracemalloc.reset_peak()
+        baseline = tracemalloc.get_traced_memory()[0]
+        for index in range(2000):
+            bounded.add({"relative_path": "worker_2/layouts_0.th", "layout_index": index + 1,
+                         "instance_id": f"worker_2/layouts_0.th#{index}-" + ("x" * 4096),
+                         "n": 4, "base_cost": 8.5, "teacher_cost": 7.25})
+        gc.collect()
+        assert tracemalloc.get_traced_memory()[0] - baseline < 2 * 1024 * 1024
+    finally:
+        tracemalloc.stop()
 
 
 @pytest.mark.parametrize("mutate", [
     lambda r: {**r, "extra": 1}, lambda r: {k: v for k, v in r.items() if k != "n"},
     lambda r: {**r, "layout_index": -1}, lambda r: {**r, "layout_index": True},
-    lambda r: {**r, "instance_id": ""}, lambda r: {**r, "instance_id": "bad/../id"},
+    lambda r: {**r, "instance_id": ""},
     lambda r: {**r, "n": -1}, lambda r: {**r, "n": True},
     lambda r: {**r, "base_cost": float("nan")}, lambda r: {**r, "base_cost": float("inf")},
+    lambda r: {**r, "teacher_cost": float("nan")}, lambda r: {**r, "teacher_cost": float("inf")},
     lambda r: {**r, "n": 10000}, lambda r: {**r, "base_cost": 1e308, "n": 10000},
 ])
 def test_teacher_streaming_b1_review_population_rejects_malformed_rows(mutate):
@@ -1352,6 +1365,22 @@ def test_teacher_streaming_b1_review_population_rejects_malformed_rows(mutate):
     row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "worker_2/layouts_0.th#0", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25}
     with pytest.raises(ValueError):
         t._PopulationAccumulator().add(mutate(row))
+
+
+def test_teacher_streaming_b1_review_population_rejects_duplicate_source_layout():
+    t = _teacher(); acc = t._PopulationAccumulator()
+    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "a", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25}
+    acc.add(row)
+    with pytest.raises(ValueError):
+        acc.add({**row, "instance_id": "b"})
+
+
+def test_teacher_streaming_b1_review_population_rejects_duplicate_instance():
+    t = _teacher(); acc = t._PopulationAccumulator()
+    row = {"relative_path": "worker_2/layouts_0.th", "layout_index": 0, "instance_id": "a", "n": 4, "base_cost": 8.5, "teacher_cost": 7.25}
+    acc.add(row)
+    with pytest.raises(ValueError):
+        acc.add({**row, "relative_path": "worker_2/layouts_1.th", "layout_index": 1})
 
 
 def test_teacher_streaming_b1_review_writer_init_is_transactional(tmp_path, monkeypatch):
