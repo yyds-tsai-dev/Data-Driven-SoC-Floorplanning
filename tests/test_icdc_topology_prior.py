@@ -1981,7 +1981,9 @@ def test_teacher_runtime_preflight_rejects_broken_literal_scorer_contract(tmp_pa
     elif broken == "evaluate_solution_signature":
         monkeypatch.setattr(evaluator, "evaluate_solution", lambda bad: bad)
     elif broken == "cost_no_runtime":
-        monkeypatch.delattr(evaluator.SolutionMetrics, "cost_no_runtime", raising=False)
+        field_map = dict(evaluator.SolutionMetrics.__dataclass_fields__)
+        field_map.pop("cost_no_runtime", None)
+        monkeypatch.setattr(evaluator.SolutionMetrics, "__dataclass_fields__", field_map)
     else:
         monkeypatch.setattr(evaluator, "compute_total_score", lambda costs, counts: sum(costs))
     with pytest.raises(ValueError, match=expected_label):
