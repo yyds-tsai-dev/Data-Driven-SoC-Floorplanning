@@ -489,21 +489,28 @@ def _task4_static_forbidden(source):
             if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
                 v = resolve(n.value)
                 if v and aliases.get(n.targets[0].id) != v: aliases[n.targets[0].id] = v; changed = True
-    bad = ("validation", "test", "golden", "sample_bank", "shelf", "collate", "load_model", "tfdl", "projection", "admission", "evaluator", "energy", "scoring")
+    bad = ("load_test_cases", "floorplandatasetlitetest", "bandfilesampler._instance", "shelf_fallback", "engine.load_model", "engine.sample_bank", "collate", "tfdl")
+    literals = {"golden", "validation", "test"}
+    forbidden_runtime = ("proposal", "admission", "tfdl", "hard-legal", "intent", "energy", "evaluate_solution", "official_score", "winner")
     for n in ast.walk(tree):
         if isinstance(n, ast.Call):
             path = resolve(n.func)
             if any(part in path.lower() for part in bad): return False
-            if isinstance(n.func, ast.Name) and n.func.id == "getattr" and len(n.args) >= 2 and isinstance(n.args[1], ast.Constant) and any(x in str(n.args[1].value) for x in bad): return False
-        if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and str(n.slice.value).lower() in bad: return False
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and n.args and isinstance(n.args[0], ast.Constant) and str(n.args[0].value).lower() in bad: return False
+            if isinstance(n.func, ast.Name) and n.func.id == "getattr" and len(n.args) >= 2 and isinstance(n.args[1], ast.Constant) and any(x in str(n.args[1].value).lower() for x in (*bad, "load_model", "sample_bank")): return False
+        if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and str(n.slice.value).lower() in literals: return False
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and n.args and isinstance(n.args[0], ast.Constant) and str(n.args[0].value).lower() in literals: return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"process_case", "_sample_direct_once", "_build_teacher_batches"}:
+            if any(isinstance(x, ast.Call) and any(part in resolve(x.func).lower() for part in forbidden_runtime) for x in ast.walk(node)):
+                return False
     return True
 
 def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
     assert _task4_static_forbidden(Path("scripts/probes/icdc_topology_teacher.py").read_text())
-    assert not _task4_static_forbidden("import icdc.engine as e\nx=e\ngetattr(x, 'load_model')()")
+    assert not _task4_static_forbidden("import icdc.engine as e\nx=e\ny=x\nz=y\na=z\nb=a\ngetattr(b, 'load_model')()")
     assert not _task4_static_forbidden("case={'golden': 1}\ncase.get('golden')\ne.sample_bank()")
     assert not _task4_static_forbidden("from icdc import tfdl as q\nq(x)")
+    assert not _task4_static_forbidden("def process_case(x):\n  fake_admission(x)\n  fake_tfdl(x)\n  official_score(x)")
     assert _task4_static_forbidden("import io, torch\nname='x'\ntorch.load(io.BytesIO(name), weights_only=True, map_location='cpu')")
 
 
@@ -565,7 +572,7 @@ def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["nonmapping", "missing_config", "config_nonmapping", "config_incomplete",
-    "same_key_model_order", "same_key_ema_order", "ema_dtype", "model_nonfinite",
+    "same_key_model_order", "same_key_ema_order", "model_ema_reversed", "ema_dtype", "model_nonfinite", "ema_nonfinite",
     "missing_model", "model_nonmapping", "model_empty",
     "missing_ema", "ema_nonmapping", "ema_empty", "key_mismatch", "extra_ema", "shape",
     "nontensor", "inf", "zdim", "zrepr", "unknown", "model_shape", "model_dtype"])
@@ -577,10 +584,15 @@ def test_task4_materializer_rejects_malformed_payload(kind):
     elif kind == "config_incomplete": bad["model_config"].pop("z_dim")
     elif kind == "same_key_model_order": bad["model"] = dict(reversed(list(bad["model"].items())))
     elif kind == "same_key_ema_order": bad["ema"] = dict(reversed(list(bad["ema"].items())))
+    elif kind == "model_ema_reversed":
+        bad["model"] = dict(reversed(list(bad["model"].items())))
+        bad["ema"] = dict(reversed(list(bad["ema"].items())))
     elif kind == "ema_dtype":
         k = next(k for k, v in bad["ema"].items() if v.is_floating_point()); bad["ema"][k] = bad["ema"][k].double()
     elif kind == "model_nonfinite":
         k = next(k for k, v in bad["model"].items() if v.is_floating_point()); bad["model"][k].fill_(float("nan"))
+    elif kind == "ema_nonfinite":
+        k = next(k for k, v in bad["ema"].items() if v.is_floating_point()); bad["ema"][k].fill_(float("nan"))
     elif kind == "missing_model": bad.pop("model")
     elif kind == "model_nonmapping": bad["model"] = []
     elif kind == "model_empty": bad["model"] = {}
@@ -636,6 +648,11 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
     def decoder(raw, area, cons, tp, scale):
         calls["decode"].append((raw, area, cons, tp, scale)); return raw.double()
     monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", sampler, raising=False)
+    def decoder(raw, area, cons, tp, scale):
+        calls["decode"].append((raw, area, cons, tp, scale))
+        out = raw.double().clone()
+        out[..., 2:] = out[..., 2:].abs() + 1.0
+        return out
     monkeypatch.setattr(t, "_DECODE_RECTS", decoder, raising=False)
     case = _task4_anchored_case_input(t).case
     case = t._sanitize_case(case, artifact=True)
@@ -664,9 +681,14 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
         assert kwargs["known_mask"].dtype == torch.bool and kwargs["known_mask"].device.type == "cpu"
         direct, _ = t._build_teacher_batches(case, torch.device("cpu"))
         import icdc.engine as engine
+        expected_cond = engine.build_cond(direct, state.cfg)
+        assert set(cond) == set(expected_cond)
+        assert all(torch.equal(cond[k], expected_cond[k]) for k in expected_cond)
         expected_z, expected_mask = engine.known_channels(direct)
         assert torch.equal(kwargs["z_known"], expected_z)
         assert torch.equal(kwargs["known_mask"], expected_mask)
+        assert kwargs["known_mask"].any()
+        assert torch.equal(kwargs["known_mask"], torch.tensor([[[False, False, True, False], [True, True, True, False], [False, False, False, False]]]))
         assert direct["node_feat"].shape == (1, 3, 26) and direct["node_feat"].dtype == torch.float32
         assert direct["mask"].shape == (1, 3) and direct["mask"].dtype == torch.bool and bool(direct["mask"].all())
         assert direct["adj"].shape == (1, 3, 3) and direct["adj"].dtype == torch.float32
@@ -724,22 +746,25 @@ def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_cl
         return t.TeacherTrustPolicy(root, hashlib.sha256(path.read_bytes()).hexdigest(),
             t._checkpoint_identity(payload), t._SCORER_SHA256,
             "iccad2026_evaluate_cost_no_runtime_v1", "2.0.5")
-    runtime = t._runtime_hooks(); runtime.preflight(policy(paths[0], p1), paths[0])
-    runtime.preflight(policy(paths[1], p2), paths[1])
-    seen = []
-    monkeypatch.setattr(t, "_materialize_teacher_model", lambda p, d: seen.append(p) or object(), raising=False)
-    monkeypatch.setattr(t, "_sample_direct_once", lambda *a: torch.ones((3, 4), dtype=torch.float64), raising=False)
-    with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
-        runtime.process_case(_task4_case_input(t))
-    assert seen and t._checkpoint_identity(seen[-1]) == t._checkpoint_identity(p2)
-    bad = policy(paths[0], p1)
-    monkeypatch.setattr(runtime, "_verify_preflight", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad preflight")), raising=False)
-    with pytest.raises((ValueError, RuntimeError)):
-        runtime.preflight(bad, paths[0])
-    seen.clear()
-    with pytest.raises(RuntimeError):
-        runtime.process_case(_task4_case_input(t))
-    assert not seen
+    runtime = t._runtime_hooks(); materialized = []; sampled = []
+    monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"), raising=False)
+    monkeypatch.setattr(t, "_materialize_teacher_model", lambda p, d: materialized.append(p) or object(), raising=False)
+    monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sampled.append(seed) or torch.ones((3, 4), dtype=torch.float64), raising=False)
+    for name in ("_run_candidate_lifecycle", "_admit_candidate", "_score_official_candidate"):
+        monkeypatch.setattr(t, name, lambda *a, _name=name, **k: pytest.fail(_name), raising=False)
+    monkeypatch.setattr(t._EVALUATOR, "evaluate_solution", lambda *a, **k: pytest.fail("evaluate_solution"), raising=False)
+    import icdc.engine as engine
+    for module, name in ((t, "_SAMPLE_DIRECT_DPM"), (engine, "z_to_legal"), (engine, "build_cond")):
+        if hasattr(module, name): monkeypatch.setattr(module, name, lambda *a, _name=name, **k: pytest.fail(_name))
+    runtime.preflight(policy(paths[0], p1), paths[0]); runtime.process_case(_task4_case_input(t, 101))
+    runtime.preflight(policy(paths[1], p2), paths[1]); runtime.process_case(_task4_case_input(t, 202))
+    assert [t._checkpoint_identity(x) for x in materialized] == [t._checkpoint_identity(p1), t._checkpoint_identity(p2)]
+    assert sampled == [101, 202]
+    with pytest.raises(ValueError, match="scorer_sha256"):
+        runtime.preflight(dataclasses.replace(policy(paths[1], p2), expected_scorer_sha256="0" * 64), paths[1])
+    with pytest.raises(RuntimeError, match="before trusted preflight"):
+        runtime.process_case(_task4_case_input(t, 303))
+    assert len(materialized) == 2 and sampled == [101, 202]
 
 
 _TASK4_FILES = (
