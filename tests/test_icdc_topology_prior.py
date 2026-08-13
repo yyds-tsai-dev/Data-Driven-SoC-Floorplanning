@@ -473,7 +473,7 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
         assert set(kw) == {"weights_only", "map_location"}
         assert kw["weights_only"].value is True and kw["map_location"].value == "cpu"
 
-def _task4_static_forbidden(source):
+def _task4_static_forbidden(source, *, require_exact_loads=False):
     tree = ast.parse(source); aliases = {}
     def resolve(n):
         if isinstance(n, ast.Name): return aliases.get(n.id, n.id)
@@ -514,17 +514,17 @@ def _task4_static_forbidden(source):
             if len(n.args) != 1 or not isinstance(n.args[0], ast.Call) or resolve(n.args[0].func) != "io.BytesIO" or len(n.args[0].args) != 1 or not isinstance(n.args[0].args[0], ast.Name): return False
             kw = {k.arg: k.value for k in n.keywords}
             if set(kw) != {"weights_only", "map_location"} or not isinstance(kw["weights_only"], ast.Constant) or kw["weights_only"].value is not True or not isinstance(kw["map_location"], ast.Constant) or kw["map_location"].value != "cpu": return False
-    if loads and len(loads) != 2: return False
+    if require_exact_loads and len(loads) != 2: return False
     return True
 
 def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
-    assert _task4_static_forbidden(Path("scripts/probes/icdc_topology_teacher.py").read_text())
+    assert _task4_static_forbidden(Path("scripts/probes/icdc_topology_teacher.py").read_text(), require_exact_loads=True)
     assert not _task4_static_forbidden("import icdc.engine as e\nx=e\ny=x\nz=y\na=z\nb=a\ngetattr(b, 'load_model')()")
     assert not _task4_static_forbidden("case={'golden': 1}\ncase.get('golden')\ne.sample_bank()")
     assert not _task4_static_forbidden("from icdc import tfdl as q\nq(x)")
     assert not _task4_static_forbidden("def process_case(x):\n  fake_admission(x)\n  fake_tfdl(x)\n  official_score(x)")
-    assert _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu')")
-    assert not _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu'); torch_alias=torch; getattr(torch_alias, 'load')('path', weights_only=True, map_location='cpu')")
+    assert _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu')", require_exact_loads=True)
+    assert not _task4_static_forbidden("import io, torch\na='x'; b='y'; c='z'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu'); torch_alias=torch; getattr(torch_alias, 'load')(io.BytesIO(c), weights_only=True, map_location='cpu')", require_exact_loads=True)
 
 
 def _task4_teacher_payload():
@@ -558,8 +558,8 @@ def _task4_case_input(t, seed=17):
 def _task4_anchored_case_input(t, seed=17):
     ci = _task4_case_input(t, seed)
     case = dict(ci.case)
-    case["area"] = [6.0, 20.0, 1.0]
-    case["cons"] = [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 0, 0, 0]]
+    case["area"] = [6.0, 20.0, 1.0000001]
+    case["cons"] = [[1, 0, 3, 5, 1], [0, 1, 4, 5, 2], [0, 0, 0, 6, 4]]
     case["tp"] = [[-1.0, -1.0, 2.0, 3.0], [7.0, 8.0, 4.0, 5.0], [-1.0] * 4]
     return dataclasses.replace(ci, case=case)
 
@@ -630,7 +630,7 @@ def test_task4_materializer_rejects_malformed_payload(kind):
 
 
 def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
-    t = _teacher(); case = _task4_case_input(t).case
+    t = _teacher(); case = _task4_anchored_case_input(t).case
     case = t._sanitize_case(case, artifact=True)
     direct, diagnostic = t._build_teacher_batches(case, torch.device("cpu"))
     assert direct["area"].shape == (1, 3) and direct["tp"].shape == (1, 3, 4)
@@ -654,7 +654,7 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
             assert torch.equal(batch[key], expected)
     f64_scale = torch.sqrt(torch.tensor(case["area"], dtype=torch.float64).sum())
     assert diagnostic["scale"].item() != f64_scale.item()
-    tiny = dict(case, area=[0.1, 0.2, 0.3])
+    tiny = t._sanitize_case(dict(_task4_case_input(t).case, area=[0.1, 0.2, 0.3]), artifact=True)
     tiny_direct, tiny_diag = t._build_teacher_batches(tiny, torch.device("cpu"))
     assert tiny_direct["scale"].item() == 1.0 and tiny_diag["scale"].item() == 1.0
 
@@ -756,18 +756,24 @@ def test_task4_runtime_materializes_lazily_caches_and_never_reopens(tmp_path, mo
 
 def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_clears(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "trusted"; root.mkdir()
-    p1, p2 = _task4_teacher_payload(), _task4_teacher_payload()
-    p2["ema"][next(iter(p2["ema"]))] = p2["ema"][next(iter(p2["ema"]))] + 2
-    paths = [root / "one.th", root / "two.th"]
-    torch.save(p1, paths[0]); torch.save(p2, paths[1])
+    p1, p2, p3 = (_task4_teacher_payload() for _ in range(3))
+    key = next(iter(p1["ema"]))
+    p2["ema"][key] = p2["ema"][key] + 2
+    p3["ema"][key] = p3["ema"][key] + 3
+    paths = [root / "one.th", root / "two.th", root / "three.th"]
+    for path, payload in zip(paths, (p1, p2, p3)): torch.save(payload, path)
     def policy(path, payload):
         return t.TeacherTrustPolicy(root, hashlib.sha256(path.read_bytes()).hexdigest(),
             t._checkpoint_identity(payload), t._SCORER_SHA256,
             "iccad2026_evaluate_cost_no_runtime_v1", "2.0.5")
-    runtime = t._runtime_hooks(); materialized = []; sampled = []
+    runtime = t._runtime_hooks(); materialized = []; sampled = []; refs = []
+    class Token: pass
+    def materialize(payload, device):
+        materialized.append(payload)
+        token = Token(); refs.append(weakref.ref(token)); return token
     monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"), raising=False)
-    monkeypatch.setattr(t, "_materialize_teacher_model", lambda p, d: materialized.append(p) or object(), raising=False)
-    monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sampled.append(seed) or torch.ones((3, 4), dtype=torch.float64), raising=False)
+    monkeypatch.setattr(t, "_materialize_teacher_model", materialize, raising=False)
+    monkeypatch.setattr(t, "_sample_direct_once", lambda s, c, seed: sampled.append((s, seed)) or torch.ones((3, 4), dtype=torch.float64), raising=False)
     for name in ("_run_candidate_lifecycle", "_admit_candidate", "_score_official_candidate"):
         monkeypatch.setattr(t, name, lambda *a, _name=name, **k: pytest.fail(_name), raising=False)
     import icdc.engine as engine
@@ -789,14 +795,18 @@ def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_cl
             with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
                 runtime.process_case(_task4_case_input(t, seed))
     runtime.preflight(policy(paths[0], p1), paths[0]); process_with_seams(101)
-    runtime.preflight(policy(paths[1], p2), paths[1]); process_with_seams(202)
-    assert [t._checkpoint_identity(x) for x in materialized] == [t._checkpoint_identity(p1), t._checkpoint_identity(p2)]
-    assert sampled == [101, 202]
+    assert [id(x) for x in materialized] == [id(p1)]
+    assert refs[0]() is not None
+    runtime.preflight(policy(paths[1], p2), paths[1]); gc.collect(); assert refs[0]() is None
+    process_with_seams(202); assert refs[1]() is not None
     with pytest.raises(ValueError, match="scorer_sha256"):
         runtime.preflight(dataclasses.replace(policy(paths[1], p2), expected_scorer_sha256="0" * 64), paths[1])
+    gc.collect(); assert refs[1]() is None
     with pytest.raises(RuntimeError, match="before trusted preflight"):
         runtime.process_case(_task4_case_input(t, 303))
-    assert len(materialized) == 2 and sampled == [101, 202]
+    runtime.preflight(policy(paths[2], p3), paths[2]); process_with_seams(303); assert refs[2]() is not None
+    assert [id(x) for x in materialized] == [id(p1), id(p2), id(p3)]
+    assert [seed for _, seed in sampled] == [101, 202, 303]
 
 
 _TASK4_FILES = (
