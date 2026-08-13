@@ -473,6 +473,39 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
         assert set(kw) == {"weights_only", "map_location"}
         assert kw["weights_only"].value is True and kw["map_location"].value == "cpu"
 
+def _task4_static_forbidden(source):
+    tree = ast.parse(source); aliases = {}
+    def resolve(n):
+        if isinstance(n, ast.Name): return aliases.get(n.id, n.id)
+        if isinstance(n, ast.Attribute): return f"{resolve(n.value)}.{n.attr}"
+        return ""
+    changed = True
+    while changed:
+        changed = False
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for x in n.names:
+                    aliases[x.asname or x.name.split(".")[0]] = (f"{n.module}.{x.name}" if isinstance(n, ast.ImportFrom) and n.module else x.name)
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                v = resolve(n.value)
+                if v and aliases.get(n.targets[0].id) != v: aliases[n.targets[0].id] = v; changed = True
+    bad = ("validation", "test", "golden", "sample_bank", "shelf", "collate", "load_model", "tfdl", "projection", "admission", "evaluator", "energy", "scoring")
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            path = resolve(n.func)
+            if any(part in path.lower() for part in bad): return False
+            if isinstance(n.func, ast.Name) and n.func.id == "getattr" and len(n.args) >= 2 and isinstance(n.args[1], ast.Constant) and any(x in str(n.args[1].value) for x in bad): return False
+        if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant) and str(n.slice.value).lower() in bad: return False
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and n.args and isinstance(n.args[0], ast.Constant) and str(n.args[0].value).lower() in bad: return False
+    return True
+
+def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
+    assert _task4_static_forbidden(Path("scripts/probes/icdc_topology_teacher.py").read_text())
+    assert not _task4_static_forbidden("import icdc.engine as e\nx=e\ngetattr(x, 'load_model')()")
+    assert not _task4_static_forbidden("case={'golden': 1}\ncase.get('golden')\ne.sample_bank()")
+    assert not _task4_static_forbidden("from icdc import tfdl as q\nq(x)")
+    assert _task4_static_forbidden("import io, torch\nname='x'\ntorch.load(io.BytesIO(name), weights_only=True, map_location='cpu')")
+
 
 def _task4_teacher_payload():
     """Small in-memory checkpoint with deliberately different EMA weights."""
@@ -505,6 +538,7 @@ def _task4_case_input(t, seed=17):
 def _task4_anchored_case_input(t, seed=17):
     ci = _task4_case_input(t, seed)
     case = dict(ci.case)
+    case["area"] = [6.0, 20.0, 1.0]
     case["cons"] = [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 0, 0, 0]]
     case["tp"] = [[-1.0, -1.0, 2.0, 3.0], [7.0, 8.0, 4.0, 5.0], [-1.0] * 4]
     return dataclasses.replace(ci, case=case)
@@ -643,13 +677,15 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
         assert cons.dtype == torch.int64
         assert all(x.device.type == "cpu" for x in (raw, area, cons, tp, scale))
 
-@pytest.mark.parametrize("bad", [torch.zeros((3, 4, 1)), torch.full((3, 4), float("nan")),
-    torch.full((3, 4), float("inf")), torch.tensor([[0., 0., 0., 1.]] * 3),
-    torch.tensor([[0., 0., 1., -1.]] * 3)])
+@pytest.mark.parametrize("bad", [torch.zeros((1, 3, 4, 1)), torch.zeros((2, 3, 4)),
+    torch.zeros((1, 2, 4)), torch.full((1, 3, 4), float("nan")),
+    torch.full((1, 3, 4), float("inf")), torch.tensor([[[0., 0., 0., 1.]] * 3]),
+    torch.tensor([[[0., 0., 1., -1.]] * 3])])
 def test_task4_sample_rejects_malformed_decoder_results(monkeypatch, bad):
     t = _teacher(); state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
-    monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", lambda *a, **k: bad, raising=False)
-    with pytest.raises((ValueError, RuntimeError)):
+    monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", lambda *a, **k: torch.zeros((1, 3, 4)), raising=False)
+    monkeypatch.setattr(t, "_DECODE_RECTS", lambda *a, **k: bad, raising=False)
+    with pytest.raises(ValueError):
         t._sample_direct_once(state, _task4_anchored_case_input(t).case, 9)
 
 
