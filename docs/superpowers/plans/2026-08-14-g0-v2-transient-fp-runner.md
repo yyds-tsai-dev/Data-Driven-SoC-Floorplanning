@@ -156,7 +156,7 @@ Add a fake optimizer trace requiring exactly one base solve per eligible case an
 
 - [ ] **Step 2: Write RED streaming and artifact-hygiene tests**
 
-Run two real tiny receipt-bound shards through injected optimizer/admission/scorer seams. Assert numeric `(worker,layout,row)` order, one verified bytes read per shard, global eligible registration before the first solve, and alternating case processing without whole-corpus retention. Recursively reject dense coordinate keys and any numeric `[N,4]` value in every persisted artifact. Reverse discovery order and require byte-identical outputs.
+Run two real tiny receipt-bound shards through injected optimizer/admission/scorer seams. Assert numeric `(worker,layout,row)` order, one verified bytes read per shard, and immediate `register -> solve -> record` processing for each eligible row without whole-corpus retention or a source reread. Recursively reject dense coordinate keys and any numeric `[N,4]` value in every persisted artifact. Reverse discovery order and require byte-identical outputs.
 
 - [ ] **Step 3: Run the focused suite and confirm RED**
 
@@ -256,4 +256,3 @@ Document command, source commit, immutable artifact hashes, population count/SHA
 git add docs/experiments/2026-08-14-g0-v2-transient-fp.md
 git commit -m "docs: record formal g0 v2 result"
 ```
-
