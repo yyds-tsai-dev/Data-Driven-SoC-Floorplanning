@@ -1204,19 +1204,30 @@ def _path_matches_lease(path: Path, lease: _StagingLease) -> bool:
 
 
 def _cleanup_owned_staging(lease: _StagingLease) -> bool:
+    _after_ownership_validation("staging_root", lease.path)
+    root_fd = None
     try:
-        fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW); root_fd = fd
         info = os.fstat(fd)
         if (info.st_dev, info.st_ino) != (lease.st_dev, lease.st_ino):
             os.close(fd); return False
         _remove_owned_staging_contents_fd(fd)
-        os.close(fd)
+        os.close(fd); root_fd = None
         if not _path_matches_lease(lease.path, lease):
             return False
+        _after_ownership_validation("staging_root", lease.path)
+        if not _path_matches_lease(lease.path, lease): return False
         lease.path.rmdir()
         return True
     except OSError:
         return False
+    finally:
+        if root_fd is not None:
+            try: os.close(root_fd)
+            except OSError: pass
+
+def _after_ownership_validation(operation: str, target: Path) -> None:
+    return None
 
 def _remove_owned_staging_contents_fd(owned_fd: int) -> None:
     for name in os.listdir(owned_fd):
@@ -1230,10 +1241,17 @@ def _remove_owned_staging_contents_fd(owned_fd: int) -> None:
                 _remove_owned_staging_contents_fd(child)
             finally:
                 os.close(child)
+            _after_ownership_validation("staging_child", Path(os.readlink(f"/proc/self/fd/{owned_fd}")) / name)
             try: os.rmdir(name, dir_fd=owned_fd)
             except FileNotFoundError: pass
         else:
-            os.unlink(name, dir_fd=owned_fd)
+            target = Path(os.readlink(f"/proc/self/fd/{owned_fd}")) / name
+            _after_ownership_validation("staging_leaf", target)
+            try:
+                now = os.stat(name, dir_fd=owned_fd, follow_symlinks=False)
+                if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino): continue
+                os.unlink(name, dir_fd=owned_fd)
+            except FileNotFoundError: pass
 
 
 def _renameat2_noreplace(source: Path, destination: Path) -> None:
@@ -1473,6 +1491,7 @@ class _PopulationAccumulator:
         self._db_path = Path(temp.name)
         temp.close()
         _POP_OWNERS[id(self)] = {(os.stat(self._db_path).st_dev, os.stat(self._db_path).st_ino)}
+        _POP_SIDECARS[id(self)] = {}
         self._db: Optional[sqlite3.Connection] = None
         try:
             self._db = sqlite3.connect(str(self._db_path))
@@ -1503,7 +1522,7 @@ class _PopulationAccumulator:
                 st = os.stat(path)
             except FileNotFoundError:
                 continue
-            _POP_SIDECARS.setdefault(id(self), {})[suffix] = (st.st_dev, st.st_ino)
+            _POP_SIDECARS[id(self)][suffix] = (st.st_dev, st.st_ino)
 
     def register(self, row: Mapping[str, Any]) -> None:
         if self._finished is not None: raise RuntimeError("population already finished")
@@ -1594,6 +1613,8 @@ class _PopulationAccumulator:
                     raise ValueError("nonfinite aggregate")
                 if r[4] is not None and r[5] is not None:
                     scored += 1; sden += weight; base_total += weight * r[4]; teacher_total += weight * r[5]
+                if not all(math.isfinite(v) for v in (denominator, sden, base_total, teacher_total)):
+                    raise ValueError("nonfinite aggregate")
             hasher.update(b"]")
             if total > 0 and (not math.isfinite(denominator) or denominator <= 0):
                 raise ValueError("invalid denominator")
@@ -1619,17 +1640,31 @@ class _PopulationAccumulator:
             except OSError:
                 pass
         if db is not None:
+            preserved = []
+            for suffix in ("-journal", "-wal", "-shm"):
+                path = Path(f"{self._db_path}{suffix}")
+                if path.exists() and suffix not in _POP_SIDECARS.get(id(self), {}):
+                    backup = Path(f"{path}.preserve-{os.getpid()}-{id(self)}")
+                    try: os.link(path, backup); preserved.append((path, backup))
+                    except OSError: pass
             try:
-                if not foreign_sidecar:
-                    db.close()
+                db.close()
             except BaseException as exc:
                 primary = exc
+            for path, backup in preserved:
+                try:
+                    if not path.exists(): os.rename(backup, path)
+                    else: backup.unlink(missing_ok=True)
+                except OSError: pass
         for suffix in ("", "-journal", "-wal", "-shm"):
             try:
                 target = Path(f"{self._db_path}{suffix}")
                 if suffix == "":
                     info = os.stat(target)
                     if (info.st_dev, info.st_ino) not in _POP_OWNERS.get(id(self), set()): continue
+                    _after_ownership_validation("population_main", target)
+                    info2 = os.stat(target)
+                    if (info2.st_dev, info2.st_ino) not in _POP_OWNERS.get(id(self), set()): continue
                 else:
                     continue
                 target.unlink()
@@ -1640,6 +1675,7 @@ class _PopulationAccumulator:
                     primary = exc
         if primary is not None:
             raise primary
+        _POP_OWNERS.pop(id(self), None); _POP_SIDECARS.pop(id(self), None)
 
     def abort(self) -> None:
         try:
@@ -1879,11 +1915,13 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         # known before either train or heldout runtime call.
         for _worker, _layout, path in files:
             raw, source = _read_verified_shard(root, _worker, _layout)
-            summary = _verified_shard_summary(raw, source, _worker, _layout)
+            source_witness = tuple(x.detach().clone() for x in source)
             direct = _VerifiedShardSummary(_worker, _layout,
                 f"worker_{_worker}/layouts_{_layout}.th",
-                hashlib.sha256(raw).hexdigest(),
-                _validate_source_shard(source)[0])
+                hashlib.sha256(raw).hexdigest(), _validate_source_shard(source)[0])
+            summary = _verified_shard_summary(raw, source, _worker, _layout)
+            if len(source) != len(source_witness) or any(not torch.equal(a, b) for a, b in zip(source, source_witness)):
+                raise ValueError("mutated verified source")
             if type(summary) is not type(direct) or summary != direct:
                 raise ValueError("forged shard provenance")
             try:
@@ -1968,7 +2006,11 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         spool.close(); spool = None
         try:
             info = os.stat(spool_path)
-            if (info.st_dev, info.st_ino) == spool_identity: spool_path.unlink()
+            if (info.st_dev, info.st_ino) == spool_identity:
+                _after_ownership_validation("case_spool", spool_path)
+                info2 = os.stat(spool_path)
+                if (info2.st_dev, info2.st_ino) == spool_identity: spool_path.unlink()
+                else: raise ValueError("case spool ownership mismatch")
             else: raise ValueError("case spool ownership mismatch")
         except FileNotFoundError: pass
         pop = population.finish()
