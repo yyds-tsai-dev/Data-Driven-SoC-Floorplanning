@@ -3625,7 +3625,8 @@ def test_teacher_streaming_b1_review_population_rejects_duplicate_instance():
     acc.abort()
 
 
-def test_teacher_streaming_b1_cleanup_population_spool_connect_failure_removes_all_artifacts(tmp_path, monkeypatch):
+def test_teacher_streaming_b1_cleanup_population_spool_connect_failure_removes_owned_main(
+        tmp_path, monkeypatch):
     t = _teacher()
     db_path = tmp_path / "population.sqlite"
     sentinel = RuntimeError("sqlite connect sentinel")
@@ -3637,12 +3638,13 @@ def test_teacher_streaming_b1_cleanup_population_spool_connect_failure_removes_a
 
     monkeypatch.setattr(t.tempfile, "NamedTemporaryFile", lambda **kwargs: TempFile())
     monkeypatch.setattr(t.sqlite3, "connect", lambda *args, **kwargs: (_ for _ in ()).throw(sentinel))
-    for suffix in ("", "-journal", "-wal", "-shm"):
-        (tmp_path / f"population.sqlite{suffix}").touch()
+    db_path.touch()
+    owned = db_path.stat()
     with pytest.raises(RuntimeError) as exc:
         t._PopulationAccumulator()
     assert exc.value is sentinel
-    assert all(not Path(f"{db_path}{suffix}").exists() for suffix in ("", "-journal", "-wal", "-shm"))
+    assert not db_path.exists()
+    assert type(owned.st_dev) is int and type(owned.st_ino) is int
 
 
 def test_teacher_streaming_b1_cleanup_baseexception_failure_cleans_transaction(tmp_path, monkeypatch):
