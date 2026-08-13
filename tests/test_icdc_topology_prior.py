@@ -11,7 +11,6 @@ import importlib.util
 import inspect
 import os
 import stat
-import shutil
 import sys
 import weakref
 import json
@@ -2685,12 +2684,15 @@ def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
 def test_cleanup_owned_staging_backend_race_preserves_foreign_directory(tmp_path, monkeypatch):
     t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
     lease = t._new_staging_lease(owned); moved = tmp_path / "moved-owned"
-    real_rmtree = shutil.rmtree
-    def race(path, *args, **kwargs):
-        Path(path).rename(moved)
-        Path(path).mkdir(); (Path(path) / "sentinel").write_text("foreign")
-        real_rmtree(path, *args, **kwargs)
-    monkeypatch.setattr(t.shutil, "rmtree", race)
+    remover = getattr(t, "_remove_owned_staging_contents", None)
+    assert callable(remover), "missing descriptor-bound staging cleanup seam"
+
+    def race(held_lease):
+        owned.rename(moved)
+        owned.mkdir(); (owned / "sentinel").write_text("foreign")
+        return remover(held_lease)
+
+    monkeypatch.setattr(t, "_remove_owned_staging_contents", race)
     assert t._cleanup_owned_staging(lease) is False
     assert moved.exists() and owned.is_dir() and (owned / "sentinel").exists()
 
