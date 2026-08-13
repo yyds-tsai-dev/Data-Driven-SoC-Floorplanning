@@ -576,12 +576,14 @@ def _new_staging(destination: Path) -> Path:
 def _iter_approved_shards(root: Path) -> list[tuple[int, int, Path]]:
     found: list[tuple[int, int, Path]] = []
     for worker in root.iterdir():
-        if worker.is_symlink() or not worker.is_dir() or not worker.name.startswith("worker_"):
+        if worker.name.startswith("worker_") and worker.is_symlink(): raise ValueError("numeric worker symlink")
+        if not worker.is_dir() or not worker.name.startswith("worker_"):
             continue
         try: wid = int(worker.name[7:])
         except ValueError: continue
         for shard in worker.iterdir():
-            if shard.is_symlink() or not shard.is_file() or not shard.name.startswith("layouts_") or not shard.name.endswith(".th"):
+            if shard.name.startswith("layouts_") and shard.name.endswith(".th") and shard.is_symlink(): raise ValueError("numeric shard symlink")
+            if not shard.is_file() or not shard.name.startswith("layouts_") or not shard.name.endswith(".th"):
                 continue
             try: lid = int(shard.name[8:-3])
             except ValueError: continue
@@ -613,7 +615,7 @@ def _read_verified_shard(root: Path, worker: int, layout: int) -> tuple[bytes, A
 def _validate_source_shard(source: Any) -> tuple[int, int]:
     if not isinstance(source, (tuple, list)) or len(source) != 7:
         raise ValueError("source schema")
-    if any(not isinstance(t, torch.Tensor) or t.dtype == torch.bool or not t.is_floating_point() or not bool(torch.isfinite(t).all()) for t in source):
+    if any(not isinstance(t, torch.Tensor) or t.device.type != "cpu" or t.requires_grad or t.dtype == torch.bool or not t.is_floating_point() or not bool(torch.isfinite(t).all()) for t in source):
         raise ValueError("source tensors")
     inp, b2b, p2b, pins, tree, fp, metrics = source
     if inp.ndim != 3 or inp.shape[2] != 6 or b2b.ndim != 3 or b2b.shape[2] != 3 or p2b.ndim != 3 or p2b.shape[2] != 3 or pins.ndim != 3 or pins.shape[2] != 2 or tree.ndim != 3 or tree.shape[2] != 3 or fp.ndim != 3 or fp.shape[2] != 4 or metrics.ndim != 2 or metrics.shape[1] != 8:
@@ -703,8 +705,10 @@ def _validate_outcome(value: Any) -> _CaseOutcome:
     if not all(isinstance(x, numbers.Real) and not isinstance(x, bool) and math.isfinite(float(x)) and float(x) > 0 for x in (value.base_cost, value.teacher_cost)) or value.teacher_cost > value.base_cost: raise ValueError("runtime costs")
     if set(value.label_row) != {"edges", "contacts", "pin_paths"} or any(k in value.label_row for k in _PROTECTED): raise ValueError("label schema")
     rows = list(value.proposal_rows); names = [r.get("name") for r in rows]; ords = [r.get("ordinal") for r in rows]
+    if any(not isinstance(n, str) or not n.strip() for n in names) or any(type(o) is not int or o < 0 for o in ords): raise ValueError("proposal identity")
     if len(names) != len(set(names)) or len(ords) != len(set(ords)) or any(k in r for r in rows for k in _PROTECTED): raise ValueError("proposal provenance")
     winners = [r for r in rows if r.get("winner") is True]
+    if len(winners) != 1: raise ValueError("runtime winner count")
     base = [r for r in winners if r.get("ordinal") == 0 and r.get("name") == "base" and r.get("status") == "winner" and r.get("feasible") is True]
     if len(base) != 1 or base[0].get("official_cost") != value.teacher_cost: raise ValueError("runtime winner")
     for row in [value.label_row, *rows, *value.rejection_rows]: _finite_json(row)
@@ -756,7 +760,8 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 legal = legal and outcome.legal; covered = covered and outcome.covered
                 rows.append({**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": "processed"})
         pop = _weighted_population(population) if population else {"denominator": 0.0, "B_H": 0.0, "T_H": 0.0, "Delta_H": 0.0, "population_sha256": hashlib.sha256(b"[]").hexdigest()}
-        coverage = {"eligible_train": len(train_c), "eligible_heldout": len(held_c), "heldout_winners": len(held_l), "legal": legal, "covered": covered and bool(processed)}
+        heldout_winners = sum(1 for label in held_l if label.get("proposal_name") == "base")
+        coverage = {"eligible_train": len(train_c), "eligible_heldout": len(held_c), "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_c) and bool(held_c) and heldout_winners == len(held_c)}
         state = _g0_state({**trust, "legal": legal, "coverage": coverage["covered"], "teacher_mean": pop["T_H"], "delta": pop["Delta_H"]})
         authorized = runtime.authorizing and state == "TARGET_GAIN_MET" and args.max_files is None
         if not processed: state = "KILLED_LEGALITY_OR_COVERAGE"; authorized = False
