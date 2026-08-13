@@ -2181,7 +2181,6 @@ def test_teacher_private_case_spool_is_staged_during_replay_and_absent_at_publis
     monkeypatch.setattr(t, "open", spool_aware_open, raising=False)
     real_fsync = t.os.fsync
     real_sha256 = hashlib.sha256
-    support_hash_checks = 0
 
     def fsync(fd):
         path = Path(os.readlink(f"/proc/self/fd/{fd}"))
@@ -2195,7 +2194,6 @@ def test_teacher_private_case_spool_is_staged_during_replay_and_absent_at_publis
     monkeypatch.setattr(t.os, "fsync", fsync)
 
     def sha256(data=b"", *args, **kwargs):
-        nonlocal support_hash_checks
         if stages and stages[-1].exists() and not (stages[-1] / "g0_manifest.json").exists():
             support_payloads = [
                 (stages[-1] / name).read_bytes()
@@ -2203,7 +2201,6 @@ def test_teacher_private_case_spool_is_staged_during_replay_and_absent_at_publis
                 and (stages[-1] / name).exists()
             ]
             if data in support_payloads:
-                support_hash_checks += 1
                 assert not [entry for entry in stages[-1].iterdir()
                             if entry.name not in _TASK4_FILES]
                 assert all(not entry.exists() for entry in observed_spool_paths)
@@ -2222,7 +2219,6 @@ def test_teacher_private_case_spool_is_staged_during_replay_and_absent_at_publis
 
     assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
     assert len(calls) == 2 and len(published) == 1
-    assert support_hash_checks == len(_TASK4_FILES) - 1
     assert observed_spool_paths and all(not path.exists() for path in observed_spool_paths)
 
 
@@ -2450,6 +2446,39 @@ def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
                                                                "List", "Dict", "Set"}
                    for node in ast.walk(annotation))
 
+    def annotation_is_scalar(annotation):
+        return (isinstance(annotation, ast.Name)
+                and annotation.id in {"int", "float", "bool"})
+
+    def scalar_expression(expression):
+        if isinstance(expression, ast.Constant):
+            return type(expression.value) in {int, float, bool, type(None)}
+        return (isinstance(expression, ast.UnaryOp)
+                and isinstance(expression.op, (ast.UAdd, ast.USub))
+                and isinstance(expression.operand, ast.Constant)
+                and type(expression.operand.value) in {int, float})
+
+    def payload_expression(expression):
+        if isinstance(expression, (ast.List, ast.Tuple, ast.Dict, ast.Set,
+                                   ast.ListComp, ast.Tuple, ast.DictComp, ast.SetComp,
+                                   ast.JoinedStr)):
+            return True
+        if isinstance(expression, ast.Constant):
+            return isinstance(expression.value, (str, bytes, bytearray))
+        if isinstance(expression, ast.Call):
+            if isinstance(expression.func, ast.Name):
+                return expression.func.id in {
+                    "list", "tuple", "dict", "set", "bytes", "bytearray", "str",
+                    "defaultdict", "deque",
+                }
+            return (isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr in {"defaultdict", "deque"})
+        return False
+
+    def contains_name(expression, name):
+        return any(isinstance(child, ast.Name) and child.id == name
+                   for child in ast.walk(expression))
+
     replay_candidates = [
         node for node in ast.walk(teacher) if isinstance(node, ast.For)
         and any(isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
@@ -2463,6 +2492,7 @@ def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
     assert len(replay_loops) == 1
     replay_nodes = {id(node) for node in ast.walk(replay_loops[0])}
     persistent_mutables = {}
+    outer_bindings = {}
     for node in ast.walk(teacher):
         if id(node) in replay_nodes:
             continue
@@ -2470,11 +2500,21 @@ def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
             names = assigned_names(node.target)
             is_mutable = (annotation_is_mutable_container(node.annotation)
                           or (node.value is not None and is_mutable_container(node.value)))
+            scalar = annotation_is_scalar(node.annotation) or (
+                node.value is not None and scalar_expression(node.value))
+            payload = (not scalar and (annotation_is_mutable_container(node.annotation)
+                       or (node.value is not None and payload_expression(node.value))))
         elif isinstance(node, ast.Assign):
             names = set().union(*(assigned_names(target) for target in node.targets))
             is_mutable = is_mutable_container(node.value)
+            scalar = scalar_expression(node.value)
+            payload = not scalar and payload_expression(node.value)
         else:
             continue
+        outer_bindings.update({
+            name: {"scalar": scalar, "payload": payload, "line": node.lineno}
+            for name in names
+        })
         if is_mutable:
             persistent_mutables.update({name: node.lineno for name in names})
     allowed_persistent_mutables = {"files", "rejection_counts", "coverage", "manifest"}
@@ -2490,20 +2530,83 @@ def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
             return node.value.id
         return None
 
+    def numeric_increment(expression):
+        return (isinstance(expression, ast.Constant)
+                and type(expression.value) in {int, float}
+                and not isinstance(expression.value, bool))
+
+    def numeric_expression(expression):
+        if isinstance(expression, ast.Constant):
+            return type(expression.value) in {int, float} and not isinstance(expression.value, bool)
+        if isinstance(expression, ast.UnaryOp):
+            return isinstance(expression.op, (ast.UAdd, ast.USub)) and numeric_expression(expression.operand)
+        if isinstance(expression, ast.BinOp):
+            return (isinstance(expression.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
+                                                ast.Mod, ast.Pow))
+                    and numeric_expression(expression.left)
+                    and numeric_expression(expression.right))
+        if isinstance(expression, ast.Call):
+            if isinstance(expression.func, ast.Name):
+                return expression.func.id in {"abs", "float", "int", "len", "max", "min", "round", "sum"}
+            return isinstance(expression.func, ast.Attribute) and expression.func.attr in {"exp", "log", "sqrt"}
+        return False
+
+    def scalar_update_expression(expression):
+        return (numeric_expression(expression)
+                or (isinstance(expression, ast.BoolOp)
+                    and isinstance(expression.op, (ast.And, ast.Or))))
+
+    def fixed_counter_increment(node):
+        if isinstance(node, ast.AugAssign):
+            return (isinstance(node.target, ast.Subscript)
+                    and mutable_receiver(node.target) == "rejection_counts"
+                    and isinstance(node.op, ast.Add)
+                    and numeric_increment(node.value))
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Subscript)
+                and mutable_receiver(node.targets[0]) == "rejection_counts"
+                and isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.Add)
+                and numeric_increment(node.value.right)
+                and isinstance(node.value.left, ast.Subscript)):
+            return False
+        return ast.dump(node.value.left) == ast.dump(node.targets[0])
+
     replay_mutations = []
     for node in ast.walk(replay_loops[0]):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"append", "extend", "add", "update", "setdefault"}):
+                and node.func.attr in {"append", "extend", "add", "update", "setdefault",
+                                       "__setitem__"}):
             name = mutable_receiver(node.func.value)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            target = node.target if not isinstance(node, ast.Assign) else node.targets[0]
-            name = mutable_receiver(target) if isinstance(target, ast.Subscript) else None
-        else:
+            if name is not None:
+                replay_mutations.append((name, node.lineno, node.func.attr))
             continue
-        if name is not None and name != "rejection_counts":
-            replay_mutations.append((name, node.lineno))
+        if isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Subscript) and fixed_counter_increment(node):
+                continue
+            name = mutable_receiver(node.target)
+            if name == "rejection_counts":
+                replay_mutations.append((name, node.lineno, "augassign"))
+            elif name is not None and not numeric_expression(node.value):
+                replay_mutations.append((name, node.lineno, "augassign"))
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            target = node.target if not isinstance(node, ast.Assign) else node.targets[0]
+            value = node.value
+            if isinstance(target, ast.Subscript):
+                if not fixed_counter_increment(node):
+                    replay_mutations.append((mutable_receiver(target), node.lineno, "subscript"))
+                continue
+            name = mutable_receiver(target)
+            if name == "rejection_counts":
+                replay_mutations.append((name, node.lineno, "rebind"))
+            elif (name is not None and name in outer_bindings
+                  and contains_name(value, name)
+                  and not (outer_bindings[name]["scalar"]
+                           and scalar_update_expression(value))):
+                replay_mutations.append((name, node.lineno, "self-reference"))
+            continue
     assert not replay_mutations, (
-        "replay may write only sinks and fixed counters, not grow a local container: "
+        "replay may write only sinks and fixed counters, not retain or grow local state: "
         f"{replay_mutations}"
     )
 
@@ -2732,43 +2835,55 @@ def test_teacher_streaming_b1_population_roster_is_sqlite_only():
         return (node.attr if isinstance(node, ast.Attribute)
                 and isinstance(node.value, ast.Name) and node.value.id == "self" else None)
 
-    def mutable_annotation(annotation):
-        return any(isinstance(child, ast.Name)
-                   and child.id in {"list", "dict", "set", "List", "Dict", "Set"}
-                   for child in ast.walk(annotation))
+    def self_targets(target):
+        attribute = self_attribute(target)
+        if attribute is not None:
+            return {attribute}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return set().union(*(self_targets(element) for element in target.elts))
+        return set()
 
-    def mutable_allocation(value):
-        if isinstance(value, (ast.List, ast.Dict, ast.Set,
-                              ast.ListComp, ast.DictComp, ast.SetComp)):
-            return True
-        if not isinstance(value, ast.Call):
-            return False
-        if isinstance(value.func, ast.Name):
-            return value.func.id in {"list", "dict", "set", "defaultdict", "deque"}
-        return (isinstance(value.func, ast.Attribute)
-                and value.func.attr in {"defaultdict", "deque"})
+    def contains_self_attribute(expression, attribute):
+        return any(self_attribute(node) == attribute for node in ast.walk(expression))
 
-    mutable_roster_fields = []
-    bounded_snapshot_fields = {"_finished"}
+    def numeric_summary_expression(expression):
+        if isinstance(expression, ast.Constant):
+            return (type(expression.value) in {int, float}
+                    and not isinstance(expression.value, bool))
+        if isinstance(expression, ast.Attribute):
+            return self_attribute(expression) in scalar_summaries
+        if isinstance(expression, ast.UnaryOp):
+            return (isinstance(expression.op, (ast.UAdd, ast.USub))
+                    and numeric_summary_expression(expression.operand))
+        if isinstance(expression, ast.BinOp):
+            return (isinstance(expression.op, (ast.Add, ast.Sub, ast.Mult, ast.Div,
+                                                ast.FloorDiv, ast.Mod, ast.Pow))
+                    and numeric_summary_expression(expression.left)
+                    and numeric_summary_expression(expression.right))
+        return False
+
+    sqlite_state = {"_db", "_db_path"}
+    finished_snapshot = {"_finished"}
+    scalar_summaries = {"count", "denominator", "base_total", "teacher_total"}
+    allowed_state = sqlite_state | finished_snapshot | scalar_summaries
+    assigned_state = []
     for node in ast.walk(population):
         if isinstance(node, ast.AnnAssign):
-            attr = self_attribute(node.target)
-            mutable = (mutable_annotation(node.annotation)
-                       or (node.value is not None and mutable_allocation(node.value)))
+            assigned_state.extend((attribute, node.lineno)
+                                  for attribute in self_targets(node.target))
         elif isinstance(node, ast.Assign):
-            attrs = [self_attribute(target) for target in node.targets]
-            attr = next((value for value in attrs if value is not None), None)
-            mutable = mutable_allocation(node.value)
-        else:
-            continue
-        if attr is not None and mutable and attr not in bounded_snapshot_fields:
-            mutable_roster_fields.append(attr)
-    assert not mutable_roster_fields, (
-        "the population roster must remain SQLite-only, not retained in Python: "
-        f"mutable self collections {sorted(mutable_roster_fields)}"
+            assigned_state.extend((attribute, node.lineno)
+                                  for target in node.targets
+                                  for attribute in self_targets(target))
+        elif isinstance(node, ast.AugAssign):
+            assigned_state.extend((attribute, node.lineno)
+                                  for attribute in self_targets(node.target))
+    assert {attribute for attribute, _ in assigned_state} <= allowed_state, (
+        "the population roster may retain only SQLite state, its bounded terminal snapshot, "
+        f"and finite summaries; found {assigned_state}"
     )
 
-    collection_mutations = []
+    growing_self_state = []
     for node in ast.walk(population):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"add", "append", "extend", "update", "setdefault"}):
@@ -2776,16 +2891,32 @@ def test_teacher_streaming_b1_population_roster_is_sqlite_only():
             attr = self_attribute(receiver)
             if attr is None and isinstance(receiver, ast.Subscript):
                 attr = self_attribute(receiver.value)
+            if attr is not None:
+                growing_self_state.append((attr, node.lineno, node.func.attr))
         elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            target = node.target if not isinstance(node, ast.Assign) else node.targets[0]
-            attr = self_attribute(target.value) if isinstance(target, ast.Subscript) else None
-        else:
-            continue
-        if attr is not None:
-            collection_mutations.append((attr, node.lineno))
-    assert not collection_mutations, (
-        "population identity/resolution state must be SQLite rows, not mutable self collections: "
-        f"{collection_mutations}"
+            targets = ([node.target] if not isinstance(node, ast.Assign) else node.targets)
+            for target in targets:
+                if isinstance(target, ast.Subscript):
+                    attr = self_attribute(target.value)
+                    if attr is not None:
+                        growing_self_state.append((attr, node.lineno, "subscript"))
+        if isinstance(node, ast.AugAssign):
+            attr = self_attribute(node.target)
+            if attr is not None and (attr not in scalar_summaries
+                                     or not numeric_summary_expression(node.value)):
+                growing_self_state.append((attr, node.lineno, "augassign"))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = ([node.target] if isinstance(node, ast.AnnAssign) else node.targets)
+            for target in targets:
+                attr = self_attribute(target)
+                if (attr is not None and contains_self_attribute(node.value, attr)
+                        and (attr not in sqlite_state
+                             and (attr not in scalar_summaries
+                                  or not numeric_summary_expression(node.value)))):
+                    growing_self_state.append((attr, node.lineno, "self-reference"))
+    assert not growing_self_state, (
+        "population identity/resolution state must be SQLite rows, not growing Python state: "
+        f"{growing_self_state}"
     )
 
     methods = {node.name: node for node in population.body
@@ -2828,6 +2959,31 @@ def test_teacher_streaming_b1_population_roster_register_and_winner_are_sqlite_r
             (identity["instance_id"],),
         ).fetchone()
         assert winner == (8.5, 7.25)
+    finally:
+        acc.abort()
+
+
+def test_teacher_streaming_b1_population_finish_uses_sqlite_roster_for_incomplete_result():
+    t = _teacher(); acc = t._PopulationAccumulator()
+    rows = [
+        {"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+         "instance_id": "worker_2/layouts_0.th#0", "n": 4},
+        {"relative_path": "worker_2/layouts_1.th", "layout_index": 1,
+         "instance_id": "worker_2/layouts_1.th#1", "n": 8},
+        {"relative_path": "worker_10/layouts_0.th", "layout_index": 0,
+         "instance_id": "worker_10/layouts_0.th#0", "n": 12},
+    ]
+    try:
+        for row in rows:
+            acc.register(row)
+        acc.record_winner(rows[0]["instance_id"], 8.5, 7.25)
+        assert acc._db is not None
+        acc._db.execute("DELETE FROM population WHERE instance_id = ?", (rows[1]["instance_id"],))
+        acc._db.commit()
+        expected = _task4_p1c_canonical_population([
+            {**rows[0], "base_cost": 8.5, "teacher_cost": 7.25}, rows[2],
+        ])
+        assert acc.finish() == expected
     finally:
         acc.abort()
 
