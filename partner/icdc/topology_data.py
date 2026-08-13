@@ -109,43 +109,166 @@ class VerifiedTrainingFpRow:
 def validate_raw_source(source: Sequence[torch.Tensor]) -> tuple[int, int]:
     if not isinstance(source, (list, tuple)) or len(source) != 7:
         raise ValueError("source schema")
-    expected = ((3, 6), (3, 3), (3, 3), (3, 2), (3, 3), (3, 4), (2, 8))
+    expected = (
+        (3, 6),
+        (3, 3),
+        (3, 3),
+        (3, 2),
+        (3, 3),
+        (3, 4),
+        (2, 8),
+    )
     for tensor, (rank, width) in zip(source, expected):
-        if (not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu"
-                or tensor.requires_grad or not tensor.is_floating_point()
-                or tensor.ndim != rank or tensor.shape[-1] != width
-                or not bool(torch.isfinite(tensor).all())):
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device.type != "cpu"
+            or tensor.requires_grad
+            or tensor.layout != torch.strided
+            or not tensor.is_floating_point()
+            or tensor.ndim != rank
+            or tensor.shape[-1] != width
+            or not bool(torch.isfinite(tensor).all())
+        ):
             raise ValueError("source tensors")
     batch, n = int(source[0].shape[0]), int(source[0].shape[1])
-    if batch < 1 or n < 1 or int(source[4].shape[1]) != n - 1:
+    if (
+        batch < 1
+        or n < 1
+        or int(source[4].shape[1]) != n - 1
+        or int(source[5].shape[1]) != n
+    ):
         raise ValueError("source shape")
     if any(int(t.shape[0]) != batch for t in source[1:]):
         raise ValueError("source batch")
-    if int(source[5].shape[1]) != n:
-        raise ValueError("source fp shape")
+    inp, b2b, p2b, pins, _tree_sol, fp_sol, _metrics_sol = source
+    for batch_index in range(batch):
+        actual_n = 0
+        seen_padding = False
+        for row in inp[batch_index]:
+            is_padding = float(row[0]) == -1.0
+            if is_padding:
+                seen_padding = True
+                continue
+            if seen_padding or float(row[0]) <= 0:
+                raise ValueError("area padding")
+            if any(float(value) != int(float(value)) for value in row[1:]):
+                raise ValueError("constraint")
+            actual_n += 1
+        if actual_n < 1:
+            raise ValueError("area padding")
+
+        relation_counts: dict[str, int] = {}
+        for name, tensor, width in (
+            ("b2b", b2b, 3),
+            ("p2b", p2b, 3),
+            ("pins", pins, 2),
+        ):
+            count = 0
+            seen_padding = False
+            for row in tensor[batch_index]:
+                values = [float(item) for item in row]
+                is_padding = all(value == -1.0 for value in values)
+                if any(value == -1.0 for value in values) and not is_padding:
+                    raise ValueError("partial padding")
+                if is_padding:
+                    seen_padding = True
+                    continue
+                if seen_padding:
+                    raise ValueError("noncontiguous padding")
+                if width == 3:
+                    if values[0] != int(values[0]) or values[1] != int(values[1]):
+                        raise ValueError("edge endpoint")
+                    if values[2] < 0:
+                        raise ValueError(f"{name} weight")
+                count += 1
+            relation_counts[name] = count
+        for row in b2b[batch_index, : relation_counts["b2b"]]:
+            first, second = int(row[0]), int(row[1])
+            if not (0 <= first < actual_n and 0 <= second < actual_n):
+                raise ValueError("b2b endpoint")
+        for row in p2b[batch_index, : relation_counts["p2b"]]:
+            pin_index, block_index = int(row[0]), int(row[1])
+            if not (
+                0 <= pin_index < relation_counts["pins"]
+                and 0 <= block_index < actual_n
+            ):
+                raise ValueError("p2b endpoint")
+        if not bool((fp_sol[batch_index, :actual_n, :2] > 0).all()):
+            raise ValueError("fp dimensions")
     return batch, n
 
 
 def verified_training_fp_row(
     source: Sequence[torch.Tensor], receipt: CorpusSourceReceipt
 ) -> VerifiedTrainingFpRow:
-    _, n = validate_raw_source(source)
+    validate_raw_source(source)
     if type(receipt) is not CorpusSourceReceipt:
         raise ValueError("receipt type")
     if receipt.layout_index < 0 or receipt.layout_index >= int(source[0].shape[0]):
         raise ValueError("receipt index")
-    from .data import BandFileSampler
-    try:
-        raw_case = BandFileSampler._instance(source, receipt.layout_index)
-        case = _sanitize(dict(raw_case))
-    except Exception as exc:
-        raise ValueError("source case") from exc
+    _validate_digest(receipt.file_sha256, "source digest")
+    _validate_digest(receipt.fingerprint, "source fingerprint")
     instance_id = source_instance_id(receipt)
-    case["instance_id"] = instance_id
-    case = _sanitize(case)
-    raw = source[5][receipt.layout_index, :n].to(dtype=torch.float64, device="cpu")
-    fp_xywh = torch.stack((raw[:, 2], raw[:, 3], raw[:, 0], raw[:, 1]), dim=1).contiguous()
-    return VerifiedTrainingFpRow(receipt, instance_id, fingerprint_case(case), case, fp_xywh)
+    inp, b2b, p2b, pins, _tree_sol, fp_sol, metrics_sol = source
+    row = inp[receipt.layout_index]
+    n = next(
+        (index for index, item in enumerate(row) if float(item[0]) == -1.0),
+        int(row.shape[0]),
+    )
+
+    def trimmed(tensor: torch.Tensor, width: int) -> list[list[float]]:
+        result: list[list[float]] = []
+        for item in tensor[receipt.layout_index]:
+            values = [float(value) for value in item]
+            if all(value == -1.0 for value in values):
+                break
+            if len(values) != width:
+                raise ValueError("source relation")
+            result.append(values)
+        return result
+
+    input_rows = row[:n]
+    area = [float(item[0]) for item in input_rows]
+    cons = [[int(float(value)) for value in item[1:]] for item in input_rows]
+    raw_fp = fp_sol[receipt.layout_index, :n].to(
+        dtype=torch.float64, device="cpu"
+    ).contiguous()
+    fp_xywh = torch.stack(
+        (raw_fp[:, 2], raw_fp[:, 3], raw_fp[:, 0], raw_fp[:, 1]), dim=1
+    ).contiguous()
+    tp: list[list[float]] = []
+    for rect, flags in zip(fp_xywh.tolist(), cons):
+        fixed, preplaced = bool(flags[0]), bool(flags[1])
+        tp.append(
+            [
+                rect[0] if preplaced else -1.0,
+                rect[1] if preplaced else -1.0,
+                rect[2] if fixed or preplaced else -1.0,
+                rect[3] if fixed or preplaced else -1.0,
+            ]
+        )
+    metrics = metrics_sol[receipt.layout_index]
+    case = _sanitize(
+        {
+            "instance_id": instance_id,
+            "n": n,
+            "area": area,
+            "cons": cons,
+            "tp": tp,
+            "b2b": trimmed(b2b, 3),
+            "p2b": trimmed(p2b, 3),
+            "pins": trimmed(pins, 2),
+            "hpwl_ref": float(metrics[6] + metrics[7]),
+            "area_ref": float(metrics[0]),
+        }
+    )
+    return VerifiedTrainingFpRow(
+        receipt=receipt,
+        instance_id=instance_id,
+        input_fingerprint=fingerprint_case(case),
+        case=case,
+        fp_xywh=fp_xywh,
+    )
 
 
 def _path(value: str | Path) -> Path:

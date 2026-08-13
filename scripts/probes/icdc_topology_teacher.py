@@ -61,7 +61,14 @@ import icdc.engine as _ENGINE
 import icdc.energy as _ENERGY
 from icdc.energy import decode_rects
 from icdc.topology_prior import ProposalConfig, generate_proposals, pin_feasible_then_exact_tfdl, extract_sparse_label, _proposal_fingerprint
-from icdc.topology_data import CorpusSourceReceipt, fingerprint_case, split_for_id
+from icdc.qa_contract import preflight_qa_contract, qa_manifest_fields
+from icdc.topology_data import (
+    CorpusSourceReceipt,
+    fingerprint_case,
+    split_for_id,
+    validate_raw_source,
+    verified_training_fp_row,
+)
 from icdc.topology_data import _sanitize as _sanitize_case
 
 from icdc.checkpoint_identity import (  # noqa: E402
@@ -518,6 +525,9 @@ _MODEL_IDENTITY = MappingProxyType({
     "ema_keyset_sha256": "79a51975d9b9f583143259198d244554c8a4e97122fc5e5cf150ec64f4429ba7",
     "ema_state_sha256": "92838740993a697a56f3afdfba4402eb83c8dc095fe43462f8bdaffdb4ef5ecb",
 })
+_G0_SEED = 20260813
+_G0_HELDOUT_MOD = 10
+_G0_N_MIN = 100
 
 
 @dataclass(frozen=True)
@@ -1690,6 +1700,7 @@ def _validate_source_shard(source: Any) -> tuple[int, int]:
     if b < 1 or n < 1 or any(t.shape[0] != b for t in source[1:]):
         raise ValueError("source batch")
     if tree.shape[1] != n - 1: raise ValueError("source tree")
+    public_shape = validate_raw_source(source)
     for tensor in source:
         if not bool(torch.isfinite(tensor).all()):
             raise ValueError("source tensors")
@@ -1718,7 +1729,10 @@ def _validate_source_shard(source: Any) -> tuple[int, int]:
                     if float(row[2]) < 0: raise ValueError(f"{kind} weight")
                 elif any(not math.isfinite(float(x)) for x in row):
                     raise ValueError("pin value")
-    return int(b), int(n)
+    result = (int(b), int(n))
+    if result != public_shape:
+        raise ValueError("source schema disagreement")
+    return result
 
 def _trim_rows(tensor: torch.Tensor, width: int, index: int) -> list[list[float]]:
     out = []
@@ -2172,7 +2186,17 @@ def _source_case(source: Sequence[torch.Tensor], index: int, instance_id: str) -
             "area_ref": float(metric[0])}
 
 def _source_case_from_shard(source: Sequence[torch.Tensor], index: int, instance_id: str) -> dict[str, Any]:
-    return _sanitize_case(_source_case(source, index, instance_id))
+    marker = "#"
+    if marker not in instance_id:
+        raise ValueError("source instance")
+    relative_path, encoded_index = instance_id.rsplit(marker, 1)
+    if encoded_index != str(index):
+        raise ValueError("source instance")
+    receipt = CorpusSourceReceipt(relative_path, "0" * 64, index, "0" * 64)
+    row = verified_training_fp_row(source, receipt)
+    if row.instance_id != instance_id:
+        raise ValueError("source instance")
+    return dict(row.case)
 
 _TRUST_FIELDS = ("trust_ok", "input_ok", "scorer_ok", "checkpoint_sha256", "model_identity", "scorer_sha256", "scorer_contract", "shapely_version")
 _PROTECTED = {"receipt", "instance_id", "partition", "sample_seed", "n", "base_cost", "teacher_cost", "record_weight"}
@@ -2341,15 +2365,17 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--index-out", required=True)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--seed", type=int, default=20260813)
-    parser.add_argument("--heldout-mod", type=_positive_int, default=10)
-    parser.add_argument("--n-min", type=_nonnegative_int, default=100)
+    parser.add_argument("--seed", type=int, default=_G0_SEED)
+    parser.add_argument("--heldout-mod", type=_positive_int, default=_G0_HELDOUT_MOD)
+    parser.add_argument("--n-min", type=_nonnegative_int, default=_G0_N_MIN)
     parser.add_argument("--max-files", type=_positive_int, default=None)
     args = parser.parse_args(argv)
+    production_invocation = _trust_policy is None
     policy = _trust_policy if _trust_policy is not None else _production_trust_policy()
     _validate_data_root(args.data_root, policy)
     _validate_outputs(args.out_dir, args.index_out)
     root, destination = Path(args.data_root).resolve(), Path(args.out_dir)
+    qa_evidence = preflight_qa_contract(_REPO)
     runtime = _runtime_hooks()
     trust = _validate_preflight(runtime.preflight(policy, Path(args.checkpoint)), policy)
     staging: Optional[Path] = None
@@ -2492,10 +2518,39 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                     "eligible_heldout_weight": eligible_heldout_weight, "positive_gain_heldout_weight": positive_gain_heldout_weight,
                     "rejection_counts": rejection_counts}
         state = _g0_state({**trust, "legal": legal, "coverage": coverage["covered"], "teacher_mean": pop["T_H"], "delta": pop["Delta_H"]})
-        authorized = runtime.authorizing and state == "TARGET_GAIN_MET" and args.max_files is None
+        production_contract_match = (
+            args.seed == _G0_SEED
+            and args.heldout_mod == _G0_HELDOUT_MOD
+            and args.n_min == _G0_N_MIN
+            and args.max_files is None
+        )
+        authorized = (
+            runtime.authorizing
+            and state == "TARGET_GAIN_MET"
+            and args.max_files is None
+            and (not production_invocation or production_contract_match)
+        )
         if not processed: state = "KILLED_LEGALITY_OR_COVERAGE"; authorized = False
         secondary_reasons = ["base_unavailable"] if rejection_counts["base_unavailable"] else []
-        manifest = {"schema":"icdc_topology_teacher_g0_v1","status":"complete","state":state,"secondary_reasons":secondary_reasons,"training_authorized":authorized,"bounded_max_files":args.max_files is not None,"trust":trust,"population":pop,"coverage":coverage}
+        manifest = {
+            "schema": "icdc_topology_teacher_g0_v1",
+            "status": "complete",
+            "state": state,
+            "secondary_reasons": secondary_reasons,
+            "training_authorized": authorized,
+            "bounded_max_files": args.max_files is not None,
+            "g0_contract": {
+                "seed": _G0_SEED,
+                "heldout_mod": _G0_HELDOUT_MOD,
+                "n_min": _G0_N_MIN,
+                "production_invocation": production_invocation,
+                "production_contract_match": production_contract_match,
+            },
+            "qa": qa_manifest_fields(qa_evidence),
+            "trust": trust,
+            "population": pop,
+            "coverage": coverage,
+        }
         writer.close()
         def _fsync_dir() -> None:
             fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY)

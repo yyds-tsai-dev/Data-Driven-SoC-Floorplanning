@@ -2137,14 +2137,30 @@ def _task4_assert_success_artifacts(t, root, out, calls, policy,
     ])
     manifest = json.loads((out / "g0_manifest.json").read_text())
     assert set(manifest) == {"schema", "status", "state", "secondary_reasons",
-                             "training_authorized", "bounded_max_files", "trust",
-                             "population", "coverage", "support_hashes", "self_sha256"}
+                             "training_authorized", "bounded_max_files", "g0_contract",
+                             "qa", "trust", "population", "coverage",
+                             "support_hashes", "self_sha256"}
     assert manifest["schema"] == "icdc_topology_teacher_g0_v1"
     assert manifest["status"] == "complete"
     assert manifest["state"] == state
     assert manifest["secondary_reasons"] == []
     assert manifest["training_authorized"] is training_authorized
     assert manifest["bounded_max_files"] is bounded
+    assert manifest["g0_contract"] == {
+        "seed": 20260813,
+        "heldout_mod": 10,
+        "n_min": 100,
+        "production_invocation": False,
+        "production_contract_match": False,
+    }
+    assert manifest["qa"] == {
+        "qa_relative_path": "docs/official/C_QA_20260804.pdf",
+        "qa_sha256": "60286cf3eb05ff41732d83fc681506b001e283141223d69bbbb9c27c9f25c5db",
+        "scorer_relative_path": "scripts/iccad2026_evaluate.py",
+        "scorer_sha256": "7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1",
+        "scorer_contract": "iccad2026_evaluate_cost_no_runtime_v1",
+        "shapely_version": "2.0.5",
+    }
     assert manifest["trust"] == _task4_expected_trust(policy)
     assert manifest["population"] == expected_population
     assert manifest["coverage"] == _task4_p1c_coverage(calls, expected_outcomes)
@@ -4622,13 +4638,24 @@ def test_teacher_excluded_rows_publish_empty_non_authorizing_terminal_evidence(t
     assert all((out / name).read_bytes() == b"" for name in _TASK4_JSONL)
     manifest = json.loads((out / "g0_manifest.json").read_text())
     assert set(manifest) == {"schema", "status", "state", "secondary_reasons",
-                             "training_authorized", "bounded_max_files", "trust",
-                             "population", "coverage", "support_hashes", "self_sha256"}
+                             "training_authorized", "bounded_max_files", "g0_contract",
+                             "qa", "trust", "population", "coverage",
+                             "support_hashes", "self_sha256"}
     assert manifest["status"] == "complete"
     assert manifest["state"] == "KILLED_LEGALITY_OR_COVERAGE"
     assert manifest["secondary_reasons"] == []
     assert manifest["training_authorized"] is False
     assert manifest["bounded_max_files"] is False
+    assert manifest["g0_contract"] == {
+        "seed": 20260813,
+        "heldout_mod": 10,
+        "n_min": 100,
+        "production_invocation": False,
+        "production_contract_match": False,
+    }
+    assert manifest["qa"]["qa_sha256"] == (
+        "60286cf3eb05ff41732d83fc681506b001e283141223d69bbbb9c27c9f25c5db"
+    )
     assert manifest["trust"] == _task4_expected_trust(policy)
     assert manifest["population"] == _task4_p1c_canonical_population([])
     assert manifest["coverage"]["eligible_train"] == 0
