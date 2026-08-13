@@ -505,7 +505,7 @@ def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["nonmapping", "missing_model", "model_nonmapping", "model_empty",
     "missing_ema", "ema_nonmapping", "ema_empty", "key_mismatch", "extra_ema", "shape",
-    "nontensor", "inf", "zdim", "zrepr", "unknown"])
+    "nontensor", "inf", "zdim", "zrepr", "unknown", "model_shape", "model_dtype"])
 def test_task4_materializer_rejects_malformed_payload(kind):
     bad = _task4_teacher_payload()
     if kind == "nonmapping": bad = []
@@ -518,12 +518,16 @@ def test_task4_materializer_rejects_malformed_payload(kind):
     elif kind == "key_mismatch": bad["ema"].pop(next(iter(bad["ema"])))
     elif kind == "extra_ema": bad["ema"]["extra"] = torch.ones(1)
     elif kind == "shape":
-        k = next(iter(bad["ema"])); bad["ema"][k] = bad["ema"][k].flatten()
+        k = next(iter(bad["ema"])); v = bad["ema"][k]; bad["ema"][k] = torch.cat((v.reshape(-1), v.new_zeros(1)))
     elif kind == "nontensor": bad["ema"][next(iter(bad["ema"]))] = 1
     elif kind == "inf": bad["ema"][next(iter(bad["ema"]))].fill_(float("inf"))
     elif kind == "zdim": bad["model_config"]["z_dim"] = 3
     elif kind == "zrepr": bad["model_config"]["z_repr"] = "bad"
     elif kind == "unknown": bad["model_config"]["unknown"] = 1
+    elif kind == "model_shape":
+        k = next(iter(bad["model"])); v = bad["model"][k]; bad["model"][k] = torch.cat((v.reshape(-1), v.new_zeros(1)))
+    elif kind == "model_dtype":
+        k = next(k for k, v in bad["model"].items() if v.is_floating_point()); bad["model"][k] = bad["model"][k].double()
     with pytest.raises(ValueError):
         _teacher()._materialize_teacher_model(bad, torch.device("cpu"))
 
@@ -531,14 +535,16 @@ def test_task4_materializer_rejects_malformed_payload(kind):
 def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
     t = _teacher(); case = _task4_case_input(t).case
     if hasattr(t, "_sanitize_case"):
-        t._sanitize_case(case, artifact=True)
+        case = t._sanitize_case(case, artifact=True)
     direct, diagnostic = t._build_teacher_batches(case, torch.device("cpu"))
     for key in ("area", "tp", "b2b", "p2b", "pins", "scale"):
         assert direct[key].dtype == torch.float32 and direct[key].device.type == "cpu"
     assert direct["cons"].dtype == torch.int64 and direct["cons"].shape[0] == 1
     assert direct["b2b"].shape == (1, 1, 3) and direct["p2b"].shape == (1, 1, 3)
     assert direct["pins"].shape == (1, 1, 2)
-    assert diagnostic["area"].dtype == torch.float64 and diagnostic["cons"].dtype == torch.int64
+    for key in ("area", "tp", "b2b", "p2b", "pins", "scale"):
+        assert diagnostic[key].dtype == torch.float64 and diagnostic[key].device.type == "cpu"
+    assert diagnostic["cons"].dtype == torch.int64 and diagnostic["cons"].device.type == "cpu"
     assert diagnostic["scale"].item() == direct["scale"].double().item()
     assert diagnostic["hpwl_ref"].item() == 4.0 and diagnostic["area_ref"].item() == 4.0
     f64_scale = torch.sqrt(torch.tensor(case["area"], dtype=torch.float64).sum())
@@ -567,12 +573,14 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
         assert len(args) == 3 and args[0] is state.model and args[2] is state.schedule
         assert set(kwargs) == {"steps", "generator", "z_known", "known_mask"} and kwargs["steps"] == 2
         assert kwargs["z_known"].shape == (1, 3, 4) and kwargs["known_mask"].shape == (1, 3, 4)
-    for decoded in calls["decode"]:
-        assert all(x.dtype == torch.float64 and x.device.type == "cpu" for x in decoded)
+    for raw, area, cons, tp, scale in calls["decode"]:
+        assert raw.dtype == area.dtype == tp.dtype == scale.dtype == torch.float64
+        assert cons.dtype == torch.int64
+        assert all(x.device.type == "cpu" for x in (raw, area, cons, tp, scale))
 
 
-def test_task4_runtime_materializes_lazily_caches_and_never_reopens(monkeypatch):
-    t = _teacher(); root = Path("/tmp") / "task4-red-runtime"; root.mkdir(exist_ok=True)
+def test_task4_runtime_materializes_lazily_caches_and_never_reopens(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "trusted"; root.mkdir()
     payload = _task4_teacher_payload(); path = root / "unused.th"; torch.save(payload, path)
     identity = t._checkpoint_identity(payload)
     policy = t.TeacherTrustPolicy(root, hashlib.sha256(path.read_bytes()).hexdigest(), identity,
