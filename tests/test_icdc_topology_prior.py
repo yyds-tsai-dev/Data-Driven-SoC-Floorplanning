@@ -5106,14 +5106,18 @@ class _P1BScorer:
         return __import__("types").SimpleNamespace(is_feasible=result[0], cost_no_runtime=result[1])
 
 
-def _p1b_run(monkeypatch, *, scorer, admissions=None, hard=True, intent=True, energy=0.):
+def _p1b_run(monkeypatch, *, scorer, admissions=None, hard=True, intent=True, energy=0., energy_calls=None):
     t = _teacher(); raw = _p1b_raw(); original = raw.clone(); case = _p1b_case()
     monkeypatch.setattr(t, "_GENERATE_PROPOSALS", lambda rects, c, cfg: ((n, rects.clone()) for n in ("base", "axis:0:1:0:0")), raising=False)
     queue = iter(admissions if admissions is not None else [(_p1b_raw(), torch.zeros((2, 2), dtype=torch.float64))] * 2)
     monkeypatch.setattr(t, "_ADMIT_PROPOSAL", lambda proposal, c: next(queue), raising=False)
-    monkeypatch.setattr(t, "_VERIFY_HARD_LEGAL", lambda legal, c: {"legal": bool(hard), "evidence": "spy"}, raising=False)
+    monkeypatch.setattr(t, "_VERIFY_HARD_LEGAL", lambda legal, c: {"legal": hard}, raising=False)
     monkeypatch.setattr(t, "_proposal_intent_holds", lambda *a: bool(intent), raising=False)
-    monkeypatch.setattr(t, "_DIAGNOSTIC_ENERGY", lambda *a: energy, raising=False)
+    def energy_spy(*a):
+        if energy_calls is not None: energy_calls.append(a[0])
+        if isinstance(energy, BaseException): raise energy
+        return energy
+    monkeypatch.setattr(t, "_DIAGNOSTIC_ENERGY", energy_spy, raising=False)
     out = t._run_candidate_lifecycle(raw, case, scorer=scorer, cfg=topology_prior.ProposalConfig())
     assert torch.equal(raw, original) and raw.dtype == torch.float64
     return out, scorer
@@ -5144,18 +5148,30 @@ def test_task4_p1b_official_argument_adapter_exact(monkeypatch):
     solution, baseline, cons, b2b, p2b, pins, areas, tp, median = scorer.calls[0]
     assert set(solution) == {"positions", "runtime"} and solution["runtime"] == 1.0
     assert all(isinstance(v, float) and math.isfinite(v) for row in solution["positions"] for v in row)
-    assert baseline == {"hpwl": 13., "area": 2.} and cons.dtype == torch.int64 and tuple(cons.shape) == (2, 5)
-    assert b2b.dtype == p2b.dtype == pins.dtype == areas.dtype == torch.float64 and tp == _p1b_case()["tp"] and median == 1.0
+    assert baseline == {"hpwl_baseline": 13., "area_baseline": 2.}
+    assert cons.device.type == b2b.device.type == p2b.device.type == pins.device.type == areas.device.type == "cpu"
+    assert cons.dtype == torch.int64 and tuple(cons.shape) == (2, 5)
+    assert b2b.dtype == p2b.dtype == pins.dtype == areas.dtype == torch.float64
+    assert tuple(b2b.shape) == (1, 3) and b2b.tolist() == [[0., 1., 2.5]]
+    assert tuple(p2b.shape) == (1, 3) and tuple(pins.shape) == (1, 2) and tuple(areas.shape) == (2,)
+    assert tp == _p1b_case()["tp"] and median == 1.0
 
 
 def test_task4_p1b_official_cost_wins_over_energy(monkeypatch):
-    scorer = _P1BScorer((True, 3.), (True, 2.)); out, _ = _p1b_run(monkeypatch, scorer=scorer, energy=99.)
+    calls = []; scorer = _P1BScorer((True, 3.), (True, 2.)); out, _ = _p1b_run(monkeypatch, scorer=scorer, energy=99., energy_calls=calls)
     assert out.winner_ordinal == 1
+    assert len(calls) == 2
 
 
 def test_task4_p1b_tie_keeps_base_and_teacher_cost(monkeypatch):
     scorer = _P1BScorer((True, 2.), (True, 2.)); out, _ = _p1b_run(monkeypatch, scorer=scorer)
     assert out.winner_ordinal == 0 and out.base_cost == out.teacher_cost == 2.
+
+
+def test_task4_p1b_worse_mutation_is_not_selected(monkeypatch):
+    scorer = _P1BScorer((True, 2.), (True, 3.)); out, _ = _p1b_run(monkeypatch, scorer=scorer)
+    assert out.winner_ordinal == 0 and out.base_cost == out.teacher_cost == 2.
+    assert out.candidates[1].official_cost == 3. and out.candidates[1].rejection_reason == "not_selected"
 
 
 @pytest.mark.parametrize("result,reason", [(RuntimeError("x"), "official_evaluator_error"), ((False, 1.), "official_infeasible"), ((True, float("nan")), "official_invalid_cost"), ((True, 0.), "official_invalid_cost")])
@@ -5178,5 +5194,22 @@ def test_task4_p1b_base_unavailable_complete_accounting(monkeypatch):
 def test_task4_p1b_accounting_and_scope_guard():
     t = _teacher(); assert hasattr(t, "_run_candidate_lifecycle")
     assert _task4_static_forbidden(Path("scripts/probes/icdc_topology_teacher.py").read_text(), require_exact_loads=True)
-    names = {n.name for n in ast.walk(ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())) if isinstance(n, ast.FunctionDef)}
-    assert not {"extract_sparse_label", "_g0_state", "_weighted_population"}.intersection(names)
+    tree = ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())
+    local = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert "_run_candidate_lifecycle" in local
+    forbidden = {"extract_sparse_label", "_g0_state", "_weighted_population", "teacher_main", "_publish_staging", "write", "fsync"}
+    assert not forbidden.intersection(local)
+
+
+@pytest.mark.parametrize("stream", [[], [("mutation", _p1b_raw())], [("base", _p1b_raw()), ("base", _p1b_raw())], [("", _p1b_raw())], [(1, _p1b_raw())], [("base", [[0., 0.]])]])
+def test_task4_p1b_generator_invalid_streams_fail_closed(monkeypatch, stream):
+    t = _teacher(); assert hasattr(t, "_run_candidate_lifecycle")
+    monkeypatch.setattr(t, "_GENERATE_PROPOSALS", lambda *a: iter(stream), raising=False)
+    with pytest.raises((ValueError, TypeError, RuntimeError)):
+        t._run_candidate_lifecycle(_p1b_raw(), _p1b_case(), scorer=_P1BScorer(), cfg=topology_prior.ProposalConfig())
+
+
+@pytest.mark.parametrize("hard", [None, "true", 1, 0, object()])
+def test_task4_p1b_invalid_hard_evidence_rejects_without_scoring(monkeypatch, hard):
+    calls = []; scorer = _P1BScorer((True, 1.)); out, _ = _p1b_run(monkeypatch, scorer=scorer, hard=hard, energy_calls=calls)
+    assert out.candidates[0].rejection_reason == "hard_audit_failed" and not scorer.calls and not calls
