@@ -137,3 +137,10 @@ Continuation GREEN: trusted shard summaries are persisted in the lease-owned
 SQLite spool and joined during ordered replay; no Python summary sequence/map
 remains. `tests/test_icdc_topology_prior.py -q`: 786 passed, 14 warnings.
 Py_compile, CLI help, and `git diff --check` passed. No full100/package review.
+
+Task 4 cumulative source hardening complete: independent builder provenance,
+finite population aggregates, inode-safe SQLite cleanup, descriptor-bound
+staging cleanup, and foreign replacement preservation. Exact cumulative RED
+selection: 15 passed. `tests/test_icdc_topology_prior.py -q`: 801 passed, 14
+warnings. `uv run python -m py_compile scripts/probes/icdc_topology_teacher.py`,
+CLI `--help`, and `git diff --check` passed. No package/full100 run.

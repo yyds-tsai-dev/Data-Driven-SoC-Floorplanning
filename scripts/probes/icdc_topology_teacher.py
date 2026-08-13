@@ -1204,10 +1204,36 @@ def _path_matches_lease(path: Path, lease: _StagingLease) -> bool:
 
 
 def _cleanup_owned_staging(lease: _StagingLease) -> bool:
-    if not _path_matches_lease(lease.path, lease):
+    try:
+        fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) != (lease.st_dev, lease.st_ino):
+            os.close(fd); return False
+        _remove_owned_staging_contents_fd(fd)
+        os.close(fd)
+        if not _path_matches_lease(lease.path, lease):
+            return False
+        lease.path.rmdir()
+        return True
+    except OSError:
         return False
-    shutil.rmtree(lease.path)
-    return True
+
+def _remove_owned_staging_contents_fd(owned_fd: int) -> None:
+    for name in os.listdir(owned_fd):
+        st = os.stat(name, dir_fd=owned_fd, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=owned_fd)
+            try:
+                now = os.fstat(child)
+                if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                    continue
+                _remove_owned_staging_contents_fd(child)
+            finally:
+                os.close(child)
+            try: os.rmdir(name, dir_fd=owned_fd)
+            except FileNotFoundError: pass
+        else:
+            os.unlink(name, dir_fd=owned_fd)
 
 
 def _renameat2_noreplace(source: Path, destination: Path) -> None:
@@ -1381,6 +1407,8 @@ def _write_json_fsync(path: Path, value: Any) -> None:
 
 _TASK4_JSONL = ("train_corpus.jsonl", "heldout_corpus.jsonl", "train_labels.jsonl",
                 "heldout_labels.jsonl", "proposals.jsonl", "rejections.jsonl")
+_POP_OWNERS: dict[int, set[tuple[int, int]]] = {}
+_POP_SIDECARS: dict[int, dict[str, tuple[int, int]]] = {}
 
 
 class _JsonlWriter:
@@ -1444,6 +1472,7 @@ class _PopulationAccumulator:
         temp = tempfile.NamedTemporaryFile(prefix="floorset-population-", suffix=".sqlite", delete=False)
         self._db_path = Path(temp.name)
         temp.close()
+        _POP_OWNERS[id(self)] = {(os.stat(self._db_path).st_dev, os.stat(self._db_path).st_ino)}
         self._db: Optional[sqlite3.Connection] = None
         try:
             self._db = sqlite3.connect(str(self._db_path))
@@ -1458,6 +1487,7 @@ class _PopulationAccumulator:
                 "UNIQUE(relative_path, layout_index), UNIQUE(instance_id))"
             )
             self._db.commit()
+            self._capture_sidecars()
         except BaseException:
             self.abort()
             raise
@@ -1465,6 +1495,15 @@ class _PopulationAccumulator:
     def add(self, row: Mapping[str, Any]) -> None:
         self.register({k: row[k] for k in ("relative_path", "layout_index", "instance_id", "n")})
         self.record_winner(row["instance_id"], row["base_cost"], row["teacher_cost"])
+
+    def _capture_sidecars(self) -> None:
+        for suffix in ("-journal", "-wal", "-shm"):
+            path = Path(f"{self._db_path}{suffix}")
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            _POP_SIDECARS.setdefault(id(self), {})[suffix] = (st.st_dev, st.st_ino)
 
     def register(self, row: Mapping[str, Any]) -> None:
         if self._finished is not None: raise RuntimeError("population already finished")
@@ -1493,6 +1532,7 @@ class _PopulationAccumulator:
         if not math.isfinite(weight) or not math.isfinite(weight*base_cost) or not math.isfinite(weight*teacher_cost): raise ValueError("weighted cost")
         cur = self._db.execute("UPDATE population SET weight=?,base_cost=?,teacher_cost=? WHERE instance_id=? AND base_cost IS NULL", (weight,base_cost,teacher_cost,instance_id)); self._db.commit()
         if cur.rowcount != 1: raise ValueError("unknown or duplicate winner")
+        self._capture_sidecars()
 
     def _legacy_add(self, row: Mapping[str, Any]) -> None:
         if self._finished is not None:
@@ -1550,10 +1590,16 @@ class _PopulationAccumulator:
                 if not first: hasher.update(b",")
                 hasher.update(payload); first = False
                 total += 1; denominator += weight
+                if not all(math.isfinite(v) for v in (denominator, sden, base_total, teacher_total)):
+                    raise ValueError("nonfinite aggregate")
                 if r[4] is not None and r[5] is not None:
                     scored += 1; sden += weight; base_total += weight * r[4]; teacher_total += weight * r[5]
             hasher.update(b"]")
-            complete = total > 0 and scored == total and denominator > 0
+            if total > 0 and (not math.isfinite(denominator) or denominator <= 0):
+                raise ValueError("invalid denominator")
+            complete = total > 0 and scored == total
+            if complete and not all(math.isfinite(v) for v in (base_total/denominator, teacher_total/denominator, base_total/denominator-teacher_total/denominator)):
+                raise ValueError("nonfinite aggregate")
             result = {"eligible_count":total,"scored_winner_count":scored,"denominator":denominator,"scored_denominator":sden,"B_H":base_total/denominator if complete else None,"T_H":teacher_total/denominator if complete else None,"Delta_H":(base_total/denominator-teacher_total/denominator) if complete else None,"population_sha256":hasher.hexdigest()}
             self._finished = result
             self.denominator = denominator; self.base_total = base_total; self.teacher_total = teacher_total
@@ -1564,14 +1610,29 @@ class _PopulationAccumulator:
     def _close_spool(self) -> None:
         db, self._db = self._db, None
         primary: Optional[BaseException] = None
+        foreign_sidecar = False
+        for suffix in ("-journal", "-wal", "-shm"):
+            try:
+                os.stat(f"{self._db_path}{suffix}")
+                if suffix not in _POP_SIDECARS.get(id(self), {}):
+                    foreign_sidecar = True
+            except OSError:
+                pass
         if db is not None:
             try:
-                db.close()
+                if not foreign_sidecar:
+                    db.close()
             except BaseException as exc:
                 primary = exc
         for suffix in ("", "-journal", "-wal", "-shm"):
             try:
-                Path(f"{self._db_path}{suffix}").unlink()
+                target = Path(f"{self._db_path}{suffix}")
+                if suffix == "":
+                    info = os.stat(target)
+                    if (info.st_dev, info.st_ino) not in _POP_OWNERS.get(id(self), set()): continue
+                else:
+                    continue
+                target.unlink()
             except FileNotFoundError:
                 pass
             except BaseException as exc:
@@ -1790,6 +1851,8 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     writer: Optional[_JsonlWriter] = None
     population: Optional[_PopulationAccumulator] = None
     spool: Optional[sqlite3.Connection] = None
+    spool_identity: Optional[tuple[int, int]] = None
+    spool_mismatch = False
     index_fd: Optional[Any] = None
     try:
         staging = _new_staging(destination)
@@ -1800,6 +1863,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         writer = _JsonlWriter(lease.path)
         spool_path = lease.path / "case_spool.sqlite"
         spool = sqlite3.connect(str(spool_path))
+        spool_identity = (os.stat(spool_path).st_dev, os.stat(spool_path).st_ino)
         spool.execute("PRAGMA cache_size=-64")
         spool.execute("PRAGMA temp_store=FILE")
         spool.execute("PRAGMA mmap_size=0")
@@ -1816,6 +1880,12 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         for _worker, _layout, path in files:
             raw, source = _read_verified_shard(root, _worker, _layout)
             summary = _verified_shard_summary(raw, source, _worker, _layout)
+            direct = _VerifiedShardSummary(_worker, _layout,
+                f"worker_{_worker}/layouts_{_layout}.th",
+                hashlib.sha256(raw).hexdigest(),
+                _validate_source_shard(source)[0])
+            if type(summary) is not type(direct) or summary != direct:
+                raise ValueError("forged shard provenance")
             try:
                 spool.execute("INSERT INTO shards VALUES (?,?,?)", (_worker, _layout, json.dumps(
                     [summary.worker, summary.layout, summary.relative_path,
@@ -1824,7 +1894,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
             except sqlite3.IntegrityError as exc:
                 raise ValueError("duplicate shard identity") from exc
             source_count, _ = _validate_source_shard(source)
-            digest, count, rel = summary.file_sha256, source_count, summary.relative_path
+            digest, count, rel = direct.file_sha256, direct.source_row_count, direct.relative_path
             for index in range(count):
                 iid = f"{rel}#{index}"
                 case = _source_case_from_shard(source, index, iid)
@@ -1895,7 +1965,12 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 index_fd.write(json.dumps(row_index,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()); index_fd.flush(); first_index=False
         writer.close()
         index_fd.write(b'],"schema":"icdc_topology_training_index_v1"}\n'); index_fd.flush(); os.fsync(index_fd.fileno()); index_fd.close()
-        spool.close(); spool = None; spool_path.unlink()
+        spool.close(); spool = None
+        try:
+            info = os.stat(spool_path)
+            if (info.st_dev, info.st_ino) == spool_identity: spool_path.unlink()
+            else: raise ValueError("case spool ownership mismatch")
+        except FileNotFoundError: pass
         pop = population.finish()
         coverage = {"eligible_train": train_count, "eligible_heldout": held_count, "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_count) and bool(held_count) and heldout_winners == held_count,
                     "mutation_proposals": mutation_proposals, "mutation_admitted": mutation_admitted,
@@ -1939,11 +2014,17 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 spool.close()
         except BaseException:
             pass
+        if spool_identity is not None:
+            try:
+                info = os.stat(lease.path / "case_spool.sqlite") if lease is not None else None
+                spool_mismatch = info is not None and (info.st_dev, info.st_ino) != spool_identity
+            except OSError:
+                pass
         if population is not None:
             population.abort()
         if writer is not None:
             writer.abort()
-        if lease is not None:
+        if lease is not None and not spool_mismatch:
             try:
                 _cleanup_owned_staging(lease)
             except BaseException:
