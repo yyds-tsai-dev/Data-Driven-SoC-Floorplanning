@@ -581,17 +581,25 @@ def _new_staging(destination: Path) -> Path:
 
 
 def _iter_approved_shards(root: Path) -> list[tuple[int, int, Path]]:
+    def canonical_decimal(body: str) -> bool:
+        if not body or any(char < "0" or char > "9" for char in body):
+            return False
+        try:
+            return str(int(body)) == body
+        except ValueError:
+            return False
+
     found: list[tuple[int, int, Path]] = []
     for worker in root.iterdir():
         wbody = worker.name[7:] if worker.name.startswith("worker_") else ""
-        if wbody.isdigit() and worker.is_symlink(): raise ValueError("numeric worker symlink")
-        if not worker.is_dir() or not wbody.isdigit():
+        if canonical_decimal(wbody) and worker.is_symlink(): raise ValueError("numeric worker symlink")
+        if not worker.is_dir() or not canonical_decimal(wbody):
             continue
         wid = int(wbody)
         for shard in worker.iterdir():
             sbody = shard.name[8:-3] if shard.name.startswith("layouts_") and shard.name.endswith(".th") else ""
-            if sbody.isdigit() and shard.is_symlink(): raise ValueError("numeric shard symlink")
-            if not shard.is_file() or not sbody.isdigit():
+            if canonical_decimal(sbody) and shard.is_symlink(): raise ValueError("numeric shard symlink")
+            if not shard.is_file() or not canonical_decimal(sbody):
                 continue
             lid = int(sbody)
             found.append((wid, lid, shard))
@@ -631,8 +639,9 @@ def _validate_source_shard(source: Any) -> tuple[int, int]:
     if b < 1 or n < 1 or any(t.shape[0] != b for t in source[1:]):
         raise ValueError("source batch")
     if tree.shape[1] != n - 1: raise ValueError("source tree")
-    if not bool(torch.isfinite(torch.cat([t.reshape(-1) for t in source])).all()):
-        raise ValueError("source tensors")
+    for tensor in source:
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError("source tensors")
     for row in inp:
         seen_pad = False
         for item in row:
@@ -723,16 +732,38 @@ def _validate_outcome(value: Any) -> _CaseOutcome:
     if not all(isinstance(x, numbers.Real) and not isinstance(x, bool) and math.isfinite(float(x)) and float(x) > 0 for x in (value.base_cost, value.teacher_cost)) or value.teacher_cost > value.base_cost: raise ValueError("runtime costs")
     if not math.isfinite(float(value.base_cost) / float(value.teacher_cost)): raise ValueError("runtime costs")
     if set(value.label_row) != {"edges", "contacts", "pin_paths"} or any(k in value.label_row for k in _PROTECTED): raise ValueError("label schema")
-    rows = list(value.proposal_rows); names = [r.get("name") for r in rows]; ords = [r.get("ordinal") for r in rows]
+    rows = list(value.proposal_rows)
+    if any(not isinstance(row, Mapping) for row in rows): raise ValueError("proposal schema")
+    names = [r.get("name") for r in rows]; ords = [r.get("ordinal") for r in rows]
     if any(not isinstance(n, str) or not n.strip() for n in names) or any(type(o) is not int or o < 0 for o in ords): raise ValueError("proposal identity")
     expected = {"ordinal", "name", "intended_intent", "admission_status", "admission_reason", "drift", "hard", "diagnostic_energy", "official_cost", "feasible", "winner", "status"}
     if any(set(r) != expected for r in rows): raise ValueError("proposal schema")
+    for row in rows:
+        diagnostic_energy = row["diagnostic_energy"]
+        if (not isinstance(diagnostic_energy, numbers.Real) or isinstance(diagnostic_energy, bool)
+                or not math.isfinite(float(diagnostic_energy))):
+            raise ValueError("diagnostic_energy")
+        drift = row["drift"]
+        if not isinstance(drift, Mapping) or not drift or "max_abs" not in drift:
+            raise ValueError("drift")
+        for key, drift_value in drift.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError("drift")
+            if (not isinstance(drift_value, numbers.Real) or isinstance(drift_value, bool)
+                    or not math.isfinite(float(drift_value)) or float(drift_value) < 0):
+                raise ValueError("drift")
+        hard = row["hard"]
+        if (not isinstance(hard, Mapping) or not hard
+                or any(not isinstance(key, str) or not key for key in hard)
+                or any(type(hard_value) is not bool for hard_value in hard.values())):
+            raise ValueError("hard")
     if len(names) != len(set(names)) or len(ords) != len(set(ords)) or any(k in r for r in rows for k in _PROTECTED): raise ValueError("proposal provenance")
     winners = [r for r in rows if r.get("winner") is True]
     if len(winners) != 1: raise ValueError("runtime winner count")
     base = [r for r in winners if r.get("ordinal") == 0 and r.get("name") == "base" and r.get("status") == "winner" and r.get("feasible") is True]
     official = base[0].get("official_cost") if len(base) == 1 else None
     if not isinstance(official, numbers.Real) or isinstance(official, bool) or not math.isfinite(float(official)) or float(official) <= 0 or float(official) != float(value.teacher_cost): raise ValueError("runtime winner")
+    if "legal" not in base[0].get("hard", {}) or base[0]["hard"]["legal"] is not True: raise ValueError("hard")
     if any(k in r for r in value.rejection_rows for k in _PROTECTED): raise ValueError("rejection provenance")
     for row in [value.label_row, *rows, *value.rejection_rows]: _finite_json(row)
     return value
@@ -793,7 +824,7 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         outputs = {"train_corpus.jsonl":train_c,"heldout_corpus.jsonl":held_c,"train_labels.jsonl":train_l,"heldout_labels.jsonl":held_l,"proposals.jsonl":proposals,"rejections.jsonl":rejections}
         for name, vals in outputs.items():
             ordered = sorted(vals, key=lambda x: (x.get("instance_id", ""), x.get("proposal_ordinal", 0)))
-            (staging / name).write_bytes(b"".join(json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode() + b"\n" for v in ordered))
+            (staging / name).write_bytes(b"".join(json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n" for v in ordered))
         _dump_json(staging / "training_index.json", {"schema":"icdc_topology_training_index_v1","rows":rows})
         manifest["support_hashes"] = {n: hashlib.sha256((staging/n).read_bytes()).hexdigest() for n in (*outputs,"training_index.json")}; manifest["self_sha256"] = _manifest_self_sha256(manifest); _dump_json(staging/"g0_manifest.json", manifest)
         _publish_staging(staging, destination)
