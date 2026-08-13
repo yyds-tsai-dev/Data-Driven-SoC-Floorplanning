@@ -483,9 +483,13 @@ def _task4_canonical_json(value):
 
 
 def _task4_receipt(path, index, case):
+    return _task4_receipt_bytes(path.read_bytes(), index, case)
+
+
+def _task4_receipt_bytes(source_bytes, index, case):
     return dataclasses.asdict(CorpusSourceReceipt(
         relative_path="worker_2/layouts_0.th",
-        file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        file_sha256=hashlib.sha256(source_bytes).hexdigest(),
         layout_index=index, fingerprint=fingerprint_case(case),
     ))
 
@@ -538,6 +542,38 @@ def _task4_artifact_projection(out):
     return projection
 
 
+_TASK4_DIGEST_FIELDS = {
+    "file_sha256", "fingerprint", "checkpoint_sha256", "model_config_sha256",
+    "model_keyset_sha256", "ema_keyset_sha256", "ema_state_sha256",
+    "scorer_sha256", "population_sha256", "self_sha256",
+}
+
+
+def _task4_assert_no_forbidden_semantic_values(values, forbidden):
+    forbidden_numbers = set(forbidden)
+    forbidden_strings = {str(value) for value in forbidden_numbers}
+
+    def walk(value, field=None):
+        if field in _TASK4_DIGEST_FIELDS or field == "support_hashes":
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                walk(child, key)
+            return
+        if isinstance(value, list):
+            for child in value:
+                walk(child)
+            return
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)) and value in forbidden_numbers:
+            raise AssertionError(f"forbidden semantic numeric value: {value!r}")
+        if isinstance(value, str) and value in forbidden_strings:
+            raise AssertionError(f"forbidden semantic string value: {value!r}")
+
+    walk(values)
+
+
 def _task4_expected_trust(policy):
     return {
         "trust_ok": True, "input_ok": True, "scorer_ok": True,
@@ -552,10 +588,12 @@ def _task4_expected_trust(policy):
 def _task4_assert_success_artifacts(t, root, out, calls, policy,
                                     preflight_calls, *, bounded=False,
                                     training_authorized=True,
-                                    state="TARGET_GAIN_MET"):
+                                    state="TARGET_GAIN_MET", source_bytes=None):
     assert sorted(path.name for path in out.iterdir()) == sorted(_TASK4_FILES)
     expected_cases = [_task4_expected_case(0), _task4_expected_case(1)]
-    expected_receipts = [_task4_receipt(root / "worker_2/layouts_0.th", i, expected_cases[i])
+    if source_bytes is None:
+        source_bytes = (root / "worker_2/layouts_0.th").read_bytes()
+    expected_receipts = [_task4_receipt_bytes(source_bytes, i, expected_cases[i])
                          for i in range(2)]
     assert [item.case for item in calls] == expected_cases
     assert [source_instance_id(item.receipt) for item in calls] == [case["instance_id"] for case in expected_cases]
@@ -638,8 +676,14 @@ def _task4_assert_success_artifacts(t, root, out, calls, policy,
     for name in ("training_index.json", "g0_manifest.json"):
         parsed = json.loads((out / name).read_text())
         assert (out / name).read_bytes() == _task4_canonical_json(parsed) + b"\n"
+    parsed_artifacts = [
+        *[_task4_jsonl(out / name) for name in _TASK4_JSONL],
+        json.loads((out / "training_index.json").read_text()),
+        json.loads((out / "g0_manifest.json").read_text()),
+    ]
+    _task4_assert_no_forbidden_semantic_values(
+        parsed_artifacts, (701, 703, 401, 403, 709, 719, 809, 811))
     blobs = b"".join((out / name).read_bytes() for name in _TASK4_FILES)
-    assert not any(str(secret).encode() in blobs for secret in (701, 703, 401, 403, 709, 719, 809, 811))
     assert b"timestamp" not in blobs and str(root).encode() not in blobs
     return manifest
 
@@ -676,7 +720,8 @@ def test_teacher_source_reads_each_file_once_from_same_bytesio_under_path_swap(t
     expected_sha = hashlib.sha256(original_bytes).hexdigest()
     index = json.loads((out / "training_index.json").read_text())
     assert {row["receipt"]["file_sha256"] for row in index["rows"]} == {expected_sha}
-    _task4_assert_success_artifacts(t, root, out, calls, policy, preflight_calls)
+    _task4_assert_success_artifacts(t, root, out, calls, policy, preflight_calls,
+                                    source_bytes=original_bytes)
 
 
 @pytest.mark.parametrize("soft_delta", [1000, 2000])
@@ -694,8 +739,12 @@ def test_teacher_soft_fp_variants_only_change_narrow_source_hashes(tmp_path, mon
     changed = (701 + soft_delta, 703 + soft_delta, 401 + soft_delta,
                403 + soft_delta, 709 + soft_delta, 719 + soft_delta,
                809 + soft_delta, 811 + soft_delta)
-    blobs = b"".join((soft_out / name).read_bytes() for name in _TASK4_FILES)
-    assert not any(str(secret).encode() in blobs for secret in changed)
+    parsed_artifacts = [
+        *[_task4_jsonl(soft_out / name) for name in _TASK4_JSONL],
+        json.loads((soft_out / "training_index.json").read_text()),
+        json.loads((soft_out / "g0_manifest.json").read_text()),
+    ]
+    _task4_assert_no_forbidden_semantic_values(parsed_artifacts, changed)
 
 
 def test_teacher_fresh_outputs_are_byte_identical_and_existing_output_is_untouched(tmp_path, monkeypatch):
@@ -854,7 +903,10 @@ def test_teacher_ast_guard_resolves_imports_aliases_and_bytesio_source_load_cont
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for item in node.names:
-                aliases[item.asname or item.name.split(".")[0]] = item.name
+                if item.asname:
+                    aliases[item.asname] = item.name
+                else:
+                    aliases[item.name.split(".")[0]] = item.name.split(".")[0]
         elif isinstance(node, ast.ImportFrom) and node.module:
             for item in node.names:
                 aliases[item.asname or item.name] = f"{node.module}.{item.name}"
@@ -892,9 +944,17 @@ def test_teacher_ast_guard_resolves_imports_aliases_and_bytesio_source_load_cont
                                for bad in banned + ("_instance",)) for symbol in imported)
         if isinstance(node, ast.Attribute):
             assert node.attr not in {"golden", "_instance"}
+        if isinstance(node, ast.Name):
+            assert node.id != "golden"
         if isinstance(node, ast.Subscript):
             literal = node.slice.value if isinstance(node.slice, ast.Constant) else None
             assert literal != "golden"
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"):
+            assert not any(
+                isinstance(argument, ast.Constant) and argument.value == "golden"
+                for argument in node.args
+            )
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
