@@ -577,13 +577,18 @@ def run_g0(
                     population.register(instance_id, n)
                     base = runtime.solve_base(optimizer, row)
                     validate_portfolio_receipt(base.portfolio_receipt)
-                    result = runtime.evaluate(
-                        base.rects,
-                        row.fp_xywh,
-                        row.case,
-                        runtime.scorer,
-                        sample_seed=_sample_seed(instance_id),
-                    )
+                    try:
+                        result = runtime.evaluate(
+                            base.rects,
+                            row.fp_xywh,
+                            row.case,
+                            runtime.scorer,
+                            sample_seed=_sample_seed(instance_id),
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"G0 case failed: {instance_id}"
+                        ) from exc
                     if type(result) is not G0CaseResult or result.sparse_label is None:
                         raise ValueError("case result")
                     population.add(result)

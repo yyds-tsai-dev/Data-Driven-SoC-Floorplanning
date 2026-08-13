@@ -80,15 +80,7 @@ def _admit_identity(proposal: torch.Tensor, _case: dict):
 
 
 def _admit_base_then_reject_teacher():
-    calls = 0
-
     def admit(proposal: torch.Tensor, _case: dict):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return proposal.clone(), torch.zeros(
-                (proposal.shape[0], 2), dtype=torch.float64
-            )
         return None
 
     return admit
@@ -172,11 +164,7 @@ def test_shifted_preplaced_transient_fp_is_rejected_before_scoring():
     candidate[0, 0] = 0.25
     out = evaluate_case(
         _rects(), candidate, _case(preplaced=True), scorer, sample_seed=17,
-        admit=lambda proposal, case: (
-            _admit_identity(proposal, case)
-            if torch.equal(proposal, _rects())
-            else None
-        ),
+        admit=lambda proposal, case: None,
     )
     assert out.winner == "production-base"
     assert out.teacher_status == "admission_failed"
@@ -198,27 +186,21 @@ def test_base_with_soft_group_v_retains_sparse_label():
     assert out.sparse_label.instance_id == _case()["instance_id"]
 
 
-def test_production_base_is_exactly_admitted_before_hard_audit_and_scoring():
-    raw_base = torch.tensor(
-        [[0.0, 0.0, 2.0, 2.0], [1.0, 0.0, 2.0, 2.0]],
-        dtype=torch.float64,
-    )
-    legal_base = _rects()
+def test_hard_legal_production_base_is_not_reprojected_through_tfdl():
+    raw_base = _rects()
     calls = []
 
     def admit(proposal, case):
         calls.append(proposal.clone())
-        legal = legal_base if len(calls) == 1 else proposal
-        return legal.clone(), torch.zeros((2, 2), dtype=torch.float64)
+        return proposal.clone(), torch.zeros((2, 2), dtype=torch.float64)
 
     scorer = _Scorer([1.2, 1.3])
     out = evaluate_case(
         raw_base, _rects(1.0), _case(), scorer, sample_seed=17, admit=admit
     )
-    assert len(calls) == 2
-    assert torch.equal(calls[0], raw_base)
-    assert torch.equal(calls[1], _rects(1.0))
-    assert scorer.calls[0]["solution"]["positions"] == legal_base.tolist()
+    assert len(calls) == 1
+    assert torch.equal(calls[0], _rects(1.0))
+    assert scorer.calls[0]["solution"]["positions"] == raw_base.tolist()
     assert out.winner == "production-base"
 
 
