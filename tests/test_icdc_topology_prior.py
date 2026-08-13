@@ -120,7 +120,11 @@ def test_teacher_publish_b2_lease_cleanup_requires_exact_identity(tmp_path):
         stage.rmdir()
         if kind == "symlink": stage.symlink_to(sentinel, target_is_directory=True)
         else: stage.mkdir(); (stage / "keep").write_text("keep")
-        assert cleanup(lease) is False and stage.exists() and (sentinel / "keep").exists()
+        assert cleanup(lease) is False and (sentinel / "keep").exists()
+        if kind == "symlink":
+            assert stage.is_symlink()
+        else:
+            assert stage.is_dir() and (stage / "keep").read_text() == "keep"
 
 
 def test_teacher_publish_b2_ambiguous_eintr_never_deletes_foreign_destination(tmp_path, monkeypatch):
@@ -163,6 +167,29 @@ def test_teacher_publish_b2_transaction_cleanup_refuses_replacement(tmp_path, mo
     monkeypatch.setattr(t, "_publish_staging", publish)
     with pytest.raises(RuntimeError, match="publish sentinel") as exc: t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
     assert exc.value is marker and not out.exists() and moved.exists() and sentinel.exists()
+    replacement_path = stages[-1]
+    if replacement == "symlink":
+        assert replacement_path.is_symlink() and (sentinel / "keep").exists()
+    else:
+        assert replacement_path.is_dir() and (replacement_path / "foreign").read_text() == "foreign"
+
+
+def test_teacher_publish_b2_transaction_existing_destination_race(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
+    _task4_fake_runtime(t, monkeypatch); stages = []
+    real_new = t._new_staging
+    def new_staging(destination):
+        stage = real_new(destination); stages.append(Path(getattr(stage, "path", stage))); return stage
+    monkeypatch.setattr(t, "_new_staging", new_staging)
+    calls = []
+    def race(source, destination):
+        calls.append((source, destination)); Path(destination).mkdir(); (Path(destination) / "sentinel").write_text("foreign")
+        raise OSError(errno.EEXIST, "exists")
+    monkeypatch.setattr(t, "_renameat2_noreplace", race, raising=False)
+    with pytest.raises(ValueError, match="existing output"):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert len(calls) == 1 and out.is_dir() and (out / "sentinel").read_text() == "foreign"
+    assert not stages[-1].exists()
 
 
 # ---------------------------------------------------------------------------
