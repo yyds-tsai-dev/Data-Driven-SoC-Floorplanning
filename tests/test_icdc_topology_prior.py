@@ -538,6 +538,16 @@ def _task4_dynamic_forbidden(source):
     tree = ast.parse(source)
     aliases = {}
 
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                local = imported.asname or imported.name.split(".")[0]
+                aliases[local] = imported.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for imported in node.names:
+                local = imported.asname or imported.name
+                aliases[local] = f"{node.module}.{imported.name}"
+
     def resolve(node):
         if isinstance(node, ast.Name):
             return aliases.get(node.id, node.id)
@@ -562,7 +572,10 @@ def _task4_dynamic_forbidden(source):
         if not changed:
             break
 
-    bare = {"eval", "exec", "__import__", "getattr", "importlib.import_module"}
+    bare = {
+        "eval", "exec", "__import__", "getattr", "importlib.import_module",
+        "builtins.eval", "__builtins__.eval",
+    }
     qualified_suffixes = {"exec", "__import__", "getattr", "import_module"}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -576,6 +589,10 @@ def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
     assert _task4_static_forbidden(Path("scripts/probes/icdc_topology_teacher.py").read_text(), require_exact_loads=True)
     assert _task4_dynamic_forbidden("eval('1')")
     assert _task4_dynamic_forbidden("danger = eval\ndanger('1')")
+    assert _task4_dynamic_forbidden("import builtins\nbuiltins.eval('1')")
+    assert _task4_dynamic_forbidden("import builtins as b\nb.eval('1')")
+    assert _task4_dynamic_forbidden("from builtins import eval as run\nrun('1')")
+    assert _task4_dynamic_forbidden("__builtins__.eval('1')")
     assert not _task4_dynamic_forbidden("model.eval()")
     assert not _task4_static_forbidden("import icdc.engine as e\nx=e\ny=x\nz=y\na=z\nb=a\ngetattr(b, 'load_model')()")
     assert not _task4_static_forbidden("case={'golden': 1}\ncase.get('golden')\ne.sample_bank()")
