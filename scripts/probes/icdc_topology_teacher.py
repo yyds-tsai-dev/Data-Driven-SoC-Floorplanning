@@ -1375,8 +1375,6 @@ class _PopulationAccumulator:
     def __init__(self) -> None:
         self.denominator = self.base_total = self.teacher_total = 0.0
         self.count = 0
-        self._registered: dict[str, dict[str, Any]] = {}
-        self._resolved: set[str] = set()
         self._finished: Optional[dict[str, float | str]] = None
         temp = tempfile.NamedTemporaryFile(prefix="floorset-population-", suffix=".sqlite", delete=False)
         self._db_path = Path(temp.name)
@@ -1387,8 +1385,8 @@ class _PopulationAccumulator:
             self._db.execute(
                 "CREATE TABLE population ("
                 "relative_path TEXT NOT NULL, layout_index TEXT NOT NULL, "
-                "instance_id TEXT NOT NULL, n TEXT NOT NULL, base_cost REAL NOT NULL, "
-                "teacher_cost REAL NOT NULL, weight REAL NOT NULL, "
+                "instance_id TEXT NOT NULL, n INTEGER NOT NULL, base_cost REAL, "
+                "teacher_cost REAL, weight REAL NOT NULL, "
                 "UNIQUE(relative_path, layout_index), UNIQUE(instance_id))"
             )
             self._db.commit()
@@ -1397,29 +1395,32 @@ class _PopulationAccumulator:
             raise
 
     def add(self, row: Mapping[str, Any]) -> None:
-        self.register(row)
+        self.register({k: row[k] for k in ("relative_path", "layout_index", "instance_id", "n")})
         self.record_winner(row["instance_id"], row["base_cost"], row["teacher_cost"])
 
     def register(self, row: Mapping[str, Any]) -> None:
         if self._finished is not None: raise RuntimeError("population already finished")
         required = {"relative_path","layout_index","instance_id","n"}
-        if not isinstance(row, Mapping) or not required.issubset(row): raise ValueError("population row keys")
+        if not isinstance(row, Mapping) or set(row) != required: raise ValueError("population row keys")
         iid = row["instance_id"]
-        if not isinstance(iid,str) or not iid: raise ValueError("instance_id")
-        if iid in self._registered: raise ValueError("duplicate population identity")
-        _canonical_relative_path(row["relative_path"])
+        if not isinstance(iid,str) or not iid or "\0" in iid: raise ValueError("instance_id")
+        rel = _canonical_relative_path(row["relative_path"])
         if type(row["layout_index"]) is not int or row["layout_index"] < 0 or type(row["n"]) is not int or row["n"] < 0: raise ValueError("population identity")
-        self._registered[iid] = dict(row)
-        self.count = len(self._registered)
+        try: weight = math.exp(row["n"] / 12)
+        except (OverflowError, ValueError) as exc: raise ValueError("weight") from exc
+        if not math.isfinite(weight): raise ValueError("weight")
+        assert self._db is not None
+        try:
+            self._db.execute("INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) VALUES (?,?,?,?,NULL,NULL,?)", (rel,row["layout_index"],iid,row["n"],weight)); self._db.commit()
+        except sqlite3.IntegrityError as exc: raise ValueError("duplicate population identity") from exc
+        self.count += 1
 
     def record_winner(self, instance_id: str, base_cost: float, teacher_cost: float) -> None:
-        if instance_id not in self._registered: raise ValueError("unknown population identity")
-        if instance_id in self._resolved: raise ValueError("duplicate winner")
-        self._registered[instance_id].update(base_cost=_finite_number(base_cost,"base_cost"), teacher_cost=_finite_number(teacher_cost,"teacher_cost"))
-        self._resolved.add(instance_id)
-        row = self._registered[instance_id]; weight = math.exp(row["n"] / 12)
+        base_cost = _finite_number(base_cost,"base_cost"); teacher_cost = _finite_number(teacher_cost,"teacher_cost")
+        if base_cost <= 0 or teacher_cost <= 0: raise ValueError("cost")
         assert self._db is not None
-        self._db.execute("INSERT INTO population VALUES (?,?,?,?,?,?,?)", (row["relative_path"], str(row["layout_index"]), instance_id, str(row["n"]), float(base_cost), float(teacher_cost), weight)); self._db.commit()
+        cur = self._db.execute("UPDATE population SET base_cost=?,teacher_cost=? WHERE instance_id=? AND base_cost IS NULL", (base_cost,teacher_cost,instance_id)); self._db.commit()
+        if cur.rowcount != 1: raise ValueError("unknown or duplicate winner")
 
     def _legacy_add(self, row: Mapping[str, Any]) -> None:
         if self._finished is not None:
@@ -1466,56 +1467,15 @@ class _PopulationAccumulator:
             return dict(self._finished)
         if self._db is None:
             raise RuntimeError("population spool closed")
-        if len(self._resolved) != len(self._registered):
-            ordered = sorted(self._registered.values(), key=lambda r:(r["relative_path"], r["layout_index"]))
-            enc = b"[" + b",".join(json.dumps({"relative_path":r["relative_path"],"layout_index":r["layout_index"],"instance_id":r["instance_id"],"n":r["n"],"weight":math.exp(r["n"]/12)},sort_keys=True,separators=(",",":"),ensure_ascii=True).encode() for r in ordered) + b"]"
-            den = sum(math.exp(r["n"]/12) for r in ordered); sden = sum(math.exp(r["n"]/12) for r in ordered if r["instance_id"] in self._resolved)
-            result = {"eligible_count":len(ordered),"scored_winner_count":len(self._resolved),"denominator":den,"scored_denominator":sden,"B_H":None,"T_H":None,"Delta_H":None,"population_sha256":hashlib.sha256(enc).hexdigest()}
-            self._finished = result; self._close_spool(); return dict(result)
         try:
-            if not self.count:
-                result = {"eligible_count": 0, "scored_winner_count": 0, "scored_denominator": 0.0, "denominator": 0.0, "B_H": None, "T_H": None, "Delta_H": None,
-                          "population_sha256": hashlib.sha256(b"[]").hexdigest()}
-            else:
-                population_hash = hashlib.sha256(b"[")
-                denominator = base_total = teacher_total = 0.0
-                first = True
-                for relative_path, layout_index, instance_id, n_text, base_cost, teacher_cost, weight in self._db.execute(
-                        "SELECT relative_path, layout_index, instance_id, n, base_cost, teacher_cost, weight "
-                        "FROM population ORDER BY relative_path, LENGTH(layout_index), layout_index"):
-                    layout_index = int(layout_index)
-                    n = int(n_text)
-                    if not first:
-                        population_hash.update(b",")
-                    first = False
-                    identity = {"relative_path": relative_path, "layout_index": layout_index,
-                                "instance_id": instance_id, "n": n, "weight": weight}
-                    population_hash.update(json.dumps(identity, sort_keys=True, separators=(",", ":"),
-                                                  ensure_ascii=True, allow_nan=False).encode("utf-8"))
-                    base_product = weight * base_cost
-                    teacher_product = weight * teacher_cost
-                    if not math.isfinite(base_product) or not math.isfinite(teacher_product):
-                        raise ValueError("weighted cost")
-                    denominator += weight
-                    base_total += base_product
-                    teacher_total += teacher_product
-                    if (not math.isfinite(denominator) or not math.isfinite(base_total)
-                            or not math.isfinite(teacher_total)):
-                        raise ValueError("weighted population arithmetic")
-                if denominator <= 0 or not math.isfinite(denominator):
-                    raise ValueError("denominator")
-                base_mean = base_total / denominator
-                teacher_mean = teacher_total / denominator
-                delta = base_mean - teacher_mean
-                if not all(math.isfinite(value) for value in (base_mean, teacher_mean, delta)):
-                    raise ValueError("weighted population result")
-                population_hash.update(b"]")
-                result = {"eligible_count": self.count, "scored_winner_count": self.count, "scored_denominator": denominator, "denominator": denominator, "B_H": base_mean, "T_H": teacher_mean,
-                          "Delta_H": delta, "population_sha256": population_hash.hexdigest()}
+            rows = list(self._db.execute("SELECT relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight FROM population ORDER BY relative_path,layout_index"))
+            enc = b"[" + b",".join(json.dumps({"relative_path":r[0],"layout_index":r[1],"instance_id":r[2],"n":r[3],"weight":r[6]},sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode() for r in rows) + b"]"
+            denominator = sum(r[6] for r in rows); scored = [r for r in rows if r[4] is not None and r[5] is not None]
+            sden = sum(r[6] for r in scored); base_total = sum(r[6]*r[4] for r in scored); teacher_total = sum(r[6]*r[5] for r in scored)
+            complete = bool(rows) and len(scored) == len(rows) and denominator > 0
+            result = {"eligible_count":len(rows),"scored_winner_count":len(scored),"denominator":denominator,"scored_denominator":sden,"B_H":base_total/denominator if complete else None,"T_H":teacher_total/denominator if complete else None,"Delta_H":(base_total-teacher_total)/denominator if complete else None,"population_sha256":hashlib.sha256(enc).hexdigest()}
             self._finished = result
-            self.denominator = result["denominator"]
-            self.base_total = base_total if self.count else 0.0
-            self.teacher_total = teacher_total if self.count else 0.0
+            self.denominator = denominator; self.base_total = base_total; self.teacher_total = teacher_total
             return dict(result)
         finally:
             self._close_spool()
@@ -1755,7 +1715,10 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         except BaseException:
             raise
         writer = _JsonlWriter(lease.path)
-        rows: list[dict[str, Any]] = []
+        spool_path = lease.path / "case_spool.sqlite"
+        spool = sqlite3.connect(str(spool_path))
+        spool.execute("CREATE TABLE cases(worker INTEGER,layout INTEGER,source_row_index INTEGER,relative_path TEXT,file_sha256 TEXT,source_row_count INTEGER,instance_id TEXT,case_json TEXT,fingerprint TEXT,PRIMARY KEY(worker,layout,source_row_index))")
+        spool.commit()
         population = _PopulationAccumulator()
         train_count = held_count = heldout_winners = 0
         legal = covered = True; processed = 0
@@ -1764,16 +1727,18 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         # Registration is a global pre-pass: every eligible heldout identity is
         # known before either train or heldout runtime call.
         for _worker, _layout, path in files:
-            raw, source = _read_verified_shard(root, _worker, _layout)
+            raw, source = _read_verified_shard(root, _worker, _layout); digest = hashlib.sha256(raw).hexdigest()
             count, _blocks = _validate_source_shard(source)
             rel = path.relative_to(root).as_posix()
             for index in range(count):
                 iid = f"{rel}#{index}"
                 case = _source_case_from_shard(source, index, iid)
+                spool.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,?)", (_worker,_layout,index,rel,digest,count,iid,json.dumps(case,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False),fingerprint_case(case)))
                 if case["n"] >= args.n_min and split_for_id(iid, args.heldout_mod) == "heldout":
                     population.register({"relative_path": rel, "layout_index": index,
                                          "instance_id": iid, "n": case["n"]})
             del source, raw
+        spool.commit()
         mutation_proposals = mutation_admitted = mutation_intent_survived = 0
         positive_gain_heldout = 0
         positive_gain_heldout_weight = 0.0
@@ -1781,16 +1746,16 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         rejection_counts = {k: 0 for k in ("admission_failed", "hard_audit_failed",
             "intent_not_survived", "official_infeasible", "official_invalid_cost",
             "official_evaluator_error", "base_unavailable")}
-        for _worker, _layout, path in files:
-            raw, source = _read_verified_shard(root, _worker, _layout); digest = hashlib.sha256(raw).hexdigest()
-            count, blocks = _validate_source_shard(source)
-            rel = path.relative_to(root).as_posix()
-            for index in range(count):
-                iid = f"{rel}#{index}"; case = _source_case_from_shard(source, index, iid)
+        index_fd = open(lease.path / "training_index.json", "wb")
+        index_fd.write(b'{"rows":['); first_index = True
+        for _worker, _layout, index, rel, digest, count, iid, case_text, fp in spool.execute("SELECT worker,layout,source_row_index,relative_path,file_sha256,source_row_count,instance_id,case_json,fingerprint FROM cases ORDER BY worker,layout,source_row_index"):
+                case = json.loads(case_text)
                 receipt = CorpusSourceReceipt(rel, digest, index, fingerprint_case(case))
                 entry = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "source_row_count": count, "block_count": case["n"]}
                 if case["n"] < args.n_min:
-                    rows.append({**entry, "partition": None, "sample_ordinal": None, "sample_seed": None, "status": "excluded_n_min"}); continue
+                    row_index = {**entry, "partition": None, "sample_ordinal": None, "sample_seed": None, "status": "excluded_n_min"}
+                    if not first_index: index_fd.write(b",")
+                    index_fd.write(json.dumps(row_index,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()); index_fd.flush(); first_index=False; continue
                 partition = split_for_id(iid, args.heldout_mod); seed = _sample_seed(args.seed, iid, 0)
                 ci = _CaseInput(case, receipt, partition, seed); outcome = _validate_outcome(runtime.process_case(ci)); processed += 1
                 env = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "partition": partition, "sample_seed": seed, "n": case["n"]}
@@ -1821,8 +1786,11 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
                 mutation_admitted += sum(p.get("admission_status") == "admitted" for p in mutation_rows)
                 mutation_intent_survived += sum(p.get("intent_status") == "passed" for p in mutation_rows)
                 legal = legal and outcome.legal; covered = covered and outcome.covered
-                rows.append({**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": outcome.case_status})
-            del source, raw
+                row_index = {**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": outcome.case_status}
+                if not first_index: index_fd.write(b",")
+                index_fd.write(json.dumps(row_index,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()); index_fd.flush(); first_index=False
+        index_fd.write(b'],"schema":"icdc_topology_training_index_v1"}\n'); index_fd.flush(); os.fsync(index_fd.fileno()); index_fd.close()
+        spool.close(); spool_path.unlink()
         pop = population.finish()
         coverage = {"eligible_train": train_count, "eligible_heldout": held_count, "heldout_winners": heldout_winners, "legal": legal, "covered": covered and bool(train_count) and bool(held_count) and heldout_winners == held_count,
                     "mutation_proposals": mutation_proposals, "mutation_admitted": mutation_admitted,
@@ -1835,8 +1803,6 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
         secondary_reasons = ["base_unavailable"] if rejection_counts["base_unavailable"] else []
         manifest = {"schema":"icdc_topology_teacher_g0_v1","status":"complete","state":state,"secondary_reasons":secondary_reasons,"training_authorized":authorized,"bounded_max_files":args.max_files is not None,"trust":trust,"population":pop,"coverage":coverage}
         writer.close()
-        with open(lease.path / "training_index.json", "wb") as fd:
-            fd.write(json.dumps({"schema":"icdc_topology_training_index_v1","rows":rows}, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n"); fd.flush(); os.fsync(fd.fileno())
         def _fsync_dir() -> None:
             fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY)
             primary: Optional[BaseException] = None
