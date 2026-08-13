@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Any, Optional
 
 import torch
+from icdc.topology_data import CorpusSourceReceipt, fingerprint_case, split_for_id
 
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -30,6 +31,34 @@ from icdc.checkpoint_identity import (  # noqa: E402
 
 
 __all__ = ["teacher_main"]
+
+@dataclass(frozen=True)
+class _CaseInput:
+    case: Mapping[str, Any]
+    receipt: CorpusSourceReceipt
+    partition: str
+    sample_seed: int
+
+@dataclass(frozen=True)
+class _CaseOutcome:
+    label_row: Mapping[str, Any]
+    proposal_rows: Sequence[Mapping[str, Any]]
+    rejection_rows: Sequence[Mapping[str, Any]]
+    base_cost: float
+    teacher_cost: float
+    legal: bool
+    covered: bool
+
+@dataclass(frozen=True)
+class _TeacherRuntime:
+    preflight: Any
+    process_case: Any
+    authorizing: bool
+
+def _runtime_hooks() -> _TeacherRuntime:
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("teacher runtime not implemented")
+    return _TeacherRuntime(fail, fail, False)
 
 _CHECKPOINT_SHA256 = "508f5fce594ba3b5aeca93ce5e8db417cb256b5e409634acf8bd837add606659"
 _SCORER_SHA256 = "7fa64bbbad201f3f6be2a6e426bc141bff7a5b14522bf309c77e055a09bbc6a1"
@@ -491,7 +520,7 @@ def _validate_outputs(raw_out: str, raw_index: str) -> None:
     _reject_symlink_components(out)
     _reject_symlink_components(index)
     if out.exists() or out.is_symlink():
-        raise ValueError("output directory must be absent")
+        raise ValueError("existing output directory")
     expected_index = out / "training_index.json"
     if index != expected_index or index.resolve() != expected_index.resolve():
         raise ValueError("index-out must be out-dir/training_index.json")
@@ -512,8 +541,29 @@ def _nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be nonnegative")
     return parsed
 
+def _publish_staging(staging: Path, destination: Path) -> None:
+    os.rename(staging, destination)
 
-def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optional[TeacherTrustPolicy] = None) -> None:
+def _dump_json(path: Path, value: Any) -> None:
+    path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode() + b"\n")
+
+def _source_case(source: Sequence[torch.Tensor], index: int, instance_id: str) -> dict[str, Any]:
+    inp, _b2b, _p2b, _pins, _tree, fp, metrics = source
+    row = inp[index].tolist(); fprow = fp[index].tolist(); metric = metrics[index].tolist()
+    n = len(row)
+    area = [float(x[0]) for x in row]
+    cons = [[int(x[1]), int(x[2]), int(x[3]), int(x[4]), int(x[5])] for x in row]
+    tp = []
+    for vals, flags in zip(fprow, cons):
+        fixed, pre = flags[:2]
+        tp.append([float(vals[2]) if pre else -1.0, float(vals[3]) if pre else -1.0,
+                   float(vals[0]) if fixed or pre else -1.0, float(vals[1]) if fixed or pre else -1.0])
+    return {"instance_id": instance_id, "n": n, "area": area, "cons": cons, "tp": tp,
+            "b2b": [], "p2b": [], "pins": [], "hpwl_ref": float(metric[6] + metric[7]),
+            "area_ref": float(metric[0])}
+
+
+def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optional[TeacherTrustPolicy] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--out-dir", required=True)
@@ -527,7 +577,64 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
     policy = _trust_policy if _trust_policy is not None else _production_trust_policy()
     _validate_data_root(args.data_root, policy)
     _validate_outputs(args.out_dir, args.index_out)
-    raise RuntimeError("teacher pipeline not implemented")
+    root, destination = Path(args.data_root).resolve(), Path(args.out_dir)
+    runtime = _runtime_hooks()
+    trust = dict(runtime.preflight(policy, Path(args.checkpoint)))
+    rows: list[dict[str, Any]] = []; train_c: list[Any] = []; held_c: list[Any] = []
+    train_l: list[Any] = []; held_l: list[Any] = []; proposals: list[Any] = []; rejections: list[Any] = []
+    population: list[dict[str, Any]] = []; legal = covered = True; processed = 0
+    try:
+        files = []
+        for worker in root.glob("worker_[0-9]*"):
+            if worker.is_dir() and worker.name[7:].isdigit():
+                files.extend((int(worker.name[7:]), p) for p in worker.glob("layouts_[0-9]*.th") if p.is_file() and p.stem[8:].isdigit())
+        files.sort(key=lambda x: (x[0], int(x[1].stem[8:])))
+        if args.max_files is not None: files = files[:args.max_files]
+        for _worker, path in files:
+            raw = path.read_bytes(); digest = hashlib.sha256(raw).hexdigest()
+            source = torch.load(io.BytesIO(raw), weights_only=True, map_location="cpu")
+            if not isinstance(source, (tuple, list)) or len(source) != 7: raise ValueError("source schema")
+            count = int(source[0].shape[0]); blocks = int(source[0].shape[1]); rel = path.relative_to(root).as_posix()
+            for index in range(count):
+                iid = f"{rel}#{index}"; case = _source_case(source, index, iid)
+                receipt = CorpusSourceReceipt(rel, digest, index, fingerprint_case(case))
+                entry = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "source_row_count": count, "block_count": blocks}
+                if case["n"] < args.n_min:
+                    rows.append({**entry, "partition": None, "sample_ordinal": None, "sample_seed": None, "status": "excluded_n_min"}); continue
+                partition = split_for_id(iid, args.heldout_mod); seed = _sample_seed(args.seed, iid, 0)
+                ci = _CaseInput(case, receipt, partition, seed); outcome = runtime.process_case(ci); processed += 1
+                env = {"receipt": dataclass_to_dict(receipt), "instance_id": iid, "partition": partition, "sample_seed": seed, "n": case["n"]}
+                label = {**env, "proposal_ordinal": 0, "proposal_name": "base", "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost, "record_weight": outcome.base_cost, **dict(outcome.label_row)}
+                for p in outcome.proposal_rows: proposals.append({**env, **dict(p)})
+                for r in outcome.rejection_rows: rejections.append({**env, **dict(r)})
+                (train_c if partition == "train" else held_c).append(case); (train_l if partition == "train" else held_l).append(label)
+                if partition == "heldout":
+                    population.append({"relative_path": rel, "layout_index": index, "instance_id": iid, "n": case["n"], "base_cost": outcome.base_cost, "teacher_cost": outcome.teacher_cost})
+                legal = legal and outcome.legal; covered = covered and outcome.covered
+                rows.append({**entry, "partition": partition, "sample_ordinal": 0, "sample_seed": seed, "status": "processed"})
+        pop = _weighted_population(population) if population else {"denominator": 0.0, "B_H": 0.0, "T_H": 0.0, "Delta_H": 0.0, "population_sha256": hashlib.sha256(b"[]").hexdigest()}
+        coverage = {"eligible_train": len(train_c), "eligible_heldout": len(held_c), "heldout_winners": len(held_l), "legal": legal, "covered": covered and bool(processed)}
+        state = _g0_state({**trust, "legal": legal, "coverage": coverage["covered"], "teacher_mean": pop["T_H"], "delta": pop["Delta_H"]})
+        authorized = runtime.authorizing and state == "TARGET_GAIN_MET" and args.max_files is None
+        if not processed: state = "KILLED_LEGALITY_OR_COVERAGE"; authorized = False
+        manifest = {"schema":"icdc_topology_teacher_g0_v1","status":"complete","state":state,"secondary_reasons":[],"training_authorized":authorized,"bounded_max_files":args.max_files is not None,"trust":trust,"population":pop,"coverage":coverage}
+        staging = destination.parent / (destination.name + ".staging")
+        staging.mkdir()
+        outputs = {"train_corpus.jsonl":train_c,"heldout_corpus.jsonl":held_c,"train_labels.jsonl":train_l,"heldout_labels.jsonl":held_l,"proposals.jsonl":proposals,"rejections.jsonl":rejections}
+        for name, vals in outputs.items():
+            ordered = sorted(vals, key=lambda x: (x.get("instance_id", ""), x.get("proposal_ordinal", 0)))
+            (staging / name).write_bytes(b"".join(json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode() + b"\n" for v in ordered))
+        _dump_json(staging / "training_index.json", {"schema":"icdc_topology_training_index_v1","rows":rows})
+        manifest["support_hashes"] = {n: hashlib.sha256((staging/n).read_bytes()).hexdigest() for n in (*outputs,"training_index.json")}; manifest["self_sha256"] = _manifest_self_sha256(manifest); _dump_json(staging/"g0_manifest.json", manifest)
+        _publish_staging(staging, destination)
+        return 0 if authorized else 1
+    except Exception:
+        staging = destination.parent / (destination.name + ".staging")
+        if staging.exists(): import shutil; shutil.rmtree(staging)
+        raise
+
+def dataclass_to_dict(value: Any) -> dict[str, Any]:
+    return {"relative_path": value.relative_path, "file_sha256": value.file_sha256, "layout_index": value.layout_index, "fingerprint": value.fingerprint}
 
 
 if __name__ == "__main__":
