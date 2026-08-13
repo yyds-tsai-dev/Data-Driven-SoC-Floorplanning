@@ -2333,14 +2333,14 @@ def _task4_spooled_replay_record(source_path, source_row_index):
     }
 
 
-def _task4_trusted_shard_summary(source_path):
+def _task4_trusted_shard_summary(source_path, *, worker=2, layout=0, source_row_count=2):
     """Verified-ingestion facts replay must use, never candidate-row metadata."""
     return {
-        "worker": 2,
-        "layout": 0,
-        "relative_path": "worker_2/layouts_0.th",
+        "worker": worker,
+        "layout": layout,
+        "relative_path": f"worker_{worker}/layouts_{layout}.th",
         "file_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
-        "source_row_count": 2,
+        "source_row_count": source_row_count,
     }
 
 
@@ -2377,6 +2377,22 @@ def _task4_semantic_value(value, name):
     return value[name] if isinstance(value, collections.abc.Mapping) else getattr(value, name)
 
 
+def _task4_summary_values(summary):
+    return {name: _task4_semantic_value(summary, name) for name in (
+        "worker", "layout", "relative_path", "file_sha256", "source_row_count",
+    )}
+
+
+def _task4_replace_summary_value(summary, name, replacement):
+    if isinstance(summary, collections.abc.Mapping):
+        changed = dict(summary)
+        changed[name] = replacement
+        return changed
+    if dataclasses.is_dataclass(summary):
+        return dataclasses.replace(summary, **{name: replacement})
+    raise TypeError("semantic shard summary must be a mapping or dataclass")
+
+
 @pytest.mark.parametrize("poison, changed_leaf", [
     ("worker", "worker"),
     ("layout", "layout"),
@@ -2386,6 +2402,7 @@ def _task4_semantic_value(value, name):
     ("source_row_count", "source_row_count"),
     ("fingerprint", "fingerprint"),
     ("receipt_fingerprint", "receipt.fingerprint"),
+    ("receipt_relative_path", "receipt.relative_path"),
     ("instance_id", "instance_id"),
     ("case_payload", "case"),
     ("case_instance_id", "case"),
@@ -2432,6 +2449,9 @@ def test_teacher_spooled_row_validator_rejects_spoofed_semantic_metadata(
         spoofed["fingerprint"] = "0" * 64
     elif poison == "receipt_fingerprint":
         spoofed["receipt"] = dataclasses.replace(spoofed["receipt"], fingerprint="0" * 64)
+    elif poison == "receipt_relative_path":
+        spoofed["receipt"] = dataclasses.replace(
+            spoofed["receipt"], relative_path="worker_2/layouts_7.th")
     elif poison == "instance_id":
         spoofed["instance_id"] = "worker_2/layouts_0.th#99"
     elif poison == "case_payload":
@@ -2513,22 +2533,34 @@ def test_teacher_replay_uses_real_spooled_row_validator_immediately_before_runti
         assert process_event[2:] == validate_event[3:]
 
 
-@pytest.mark.parametrize("poison, changed_leaf", [
-    ("source_row_count", "source_row_count"),
-    ("file_sha256", "file_sha256"),
-])
-def test_teacher_replay_summary_is_from_verified_ingestion_not_spooled_record(
-        tmp_path, monkeypatch, poison, changed_leaf):
-    """A poisoned decoded spool record cannot rewrite its verified shard summary."""
+def test_teacher_verified_shard_summary_binds_raw_source_and_numeric_coordinates(tmp_path):
+    """Verified ingestion produces a replay summary from bytes and source, not a row."""
     t = _teacher()
+    builder = getattr(t, "_verified_shard_summary", None)
+    assert callable(builder), "missing real _verified_shard_summary semantic ingestion seam"
+    root = tmp_path / "floorset_lite"
+    sources = [
+        (2, 0, _task4_shard(root)),
+        (2, 1, _task4_single_shard(root, "worker_2/layouts_1.th")),
+    ]
+    for worker, layout, path in sources:
+        raw, source = t._read_verified_shard(root, worker, layout)
+        source_row_count, _blocks = t._validate_source_shard(source)
+        summary = builder(raw, source, worker, layout)
+        assert raw == path.read_bytes()
+        assert _task4_summary_values(summary) == _task4_trusted_shard_summary(
+            path, worker=worker, layout=layout, source_row_count=source_row_count
+        )
+
+
+def test_teacher_replay_rejects_builder_returned_count_not_matching_spooled_row(
+        tmp_path, monkeypatch):
+    """A replaceable summary cannot rewrite an independently decoded replay record."""
+    t = _teacher()
+    builder = getattr(t, "_verified_shard_summary", None)
     validator = getattr(t, "_validate_spooled_case_row", None)
-    summary_builder = getattr(t, "_trusted_shard_summary_from_verified_source", None)
-    record_decoder = getattr(t, "_replay_record_from_spool", None)
+    assert callable(builder), "missing real _verified_shard_summary semantic ingestion seam"
     assert callable(validator), "missing real _validate_spooled_case_row semantic replay seam"
-    assert callable(summary_builder), (
-        "missing _trusted_shard_summary_from_verified_source ingestion seam"
-    )
-    assert callable(record_decoder), "missing _replay_record_from_spool semantic replay seam"
     root = tmp_path / "floorset_lite"; source_path = _task4_shard(root); out = tmp_path / "out"
     expected_summary = _task4_trusted_shard_summary(source_path)
     calls = []
@@ -2539,95 +2571,34 @@ def test_teacher_replay_summary_is_from_verified_ingestion_not_spooled_record(
         t, "_new_staging",
         lambda destination: (stages.append(Path(real_staging(destination))) or stages[-1]),
     )
-    real_read = t._read_verified_shard
-    real_source_validate = t._validate_source_shard
-    verified = []
-    flow = []
+    real_builder = builder
+    returned_summaries = []
 
-    def read_verified(root_path, worker, layout):
-        raw, source = real_read(root_path, worker, layout)
-        verified.append({"worker": worker, "layout": layout, "raw": raw, "source": source})
-        flow.append(("read_verified", worker, layout))
-        return raw, source
+    def return_wrong_count(raw, source, worker, layout):
+        verified = real_builder(raw, source, worker, layout)
+        changed = _task4_replace_summary_value(verified, "source_row_count", 1)
+        returned_summaries.append((verified, changed))
+        return changed
 
-    def validate_source(source):
-        result = real_source_validate(source)
-        for item in verified:
-            if item["source"] is source:
-                item["source_row_count"] = result[0]
-                flow.append(("validate_source", item["worker"], item["layout"]))
-        return result
-
-    monkeypatch.setattr(t, "_read_verified_shard", read_verified)
-    monkeypatch.setattr(t, "_validate_source_shard", validate_source)
-    real_summary_builder = summary_builder
-    constructed_summaries = []
-
-    def build_trusted_summary(worker, layout, relative_path, raw, source_row_count):
-        result = real_summary_builder(worker, layout, relative_path, raw, source_row_count)
-        constructed_summaries.append({
-            "worker": worker, "layout": layout, "relative_path": relative_path,
-            "raw": raw, "source_row_count": source_row_count, "result": result,
-        })
-        flow.append(("build_summary", worker, layout))
-        return result
-
-    monkeypatch.setattr(t, "_trusted_shard_summary_from_verified_source",
-                        build_trusted_summary)
-    real_record_decoder = record_decoder
-    decoded = []
-
-    def decode_replay_record(*args, **kwargs):
-        record = real_record_decoder(*args, **kwargs)
-        before = copy.deepcopy(record)
-        after = copy.deepcopy(record)
-        if isinstance(after, collections.abc.Mapping) and not decoded:
-            after = dict(after)
-            after[changed_leaf] = (1 if poison == "source_row_count" else "0" * 64)
-        decoded.append((before, after))
-        if isinstance(after, collections.abc.Mapping):
-            flow.append(("decode_record", after.get("worker"), after.get("layout")))
-        return after
-
-    monkeypatch.setattr(t, "_replay_record_from_spool", decode_replay_record)
+    monkeypatch.setattr(t, "_verified_shard_summary", return_wrong_count)
     real_validator = validator
-    validations = []
+    validation_calls = []
 
     def validate_record(record, shard_summary):
-        validations.append((copy.deepcopy(record), copy.deepcopy(shard_summary)))
-        flow.append(("validate_record", _task4_semantic_value(record, "worker"),
-                     _task4_semantic_value(record, "layout")))
+        validation_calls.append((copy.deepcopy(record), copy.deepcopy(shard_summary)))
         return real_validator(record, shard_summary)
 
     monkeypatch.setattr(t, "_validate_spooled_case_row", validate_record)
     with pytest.raises(ValueError):
         t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
-    assert len(verified) == 1
-    verified_shard = verified[0]
-    assert verified_shard["worker"] == expected_summary["worker"]
-    assert verified_shard["layout"] == expected_summary["layout"]
-    assert hashlib.sha256(verified_shard["raw"]).hexdigest() == expected_summary["file_sha256"]
-    assert verified_shard["source_row_count"] == expected_summary["source_row_count"]
-    assert len(constructed_summaries) == 1
-    construction = constructed_summaries[0]
-    assert {name: construction[name] for name in expected_summary} == expected_summary
-    assert construction["raw"] == verified_shard["raw"]
-    assert construction["source_row_count"] == verified_shard["source_row_count"]
-    assert {name: _task4_semantic_value(construction["result"], name)
-            for name in expected_summary} == expected_summary
-    assert len(decoded) == len(validations) == 1
-    before, after = decoded[0]
-    assert isinstance(before, collections.abc.Mapping) and isinstance(after, collections.abc.Mapping)
-    assert [name for name, value in _task4_spooled_replay_leaves(before).items()
-            if value != _task4_spooled_replay_leaves(after)[name]] == [changed_leaf]
-    poisoned_record, passed_summary = validations[0]
-    assert poisoned_record == after
-    assert {name: _task4_semantic_value(passed_summary, name)
-            for name in expected_summary} == expected_summary
-    assert flow == [
-        ("read_verified", 2, 0), ("validate_source", 2, 0), ("build_summary", 2, 0),
-        ("decode_record", 2, 0), ("validate_record", 2, 0),
-    ]
+    assert len(returned_summaries) == len(validation_calls) == 1
+    pristine_summary, changed_summary = returned_summaries[0]
+    assert _task4_summary_values(pristine_summary) == expected_summary
+    assert [name for name, value in _task4_summary_values(pristine_summary).items()
+            if value != _task4_summary_values(changed_summary)[name]] == ["source_row_count"]
+    record, passed_summary = validation_calls[0]
+    assert _task4_semantic_value(record, "source_row_count") == 2
+    assert _task4_summary_values(passed_summary) == _task4_summary_values(changed_summary)
     assert calls == []
     assert not out.exists() and stages and not stages[-1].exists()
 
