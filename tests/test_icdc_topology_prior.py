@@ -1951,6 +1951,12 @@ def test_teacher_source_reads_each_file_once_from_same_bytesio_under_path_swap(t
         outcome_factory=_task4_p1c_mutation_outcome,
     )
     original_bytes = path.read_bytes(); seen = []
+    reader_calls = []; real_read = t._read_verified_shard
+
+    def read(root_path, worker, layout):
+        reader_calls.append((worker, layout))
+        return real_read(root_path, worker, layout)
+
     real_load = torch.load
 
     def load_from_verified_bytes(source, **kwargs):
@@ -1960,10 +1966,12 @@ def test_teacher_source_reads_each_file_once_from_same_bytesio_under_path_swap(t
         path.write_bytes(b"replaced-after-read")
         return real_load(source, **kwargs)
 
+    monkeypatch.setattr(t, "_read_verified_shard", read)
     monkeypatch.setattr(torch, "load", load_from_verified_bytes)
     policy = _policy_for(root)
     result = t.teacher_main(_task4_args(root, out), _trust_policy=policy)
-    assert result == 0 and seen == [original_bytes] and len(calls) == 2
+    assert result == 0 and reader_calls == [(2, 0)]
+    assert seen == [original_bytes] and len(calls) == 2
     expected_sha = hashlib.sha256(original_bytes).hexdigest()
     index = json.loads((out / "training_index.json").read_text())
     assert {row["receipt"]["file_sha256"] for row in index["rows"]} == {expected_sha}
@@ -2193,6 +2201,11 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
     def new_staging(destination):
         stage = real_new_staging(destination); created.append(stage); return stage
 
+    reader_calls = []; real_read = t._read_verified_shard
+    def read(root_path, worker, layout):
+        reader_calls.append((worker, layout))
+        return real_read(root_path, worker, layout)
+
     real_load = torch.load
     def load(source, **kwargs):
         assert isinstance(source, io.BytesIO)
@@ -2200,7 +2213,6 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
         assert created, "staging must exist before any shard is loaded"
         stage = created[-1]
         assert all((stage / name).exists() for name in _TASK4_JSONL)
-        assert not any(event[0] in {"process", "write"} for event in events)
         events.append(("load", source.getvalue()))
         return real_load(source, **kwargs)
 
@@ -2215,6 +2227,7 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
         return real_write(writer, name, value)
 
     monkeypatch.setattr(t, "_new_staging", new_staging)
+    monkeypatch.setattr(t, "_read_verified_shard", read)
     monkeypatch.setattr(torch, "load", load)
     monkeypatch.setattr(t._PopulationAccumulator, "register", register)
     monkeypatch.setattr(t._JsonlWriter, "write", write)
@@ -2222,6 +2235,7 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
 
     expected_paths = ["worker_2/layouts_0.th", "worker_2/layouts_2.th",
                       "worker_2/layouts_10.th"]
+    assert reader_calls == [(2, 0), (2, 2), (2, 10)]
     assert [event[1] for event in events if event[0] == "load"] == [
         (root / relative_path).read_bytes() for relative_path in expected_paths]
     heldout_ids = [f"{relative_path}#1" for relative_path in expected_paths]
@@ -2233,11 +2247,13 @@ def test_teacher_spool_ingests_all_shards_before_ordered_runtime_replay(tmp_path
     assert first_process < first_write
 
     expected_all = [
-        f"worker_2/layouts_0.th#{index}" for index in range(2)
-    ] + [
-        f"{relative_path}#0" for relative_path in expected_paths[1:]
+        f"{relative_path}#{index}"
+        for relative_path in expected_paths
+        for index in range(2)
     ]
     assert [case.case["instance_id"] for case in calls] == expected_all
+    assert len(calls) == len(expected_all) == len({case.case["instance_id"] for case in calls})
+    assert {case.case["instance_id"] for case in calls} == set(expected_all)
     for name in _TASK4_JSONL:
         rows = _task4_jsonl(out / name)
         assert (out / name).read_bytes() == b"".join(_task4_canonical_json(row) + b"\n" for row in rows)
@@ -2279,6 +2295,113 @@ def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
     forbidden = {"train_c", "held_c", "train_l", "held_l", "proposals", "rejections"}
     assert not ({node.id for node in ast.walk(teacher) if isinstance(node, ast.Name)} & forbidden)
     assert not ({node.arg for node in ast.walk(teacher) if isinstance(node, ast.arg)} & forbidden)
+
+    def assigned_names(target):
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return set().union(*(assigned_names(element) for element in target.elts))
+        return set()
+
+    def is_mutable_container(expression):
+        if isinstance(expression, (ast.List, ast.Dict, ast.Set,
+                                   ast.ListComp, ast.DictComp, ast.SetComp)):
+            return True
+        return (isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Name)
+                and expression.func.id in {"list", "dict", "set"})
+
+    def annotation_is_mutable_container(annotation):
+        return any(isinstance(node, ast.Name) and node.id in {"list", "dict", "set",
+                                                               "List", "Dict", "Set"}
+                   for node in ast.walk(annotation))
+
+    accumulator_fragments = ("row", "corpus", "index")
+    immediate_case_containers = {"mutation_rows", "proposal_rows", "rejection_rows"}
+    mutable_accumulators = []
+    for node in ast.walk(teacher):
+        if isinstance(node, ast.AnnAssign):
+            names = assigned_names(node.target)
+            is_mutable = (annotation_is_mutable_container(node.annotation)
+                          or (node.value is not None and is_mutable_container(node.value)))
+        elif isinstance(node, ast.Assign):
+            names = set().union(*(assigned_names(target) for target in node.targets))
+            is_mutable = is_mutable_container(node.value)
+        else:
+            continue
+        mutable_accumulators.extend(
+            name for name in names
+            if is_mutable and any(fragment in name.lower()
+                                  for fragment in accumulator_fragments)
+            and name not in immediate_case_containers
+        )
+    assert not mutable_accumulators, (
+        "teacher_main may retain only selected file paths and the immediate case; "
+        f"not mutable corpus/index rows: {mutable_accumulators}"
+    )
+
+    row_appends = []
+    for node in ast.walk(teacher):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"append", "extend"}
+                and isinstance(node.func.value, ast.Name)):
+            continue
+        if any(fragment in node.func.value.id.lower() for fragment in accumulator_fragments):
+            row_appends.append(node.func.value.id)
+    assert not row_appends, f"teacher_main must stream rows, not append them: {row_appends}"
+
+
+def test_teacher_streaming_b1_index_rows_are_emitted_during_replay(tmp_path, monkeypatch):
+    """A later runtime case proves the earlier index row was already streamed."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root)
+    calls = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls,
+                        outcome_factory=_task4_p1c_mutation_outcome)
+    import builtins
+    real_open = builtins.open
+    index_writes = []
+
+    class IndexWriterSpy:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def write(self, data):
+            index_writes.append(data if isinstance(data, bytes) else data.encode("utf-8"))
+            return self._handle.write(data)
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+    def streaming_index_open(path, mode="r", *args, **kwargs):
+        handle = real_open(path, mode, *args, **kwargs)
+        if "w" in mode and Path(path).name.startswith("training_index"):
+            return IndexWriterSpy(handle)
+        return handle
+
+    monkeypatch.setattr(t, "open", streaming_index_open, raising=False)
+    runtime = t._runtime_hooks(); real_process = runtime.process_case
+
+    def process(case_input):
+        if calls:
+            first_id = b'"instance_id":"worker_2/layouts_0.th#0"'
+            assert first_id in b"".join(index_writes), (
+                "the first completed case must reach the streaming index before replay continues"
+            )
+        return real_process(case_input)
+
+    monkeypatch.setattr(t, "_runtime_hooks",
+                        lambda: dataclasses.replace(runtime, process_case=process))
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert index_writes
+    assert json.loads((out / "training_index.json").read_text())["rows"]
 
 
 def test_teacher_streaming_b1_durability_precedes_publish(tmp_path, monkeypatch):
@@ -2383,6 +2506,54 @@ def test_teacher_streaming_b1_review_population_is_bounded_exact_and_ordered():
     finally:
         bounded.abort()
         tracemalloc.stop()
+
+
+def test_teacher_streaming_b1_population_roster_is_sqlite_only():
+    tree = ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())
+    population = next(node for node in tree.body
+                      if isinstance(node, ast.ClassDef)
+                      and node.name == "_PopulationAccumulator")
+
+    retained_identity_registries = {
+        node.attr for node in ast.walk(population)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        and node.attr.lower() in {"_registered", "_resolved", "_identities", "_roster"}
+    }
+    assert not retained_identity_registries, (
+        "the population roster must remain SQLite-only, not retained in Python: "
+        f"{sorted(retained_identity_registries)}"
+    )
+
+    def mutable_annotation(annotation):
+        return any(isinstance(child, ast.Name)
+                   and child.id in {"list", "dict", "set", "List", "Dict", "Set"}
+                   for child in ast.walk(annotation))
+
+    mutable_registry_fields = []
+    for node in ast.walk(population):
+        target = node.target if isinstance(node, ast.AnnAssign) else None
+        if not (isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name) and target.value.id == "self"):
+            continue
+        if any(fragment in target.attr.lower()
+               for fragment in ("register", "resolv", "identit", "roster")):
+            if mutable_annotation(node.annotation):
+                mutable_registry_fields.append(target.attr)
+    assert not mutable_registry_fields, (
+        "identity/resolution registries must not be retained as mutable fields: "
+        f"{sorted(mutable_registry_fields)}"
+    )
+
+    methods = {node.name: node for node in population.body
+               if isinstance(node, ast.FunctionDef)}
+    for name in ("register", "record_winner", "finish"):
+        assert name in methods
+        assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and node.func.attr == "execute"
+                   for node in ast.walk(methods[name])), (
+            f"{name} must use SQLite execute-backed roster state"
+        )
 
 
 @pytest.mark.parametrize("mutate", [
@@ -2644,6 +2815,12 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
         outcome_factory=_task4_p1c_mutation_outcome,
     )
     loaded = []
+    reader_calls = []; real_read = t._read_verified_shard
+
+    def read(root_path, worker, layout):
+        reader_calls.append((worker, layout))
+        return real_read(root_path, worker, layout)
+
     real_load = torch.load
 
     def count_load(source, **kwargs):
@@ -2653,6 +2830,7 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
         events.append(("load", source.getvalue(), kwargs.copy()))
         return real_load(source, **kwargs)
 
+    monkeypatch.setattr(t, "_read_verified_shard", read)
     monkeypatch.setattr(torch, "load", count_load)
     out = tmp_path / "out"
     assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
@@ -2660,9 +2838,10 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
         "worker_2/layouts_0.th", "worker_2/layouts_0.th",
         "worker_2/layouts_2.th", "worker_2/layouts_10.th",
         "worker_10/layouts_0.th"]
-    assert len(loaded) == 4
     expected_paths = ["worker_2/layouts_0.th", "worker_2/layouts_2.th",
                       "worker_2/layouts_10.th", "worker_10/layouts_0.th"]
+    assert reader_calls == [(2, 0), (2, 2), (2, 10), (10, 0)]
+    assert len(loaded) == 4
     expected_events = [
         ("load", (root / relative_path).read_bytes(),
          {"weights_only": True, "map_location": "cpu"})
