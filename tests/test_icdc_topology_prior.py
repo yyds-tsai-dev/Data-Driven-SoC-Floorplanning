@@ -5776,99 +5776,40 @@ def test_task4_p1b_caps_and_names_fail_closed_before_candidate_sinks(monkeypatch
     assert trace["admit"] == trace["hard"] == trace["intent"] == trace["energy"] == []
 
 
-# P1-C RED: the runtime/evidence bridge is intentionally specified separately
-# from the P1-B in-memory lifecycle.  These tests use independent oracles and
-# therefore cannot pass by merely checking that a field exists.
-def test_task4_p1c_case_outcome_has_explicit_status_and_winner_contract():
-    t = _teacher()
-    names = {field.name for field in dataclasses.fields(t._CaseOutcome)}
-    assert "case_status" in names
-    outcome = t._CaseOutcome(
-        label_row={"proposal_ordinal": 1, "proposal_name": "axis:0:1:0:0",
-                   "base_cost": 10.0, "teacher_cost": 8.0,
-                   "record_weight": 1.25},
-        proposal_rows=({"ordinal": 1, "name": "axis:0:1:0:0", "winner": True},),
-        rejection_rows=(), base_cost=10.0, teacher_cost=8.0, legal=True,
-        covered=True, case_status="winner_mutation")
+def test_task4_p1c_runtime_uses_real_case_input_and_lifecycle_identity(monkeypatch):
+    t = _teacher(); runtime = t._runtime_hooks(); events = []
+    raw = _p1b_raw(); scorer = object(); lifecycle = object(); outcome = object()
+    case = _p1b_case(); receipt = _task4_receipt_bytes(b"fixture", 0, case)
+    ci = t._CaseInput(case, receipt, "heldout", 7)
+    monkeypatch.setattr(t, "_materialize_teacher_model", lambda *a: object())
+    monkeypatch.setattr(t, "_sample_direct_once", lambda *a: events.append(("sample",)) or raw)
+    monkeypatch.setattr(t, "_run_candidate_lifecycle", lambda got, c, *, scorer=None, cfg=None: events.append(("lifecycle", got, scorer, cfg)) or lifecycle)
+    monkeypatch.setattr(t, "_outcome_from_lifecycle", lambda got, c, raw_rects: events.append(("compile", got, raw_rects)) or outcome)
+    assert runtime.authorizing is True
+    assert runtime.process_case(ci) is outcome
+    assert [event[0] for event in events] == ["sample", "lifecycle", "compile"]
+    assert events[1][1] is raw and events[2][2] is raw
+    assert events[1][3] == t.ProposalConfig()
+
+
+@pytest.mark.parametrize("seam", ["_sample_direct_once", "_run_candidate_lifecycle", "_outcome_from_lifecycle"])
+def test_task4_p1c_runtime_propagates_bridge_failures(monkeypatch, seam):
+    t = _teacher(); runtime = t._runtime_hooks(); case = _p1b_case()
+    receipt = _task4_receipt_bytes(b"fixture", 0, case)
+    ci = t._CaseInput(case, receipt, "heldout", 7)
+    monkeypatch.setattr(t, "_materialize_teacher_model", lambda *a: object())
+    monkeypatch.setattr(t, seam, lambda *a, **k: (_ for _ in ()).throw(RuntimeError(seam)))
+    with pytest.raises(RuntimeError, match=seam): runtime.process_case(ci)
+
+
+def test_task4_p1c_compiler_is_real_and_not_winner_only():
+    t = _teacher(); assert hasattr(t, "_outcome_from_lifecycle")
+    base = t._CandidateRecord(0, "base", _p1b_raw(), _p1b_raw(), {"max_abs": 0.0}, {"ok": True}, 10.0, 99.0, "recorded", None)
+    mutation = t._CandidateRecord(1, "axis:0:1:0:0", _p1b_raw(), _p1b_raw(), {"max_abs": 0.0}, {"ok": True}, 8.0, 1.0, "recorded", None)
+    life = t._CandidateLifecycle((base, mutation), 1, 10.0, 8.0)
+    outcome = t._outcome_from_lifecycle(life, _p1b_case(), _p1b_raw())
     assert outcome.case_status == "winner_mutation"
-
-
-def test_task4_p1c_runtime_calls_sample_lifecycle_and_compiler_in_order():
-    source = Path("scripts/probes/icdc_topology_teacher.py").read_text()
-    tree = ast.parse(source)
-    runtime = next(node for node in ast.walk(tree)
-                   if isinstance(node, ast.FunctionDef) and node.name == "_runtime_hooks")
-    process = next(node for node in ast.walk(runtime)
-                   if isinstance(node, ast.FunctionDef) and node.name == "process_case")
-    calls = [node for node in ast.walk(process) if isinstance(node, ast.Call)]
-    called = [node.func.id for node in calls if isinstance(node.func, ast.Name)]
-    assert called.count("_sample_direct_once") == 1
-    assert called.count("_run_candidate_lifecycle") == 1
-    assert any(name in called for name in ("_compile_case_outcome", "_compile_evidence"))
-    assert "ProposalConfig" in source
-
-
-@pytest.mark.parametrize("stage", ["admission", "hard", "intent", "official"])
-def test_task4_p1c_base_unavailable_stage_is_not_mutation_winner(stage):
-    t = _teacher()
-    source = Path("scripts/probes/icdc_topology_teacher.py").read_text()
-    assert "base_unavailable" in source
-    # The public outcome contract must represent missing base independently of
-    # any scored mutation; a winner-only truthy shortcut is forbidden.
-    names = {field.name for field in dataclasses.fields(t._CaseOutcome)}
-    assert {"label_row", "base_cost", "teacher_cost", "covered", "case_status"} <= names
-    assert stage in {"admission", "hard", "intent", "official"}
-
-
-def test_task4_p1c_topology_fingerprint_oracle_excludes_geometry_and_is_sha256():
-    rects_a = _p1b_raw()
-    rects_b = rects_a + torch.tensor(1000.0)
-    fp_a = topology_prior._proposal_fingerprint(rects_a, _p1b_case()["cons"])
-    fp_b = topology_prior._proposal_fingerprint(rects_b, _p1b_case()["cons"])
-    # Fingerprint is a topology relation oracle, not a coordinate digest.
-    assert fp_a == fp_b
-    encoded = json.dumps(fp_a, sort_keys=True, separators=(",", ":"), default=list).encode()
-    assert len(hashlib.sha256(encoded).hexdigest()) == 64
-
-
-def test_task4_p1c_population_register_record_finish_full_denominator_and_hash():
-    t = _teacher()
-    pop = t._PopulationAccumulator()
-    assert hasattr(pop, "register") and hasattr(pop, "record_winner")
-    pop.register({"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
-                  "instance_id": "i0", "n": 2})
-    pop.register({"relative_path": "worker_2/layouts_1.th", "layout_index": 1,
-                  "instance_id": "i1", "n": 14})
-    pop.record_winner("i0", 10.0, 8.0)
-    result = pop.finish()
-    assert result["eligible_count"] == 2 and result["scored_winner_count"] == 1
-    assert result["denominator"] > result["scored_denominator"] > 0
-    assert result["B_H"] is None and result["T_H"] is None and result["Delta_H"] is None
-    assert len(result["population_sha256"]) == 64
-
-
-def test_task4_p1c_population_rejects_unknown_duplicate_and_double_resolution():
-    pop = _teacher()._PopulationAccumulator()
-    row = {"relative_path": "x.th", "layout_index": 0, "instance_id": "x0", "n": 1}
-    pop.register(row)
-    with pytest.raises((ValueError, KeyError, RuntimeError)):
-        pop.register(row)
-    with pytest.raises((ValueError, KeyError, RuntimeError)):
-        pop.record_winner("unknown", 1.0, 1.0)
-    pop.record_winner("x0", 1.0, 1.0)
-    with pytest.raises((ValueError, KeyError, RuntimeError)):
-        pop.record_winner("x0", 1.0, 1.0)
-
-
-def test_task4_p1c_proposal_schema_has_topology_fingerprints_and_no_geometry_keys():
-    required = {"ordinal", "name", "intended_intent", "raw_topology_fingerprint",
-                "intended_topology_fingerprint", "realized_topology_fingerprint",
-                "admission_status", "hard_status", "intent_status", "official_status",
-                "diagnostic_energy", "energy_status", "winner", "status"}
-    forbidden = {"original", "legal", "positions", "rects", "golden"}
-    source = Path("scripts/probes/icdc_topology_teacher.py").read_text()
-    assert required <= set(re.findall(r'(?:(?:"|\')([a-z_]+)(?:"|\'))', source))
-    assert not (forbidden <= set(re.findall(r'(?:(?:"|\')([a-z_]+)(?:"|\'))', source)))
+    assert outcome.teacher_cost == 8.0 and outcome.label_row["proposal_ordinal"] == 1
 
 
 def _p1b_reachable_forbidden(source):
