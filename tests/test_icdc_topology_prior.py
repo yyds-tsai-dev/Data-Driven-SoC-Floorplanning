@@ -1383,6 +1383,56 @@ def test_teacher_streaming_b1_review_population_rejects_duplicate_instance():
         acc.add({**row, "relative_path": "worker_2/layouts_1.th", "layout_index": 1})
 
 
+def test_teacher_streaming_b1_population_spool_connect_failure_removes_all_artifacts(tmp_path, monkeypatch):
+    t = _teacher()
+    db_path = tmp_path / "population.sqlite"
+    sentinel = RuntimeError("sqlite connect sentinel")
+
+    class TempFile:
+        name = str(db_path)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(t.tempfile, "NamedTemporaryFile", lambda **kwargs: TempFile())
+    monkeypatch.setattr(t.sqlite3, "connect", lambda *args, **kwargs: (_ for _ in ()).throw(sentinel))
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        (tmp_path / f"population.sqlite{suffix}").touch()
+    with pytest.raises(RuntimeError) as exc:
+        t._PopulationAccumulator()
+    assert exc.value is sentinel
+    assert all(not Path(f"{db_path}{suffix}").exists() for suffix in ("", "-journal", "-wal", "-shm"))
+
+
+def test_teacher_streaming_b1_baseexception_failure_cleans_transaction(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
+    _task4_shard(root, relative_path="worker_0/layouts_0.th"); _task4_fake_runtime(t, monkeypatch)
+    class CustomBase(BaseException):
+        pass
+    sentinel = CustomBase("writer baseexception")
+    staging_paths = []; writers = []; populations = []
+    real_staging = t._new_staging
+    monkeypatch.setattr(t, "_new_staging", lambda destination: (staging_paths.append(Path(real_staging(destination))) or staging_paths[-1]))
+    real_writer_init = t._JsonlWriter.__init__
+    def writer_init(writer, staging):
+        writers.append(writer); real_writer_init(writer, staging)
+    monkeypatch.setattr(t._JsonlWriter, "__init__", writer_init)
+    real_population_init = t._PopulationAccumulator.__init__
+    def population_init(population):
+        real_population_init(population); populations.append(population)
+    monkeypatch.setattr(t._PopulationAccumulator, "__init__", population_init)
+    monkeypatch.setattr(t._JsonlWriter, "write", lambda *args, **kwargs: (_ for _ in ()).throw(sentinel))
+    published = []; monkeypatch.setattr(t, "_publish_staging", lambda *args: published.append(args))
+    with pytest.raises(CustomBase) as exc:
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert exc.value is sentinel
+    assert published == [] and not out.exists()
+    assert staging_paths and not staging_paths[-1].exists()
+    assert writers and all(handle.closed for handle in writers[0]._files.values())
+    assert populations
+    db_path = populations[0]._db_path
+    assert all(not Path(f"{db_path}{suffix}").exists() for suffix in ("", "-journal", "-wal", "-shm"))
+
+
 def test_teacher_streaming_b1_review_writer_init_is_transactional(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; out = tmp_path / "out"
     _task4_shard(root, relative_path="worker_0/layouts_0.th"); _task4_fake_runtime(t, monkeypatch)
