@@ -502,11 +502,23 @@ def _task4_case_input(t, seed=17):
                                   layout_index=0, fingerprint="1" * 64)
     return ci(case, receipt, "train", seed)
 
+def _task4_anchored_case_input(t, seed=17):
+    ci = _task4_case_input(t, seed)
+    case = dict(ci.case)
+    case["cons"] = [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 0, 0, 0]]
+    case["tp"] = [[-1.0, -1.0, 2.0, 3.0], [7.0, 8.0, 4.0, 5.0], [-1.0] * 4]
+    return dataclasses.replace(ci, case=case)
+
 
 def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
     t = _teacher(); payload = _task4_teacher_payload()
     monkeypatch.setattr(torch, "load", lambda *a, **k: pytest.fail("reopened checkpoint"))
+    real = t.DirectDenoiser.load_state_dict; calls = []
+    def wrapped(self, state_dict, *args, **kwargs):
+        calls.append(kwargs.copy()); return real(self, state_dict, *args, **kwargs)
+    monkeypatch.setattr(t.DirectDenoiser, "load_state_dict", wrapped)
     state = t._materialize_teacher_model(payload, torch.device("cpu"))
+    assert calls and calls[-1].get("strict") is True
     assert isinstance(state, t._TeacherModelState)
     assert state.model.training is False and state.schedule.timesteps == 8
     assert all(not p.requires_grad for p in state.model.parameters())
@@ -518,12 +530,23 @@ def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
     assert all(p.dtype == torch.float32 for p in state.model.parameters())
 
 
-@pytest.mark.parametrize("kind", ["nonmapping", "missing_model", "model_nonmapping", "model_empty",
+@pytest.mark.parametrize("kind", ["nonmapping", "missing_config", "config_nonmapping", "config_incomplete",
+    "same_key_model_order", "same_key_ema_order", "ema_dtype", "model_nonfinite",
+    "missing_model", "model_nonmapping", "model_empty",
     "missing_ema", "ema_nonmapping", "ema_empty", "key_mismatch", "extra_ema", "shape",
     "nontensor", "inf", "zdim", "zrepr", "unknown", "model_shape", "model_dtype"])
 def test_task4_materializer_rejects_malformed_payload(kind):
     bad = _task4_teacher_payload()
     if kind == "nonmapping": bad = []
+    elif kind == "missing_config": bad.pop("model_config")
+    elif kind == "config_nonmapping": bad["model_config"] = []
+    elif kind == "config_incomplete": bad["model_config"].pop("z_dim")
+    elif kind == "same_key_model_order": bad["model"] = dict(reversed(list(bad["model"].items())))
+    elif kind == "same_key_ema_order": bad["ema"] = dict(reversed(list(bad["ema"].items())))
+    elif kind == "ema_dtype":
+        k = next(k for k, v in bad["ema"].items() if v.is_floating_point()); bad["ema"][k] = bad["ema"][k].double()
+    elif kind == "model_nonfinite":
+        k = next(k for k, v in bad["model"].items() if v.is_floating_point()); bad["model"][k].fill_(float("nan"))
     elif kind == "missing_model": bad.pop("model")
     elif kind == "model_nonmapping": bad["model"] = []
     elif kind == "model_empty": bad["model"] = {}
@@ -580,9 +603,12 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
         calls["decode"].append((raw, area, cons, tp, scale)); return raw.double()
     monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", sampler, raising=False)
     monkeypatch.setattr(t, "_DECODE_RECTS", decoder, raising=False)
-    case = _task4_case_input(t).case
+    case = _task4_anchored_case_input(t).case
     case = t._sanitize_case(case, artifact=True)
+    cpu_before = torch.get_rng_state(); cuda_before = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     out1 = t._sample_direct_once(state, case, 31)
+    assert torch.equal(cpu_before, torch.get_rng_state())
+    if cuda_before is not None: assert all(torch.equal(a, b) for a, b in zip(cuda_before, torch.cuda.get_rng_state_all()))
     out2 = t._sample_direct_once(state, case, 31)
     out3 = t._sample_direct_once(state, case, 32)
     assert out1.shape == (3, 4) and out1.dtype == torch.float64 and torch.isfinite(out1).all()
@@ -617,6 +643,15 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
         assert cons.dtype == torch.int64
         assert all(x.device.type == "cpu" for x in (raw, area, cons, tp, scale))
 
+@pytest.mark.parametrize("bad", [torch.zeros((3, 4, 1)), torch.full((3, 4), float("nan")),
+    torch.full((3, 4), float("inf")), torch.tensor([[0., 0., 0., 1.]] * 3),
+    torch.tensor([[0., 0., 1., -1.]] * 3)])
+def test_task4_sample_rejects_malformed_decoder_results(monkeypatch, bad):
+    t = _teacher(); state = t._materialize_teacher_model(_task4_teacher_payload(), torch.device("cpu"))
+    monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", lambda *a, **k: bad, raising=False)
+    with pytest.raises((ValueError, RuntimeError)):
+        t._sample_direct_once(state, _task4_anchored_case_input(t).case, 9)
+
 
 def test_task4_runtime_materializes_lazily_caches_and_never_reopens(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "trusted"; root.mkdir()
@@ -642,6 +677,33 @@ def test_task4_runtime_materializes_lazily_caches_and_never_reopens(tmp_path, mo
     assert len(materialize_calls) == 1 and materialize_calls[0][1].type == "cpu"
     assert t._checkpoint_identity(materialize_calls[0][0]) == identity
     assert [seed for _, seed in sample_calls] == [101, 202]
+
+def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_clears(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "trusted"; root.mkdir()
+    p1, p2 = _task4_teacher_payload(), _task4_teacher_payload()
+    p2["ema"][next(iter(p2["ema"]))] = p2["ema"][next(iter(p2["ema"]))] + 2
+    paths = [root / "one.th", root / "two.th"]
+    torch.save(p1, paths[0]); torch.save(p2, paths[1])
+    def policy(path, payload):
+        return t.TeacherTrustPolicy(root, hashlib.sha256(path.read_bytes()).hexdigest(),
+            t._checkpoint_identity(payload), t._SCORER_SHA256,
+            "iccad2026_evaluate_cost_no_runtime_v1", "2.0.5")
+    runtime = t._runtime_hooks(); runtime.preflight(policy(paths[0], p1), paths[0])
+    runtime.preflight(policy(paths[1], p2), paths[1])
+    seen = []
+    monkeypatch.setattr(t, "_materialize_teacher_model", lambda p, d: seen.append(p) or object(), raising=False)
+    monkeypatch.setattr(t, "_sample_direct_once", lambda *a: torch.ones((3, 4), dtype=torch.float64), raising=False)
+    with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
+        runtime.process_case(_task4_case_input(t))
+    assert seen and t._checkpoint_identity(seen[-1]) == t._checkpoint_identity(p2)
+    bad = policy(paths[0], p1)
+    monkeypatch.setattr(runtime, "_verify_preflight", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad preflight")), raising=False)
+    with pytest.raises((ValueError, RuntimeError)):
+        runtime.preflight(bad, paths[0])
+    seen.clear()
+    with pytest.raises(RuntimeError):
+        runtime.process_case(_task4_case_input(t))
+    assert not seen
 
 
 _TASK4_FILES = (
