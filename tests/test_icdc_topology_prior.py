@@ -1249,7 +1249,7 @@ def test_teacher_streaming_b1_teacher_main_has_no_row_sequence_accumulators():
     teacher = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "teacher_main")
     forbidden = {"train_c", "held_c", "train_l", "held_l", "proposals", "rejections"}
     assert not ({node.id for node in ast.walk(teacher) if isinstance(node, ast.Name)} & forbidden)
-    assert not ({node.id for node in ast.walk(teacher) if isinstance(node, ast.arg)} & forbidden)
+    assert not ({node.arg for node in ast.walk(teacher) if isinstance(node, ast.arg)} & forbidden)
 
 
 def test_teacher_streaming_b1_durability_precedes_publish(tmp_path, monkeypatch):
