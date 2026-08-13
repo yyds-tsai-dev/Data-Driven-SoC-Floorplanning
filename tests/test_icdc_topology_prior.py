@@ -440,26 +440,38 @@ def test_checkpoint_identity_streams_tensor_bytes_incrementally(monkeypatch):
 
 def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     path = Path("scripts/probes/icdc_topology_teacher.py")
-    t = _teacher(); tree = ast.parse(path.read_text())
-    text = path.read_text()
-    forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "BandFileSampler._instance", "shelf_fallback", "golden", "validation", "sample_bank")
-    def dotted(n):
-        if isinstance(n, ast.Name): return n.id
-        if isinstance(n, ast.Attribute):
-            p = dotted(n.value); return f"{p}.{n.attr}" if p else n.attr
+    tree = ast.parse(path.read_text())
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                aliases[item.asname or item.name.split('.')[0]] = item.name if item.asname else item.name.split('.')[0]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for item in node.names:
+                aliases[item.asname or item.name] = f"{node.module}.{item.name}"
+    def resolve(node):
+        if isinstance(node, ast.Name): return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            base = resolve(node.value); return f"{base}.{node.attr}" if base else node.attr
         return ""
-    calls = [dotted(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
-    forbidden_suffixes = ("load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance", "sample_bank")
-    assert not any(any(x == suffix or x.endswith("." + suffix) for suffix in forbidden_suffixes) for x in calls)
-    assert "engine.load_model" not in calls
-    assert not any(x.endswith(".collate") or x == "collate" for x in calls)
-    loads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and dotted(n.func) == "torch.load"]
+    for _ in range(2):
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                value = resolve(node.value)
+                if value and value != node.targets[0].id and isinstance(node.value, (ast.Name, ast.Attribute)):
+                    aliases[node.targets[0].id] = value
+    calls = [resolve(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance", "engine.load_model", "engine.sample_bank", "sample_bank")
+    assert not any(any(x == bad or x.endswith("." + bad) for bad in forbidden) for x in calls)
+    assert not any(x == "collate" or x.endswith(".collate") for x in calls)
+    loads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and resolve(n.func) == "torch.load"]
     assert len(loads) == 2
     for node in loads:
-        assert node.args and isinstance(node.args[0], ast.Call) and dotted(node.args[0].func) == "io.BytesIO"
+        assert len(node.args) == 1 and isinstance(node.args[0], ast.Call) and resolve(node.args[0].func) == "io.BytesIO"
+        assert len(node.args[0].args) == 1 and isinstance(node.args[0].args[0], ast.Name) and not node.args[0].keywords
         kw = {k.arg: k.value for k in node.keywords}
-        assert isinstance(kw.get("weights_only"), ast.Constant) and kw["weights_only"].value is True
-        assert isinstance(kw.get("map_location"), ast.Constant) and kw["map_location"].value == "cpu"
+        assert set(kw) == {"weights_only", "map_location"}
+        assert kw["weights_only"].value is True and kw["map_location"].value == "cpu"
 
 
 def _task4_teacher_payload():
@@ -472,7 +484,8 @@ def _task4_teacher_payload():
                             dropout=0.0, timesteps=8, self_conditioning=True)
     model = DirectDenoiser(cfg)
     model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    ema_state = {k: v.detach().clone().add(1.0) for k, v in model_state.items()}
+    ema_state = {k: (v.detach().clone().add(1.0) if i == 0 and v.is_floating_point() else v.detach().clone())
+                 for i, (k, v) in enumerate(model_state.items())}
     return {"model_config": dataclasses.asdict(cfg), "model": model_state,
             "ema": ema_state}
 
@@ -499,7 +512,9 @@ def test_task4_materializes_ema_eval_and_frozen_from_memory(monkeypatch):
     assert all(not p.requires_grad for p in state.model.parameters())
     assert list(state.model.state_dict()) == list(payload["ema"])
     assert all(torch.equal(state.model.state_dict()[k], payload["ema"][k]) for k in payload["ema"])
-    assert any(not torch.equal(payload["model"][k], payload["ema"][k]) for k in payload["ema"])
+    differing = {k for k in payload["ema"] if not torch.equal(payload["model"][k], payload["ema"][k])}
+    assert differing
+    assert all(torch.equal(state.model.state_dict()[k], payload["ema"][k]) for k in payload["ema"])
     assert all(p.dtype == torch.float32 for p in state.model.parameters())
 
 
@@ -534,12 +549,13 @@ def test_task4_materializer_rejects_malformed_payload(kind):
 
 def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
     t = _teacher(); case = _task4_case_input(t).case
-    if hasattr(t, "_sanitize_case"):
-        case = t._sanitize_case(case, artifact=True)
+    case = t._sanitize_case(case, artifact=True)
     direct, diagnostic = t._build_teacher_batches(case, torch.device("cpu"))
+    assert direct["area"].shape == (1, 3) and direct["tp"].shape == (1, 3, 4)
+    assert direct["cons"].shape == (1, 3, 5) and direct["scale"].shape == (1,)
     for key in ("area", "tp", "b2b", "p2b", "pins", "scale"):
         assert direct[key].dtype == torch.float32 and direct[key].device.type == "cpu"
-    assert direct["cons"].dtype == torch.int64 and direct["cons"].shape[0] == 1
+    assert direct["cons"].dtype == torch.int64 and direct["cons"].shape == (1, 3, 5)
     assert direct["b2b"].shape == (1, 1, 3) and direct["p2b"].shape == (1, 1, 3)
     assert direct["pins"].shape == (1, 1, 2)
     for key in ("area", "tp", "b2b", "p2b", "pins", "scale"):
@@ -547,6 +563,9 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
     assert diagnostic["cons"].dtype == torch.int64 and diagnostic["cons"].device.type == "cpu"
     assert diagnostic["scale"].item() == direct["scale"].double().item()
     assert diagnostic["hpwl_ref"].item() == 4.0 and diagnostic["area_ref"].item() == 4.0
+    for batch in (direct, diagnostic):
+        assert batch["area"].shape == (1, 3) and batch["tp"].shape == (1, 3, 4)
+        assert batch["cons"].shape == (1, 3, 5) and batch["scale"].shape == (1,)
     f64_scale = torch.sqrt(torch.tensor(case["area"], dtype=torch.float64).sum())
     assert diagnostic["scale"].item() != f64_scale.item()
 
@@ -562,6 +581,7 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
     monkeypatch.setattr(t, "_SAMPLE_DIRECT_DPM", sampler, raising=False)
     monkeypatch.setattr(t, "_DECODE_RECTS", decoder, raising=False)
     case = _task4_case_input(t).case
+    case = t._sanitize_case(case, artifact=True)
     out1 = t._sample_direct_once(state, case, 31)
     out2 = t._sample_direct_once(state, case, 31)
     out3 = t._sample_direct_once(state, case, 32)
@@ -571,8 +591,27 @@ def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch)
     assert [x[2] for x in calls["sample"]] == [31, 31, 32]
     for args, kwargs, _ in calls["sample"]:
         assert len(args) == 3 and args[0] is state.model and args[2] is state.schedule
+        cond = args[1]
+        assert isinstance(cond, collections.abc.Mapping)
+        assert cond["node_feat"].shape == (1, 3, 26) and cond["node_feat"].dtype == torch.float32 and cond["node_feat"].device.type == "cpu"
+        assert cond["mask"].shape == (1, 3) and cond["mask"].dtype == torch.bool and bool(cond["mask"].all())
+        assert cond["adj"].shape == (1, 3, 3) and cond["adj"].dtype == torch.float32
+        if "rel_feat" in cond:
+            assert cond["rel_feat"].shape == (1, 3, 3, 9) and cond["rel_feat"].dtype == torch.float32
         assert set(kwargs) == {"steps", "generator", "z_known", "known_mask"} and kwargs["steps"] == 2
         assert kwargs["z_known"].shape == (1, 3, 4) and kwargs["known_mask"].shape == (1, 3, 4)
+        assert kwargs["z_known"].dtype == torch.float32 and kwargs["z_known"].device.type == "cpu"
+        assert kwargs["known_mask"].dtype == torch.bool and kwargs["known_mask"].device.type == "cpu"
+        direct, _ = t._build_teacher_batches(case, torch.device("cpu"))
+        import icdc.engine as engine
+        expected_z, expected_mask = engine.known_channels(direct)
+        assert torch.equal(kwargs["z_known"], expected_z)
+        assert torch.equal(kwargs["known_mask"], expected_mask)
+        assert direct["node_feat"].shape == (1, 3, 26) and direct["node_feat"].dtype == torch.float32
+        assert direct["mask"].shape == (1, 3) and direct["mask"].dtype == torch.bool and bool(direct["mask"].all())
+        assert direct["adj"].shape == (1, 3, 3) and direct["adj"].dtype == torch.float32
+        if "rel_feat" in direct:
+            assert direct["rel_feat"].shape == (1, 3, 3, 9) and direct["rel_feat"].dtype == torch.float32
     for raw, area, cons, tp, scale in calls["decode"]:
         assert raw.dtype == area.dtype == tp.dtype == scale.dtype == torch.float64
         assert cons.dtype == torch.int64
