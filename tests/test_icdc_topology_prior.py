@@ -300,22 +300,6 @@ def test_teacher_source_transaction_publishes_verified_two_row_corpus(tmp_path, 
     out = tmp_path / "out"
     policy = _policy_for(root)
 
-    @dataclasses.dataclass(frozen=True)
-    class FakeRuntime:
-        preflight: object
-        process_case: object
-        authorizing: bool = True
-
-    def preflight(_policy, _root):
-        return {"trust_ok": True, "scorer_ok": True, "input_ok": True}
-
-    def process(case):
-        row = {"instance_id": case.receipt.instance_id, "partition": case.partition,
-               "base_cost": 1.10, "teacher_cost": 1.00, "legal": True, "covered": True}
-        return t._CaseOutcome(row, [{"name": "base", "instance_id": case.receipt.instance_id}], [],
-                              1.10, 1.00, True, True)
-
-    monkeypatch.setattr(t, "_runtime_hooks", lambda: FakeRuntime(preflight, process), raising=False)
     result = t.teacher_main(["--data-root", str(root), "--out-dir", str(out),
                              "--index-out", str(out / "training_index.json"),
                              "--checkpoint", str(tmp_path / "unused.th"),
@@ -328,6 +312,90 @@ def test_teacher_source_transaction_publishes_verified_two_row_corpus(tmp_path, 
         "train_labels.jsonl", "training_index.json"]
     blobs = b"".join(p.read_bytes() for p in out.iterdir())
     assert not any(str(secret).encode() in blobs for secret in (701, 703, 401, 403, 709, 719, 809, 811))
+
+
+def _task4_run(tmp_path, *, n_min="1", extra=()):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"
+    return t, root, out, t.teacher_main(
+        ["--data-root", str(root), "--out-dir", str(out),
+         "--index-out", str(out / "training_index.json"),
+         "--checkpoint", str(tmp_path / "unused.th"), "--heldout-mod", "2",
+         "--n-min", n_min, *extra], _trust_policy=_policy_for(root))
+
+
+def test_teacher_source_receipts_index_partitions_and_manifest_are_canonical(tmp_path):
+    t, root, out, result = _task4_run(tmp_path)
+    assert result == 0
+    index = json.loads((out / "training_index.json").read_text())
+    assert [r["relative_path"] for r in index["rows"]] == ["worker_2/layouts_0.th"] * 2
+    assert {r["partition"] for r in index["rows"]} == {"train", "heldout"}
+    assert all(len(r["source_sha256"]) == 64 and r["layout_index"] == 0 for r in index["rows"])
+    assert json.loads((out / "g0_manifest.json").read_text())["status"] == "complete"
+
+
+def test_teacher_source_loads_each_shard_once_from_verified_bytesio(tmp_path, monkeypatch):
+    t, root, out = _teacher(), tmp_path / "floorset_lite", tmp_path / "out"
+    _task4_shard(root); seen = []
+    original = torch.load
+    def load_once(source, **kwargs):
+        assert isinstance(source, io.BytesIO)
+        assert kwargs == {"weights_only": True, "map_location": "cpu"}
+        seen.append(source.getvalue())
+        return original(source, **kwargs)
+    monkeypatch.setattr(torch, "load", load_once)
+    t.teacher_main(["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"), "--checkpoint", str(tmp_path / "unused.th"), "--heldout-mod", "2", "--n-min", "1"], _trust_policy=_policy_for(root))
+    assert len(seen) == 1
+
+
+def test_teacher_masks_unauthorized_soft_fp_coordinates(tmp_path):
+    t, root, out, result = _task4_run(tmp_path)
+    assert result == 0
+    assert b"701" not in (out / "train_corpus.jsonl").read_bytes()
+    assert b"809" not in (out / "heldout_corpus.jsonl").read_bytes()
+
+
+def test_teacher_is_deterministic_and_never_replaces_existing_output(tmp_path):
+    t, root, out, result = _task4_run(tmp_path)
+    assert result == 0
+    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in out.iterdir()}
+    with pytest.raises((FileExistsError, ValueError, RuntimeError)):
+        t.teacher_main(["--data-root", str(root), "--out-dir", str(out), "--index-out", str(out / "training_index.json"), "--checkpoint", str(tmp_path / "unused.th"), "--heldout-mod", "2", "--n-min", "1"], _trust_policy=_policy_for(root))
+    assert before == {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in out.iterdir()}
+
+
+def test_teacher_process_failure_leaves_no_final_output(tmp_path):
+    _task4_run(tmp_path)
+    assert not (tmp_path / "out").exists()
+
+
+def test_teacher_publish_failure_leaves_staging_only_until_atomic_commit(tmp_path):
+    _task4_run(tmp_path)
+    assert not (tmp_path / "out").exists()
+
+
+def test_teacher_excluded_rows_publish_terminal_non_authorizing_evidence(tmp_path):
+    t, root, out, result = _task4_run(tmp_path, n_min="4")
+    assert result != 0
+    manifest = json.loads((out / "g0_manifest.json").read_text())
+    assert manifest["training_authorized"] is False
+    assert manifest["state"] == "KILLED_LEGALITY_OR_COVERAGE"
+    assert all(not (out / name).read_bytes() for name in ("train_corpus.jsonl", "heldout_corpus.jsonl", "proposals.jsonl", "rejections.jsonl"))
+
+
+def test_teacher_ast_dataflow_forbids_validation_golden_and_path_source_loads():
+    tree = ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())
+    calls = []
+    def dotted(n):
+        if isinstance(n, ast.Name): return n.id
+        if isinstance(n, ast.Attribute):
+            p = dotted(n.value); return f"{p}.{n.attr}" if p else n.attr
+        return ""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call): calls.append((dotted(node.func), node))
+    forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "golden", "validation", "BandFileSampler._instance")
+    assert not any(any(name == bad or name.endswith("." + bad) for bad in forbidden) for name, _ in calls)
+    assert not any(name == "torch.load" and node.args and isinstance(node.args[0], ast.Name) for name, node in calls)
 
 
 def test_teacher_g0_state_precedence_literals():
