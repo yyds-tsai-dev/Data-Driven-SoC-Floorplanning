@@ -1268,6 +1268,64 @@ def test_teacher_numeric_discovery_filters_decoys_and_preserves_order(tmp_path, 
     assert events == expected_events
 
 
+def test_teacher_canonical_ascii_discovery_binds_paths_and_ignores_unicode_decoys(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    # These names must not become valid after parse-to-int/path reconstruction.
+    _task4_single_shard(root, "worker_02/layouts_00.th", metric_delta=9)
+    _task4_single_shard(root, "worker_²/layouts_⁰.th", metric_delta=8)
+    _task4_single_shard(root, "worker_2/layouts_０.th", metric_delta=7)
+    calls = []; _task4_fake_runtime(t, monkeypatch, calls=calls)
+    out = tmp_path / "out"
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert [c.receipt.relative_path for c in calls] == [
+        "worker_2/layouts_0.th", "worker_2/layouts_0.th"]
+    assert [c.receipt.layout_index for c in calls] == [0, 1]
+    assert all("02" not in c.receipt.relative_path for c in calls)
+
+
+def test_teacher_validate_source_shard_uses_bounded_finite_checks(monkeypatch):
+    t = _teacher(); source = _task4_padded_tensors()
+    monkeypatch.setattr(torch, "cat", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("validation concatenated source tensors")))
+    assert t._validate_source_shard(source) == (2, 3)
+
+
+def test_teacher_json_serialization_always_disables_nan(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    _task4_fake_runtime(t, monkeypatch); out = tmp_path / "out"
+    real_dumps = t.json.dumps; seen = []
+    def spy(value, *args, **kwargs):
+        seen.append(kwargs.get("allow_nan", "missing"))
+        return real_dumps(value, *args, **kwargs)
+    monkeypatch.setattr(t.json, "dumps", spy)
+    assert t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root)) == 0
+    assert seen and all(value is False for value in seen)
+
+
+@pytest.mark.parametrize("field,value,match", [
+    ("diagnostic_energy", "bad", "diagnostic_energy"),
+    ("diagnostic_energy", True, "diagnostic_energy"),
+    ("diagnostic_energy", float("inf"), "(diagnostic_energy|noncanonical runtime evidence)"),
+    ("drift", [], "drift"), ("drift", {}, "drift"),
+    ("drift", {"max_abs": True}, "drift"),
+    ("drift", {"max_abs": -1.0}, "drift"),
+    ("drift", {"max_abs": float("nan")}, "(drift|noncanonical runtime evidence)"),
+    ("hard", {}, "hard"), ("hard", {1: True}, "hard"),
+    ("hard", {"legal": 1}, "hard"), ("hard", {"legal": False}, "hard"),
+])
+def test_teacher_diagnostic_evidence_schema_is_semantically_rejected(
+        tmp_path, monkeypatch, field, value, match):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"; calls, _ = _task4_install_custom_runtime(
+        t, monkeypatch,
+        outcome_factory=lambda module, _case: module._CaseOutcome(
+            {"edges": [], "contacts": [], "pin_paths": []},
+            (dict(_task4_good_proposal(), **{field: value}),), (), 1.1, 1.0, True, True))
+    with pytest.raises(ValueError, match=match):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert len(calls) == 1 and not out.exists()
+
+
 def test_teacher_ast_guard_resolves_imports_aliases_and_bytesio_source_load_contract():
     tree = ast.parse(Path("scripts/probes/icdc_topology_teacher.py").read_text())
     aliases = {}
