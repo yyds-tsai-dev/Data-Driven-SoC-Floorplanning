@@ -829,7 +829,7 @@ def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_cl
             with pytest.raises(RuntimeError, match="teacher process (candidate lifecycle|runtime) not implemented"):
                 runtime.process_case(_task4_case_input(t, seed))
     runtime.preflight(policy(paths[0], p1), paths[0]); process_with_seams(101)
-    assert [id(x) for x in materialized] == [id(p1)]
+    assert [t._checkpoint_identity(x) for x in materialized] == [t._checkpoint_identity(p1)]
     assert refs[0]() is not None
     runtime.preflight(policy(paths[1], p2), paths[1]); gc.collect(); assert refs[0]() is None
     process_with_seams(202); assert refs[1]() is not None
@@ -839,7 +839,9 @@ def test_task4_runtime_preflight_replaces_cached_payload_and_failed_preflight_cl
     with pytest.raises(RuntimeError, match="before trusted preflight"):
         runtime.process_case(_task4_case_input(t, 303))
     runtime.preflight(policy(paths[2], p3), paths[2]); process_with_seams(303); assert refs[2]() is not None
-    assert [id(x) for x in materialized] == [id(p1), id(p2), id(p3)]
+    assert [t._checkpoint_identity(x) for x in materialized] == [
+        t._checkpoint_identity(p1), t._checkpoint_identity(p2), t._checkpoint_identity(p3)
+    ]
     assert sampled == [101, 202, 303]
 
 
