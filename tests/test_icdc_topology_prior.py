@@ -2603,6 +2603,101 @@ def test_teacher_replay_rejects_builder_returned_count_not_matching_spooled_row(
     assert not out.exists() and stages and not stages[-1].exists()
 
 
+@pytest.mark.parametrize("field", ["relative_path", "file_sha256"])
+def test_teacher_ingestion_rejects_forged_builder_provenance_before_processing(
+        tmp_path, monkeypatch, field):
+    t = _teacher(); root = tmp_path / "floorset_lite"; source = _task4_shard(root)
+    out = tmp_path / "out"; calls = []
+    _task4_fake_runtime(t, monkeypatch, calls=calls,
+                        outcome_factory=_task4_p1c_mutation_outcome)
+    real_builder = t._verified_shard_summary
+    forged = []
+
+    def forge(raw, source_info, worker, layout):
+        verified = real_builder(raw, source_info, worker, layout)
+        value = "worker_99/layouts_9.th" if field == "relative_path" else "0" * 64
+        changed = _task4_replace_summary_value(verified, field, value)
+        forged.append((verified, changed))
+        return changed
+
+    monkeypatch.setattr(t, "_verified_shard_summary", forge)
+    with pytest.raises(ValueError):
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert len(forged) == 1 and calls == [] and not out.exists()
+
+
+def test_population_finish_rejects_nonfinite_aggregate_even_when_each_product_is_finite():
+    t = _teacher(); acc = t._PopulationAccumulator()
+    try:
+        for index in range(11):
+            row = {"relative_path": f"worker_2/layouts_{index}.th",
+                   "layout_index": index, "instance_id": f"row-{index}", "n": 8000}
+            acc.register(row)
+            weight = math.exp(row["n"] / 12)
+            assert math.isfinite(weight)
+            assert math.isfinite(weight * 5e17)
+            assert math.isfinite(weight * 2.5e17)
+            acc.record_winner(row["instance_id"], 5e17, 2.5e17)
+        with pytest.raises(ValueError):
+            acc.finish()
+    finally:
+        acc.abort()
+    db_path = getattr(acc, "_db_path", None)
+    if db_path:
+        assert all(not Path(f"{db_path}{suffix}").exists()
+                   for suffix in ("", "-journal", "-wal", "-shm"))
+
+
+def test_population_abort_does_not_unlink_foreign_replacement(tmp_path):
+    t = _teacher(); acc = t._PopulationAccumulator(); db_path = Path(acc._db_path)
+    original = db_path.stat()
+    db_path.unlink(); db_path.write_bytes(b"foreign-population")
+    try:
+        acc.abort()
+        assert db_path.exists() and db_path.stat().st_ino != original.st_ino
+        assert db_path.read_bytes() == b"foreign-population"
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
+    t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
+    lease = t._new_staging_lease(owned); moved = tmp_path / "moved-owned"
+    sentinel = tmp_path / "foreign"; sentinel.mkdir(); (sentinel / "keep").write_text("keep")
+    owned.rename(moved); owned.symlink_to(sentinel, target_is_directory=True)
+    assert t._cleanup_owned_staging(lease) is False
+    assert owned.is_symlink() and moved.exists() and (sentinel / "keep").exists()
+
+
+def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monkeypatch):
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"; stages = []; moved = tmp_path / "moved-spool"
+    _task4_fake_runtime(t, monkeypatch, outcome_factory=_task4_p1c_mutation_outcome)
+    real_staging = t._new_staging
+    monkeypatch.setattr(t, "_new_staging",
+                        lambda destination: (stages.append(Path(real_staging(destination)))
+                                             or stages[-1]))
+    marker = RuntimeError("spool writer failure")
+    runtime = t._runtime_hooks(); real_process = runtime.process_case
+    attacked = {}
+
+    def process(case_input):
+        identity, _ = _task4_private_case_spool(stages[-1])
+        spool = identity[0]; spool.rename(moved); spool.write_bytes(b"owned-spool")
+        spool.write_bytes(b"foreign-spool")
+        attacked["path"] = spool
+        raise marker
+
+    monkeypatch.setattr(t, "_runtime_hooks",
+                        lambda: dataclasses.replace(runtime, process_case=process))
+    with pytest.raises(RuntimeError) as exc:
+        t.teacher_main(_task4_args(root, out), _trust_policy=_policy_for(root))
+    assert exc.value is marker and not out.exists()
+    assert moved.read_bytes().startswith(_TASK4_SQLITE_MAGIC)
+    replacement = Path(attacked["path"])
+    assert replacement.exists() and replacement.read_bytes() == b"foreign-spool"
+
+
 def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
     t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root); out = tmp_path / "out"
     policy = _policy_for(root); calls = []; preflight_calls = []
