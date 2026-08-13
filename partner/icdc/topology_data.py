@@ -156,6 +156,25 @@ def validate_raw_source(source: Sequence[torch.Tensor]) -> tuple[int, int]:
         (valid_blocks.unsqueeze(-1) & constraint_values.ne(constraint_values.round())).any()
     ):
         raise ValueError("constraint")
+    flags = constraint_values[..., :2]
+    if bool(
+        (
+            valid_blocks.unsqueeze(-1)
+            & flags.ne(0)
+            & flags.ne(1)
+        ).any()
+    ):
+        raise ValueError("constraint flag")
+    if bool(
+        (
+            valid_blocks.unsqueeze(-1)
+            & constraint_values[..., 2:].lt(0)
+        ).any()
+    ):
+        raise ValueError("constraint id")
+    boundary = constraint_values[..., 4].to(torch.int64)
+    if bool((valid_blocks & boundary.bitwise_and(~15).ne(0)).any()):
+        raise ValueError("boundary code")
 
     relation_valid: dict[str, torch.Tensor] = {}
     for name, tensor in (("b2b", b2b), ("p2b", p2b), ("pins", pins)):
@@ -207,6 +226,9 @@ def validate_raw_source(source: Sequence[torch.Tensor]) -> tuple[int, int]:
         raise ValueError("p2b endpoint")
     if bool((valid_blocks.unsqueeze(-1) & fp_sol[..., :2].le(0)).any()):
         raise ValueError("fp dimensions")
+    metrics = source[6]
+    if bool(metrics[:, 0].le(0).any()) or bool((metrics[:, 6] + metrics[:, 7]).lt(0).any()):
+        raise ValueError("source metrics")
     return batch, n
 
 

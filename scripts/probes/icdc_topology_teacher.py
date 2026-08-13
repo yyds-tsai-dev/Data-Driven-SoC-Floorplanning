@@ -2136,8 +2136,12 @@ def _source_case(source: Sequence[torch.Tensor], index: int, instance_id: str) -
         fixed, pre = flags[:2]
         tp.append([float(vals[2]) if pre else -1.0, float(vals[3]) if pre else -1.0,
                    float(vals[0]) if fixed or pre else -1.0, float(vals[1]) if fixed or pre else -1.0])
+    b2b_rows = [[int(a), int(b), float(weight)]
+                for a, b, weight in _trim_rows(b2b, 3, index)]
+    p2b_rows = [[int(pin), int(block), float(weight)]
+                for pin, block, weight in _trim_rows(p2b, 3, index)]
     return {"instance_id": instance_id, "n": n, "area": area, "cons": cons, "tp": tp,
-            "b2b": _trim_rows(b2b, 3, index), "p2b": _trim_rows(p2b, 3, index),
+            "b2b": b2b_rows, "p2b": p2b_rows,
             "pins": _trim_rows(pins, 2, index), "hpwl_ref": float(metric[6] + metric[7]),
             "area_ref": float(metric[0])}
 
@@ -2145,7 +2149,30 @@ def _source_case_from_shard(source: Sequence[torch.Tensor], index: int, instance
     # The complete shard has already passed ``validate_raw_source`` and the
     # stricter transaction validator.  Row extraction must stay O(N), not
     # rescan all 112 layouts for every row.
-    return _sanitize_case(_source_case(source, index, instance_id))
+    return _source_case(source, index, instance_id)
+
+
+def _fingerprint_validated_source_case(
+        case: Mapping[str, Any], case_json: Optional[str] = None) -> str:
+    """Hash an already source-validated case without normalizing it again."""
+    instance_id = case.get("instance_id")
+    if not isinstance(instance_id, str) or not instance_id:
+        raise ValueError("source case")
+    if case_json is None:
+        case_json = json.dumps(
+            case,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    fragment = ',"instance_id":' + json.dumps(
+        instance_id, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+    )
+    if case_json.count(fragment) != 1:
+        raise ValueError("source case")
+    fingerprint_json = case_json.replace(fragment, "", 1)
+    return hashlib.sha256(fingerprint_json.encode("utf-8")).hexdigest()
 
 _TRUST_FIELDS = ("trust_ok", "input_ok", "scorer_ok", "checkpoint_sha256", "model_identity", "scorer_sha256", "scorer_contract", "shapely_version")
 _PROTECTED = {"receipt", "instance_id", "partition", "sample_seed", "n", "base_cost", "teacher_cost", "record_weight"}
@@ -2381,8 +2408,12 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
             for index in range(count):
                 iid = f"{rel}#{index}"
                 case = _source_case_from_shard(source, index, iid)
+                case_text = json.dumps(
+                    case, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=True, allow_nan=False)
+                case_fingerprint = _fingerprint_validated_source_case(case, case_text)
                 try:
-                    spool.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,?)", (_worker, _layout, index, rel, digest, count, iid, json.dumps(case, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False), fingerprint_case(case)))
+                    spool.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,?)", (_worker, _layout, index, rel, digest, count, iid, case_text, case_fingerprint))
                 except sqlite3.IntegrityError as exc:
                     raise ValueError("duplicate case spool identity") from exc
                 if case["n"] >= args.n_min and split_for_id(iid, args.heldout_mod) == "heldout":
