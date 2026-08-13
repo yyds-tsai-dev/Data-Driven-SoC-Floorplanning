@@ -503,6 +503,18 @@ def _task4_static_forbidden(source):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"process_case", "_sample_direct_once", "_build_teacher_batches"}:
             if any(isinstance(x, ast.Call) and any(part in resolve(x.func).lower() for part in forbidden_runtime) for x in ast.walk(node)):
                 return False
+    loads = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        path = resolve(n.func)
+        is_load = path == "torch.load" or (isinstance(n.func, ast.Call) and isinstance(n.func.func, ast.Name) and n.func.func.id == "getattr" and len(n.func.args) >= 2 and isinstance(n.func.args[1], ast.Constant) and n.func.args[1].value == "load" and resolve(n.func.args[0]) == "torch")
+        if is_load:
+            loads.append(n)
+            if len(n.args) != 1 or not isinstance(n.args[0], ast.Call) or resolve(n.args[0].func) != "io.BytesIO" or len(n.args[0].args) != 1 or not isinstance(n.args[0].args[0], ast.Name): return False
+            kw = {k.arg: k.value for k in n.keywords}
+            if set(kw) != {"weights_only", "map_location"} or not isinstance(kw["weights_only"], ast.Constant) or kw["weights_only"].value is not True or not isinstance(kw["map_location"], ast.Constant) or kw["map_location"].value != "cpu": return False
+    if loads and len(loads) != 2: return False
     return True
 
 def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
@@ -511,7 +523,8 @@ def test_task4_static_checker_rejects_synthetic_legacy_paths_and_accepts_safe():
     assert not _task4_static_forbidden("case={'golden': 1}\ncase.get('golden')\ne.sample_bank()")
     assert not _task4_static_forbidden("from icdc import tfdl as q\nq(x)")
     assert not _task4_static_forbidden("def process_case(x):\n  fake_admission(x)\n  fake_tfdl(x)\n  official_score(x)")
-    assert _task4_static_forbidden("import io, torch\nname='x'\ntorch.load(io.BytesIO(name), weights_only=True, map_location='cpu')")
+    assert _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu')")
+    assert not _task4_static_forbidden("import io, torch\na='x'; b='y'\ntorch.load(io.BytesIO(a), weights_only=True, map_location='cpu'); torch.load(io.BytesIO(b), weights_only=True, map_location='cpu'); torch_alias=torch; getattr(torch_alias, 'load')('path', weights_only=True, map_location='cpu')")
 
 
 def _task4_teacher_payload():
@@ -635,8 +648,15 @@ def test_task4_teacher_batch_adapter_has_frozen_shapes_dtypes_and_scale():
     for batch in (direct, diagnostic):
         assert batch["area"].shape == (1, 3) and batch["tp"].shape == (1, 3, 4)
         assert batch["cons"].shape == (1, 3, 5) and batch["scale"].shape == (1,)
+        for key in ("area", "tp", "b2b", "p2b", "pins"):
+            expected = torch.as_tensor(case[key], dtype=batch[key].dtype).unsqueeze(0)
+            if key in ("b2b", "p2b", "pins"): expected = expected.reshape(batch[key].shape)
+            assert torch.equal(batch[key], expected)
     f64_scale = torch.sqrt(torch.tensor(case["area"], dtype=torch.float64).sum())
     assert diagnostic["scale"].item() != f64_scale.item()
+    tiny = dict(case, area=[0.1, 0.2, 0.3])
+    tiny_direct, tiny_diag = t._build_teacher_batches(tiny, torch.device("cpu"))
+    assert tiny_direct["scale"].item() == 1.0 and tiny_diag["scale"].item() == 1.0
 
 
 def test_task4_sample_direct_once_calls_dpmpp_once_and_decodes_once(monkeypatch):
@@ -720,17 +740,6 @@ def test_task4_runtime_materializes_lazily_caches_and_never_reopens(tmp_path, mo
     materialize_calls = []; sample_calls = []; materialized = object()
     monkeypatch.setattr(torch, "load", lambda *a, **k: pytest.fail("reopened checkpoint"))
     import icdc.engine as engine
-    import icdc.topology_prior as topology_prior
-    for mod_name in ("icdc.energy", "icdc.tfdl"):
-        try:
-            mod = __import__(mod_name, fromlist=["*"])
-        except ImportError:
-            mod = None
-        if mod is not None:
-            for name in ("energy", "tfdl"):
-                if hasattr(mod, name):
-                    # Captured below in each process_with_seams context.
-                    pass
     if hasattr(engine, "load_model"):
         monkeypatch.setattr(engine, "load_model", lambda *a, **k: pytest.fail("legacy reopen"))
     monkeypatch.setattr(t, "_select_teacher_device", lambda: torch.device("cpu"), raising=False)
