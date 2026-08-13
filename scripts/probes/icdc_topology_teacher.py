@@ -70,7 +70,7 @@ from icdc.checkpoint_identity import (  # noqa: E402
 __all__ = ["teacher_main"]
 
 _SAMPLE_DIRECT_DPM = sample_direct_dpmpp
-_DECODE_RECTS = lambda *args, **kwargs: decode_rects(*args, **kwargs)
+_DECODE_RECTS = decode_rects
 
 @dataclass(frozen=True)
 class _TeacherModelState:
@@ -80,23 +80,53 @@ class _TeacherModelState:
     device: torch.device
 
 def _select_teacher_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+
+
+def _validate_teacher_device(device: torch.device) -> torch.device:
+    if not isinstance(device, torch.device) or device.type not in {"cpu", "cuda"}:
+        raise ValueError("teacher device")
+    if device.type == "cpu":
+        if device.index not in (None, 0):
+            raise ValueError("teacher device")
+    elif (not torch.cuda.is_available() or (device.index is not None and (device.index < 0 or device.index >= torch.cuda.device_count()))):
+        raise ValueError("teacher device")
+    return torch.device("cuda", torch.cuda.current_device()) if device.type == "cuda" and device.index is None else device
 
 def _materialize_teacher_model(payload: Mapping[str, Any], device: torch.device) -> _TeacherModelState:
     try:
-        if not isinstance(payload, Mapping) or not isinstance(device, torch.device): raise ValueError("payload")
+        device = _validate_teacher_device(device)
+        if not isinstance(payload, Mapping): raise ValueError("payload")
         cfg_data = payload.get("model_config")
-        if not isinstance(cfg_data, Mapping) or set(cfg_data) != {f.name for f in fields(DirectModelConfig)}: raise ValueError("config")
-        ints = {"node_feat_dim", "relation_feat_dim", "z_dim", "d_model", "layers", "heads", "timesteps"}
-        for k in ints:
+        cfg_fields = [f.name for f in fields(DirectModelConfig)]
+        if not isinstance(cfg_data, Mapping) or list(cfg_data) != cfg_fields: raise ValueError("config")
+        positive_ints = {"node_feat_dim", "z_dim", "d_model", "layers", "heads", "timesteps"}
+        nonnegative_ints = {"relation_feat_dim"}
+        for k in positive_ints | nonnegative_ints:
             v = cfg_data[k]
-            if type(v) is not int or v <= 0: raise ValueError("config")
+            if type(v) is not int or (k in positive_ints and v <= 0) or (k in nonnegative_ints and v < 0): raise ValueError("config")
         if cfg_data["z_dim"] != 4 or cfg_data["d_model"] % cfg_data["heads"]: raise ValueError("config")
         if cfg_data["z_repr"] != "xyaspect" or type(cfg_data["self_conditioning"]) is not bool: raise ValueError("config")
         if type(cfg_data["dropout"]) not in (int, float) or not math.isfinite(float(cfg_data["dropout"])) or not 0 <= float(cfg_data["dropout"]) < 1: raise ValueError("config")
         model_weights, ema = payload.get("model"), payload.get("ema")
         if not isinstance(model_weights, Mapping) or not model_weights or not isinstance(ema, Mapping) or not ema: raise ValueError("weights")
-        cfg = DirectModelConfig(**dict(cfg_data)); model = DirectDenoiser(cfg)
+        cfg = DirectModelConfig(
+            node_feat_dim=cfg_data["node_feat_dim"],
+            relation_feat_dim=cfg_data["relation_feat_dim"],
+            z_dim=cfg_data["z_dim"],
+            z_repr=cfg_data["z_repr"],
+            d_model=cfg_data["d_model"],
+            layers=cfg_data["layers"],
+            heads=cfg_data["heads"],
+            dropout=cfg_data["dropout"],
+            timesteps=cfg_data["timesteps"],
+            self_conditioning=cfg_data["self_conditioning"],
+        )
+        cpu_state = torch.get_rng_state()
+        try:
+            model = DirectDenoiser(cfg)
+        finally:
+            torch.set_rng_state(cpu_state)
         expected = list(model.state_dict())
         if list(model_weights) != expected or list(ema) != expected: raise ValueError("keys")
         reference = model.state_dict()
@@ -112,26 +142,56 @@ def _materialize_teacher_model(payload: Mapping[str, Any], device: torch.device)
     except ValueError: raise
     except Exception as exc: raise ValueError("materialize") from exc
 
-def _build_teacher_batches(case: Mapping[str, Any], device: torch.device):
+def _build_teacher_batches(case: Mapping[str, Any], device: torch.device, cfg: DirectModelConfig):
     try:
-        n, _cons, _tp = _validate_case(case)
-        keys = ("area", "tp", "b2b", "p2b", "pins", "cons")
-        direct = {}
-        for key in keys:
-            dtype = torch.int64 if key == "cons" else torch.float32
-            value = torch.as_tensor(case[key], dtype=dtype, device=device).unsqueeze(0)
-            direct[key] = value
-        area = direct["area"]; direct["scale"] = torch.sqrt(area[area > 0].sum()).clamp_min(1.0).reshape(1)
-        direct.update(_ENGINE.build_cond(direct, DirectModelConfig(node_feat_dim=26, relation_feat_dim=9, z_dim=4, d_model=8, layers=1, heads=1, dropout=0.0, timesteps=8, self_conditioning=True)))
-        diagnostic = {k: (torch.as_tensor(case[k], dtype=torch.float64, device="cpu").unsqueeze(0) if k != "cons" else direct[k].detach().to("cpu")) for k in keys}
-        diagnostic["scale"] = direct["scale"].detach().to("cpu", dtype=torch.float64)
-        diagnostic["hpwl_ref"] = torch.tensor([case["hpwl_ref"]], dtype=torch.float64); diagnostic["area_ref"] = torch.tensor([case["area_ref"]], dtype=torch.float64)
-        return direct, diagnostic
+        device = _validate_teacher_device(device)
+        if not isinstance(cfg, DirectModelConfig):
+            raise ValueError("teacher config")
+        n, normalized_cons, normalized_tp = _validate_case(case)
+        area = torch.as_tensor(case["area"], dtype=torch.float32, device=device)
+        tp = torch.as_tensor(normalized_tp, dtype=torch.float32, device=device)
+        cons = torch.as_tensor(normalized_cons, dtype=torch.int64, device=device)
+        if tuple(area.shape) != (n,) or tuple(tp.shape) != (n, 4) or tuple(cons.shape) != (n, 5):
+            raise ValueError("teacher batch shape")
+
+        def relation_tensor(name: str, width: int) -> torch.Tensor:
+            try:
+                value = torch.as_tensor(case[name], dtype=torch.float32, device=device)
+            except Exception as exc:
+                raise ValueError(name) from exc
+            if value.numel() == 0:
+                return torch.empty((1, 0, width), dtype=torch.float32, device=device)
+            if value.ndim != 2 or value.shape[-1] != width or not bool(torch.isfinite(value).all()):
+                raise ValueError(name)
+            return value.reshape(1, -1, width)
+
+        b2b = relation_tensor("b2b", 3)
+        p2b = relation_tensor("p2b", 3)
+        pins = relation_tensor("pins", 2)
+        direct = {"area": area.unsqueeze(0), "tp": tp.unsqueeze(0), "b2b": b2b,
+                  "p2b": p2b, "pins": pins, "cons": cons.unsqueeze(0)}
+        direct["scale"] = torch.sqrt(direct["area"][direct["area"] > 0].sum()).clamp_min(1.0).reshape(1)
+        condition = _ENGINE.build_cond(direct, cfg)
+        if not isinstance(condition, Mapping):
+            raise ValueError("teacher condition")
+        direct.update(condition)
+        diagnostic = {
+            "area": torch.as_tensor(case["area"], dtype=torch.float64).unsqueeze(0),
+            "tp": torch.as_tensor(normalized_tp, dtype=torch.float64).unsqueeze(0),
+            "b2b": torch.as_tensor(case["b2b"], dtype=torch.float64).reshape(1, -1, 3),
+            "p2b": torch.as_tensor(case["p2b"], dtype=torch.float64).reshape(1, -1, 3),
+            "pins": torch.as_tensor(case["pins"], dtype=torch.float64).reshape(1, -1, 2),
+            "cons": cons.detach().to("cpu", dtype=torch.int64).clone().unsqueeze(0),
+            "scale": direct["scale"].detach().to("cpu", dtype=torch.float64).clone(),
+            "hpwl_ref": torch.tensor([case["hpwl_ref"]], dtype=torch.float64),
+            "area_ref": torch.tensor([case["area_ref"]], dtype=torch.float64),
+        }
+        return direct, diagnostic, condition
     except Exception as exc: raise ValueError("teacher batches") from exc
 
 def _sample_direct_once(state: _TeacherModelState, case: Mapping[str, Any], seed: int) -> torch.Tensor:
-    direct, diagnostic = _build_teacher_batches(case, state.device)
-    cond = _ENGINE.build_cond(direct, state.cfg); z_known, known_mask = _ENGINE.known_channels(direct)
+    direct, diagnostic, cond = _build_teacher_batches(case, state.device, state.cfg)
+    z_known, known_mask = _ENGINE.known_channels(direct)
     generator = torch.Generator(device=state.device); generator.manual_seed(seed)
     raw = _SAMPLE_DIRECT_DPM(state.model, cond, state.schedule, steps=2, generator=generator, z_known=z_known, known_mask=known_mask)
     n = direct["area"].shape[1]
