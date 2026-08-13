@@ -2952,9 +2952,8 @@ def test_population_abort_preserves_replaced_captured_journal_identity(tmp_path)
     main = Path(acc._db_path); journal = Path(f"{main}-journal")
     moved = tmp_path / "captured-owned-journal"
     db.execute("BEGIN IMMEDIATE")
-    db.execute("INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) "
-               "VALUES (?,?,?,?,NULL,NULL,?)",
-               ("worker_2/layouts_0.th", 0, "active", 1, 1.0))
+    acc.register({"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+                  "instance_id": "active", "n": 1})
     # MEMORY-journal implementations may not materialize a sidecar.  The
     # external file keeps this identity test valid for those designs too.
     if not journal.exists():
@@ -2987,9 +2986,8 @@ def test_population_abort_preserves_dangling_foreign_journal_symlink(tmp_path):
     main = Path(acc._db_path); journal = Path(f"{main}-journal")
     missing_target = tmp_path / "missing-foreign-journal-target"
     db.execute("BEGIN IMMEDIATE")
-    db.execute("INSERT INTO population(relative_path,layout_index,instance_id,n,base_cost,teacher_cost,weight) "
-               "VALUES (?,?,?,?,NULL,NULL,?)",
-               ("worker_2/layouts_0.th", 0, "active", 1, 1.0))
+    acc.register({"relative_path": "worker_2/layouts_0.th", "layout_index": 0,
+                  "instance_id": "active", "n": 1})
     journal.unlink(missing_ok=True)
     journal.symlink_to(missing_target)
     link = journal.lstat()
