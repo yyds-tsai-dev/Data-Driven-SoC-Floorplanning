@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Formal population: every receipt-bound row with `n >= 100` and `split_for_id(instance_id, heldout_mod=10) == "heldout"`; `--max-files` is a non-authorizing tracer only.
-- Frozen base: exactly six production candidates, `PARTNER_NREF=6`, `PARTNER_FLOW_SLOTS=3`, Direct DPM++/2, Flow Euler/8.
+- Frozen base: exactly six production candidates, `PARTNER_NREF=6`, `PARTNER_FLOW_SLOTS=3`, `PARTNER_OVERSAMPLE=1`, Direct DPM++/2, Flow Euler/8.
 - Candidate set: exactly `0=production-base`, `1=transient-fp-exact-tfdl`; no blind mutation bank.
 - `fp_sol` is training-only and converted exactly `(w,h,x,y) -> (x,y,w,h)` on CPU float64. Soft V is scoreable, not a hard rejection.
 - Dense fp coordinates may not be serialized, persisted in SQLite, used as a student target/input, or reach validation/test or inference.
@@ -147,6 +147,7 @@ git commit -m "feat: add transient fp g0 oracle core"
 def test_production_environment_is_exact_3d3f():
     assert production_environment() == {
         "PARTNER_NREF": "6", "PARTNER_FLOW_SLOTS": "3",
+        "PARTNER_OVERSAMPLE": "1",
         "PARTNER_DIRECT_SOLVER": "dpmpp", "PARTNER_DDIM_STEPS": "2",
         "PARTNER_FLOW_SOLVER": "euler", "PARTNER_FLOW_STEPS": "8",
     }

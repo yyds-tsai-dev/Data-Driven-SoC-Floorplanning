@@ -139,7 +139,9 @@ unchanged.
 - The G0 base is the frozen production hard-legal portfolio, with exactly six
   candidates split as `3` Direct DPM++/2 and `3` Flow Euler/8. The same wrapper,
   checkpoints, seeds, ranker, repair policy, environment, and official scorer
-  are bound in the G0 receipt.
+  are bound in the G0 receipt. `PARTNER_OVERSAMPLE=1` is mandatory so the raw
+  six-candidate pool itself is `3D+3F`; inherited oversampling is a contract
+  failure.
 - For each receipt-verified eligible training-heldout row, G0 may read
   `fp_sol` exactly once, convert `(w,h,x,y)` to CPU-float64 `(x,y,w,h)`, and use
   it transiently as exactly one candidate seed for exact TFDL. The candidate
