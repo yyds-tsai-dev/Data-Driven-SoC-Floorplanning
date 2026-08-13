@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import os
 import stat
+import shutil
 import sys
 import weakref
 import json
@@ -2661,13 +2662,12 @@ def test_population_abort_does_not_unlink_foreign_replacement(tmp_path):
 
 
 @pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
-def test_population_abort_preserves_replaced_captured_sidecar(tmp_path, suffix):
+def test_population_abort_preserves_untracked_foreign_sidecar(tmp_path, suffix):
     t = _teacher(); acc = t._PopulationAccumulator(); sidecar = Path(f"{acc._db_path}{suffix}")
-    sidecar.write_bytes(b"owned-sidecar"); owned = sidecar.stat()
-    sidecar.unlink(); sidecar.write_bytes(b"foreign-sidecar")
+    sidecar.write_bytes(b"foreign-sidecar"); foreign = sidecar.stat()
     try:
         acc.abort()
-        assert sidecar.exists() and sidecar.stat().st_ino != owned.st_ino
+        assert sidecar.exists() and sidecar.stat().st_ino == foreign.st_ino
         assert sidecar.read_bytes() == b"foreign-sidecar"
     finally:
         sidecar.unlink(missing_ok=True)
@@ -2682,24 +2682,17 @@ def test_cleanup_owned_staging_does_not_traverse_foreign_replacement(tmp_path):
     assert owned.is_symlink() and moved.exists() and (sentinel / "keep").exists()
 
 
-def test_cleanup_owned_staging_rechecks_identity_after_first_lstat(tmp_path, monkeypatch):
+def test_cleanup_owned_staging_backend_race_preserves_foreign_directory(tmp_path, monkeypatch):
     t = _teacher(); owned = tmp_path / "stage"; owned.mkdir()
     lease = t._new_staging_lease(owned); moved = tmp_path / "moved-owned"
-    foreign = tmp_path / "foreign"; foreign.mkdir(); (foreign / "keep").write_text("keep")
-    real_match = t._path_matches_lease; checked = {"count": 0}
-
-    def race(path, held_lease):
-        result = real_match(path, held_lease)
-        checked["count"] += 1
-        if checked["count"] == 1:
-            Path(path).rename(moved)
-            Path(path).symlink_to(foreign, target_is_directory=True)
-        return result
-
-    monkeypatch.setattr(t, "_path_matches_lease", race)
+    real_rmtree = shutil.rmtree
+    def race(path, *args, **kwargs):
+        Path(path).rename(moved)
+        Path(path).mkdir(); (Path(path) / "sentinel").write_text("foreign")
+        real_rmtree(path, *args, **kwargs)
+    monkeypatch.setattr(t.shutil, "rmtree", race)
     assert t._cleanup_owned_staging(lease) is False
-    assert checked["count"] >= 2 and moved.exists() and owned.is_symlink()
-    assert (foreign / "keep").exists()
+    assert moved.exists() and owned.is_dir() and (owned / "sentinel").exists()
 
 
 def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monkeypatch):
@@ -2717,8 +2710,12 @@ def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monk
     def process(case_input):
         identity, _ = _task4_private_case_spool(stages[-1])
         spool = identity[0]; original_bytes = spool.read_bytes()
-        spool.rename(moved); spool.write_bytes(b"foreign-spool")
-        attacked["path"] = spool; attacked["original"] = original_bytes
+        original_identity = (spool.stat().st_dev, spool.stat().st_ino)
+        spool.rename(moved); moved_identity = (moved.stat().st_dev, moved.stat().st_ino)
+        spool.write_bytes(b"foreign-spool"); foreign_identity = (spool.stat().st_dev, spool.stat().st_ino)
+        attacked.update(path=spool, original=original_bytes,
+                        original_identity=original_identity, moved_identity=moved_identity,
+                        foreign_identity=foreign_identity)
         raise marker
 
     monkeypatch.setattr(t, "_runtime_hooks",
@@ -2729,6 +2726,8 @@ def test_teacher_case_spool_cleanup_preserves_foreign_replacement(tmp_path, monk
     assert moved.read_bytes() == attacked["original"]
     replacement = Path(attacked["path"])
     assert replacement.exists() and replacement.read_bytes() == b"foreign-spool"
+    assert (moved.stat().st_dev, moved.stat().st_ino) == attacked["moved_identity"]
+    assert (replacement.stat().st_dev, replacement.stat().st_ino) == attacked["foreign_identity"]
 
 
 def test_teacher_publish_failure_inspects_complete_staging_and_leaves_no_destination(tmp_path, monkeypatch):
