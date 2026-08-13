@@ -595,37 +595,49 @@ def test_teacher_evidence_a_cli_help_exposes_data_root():
 
 
 def test_teacher_evidence_a_padded_connectivity_is_retained_and_fingerprinted():
-    t = _teacher()
-    source = list(_task4_tensors())
-    source[0] = torch.tensor([[[4, 0, 0, 0, 0, 0], [6, 1, 0, 0, 0, 0], [9, 0, 1, 0, 2, 5], [-1, 0, 0, 0, 0, 0]],
-                              [[5, 0, 0, 0, 0, 0], [20, 1, 0, 0, 0, 0], [20, 0, 1, 0, 2, 5], [-1, 0, 0, 0, 0, 0]]], dtype=torch.float32)
-    source[1] = torch.tensor([[[0, 1, 1.5], [-1, -1, -1]], [[1, 2, 2.5], [-1, -1, -1]]])
-    source[2] = torch.tensor([[[0, 2, 3], [-1, -1, -1]], [[0, 0, 4], [-1, -1, -1]]])
-    source[3] = torch.tensor([[[1.25, 2.5], [-1, -1]], [[3.5, 4.5], [-1, -1]]])
-    source[4] = torch.tensor([[[2, 3, 3]], [[2, 3, 3]]], dtype=torch.float32)
+    t = _teacher(); source = list(_task4_tensors())
+    source[0] = torch.cat((source[0], torch.full((2, 1, 6), -1.0)), dim=1)
+    source[1] = torch.tensor([[[0, 1, 1.5], [-1, -1, -1]], [[1, 2, 2.5], [-1, -1, -1]]], dtype=torch.float32)
+    source[2] = torch.tensor([[[0, 2, 3], [-1, -1, -1]], [[0, 0, 4], [-1, -1, -1]]], dtype=torch.float32)
+    source[3] = torch.tensor([[[1.25, 2.5], [-1, -1]], [[3.5, 4.5], [-1, -1]]], dtype=torch.float32)
+    source[4] = torch.zeros((2, 3, 3), dtype=torch.float32)
+    source[5] = torch.cat((source[5], torch.full((2, 1, 4), -1.0)), dim=1)
     assert t._validate_source_shard(tuple(source)) == (2, 4)
     cases = [t._source_case_from_shard(tuple(source), i, f"x#{i}") for i in range(2)]
-    assert all(c["n"] == 3 and all(-1 not in row for row in c[k]) for c in cases for k in ("b2b", "p2b", "pins"))
-    assert [fingerprint_case(c) for c in cases] == [fingerprint_case(c) for c in cases]
+    assert [c["b2b"] for c in cases] == [[[0, 1, 1.5]], [[1, 2, 2.5]]]
+    assert [c["p2b"] for c in cases] == [[[0, 2, 3]], [[0, 0, 4]]]
+    assert [c["pins"] for c in cases] == [[[1.25, 2.5]], [[3.5, 4.5]]]
+    assert all(c["n"] == 3 for c in cases)
 
 
 @pytest.mark.parametrize("mutator", [
-    lambda s: s.__setitem__(0, s[0].clone().requires_grad_()),
-    lambda s: s.__setitem__(1, s[1][..., :2]),
-    lambda s: s.__setitem__(4, s[4][:, :-1]),
-    lambda s: s.__setitem__(0, torch.cat([s[0], s[0][:, :1]], dim=1)),
-    lambda s: s.__setitem__(1, torch.zeros((2, 1, 2))),
+    lambda s: s[0].clone().masked_fill_(torch.tensor([[[True,False,False,False,False,False]]*3]*2), float("nan")),
+    lambda s: s[0].to(torch.bool), lambda s: tuple(x.clone().requires_grad_() for x in s),
+    lambda s: s[1][:, :, :2], lambda s: s[1].new_zeros((2, 1, 2)),
+    lambda s: s[0].new_zeros((1, 3, 6)), lambda s: s[4].new_zeros((2, 2)),
+    lambda s: s[0].clone().index_put_((torch.tensor([0]), torch.tensor([2]), torch.tensor([0])), torch.tensor([1.])),
+    lambda s: s[1].new_tensor([[[0, 1, -1], [-1,-1,-1]], [[1,2,2.5],[-1,-1,-1]]]),
+    lambda s: s[2].new_tensor([[[0, 2, 3], [0,-1,-1]], [[0,0,4],[-1,-1,-1]]]),
+    lambda s: s[3].new_tensor([[[1.25,2.5],[0,0]], [[3.5,4.5],[-1,-1]]]),
+    lambda s: s[1].new_tensor([[[0,1,-2],[-1,-1,-1]], [[1,2,2.5],[-1,-1,-1]]]),
+    lambda s: s[1].new_tensor([[[0,9,1],[-1,-1,-1]], [[1,2,2.5],[-1,-1,-1]]]),
+    lambda s: s[2].new_tensor([[[0,0,1],[-1,-1,-1]], [[0,0,4],[-1,-1,-1]]]),
+    lambda s: s[4].new_tensor([[[2.5,3,3]], [[2,3,3]]]),
 ])
 def test_teacher_evidence_a_source_shard_malformed_transaction(mutator):
-    t = _teacher(); source = list(_task4_tensors()); mutator(source)
+    t = _teacher(); source = list(_task4_tensors()); changed = mutator(source)
+    if changed is not None: source = list(changed)
     with pytest.raises(ValueError): t._validate_source_shard(tuple(source))
 
 
 def test_teacher_evidence_a_preflight_is_exact_and_boolean():
     t = _teacher(); policy = _policy_for(Path("/tmp/canonical"))
     good = _task4_expected_trust(policy)
-    for key in ("trust_ok", "input_ok", "scorer_ok"):
-        bad = dict(good); bad[key] = 1
+    for key in (*good, "unknown"):
+        bad = dict(good); bad[key] = (1 if key in good else True)
+        if key == "unknown":
+            with pytest.raises(ValueError): t._validate_preflight(bad, policy)
+            continue
         with pytest.raises(ValueError): t._validate_preflight(bad, policy)
     bad = dict(good); bad.pop("trust_ok")
     with pytest.raises(ValueError): t._validate_preflight(bad, policy)
