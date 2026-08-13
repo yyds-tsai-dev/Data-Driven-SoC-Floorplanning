@@ -1382,6 +1382,9 @@ class _PopulationAccumulator:
         self._db: Optional[sqlite3.Connection] = None
         try:
             self._db = sqlite3.connect(str(self._db_path))
+            self._db.execute("PRAGMA cache_size=8")
+            self._db.execute("PRAGMA temp_store=FILE")
+            self._db.execute("PRAGMA mmap_size=0")
             self._db.execute(
                 "CREATE TABLE population ("
                 "relative_path TEXT NOT NULL, layout_index INTEGER NOT NULL, "
@@ -1738,7 +1741,10 @@ def teacher_main(argv: Optional[Sequence[str]] = None, *, _trust_policy: Optiona
             for index in range(count):
                 iid = f"{rel}#{index}"
                 case = _source_case_from_shard(source, index, iid)
-                spool.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,?)", (_worker,_layout,index,rel,digest,count,iid,json.dumps(case,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False),fingerprint_case(case)))
+                try:
+                    spool.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,?)", (_worker, _layout, index, rel, digest, count, iid, json.dumps(case, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False), fingerprint_case(case)))
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError("duplicate case spool identity") from exc
                 if case["n"] >= args.n_min and split_for_id(iid, args.heldout_mod) == "heldout":
                     population.register({"relative_path": rel, "layout_index": index,
                                          "instance_id": iid, "n": case["n"]})
