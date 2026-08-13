@@ -436,7 +436,7 @@ def test_teacher_weighted_population_rejects_nonfinite_weighted_arithmetic():
             "n": 1, "base_cost": 2., "teacher_cost": 1.}
     for bad in [
         {**base, "n": 100_000},
-        {**base, "base_cost": 1e308, "teacher_cost": 1e308},
+        {**base, "n": 700, "base_cost": 1e308, "teacher_cost": 1e308},
     ]:
         with pytest.raises((ValueError, OverflowError)):
             t._weighted_population([bad])
