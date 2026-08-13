@@ -267,7 +267,7 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     path = Path("scripts/probes/icdc_topology_teacher.py")
     t = _teacher(); tree = ast.parse(path.read_text())
     text = path.read_text()
-    forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "BandFileSampler._instance", "shelf_fallback")
+    forbidden = ("load_test_cases", "FloorplanDatasetLiteTest", "BandFileSampler._instance", "shelf_fallback", "golden", "validation")
     def dotted(n):
         if isinstance(n, ast.Name): return n.id
         if isinstance(n, ast.Attribute):
@@ -276,6 +276,58 @@ def test_teacher_ast_guard_forbids_legacy_data_and_energy_shortlist():
     calls = [dotted(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)]
     forbidden_suffixes = ("load_test_cases", "FloorplanDatasetLiteTest", "shelf_fallback", "BandFileSampler._instance")
     assert not any(any(x == suffix or x.endswith("." + suffix) for suffix in forbidden_suffixes) for x in calls)
+
+
+def _task4_shard(root):
+    path = root / "worker_2" / "layouts_0.th"
+    path.parent.mkdir(parents=True)
+    tensors = (
+        torch.tensor([[[4, 0, 0, 0, 0, 0], [6, 1, 0, 0, 0, 0], [9, 0, 1, 0, 2, 5]],
+                      [[5, 0, 0, 0, 0, 0], [20, 1, 0, 0, 0, 0], [20, 0, 1, 0, 2, 5]]], dtype=torch.float32),
+        torch.zeros((2, 0, 3)), torch.zeros((2, 0, 3)), torch.zeros((2, 0, 2)),
+        torch.zeros((2, 2, 3)),
+        torch.tensor([[[71, 73, 701, 703], [2, 3, 401, 403], [3, 3, 10, 11]],
+                      [[79, 83, 709, 719], [5, 4, 809, 811], [4, 5, 20, 21]]], dtype=torch.float32),
+        torch.tensor([[100, 0, 0, 0, 0, 0, 2, 3], [200, 0, 0, 0, 0, 0, 5, 7]], dtype=torch.float32),
+    )
+    torch.save(tensors, path)
+    return path
+
+
+def test_teacher_source_transaction_publishes_verified_two_row_corpus(tmp_path, monkeypatch):
+    """RED: the real source adapter must own loading, sanitizing, and publication."""
+    t = _teacher(); root = tmp_path / "floorset_lite"; _task4_shard(root)
+    out = tmp_path / "out"
+    policy = _policy_for(root)
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeRuntime:
+        preflight: object
+        process_case: object
+        authorizing: bool = True
+
+    def preflight(_policy, _root):
+        return {"trust_ok": True, "scorer_ok": True, "input_ok": True}
+
+    def process(case):
+        row = {"instance_id": case.receipt.instance_id, "partition": case.partition,
+               "base_cost": 1.10, "teacher_cost": 1.00, "legal": True, "covered": True}
+        return t._CaseOutcome(row, [{"name": "base", "instance_id": case.receipt.instance_id}], [],
+                              1.10, 1.00, True, True)
+
+    monkeypatch.setattr(t, "_runtime_hooks", lambda: FakeRuntime(preflight, process), raising=False)
+    result = t.teacher_main(["--data-root", str(root), "--out-dir", str(out),
+                             "--index-out", str(out / "training_index.json"),
+                             "--checkpoint", str(tmp_path / "unused.th"),
+                             "--heldout-mod", "2", "--n-min", "1"],
+                            _trust_policy=policy)
+    assert result == 0
+    assert sorted(p.name for p in out.iterdir()) == [
+        "g0_manifest.json", "heldout_corpus.jsonl", "heldout_labels.jsonl",
+        "proposals.jsonl", "rejections.jsonl", "train_corpus.jsonl",
+        "train_labels.jsonl", "training_index.json"]
+    blobs = b"".join(p.read_bytes() for p in out.iterdir())
+    assert not any(str(secret).encode() in blobs for secret in (701, 703, 401, 403, 709, 719, 809, 811))
 
 
 def test_teacher_g0_state_precedence_literals():
