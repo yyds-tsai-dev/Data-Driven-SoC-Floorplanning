@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import math
 import sys
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -80,6 +81,7 @@ def qa_manifest_fields(evidence: QAContractEvidence) -> dict[str, str]:
     }
 
 
+@lru_cache(maxsize=1)
 def _checked_scorer(evidence: QAContractEvidence) -> Any:
     expected = QAContractEvidence(
         QA_RELATIVE_PATH,
