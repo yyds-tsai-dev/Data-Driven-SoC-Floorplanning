@@ -101,10 +101,20 @@ def _checked_scorer(evidence: QAContractEvidence) -> Any:
         raise ValueError("scorer import")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    floorset_path = str(root / "FloorSet")
+    inserted = floorset_path not in sys.path
+    if inserted:
+        sys.path.insert(0, floorset_path)
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
         raise ValueError("scorer import") from exc
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(floorset_path)
+            except ValueError:
+                pass
     return module
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -29,6 +30,8 @@ from icdc.topology_data import (
 )
 from icdc.topology_data import SparseEdge
 from icdc.topology_prior import _separation_edges
+from icdc.engine import verify_hard_legal
+from icdc.qa_contract import preflight_qa_contract, score_provided_local_no_runtime
 
 
 def _source(tree_value: float = 0.0) -> list[torch.Tensor]:
@@ -142,6 +145,57 @@ def test_soft_v_fp_is_admitted_and_official_cost_selects_winner():
         and tuple(call["args"][1].shape) == (2, 5)
         for call in scorer.calls
     )
+
+
+def test_official_qa_soft_golden_violation_remains_feasible():
+    evidence = preflight_qa_contract(Path(__file__).resolve().parents[1])
+    audit = score_provided_local_no_runtime(
+        _case(soft_group=True), _rects(3.0), evidence
+    )
+    assert audit.feasible
+    assert audit.grouping_violations > 0
+
+
+def test_official_qa_preplaced_boundary_conflict_never_moves_preplaced():
+    evidence = preflight_qa_contract(Path(__file__).resolve().parents[1])
+    case = _case(preplaced=True)
+    case["cons"][0][4] = 2  # soft right-boundary tag conflicts with x=0 pin.
+    stable = _rects()
+    stable[1, 0] = 2.0
+    audit = score_provided_local_no_runtime(case, stable, evidence)
+    assert audit.feasible and audit.boundary_violations == 1
+    hard = verify_hard_legal(
+        stable.numpy(), np.asarray(case["area"]), np.asarray(case["cons"]),
+        np.asarray(case["tp"]),
+    )
+    assert hard["preplaced"] and hard["ok"]
+    moved = stable.numpy().copy()
+    moved[0, 0] = 4.0
+    assert not verify_hard_legal(
+        moved, np.asarray(case["area"]), np.asarray(case["cons"]),
+        np.asarray(case["tp"]),
+    )["preplaced"]
+
+
+@pytest.mark.parametrize(
+    ("factor", "accepted"),
+    (
+        (math.nextafter(1.01, 1.0), True),
+        (math.nextafter(0.99, 1.0), True),
+        (math.nextafter(1.01, math.inf), False),
+        (math.nextafter(0.99, -math.inf), False),
+    ),
+)
+def test_official_qa_area_tolerance_is_symmetric_and_inclusive(
+    factor: float, accepted: bool
+):
+    evidence = preflight_qa_contract(Path(__file__).resolve().parents[1])
+    case = _case()
+    rects = _rects()
+    rects[:, 3] *= factor
+    audit = score_provided_local_no_runtime(case, rects, evidence)
+    assert (audit.area_violations == 0) is accepted
+    assert audit.feasible is accepted
 
 
 @pytest.mark.parametrize(
