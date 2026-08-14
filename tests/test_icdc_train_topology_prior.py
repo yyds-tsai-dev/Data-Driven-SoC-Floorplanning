@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from icdc.audit_topology_prior import retained_gain_summary
+
 
 def _checkpoint(model_fill: float = 1.0, ema_fill: float = 1.0):
     return {
@@ -288,3 +290,30 @@ def test_three_trajectory_sparse_loss_backpropagates_through_real_tiny_model():
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()
     )
+
+
+def test_retained_gain_is_weighted_over_positive_teacher_gain_only():
+    rows = [
+        {
+            "instance_id": "a", "n": 100, "weight": 2.0,
+            "base_cost": 1.4, "teacher_cost": 1.0,
+            "student_cost": 1.1, "admitted": True,
+        },
+        {
+            "instance_id": "b", "n": 110, "weight": 1.0,
+            "base_cost": 1.2, "teacher_cost": 1.0,
+            "student_cost": 1.1, "admitted": True,
+        },
+        {
+            "instance_id": "ignored", "n": 120, "weight": 100.0,
+            "base_cost": 1.0, "teacher_cost": 1.0,
+            "student_cost": 10.0, "admitted": False,
+        },
+    ]
+    summary = retained_gain_summary(rows)
+    assert summary["eligible_count"] == 2
+    assert summary["admitted_count"] == 2
+    assert summary["teacher_gain_weighted_sum"] == pytest.approx(1.0)
+    assert summary["student_gain_weighted_sum"] == pytest.approx(0.7)
+    assert summary["retained_gain_fraction"] == pytest.approx(0.7)
+    assert not summary["retained_gain_pass"]
