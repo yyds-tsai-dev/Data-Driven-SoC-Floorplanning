@@ -82,6 +82,7 @@ class G1PortfolioReceipt:
     flow_sampler: str
     flow_steps: int
     normal_pool: bool
+    direct_gate_open: bool = True
 
     def to_record(self) -> dict[str, object]:
         return asdict(self)
@@ -149,6 +150,7 @@ class G1Comparison:
     internal_runtime_target_met: bool
     matched_ids: bool
     matched_alpha_medians: bool
+    matched_statuses: bool
     portfolio_ok: bool
     feasibility_ok: bool
     freeze_ok: bool
@@ -200,8 +202,22 @@ def _validate_input_row(row: G1CaseRow, case_id: str) -> None:
 
 
 def _validate_receipt(receipt: G1PortfolioReceipt, case_id: str) -> None:
-    expected = G1PortfolioReceipt(case_id, 3, 3, "dpmpp", 2, "euler", 8, True)
-    if type(receipt) is not G1PortfolioReceipt or receipt != expected:
+    if type(receipt) is not G1PortfolioReceipt or receipt.case_id != case_id:
+        raise ValueError("portfolio")
+    if type(receipt.direct_gate_open) is not bool:
+        raise ValueError("portfolio")
+    expected = G1PortfolioReceipt(
+        case_id,
+        3 if receipt.direct_gate_open else 0,
+        3 if receipt.direct_gate_open else 0,
+        "dpmpp",
+        2,
+        "euler",
+        8,
+        receipt.direct_gate_open,
+        receipt.direct_gate_open,
+    )
+    if receipt != expected:
         raise ValueError("portfolio")
 
 
@@ -346,6 +362,16 @@ def compare_g1_arms(control: G1ArmEvidence, candidate: G1ArmEvidence) -> G1Compa
     candidate_alpha = tuple(row.alpha_median for row in candidate.rows)
     if control_alpha != candidate_alpha:
         raise ValueError("matched Alpha medians")
+    control_statuses = tuple(
+        (receipt.case_id, receipt.direct_gate_open, receipt.normal_pool)
+        for receipt in control.receipts
+    )
+    candidate_statuses = tuple(
+        (receipt.case_id, receipt.direct_gate_open, receipt.normal_pool)
+        for receipt in candidate.receipts
+    )
+    if control_statuses != candidate_statuses:
+        raise ValueError("status vector")
     freeze_ok = (
         control.freeze_ok
         and candidate.freeze_ok
@@ -366,6 +392,7 @@ def compare_g1_arms(control: G1ArmEvidence, candidate: G1ArmEvidence) -> G1Compa
         internal_runtime_target_met=candidate.runtime_mean <= 0.300,
         matched_ids=True,
         matched_alpha_medians=True,
+        matched_statuses=True,
         portfolio_ok=portfolio_ok,
         feasibility_ok=feasibility_ok,
         freeze_ok=freeze_ok,
