@@ -199,7 +199,7 @@ def audit(args: argparse.Namespace) -> dict[str, object]:
             rows.append({
                 "instance_id": record.label.instance_id,
                 "n": n,
-                "weight": float(record.label.record_weight),
+                "weight": math.exp(n / 12.0),
                 "base_cost": float(record.label.base_cost),
                 "teacher_cost": float(record.label.teacher_cost),
                 "student_cost": min(costs) if costs else 10.0,
