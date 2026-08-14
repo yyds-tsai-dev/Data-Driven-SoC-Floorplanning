@@ -219,6 +219,8 @@ def test_export_corpus_reconstructs_only_authorized_training_inputs(tmp_path):
     out = tmp_path / "out"
     manifest = export_corpus(labels, root, out, canonical_root=root)
     assert manifest["record_count"] == 1
+    assert manifest["selection_mod"] == 1
+    assert json.loads((out / "labels.jsonl").read_text())["label"] == label
     row = json.loads((out / "corpus.jsonl").read_text())
     assert row["case"]["tp"][0] == [10.0, 20.0, 2.0, 2.0]
     assert row["case"]["tp"][1] == [-1.0, -1.0, -1.0, -1.0]

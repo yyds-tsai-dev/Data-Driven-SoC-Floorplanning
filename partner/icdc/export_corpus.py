@@ -107,7 +107,16 @@ def export_corpus(
     out_dir: str | Path,
     *,
     canonical_root: Optional[Path] = None,
+    selection_mod: int = 1,
+    selection_namespace: str = "icdc-bound-corpus-export-v1",
+    max_records: Optional[int] = None,
 ) -> dict[str, Any]:
+    if type(selection_mod) is not int or selection_mod <= 0:
+        raise ValueError("selection modulus")
+    if not isinstance(selection_namespace, str) or not selection_namespace:
+        raise ValueError("selection namespace")
+    if max_records is not None and (type(max_records) is not int or max_records <= 0):
+        raise ValueError("max records")
     expected_root = (canonical_root or _CANONICAL_ROOT).resolve()
     supplied_root = Path(data_root)
     if supplied_root.is_symlink() or supplied_root.resolve() != expected_root:
@@ -121,15 +130,18 @@ def export_corpus(
         tempfile.mkdtemp(prefix=f".{destination.name}.staging.", dir=destination.parent)
     )
     corpus_path = stage / "corpus.jsonl"
+    selected_labels_path = stage / "labels.jsonl"
     count = 0
     previous_id: Optional[str] = None
     current_path: Optional[str] = None
     current_digest: Optional[str] = None
     current_source: Any = None
     try:
-        with labels.open("r", encoding="ascii") as label_stream, corpus_path.open(
-            "wb"
-        ) as corpus_stream:
+        with (
+            labels.open("r", encoding="ascii") as label_stream,
+            corpus_path.open("wb") as corpus_stream,
+            selected_labels_path.open("wb") as selected_labels_stream,
+        ):
             for line in label_stream:
                 try:
                     record = json.loads(line)
@@ -146,6 +158,16 @@ def export_corpus(
                     raise ValueError("label binding")
                 if previous_id is not None and instance_id == previous_id:
                     raise ValueError("duplicate label")
+                previous_id = instance_id
+                bucket_payload = (
+                    selection_namespace.encode("utf-8")
+                    + b"\0"
+                    + instance_id.encode("utf-8")
+                )
+                if int.from_bytes(
+                    hashlib.sha256(bucket_payload).digest()[:8], "big"
+                ) % selection_mod != 0:
+                    continue
                 if receipt.relative_path != current_path:
                     raw, source = _read_source(expected_root, receipt.relative_path)
                     digest = hashlib.sha256(raw).hexdigest()
@@ -172,20 +194,27 @@ def export_corpus(
                         }
                     )
                 )
+                selected_labels_stream.write(_canonical(record))
                 del verified
-                previous_id = instance_id
                 count += 1
+                if max_records is not None and count >= max_records:
+                    break
             corpus_stream.flush()
             os.fsync(corpus_stream.fileno())
+            selected_labels_stream.flush()
+            os.fsync(selected_labels_stream.fileno())
         if count == 0:
             raise ValueError("empty labels")
         manifest = {
             "schema": "icdc_bound_corpus_export_v1",
             "status": "complete",
             "record_count": count,
-            "labels_sha256": _sha256(labels),
+            "source_labels_sha256": _sha256(labels),
+            "labels_sha256": _sha256(selected_labels_path),
             "corpus_sha256": _sha256(corpus_path),
             "source_root": "FloorSet/floorset_lite",
+            "selection_mod": selection_mod,
+            "selection_namespace": selection_namespace,
         }
         with (stage / "manifest.json").open("wb") as stream:
             stream.write(_canonical(manifest))
@@ -209,8 +238,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--labels", required=True)
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--selection-mod", type=int, default=1)
+    parser.add_argument(
+        "--selection-namespace", default="icdc-bound-corpus-export-v1"
+    )
+    parser.add_argument("--max-records", type=int)
     args = parser.parse_args(argv)
-    result = export_corpus(args.labels, args.data_root, args.out_dir)
+    result = export_corpus(
+        args.labels,
+        args.data_root,
+        args.out_dir,
+        selection_mod=args.selection_mod,
+        selection_namespace=args.selection_namespace,
+        max_records=args.max_records,
+    )
     print(json.dumps(result, sort_keys=True, allow_nan=False))
     return 0
 
