@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import importlib.util
 import sys
@@ -20,7 +21,12 @@ from icdc.g0_v2 import (
     evaluate_case,
     transient_fp_xywh,
 )
-from icdc.topology_data import CorpusSourceReceipt, TopologyLabel, fingerprint_case
+from icdc.topology_data import (
+    CorpusSourceReceipt,
+    TopologyLabel,
+    fingerprint_case,
+    split_for_id,
+)
 from icdc.topology_data import SparseEdge
 from icdc.topology_prior import _separation_edges
 
@@ -637,6 +643,132 @@ def test_runner_parts_are_disjoint_and_merge_to_one_authorizing_population(tmp_p
         "count": 2,
         "merged": True,
     }
+
+
+def test_runner_emits_deterministic_train_split_corpus_without_dense_fp(tmp_path):
+    runner = _runner_module()
+    count = 12
+
+    def iter_shards(_root):
+        return [(0, 2, tmp_path / "worker_0/layouts_2.th")]
+
+    def read_shard(_root, worker, layout):
+        assert (worker, layout) == (0, 2)
+        return b"train-raw", [torch.ones((count, 1, 6))]
+
+    def make_row(_source, relative_path, digest, index):
+        iid = f"{relative_path}#{index}"
+        case = {
+            "instance_id": iid,
+            "n": 1,
+            "area": [4.0],
+            "cons": [[0, 0, 0, 0, 0]],
+            "tp": [[-1.0, -1.0, -1.0, -1.0]],
+            "b2b": [],
+            "p2b": [],
+            "pins": [],
+            "hpwl_ref": 1.0,
+            "area_ref": 4.0,
+        }
+        return runner.TrainingRow(
+            CorpusSourceReceipt(relative_path, digest, index, fingerprint_case(case)),
+            case,
+            torch.tensor([[9.0, 8.0, 2.0, 2.0]], dtype=torch.float64),
+        )
+
+    portfolio = {
+        "pool_ready": True,
+        "requested_k": 6,
+        "raw_candidate_count": 6,
+        "direct_count": 3,
+        "flow_count": 3,
+        "oversample": False,
+        "flow_exception": None,
+        "fallback": False,
+    }
+
+    def evaluate(base, fp_seed, case, scorer, *, sample_seed):
+        label = TopologyLabel(
+            case["instance_id"], 1, sample_seed, 1.0, 1.2, 1.2, (), (), ()
+        )
+        return G0CaseResult(
+            case["instance_id"], 1, sample_seed, 1.2, 1.0, 1.0,
+            "transient-fp-exact-tfdl", "winner", label,
+            {"ok": True}, {"ok": True},
+        )
+
+    deps = runner.RuntimeDependencies(
+        iter_shards=iter_shards,
+        read_shard=read_shard,
+        validate_source=lambda source: (count, 1),
+        make_row=make_row,
+        build_optimizer=lambda: object(),
+        solve_base=lambda optimizer, row: runner.BaseSolveResult(
+            torch.tensor([[0.0, 0.0, 2.0, 2.0]], dtype=torch.float64),
+            portfolio,
+        ),
+        scorer=object(),
+        evaluate=evaluate,
+        bindings=lambda: {"test_binding": "a" * 64},
+    )
+    out_dir = tmp_path / "train"
+    summary = runner.run_g0(
+        tmp_path,
+        out_dir,
+        n_min=1,
+        heldout_mod=3,
+        population_split="train",
+        sample_mod=2,
+        emit_corpus=True,
+        deps=deps,
+    )
+    expected = [
+        f"worker_0/layouts_2.th#{index}"
+        for index in range(count)
+        if split_for_id(f"worker_0/layouts_2.th#{index}", 3) == "train"
+        and runner.training_sample_bucket(
+            f"worker_0/layouts_2.th#{index}", 2
+        ) == 0
+    ]
+    assert expected
+    assert summary.authorizing is False
+    assert summary.terminal_state == "TRAINING_LABELS_COMPLETE"
+    corpus = [json.loads(line) for line in (out_dir / "corpus.jsonl").read_text().splitlines()]
+    labels = [json.loads(line) for line in (out_dir / "labels.jsonl").read_text().splitlines()]
+    assert [row["case"]["instance_id"] for row in corpus] == expected
+    assert [row["label"]["instance_id"] for row in labels] == expected
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["population_split"] == "train"
+    assert manifest["sample_mod"] == 2
+    assert manifest["emit_corpus"] is True
+    assert set(manifest["support_sha256"]) == {
+        "cases.jsonl", "corpus.jsonl", "labels.jsonl", "population.json"
+    }
+    for path in out_dir.iterdir():
+        payload = path.read_bytes()
+        for forbidden in (b"fp_sol", b"fp_xywh", b"tree_sol", b"golden"):
+            assert forbidden not in payload
+
+
+def test_training_label_generation_requires_completed_authorizing_g0(tmp_path):
+    runner = _runner_module()
+    path = tmp_path / "manifest.json"
+    payload = {
+        "authorizing": True,
+        "status": "complete",
+        "terminal_state": "TARGET_GAIN_MET",
+    }
+    raw = json.dumps(payload, sort_keys=True).encode("ascii")
+    path.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    assert runner._verify_training_authority(path, digest) == digest
+    path.write_text(
+        json.dumps({**payload, "terminal_state": "STOP_HARD_GAIN_MISSED"}),
+        encoding="ascii",
+    )
+    bad_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="g0 authority"):
+        runner._verify_training_authority(path, bad_digest)
 
 
 def _legacy_separation_edges(rects, n):

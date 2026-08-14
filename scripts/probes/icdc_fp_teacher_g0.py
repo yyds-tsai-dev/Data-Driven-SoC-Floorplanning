@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import heapq
@@ -52,6 +53,10 @@ _DIRECT_SHA256 = "2b9ce827aed93443e442a002d178e8e6282cb4c6148818c9122a6ff0411c8a
 _FLOW_SHA256 = "110c1d84d74ee88d94cf8d3be9ac464602747db8c301d95b3ca69a2cb8bd2f09"
 _WRAPPER_SHA256 = "15419b21acc629934181c552e0ba2798582e220edef26fcff63eef7710d3c577"
 _SOURCE_SHA256 = "6b31e01c87ff1d8e157a116551dac31115b9de82ce7fe68e3ab1670daf872a3c"
+_G0_AUTHORITY_MANIFEST_SHA256 = (
+    "30902df28356748a0d83414eda193af9db2430274d6532a72b2e09b64d7b70dc"
+)
+_G0_AUTHORITY_PATH = _REPO / "artifacts/icdc_g0_v2_area_full/manifest.json"
 _CANONICAL_DATA_ROOT = (_REPO / "FloorSet" / "floorset_lite").resolve()
 _FORBIDDEN_SOLVER_KEYS = {
     "PARTNER_GPU_ARM",
@@ -221,6 +226,25 @@ def _static_bindings() -> Mapping[str, Any]:
     except Exception as exc:
         raise ValueError("source commit") from exc
     return result
+
+
+def _verify_training_authority(
+    path: Path = _G0_AUTHORITY_PATH,
+    expected_sha256: str = _G0_AUTHORITY_MANIFEST_SHA256,
+) -> str:
+    actual = _verify_file(Path(path), expected_sha256, "g0 authority")
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="ascii"))
+    except Exception as exc:
+        raise ValueError("g0 authority") from exc
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("authorizing") is not True
+        or manifest.get("terminal_state") != "TARGET_GAIN_MET"
+        or manifest.get("status") != "complete"
+    ):
+        raise ValueError("g0 authority")
+    return actual
 
 
 def _canonical_decimal(value: str) -> bool:
@@ -474,6 +498,15 @@ def _sample_seed(instance_id: str) -> int:
     return int.from_bytes(hashlib.sha256(instance_id.encode("utf-8")).digest()[:8], "big")
 
 
+def training_sample_bucket(instance_id: str, sample_mod: int) -> int:
+    if not isinstance(instance_id, str) or not instance_id:
+        raise ValueError("instance id")
+    if type(sample_mod) is not int or sample_mod <= 0:
+        raise ValueError("sample mod")
+    payload = b"icdc-g0-v2-train-v1\0" + instance_id.encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % sample_mod
+
+
 def _write_fsync(path: Path, payload: bytes) -> None:
     with path.open("wb") as handle:
         handle.write(payload)
@@ -510,6 +543,9 @@ def run_g0(
     *,
     n_min: int = 100,
     heldout_mod: int = 10,
+    population_split: str = "heldout",
+    sample_mod: int = 1,
+    emit_corpus: bool = False,
     max_files: Optional[int] = None,
     shard_count: int = 1,
     shard_index: int = 0,
@@ -519,6 +555,18 @@ def run_g0(
         raise ValueError("n_min")
     if type(heldout_mod) is not int or heldout_mod <= 0:
         raise ValueError("heldout_mod")
+    if population_split not in {"heldout", "train"}:
+        raise ValueError("population split")
+    if type(sample_mod) is not int or sample_mod <= 0:
+        raise ValueError("sample mod")
+    if population_split == "heldout" and sample_mod != 1:
+        raise ValueError("sample mod")
+    if type(emit_corpus) is not bool:
+        raise ValueError("emit corpus")
+    if population_split == "train" and not emit_corpus:
+        raise ValueError("training corpus")
+    if emit_corpus and shard_count != 1:
+        raise ValueError("partitioned corpus")
     if max_files is not None and (type(max_files) is not int or max_files <= 0):
         raise ValueError("max_files")
     if type(shard_count) is not int or shard_count <= 0:
@@ -532,13 +580,21 @@ def run_g0(
     destination.parent.mkdir(parents=True, exist_ok=True)
     runtime = deps if deps is not None else _production_dependencies()
     bindings = dict(runtime.bindings())
+    if deps is None and population_split == "train":
+        bindings["g0_authority_manifest_sha256"] = _verify_training_authority()
     optimizer = runtime.build_optimizer()
     stage = Path(
         tempfile.mkdtemp(prefix=f".{destination.name}.staging.", dir=destination.parent)
     )
     cases_path = stage / "cases.jsonl"
     labels_path = stage / "labels.jsonl"
-    authorizing = max_files is None and shard_count == 1
+    corpus_path = stage / "corpus.jsonl"
+    authorizing = (
+        population_split == "heldout"
+        and sample_mod == 1
+        and max_files is None
+        and shard_count == 1
+    )
     population = PopulationAccumulator(authorizing=authorizing)
     positive_gain = teacher_admitted = 0
     try:
@@ -560,7 +616,12 @@ def run_g0(
             item for ordinal, item in enumerate(shards)
             if ordinal % shard_count == shard_index
         ]
-        with cases_path.open("wb") as cases_fd, labels_path.open("wb") as labels_fd:
+        with contextlib.ExitStack() as stack:
+            cases_fd = stack.enter_context(cases_path.open("wb"))
+            labels_fd = stack.enter_context(labels_path.open("wb"))
+            corpus_fd = (
+                stack.enter_context(corpus_path.open("wb")) if emit_corpus else None
+            )
             for worker, layout, _path in selected_shards:
                 relative_path = f"worker_{worker}/layouts_{layout}.th"
                 raw, source = runtime.read_shard(root, worker, layout)
@@ -570,7 +631,14 @@ def run_g0(
                     input_row = source[0][index]
                     n = int(input_row[:, 0].ne(-1).sum().item())
                     instance_id = f"{relative_path}#{index}"
-                    if n < n_min or split_for_id(instance_id, heldout_mod) != "heldout":
+                    if (
+                        n < n_min
+                        or split_for_id(instance_id, heldout_mod) != population_split
+                        or (
+                            population_split == "train"
+                            and training_sample_bucket(instance_id, sample_mod) != 0
+                        )
+                    ):
                         continue
                     row = runtime.make_row(source, relative_path, digest, index)
                     _validate_training_row(row, relative_path, digest, index)
@@ -605,13 +673,35 @@ def run_g0(
                     }
                     cases_fd.write(_json_bytes(case_payload))
                     labels_fd.write(_json_bytes(label_payload))
+                    if corpus_fd is not None:
+                        corpus_fd.write(
+                            _json_bytes(
+                                {
+                                    "receipt": dataclasses.asdict(row.receipt),
+                                    "case": dict(row.case),
+                                }
+                            )
+                        )
                     del row, base, result
                 del source, raw
-            for handle in (cases_fd, labels_fd):
+            handles = [cases_fd, labels_fd]
+            if corpus_fd is not None:
+                handles.append(corpus_fd)
+            for handle in handles:
                 handle.flush()
                 os.fsync(handle.fileno())
         summary = population.finish(complete=True)
-        if shard_count > 1:
+        if population_split == "train":
+            summary = dataclasses.replace(
+                summary,
+                authorizing=False,
+                terminal_state=(
+                    "TRAINING_LABELS_COMPLETE"
+                    if max_files is None and shard_count == 1
+                    else "NON_AUTHORIZING_TRAINING_TRACER"
+                ),
+            )
+        elif shard_count > 1:
             summary = dataclasses.replace(
                 summary,
                 authorizing=False,
@@ -623,9 +713,12 @@ def run_g0(
             "teacher_admitted_count": teacher_admitted,
         }
         _write_fsync(stage / "population.json", _json_bytes(population_payload))
+        support_names = ["cases.jsonl", "labels.jsonl", "population.json"]
+        if emit_corpus:
+            support_names.append("corpus.jsonl")
         support_hashes = {
             name: _sha256(stage / name)
-            for name in ("cases.jsonl", "labels.jsonl", "population.json")
+            for name in support_names
         }
         manifest = {
             "schema": "icdc_g0_v2.transient_fp.v1",
@@ -634,6 +727,10 @@ def run_g0(
             "terminal_state": summary.terminal_state,
             "n_min": n_min,
             "heldout_mod": heldout_mod,
+            "population_split": population_split,
+            "sample_mod": sample_mod,
+            "sample_bucket_contract": "sha256(icdc-g0-v2-train-v1\\0+instance_id)-u64be-mod",
+            "emit_corpus": emit_corpus,
             "max_files": max_files,
             "partition": {"count": shard_count, "index": shard_index},
             "discovered_shards": len(shards),
@@ -882,6 +979,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--n-min", type=int, default=100)
     parser.add_argument("--heldout-mod", type=int, default=10)
+    parser.add_argument(
+        "--population-split", choices=("heldout", "train"), default="heldout"
+    )
+    parser.add_argument("--sample-mod", type=int, default=1)
+    parser.add_argument("--emit-corpus", action="store_true")
     parser.add_argument("--max-files", type=int)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
@@ -903,11 +1005,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         Path(args.out_dir),
         n_min=args.n_min,
         heldout_mod=args.heldout_mod,
+        population_split=args.population_split,
+        sample_mod=args.sample_mod,
+        emit_corpus=args.emit_corpus,
         max_files=args.max_files,
         shard_count=args.shard_count,
         shard_index=args.shard_index,
     )
     print(json.dumps(dataclasses.asdict(summary), sort_keys=True, allow_nan=False))
+    if summary.terminal_state == "TRAINING_LABELS_COMPLETE":
+        return 0
     if not summary.authorizing:
         return 3
     return 0 if summary.terminal_state == "TARGET_GAIN_MET" else 2
