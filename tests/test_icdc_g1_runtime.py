@@ -11,6 +11,7 @@ from icdc.g1_runtime import (
     assert_solver_environment,
     build_solver_environment,
     environment_identities,
+    seal_evaluator_arm,
     validate_matched_environments,
     validate_portfolio_receipt,
 )
@@ -116,3 +117,56 @@ def test_g1_matched_environment_masks_only_direct_arm_transport(tmp_path: Path) 
     candidate["PARTNER_FLOW_STEPS"] = "7"
     with pytest.raises(PortfolioContractError, match="environment delta"):
         validate_matched_environments(control, candidate)
+
+
+def test_g1_seals_evaluator_rows_against_wrapper_gate_statuses() -> None:
+    evaluator = {
+        "test_results": [
+            {
+                "test_id": index,
+                "block_count": 21 + index,
+                "runtime_seconds": 0.05 + index / 1000,
+                "cost_no_runtime": 1.0 + index / 10000,
+                "is_feasible": True,
+                "error": None,
+            }
+            for index in range(100)
+        ]
+    }
+    cases = []
+    for index in range(100):
+        gate = index >= 78
+        portfolio = {
+            "case_id": str(index), "direct_gate_open": gate,
+            "pool_ready": True, "requested_K": 6 if gate else 0,
+            "oversample": False, "direct_count": 3 if gate else 0,
+            "flow_count": 3 if gate else 0,
+            "post_candidate_count": 6 if gate else 0,
+            "direct_sampler": "dpmpp", "direct_steps": 2,
+            "flow_sampler": "euler", "flow_steps": 8,
+            "flow_exception": None, "fallback": False,
+        }
+        cases.append({
+            "ordinal": index, "block_count": 21 + index,
+            "status": "normal_pool_valid" if gate else "direct_gate_closed",
+            "portfolio": portfolio,
+        })
+    receipt = {
+        "schema": "icdc_topology_3d3f_arm_receipt_v1",
+        "arm_id": "C0", "complete": True, "expected_cases": 100,
+        "environment": {}, "cases": cases, "invalid_events": [],
+    }
+    arm = seal_evaluator_arm(
+        "C0", evaluator, receipt, Path(__file__).resolve().parents[1],
+        freeze_sha256="a" * 64, causal_smoke_ok=True,
+    )
+    assert arm.feasible_count == 100 and arm.error_count == 0
+    assert not arm.receipts[0].direct_gate_open
+    assert arm.receipts[-1].direct_gate_open
+
+    cases[0] = {**cases[0], "block_count": 999}
+    with pytest.raises(PortfolioContractError, match="block count"):
+        seal_evaluator_arm(
+            "C0", evaluator, receipt, Path(__file__).resolve().parents[1],
+            freeze_sha256="a" * 64, causal_smoke_ok=True,
+        )

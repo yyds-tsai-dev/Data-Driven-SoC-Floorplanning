@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 
 class PortfolioContractError(ValueError):
@@ -243,3 +244,107 @@ def validate_portfolio_receipt(receipt: Mapping[str, object]) -> dict[str, objec
     elif counts != (0, 0, 0, 0):
         raise PortfolioContractError("direct gate closed")
     return value
+
+
+def seal_evaluator_arm(
+    arm_id: str,
+    evaluator: Mapping[str, Any],
+    wrapper_receipt: Mapping[str, Any],
+    repo_root: Path,
+    *,
+    freeze_sha256: str,
+    causal_smoke_ok: bool,
+):
+    """Join the two independently written arm artifacts and seal G1 evidence."""
+
+    from .g1_evidence import (
+        G1CaseRow,
+        G1PortfolioReceipt,
+        seal_g1_arm,
+    )
+
+    if not isinstance(arm_id, str) or not arm_id:
+        raise PortfolioContractError("arm id")
+    required_receipt = {
+        "schema", "arm_id", "complete", "expected_cases", "environment",
+        "cases", "invalid_events",
+    }
+    if (
+        not isinstance(wrapper_receipt, Mapping)
+        or set(wrapper_receipt) != required_receipt
+        or wrapper_receipt["schema"] != "icdc_topology_3d3f_arm_receipt_v1"
+        or wrapper_receipt["arm_id"] != arm_id
+        or wrapper_receipt["complete"] is not True
+        or wrapper_receipt["expected_cases"] != 100
+        or wrapper_receipt["invalid_events"] != []
+        or not isinstance(wrapper_receipt["environment"], Mapping)
+    ):
+        raise PortfolioContractError("arm receipt")
+    cases = wrapper_receipt["cases"]
+    results = evaluator.get("test_results") if isinstance(evaluator, Mapping) else None
+    if not isinstance(cases, list) or not isinstance(results, list):
+        raise PortfolioContractError("100 ordered cases")
+    if len(cases) != 100 or len(results) != 100:
+        raise PortfolioContractError("100 ordered cases")
+
+    rows = []
+    receipts = []
+    feasible_count = 0
+    error_count = 0
+    for index, (case, result) in enumerate(zip(cases, results)):
+        if not isinstance(case, Mapping) or not isinstance(result, Mapping):
+            raise PortfolioContractError("ordered cases")
+        if case.get("ordinal") != index or result.get("test_id") != index:
+            raise PortfolioContractError("ordered cases")
+        n = result.get("block_count")
+        if type(n) is not int or n <= 0 or case.get("block_count") != n:
+            raise PortfolioContractError("block count")
+        portfolio = validate_portfolio_receipt(case.get("portfolio"))
+        gate = portfolio["direct_gate_open"]
+        expected_status = "normal_pool_valid" if gate else "direct_gate_closed"
+        if case.get("status") != expected_status:
+            raise PortfolioContractError("gate status")
+        runtime = result.get("runtime_seconds")
+        cost = result.get("cost_no_runtime")
+        if (
+            isinstance(runtime, bool)
+            or not isinstance(runtime, (int, float))
+            or not math.isfinite(float(runtime))
+            or float(runtime) <= 0
+            or isinstance(cost, bool)
+            or not isinstance(cost, (int, float))
+            or not math.isfinite(float(cost))
+            or float(cost) <= 0
+        ):
+            raise PortfolioContractError("evaluator row")
+        error = result.get("error")
+        feasible = result.get("is_feasible")
+        if error is not None and not isinstance(error, str):
+            raise PortfolioContractError("evaluator error")
+        if type(feasible) is not bool:
+            raise PortfolioContractError("evaluator feasibility")
+        error_count += int(error is not None)
+        feasible_count += int(feasible)
+        rows.append(G1CaseRow(str(index), n, float(runtime), float(cost)))
+        receipts.append(G1PortfolioReceipt(
+            str(index),
+            int(portfolio["direct_count"]),
+            int(portfolio["flow_count"]),
+            str(portfolio["direct_sampler"]),
+            int(portfolio["direct_steps"]),
+            str(portfolio["flow_sampler"]),
+            int(portfolio["flow_steps"]),
+            bool(gate),
+            direct_gate_open=bool(gate),
+        ))
+    return seal_g1_arm(
+        arm_id,
+        rows,
+        receipts,
+        Path(repo_root),
+        feasible_count=feasible_count,
+        error_count=error_count,
+        freeze_sha256=freeze_sha256,
+        calculator_path=Path("partner/icdc/g1_evidence.py"),
+        causal_smoke_ok=causal_smoke_ok,
+    )
