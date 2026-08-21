@@ -1,0 +1,179 @@
+Using GNN fallback checkpoint: /nashome/NVL4/vdalab/yyds-dev/Data-Driven-SoC-Floorplanning/checkpoints/gnn_transformer_best_0521_ns1000000_ep3_encgraph_transformer_h256_l6_acc32_heads8.pt
+Loading validation dataset...
+Loaded 100 validation cases
+checkpoint not found: /nashome/NVL4/vdalab/yyds-dev/Data-Driven-SoC-Floorplanning/.claude/worktrees/agent-ae70c831b38cdd03d/partner/checkpoints/diffusion_stable_xywh_order_2day/step_00080000.pt; using heuristic init only
+loaded direct model step 1200000 from /nashome/NVL4/vdalab/yyds-dev/Data-Driven-SoC-Floorplanning/partner/checkpoints/direct_v2_cont/eval_step1p2M.pt
+Evaluating:   0%|          | 0/1 [00:00<?, ?it/s][squeeze] 0 wins 8 fails frame 151.4x255.3
+[squeeze] 0 wins 8 fails frame 144.0x254.4
+[squeeze] 0 wins 8 fails frame 148.4x254.8
+[squeeze] 0 wins 8 fails frame 150.3x254.6
+[squeeze] 0 wins 8 fails frame 150.0x254.4
+[squeeze] 0 wins 8 fails frame 150.7x255.7
+[squeeze] 0 wins 8 fails frame 145.7x254.3
+[squeeze] 0 wins 8 fails frame 147.9x254.7
+[squeeze] 0 wins 8 fails frame 148.4x253.5
+[lsoft] s=0.86 ok=True ovl=0
+[lsoft] s=0.93 ok=True ovl=0
+[lsoft] s=0.965 ok=False ovl=15
+[lsoft] s=0.985 ok=False ovl=20
+[lsoft] s=1.0 ok=False ovl=78
+[rp] rung FIXED failed ovl=78
+[lsoft] s=0.86 ok=True ovl=0
+[lsoft] s=0.93 ok=False ovl=8
+[lsoft] s=0.965 ok=False ovl=15
+[lsoft] s=0.985 ok=False ovl=28
+[lsoft] s=1.0 ok=False ovl=61
+[rp] rung FIXED failed ovl=61
+[lsoft] s=0.86 ok=True ovl=0
+[lsoft] s=0.93 ok=False ovl=5
+[lsoft] s=0.965 ok=False ovl=16
+[lsoft] s=0.985 ok=False ovl=23
+[lsoft] s=1.0 ok=False ovl=60
+[rp] rung FIXED failed ovl=60
+[lsoft] s=0.86 ok=False ovl=6
+[lsoft] s=0.93 ok=False ovl=10
+[lsoft] s=0.965 ok=False ovl=16
+[lsoft] s=0.985 ok=False ovl=33
+[lsoft] s=1.0 ok=False ovl=73
+[rp] rung FIXED failed ovl=73
+[lsoft] s=0.86 ok=False ovl=5
+[lsoft] s=0.93 ok=False ovl=8
+[lsoft] s=0.965 ok=False ovl=17
+[lsoft] s=0.985 ok=False ovl=33
+[lsoft] s=1.0 ok=False ovl=73
+[rp] rung FIXED failed ovl=73
+[refiner] rounds=14 kicks=6 discrete: 1 batches, 12 moves accepted
+[refiner] n=116 groups=89 hp 477.7 -> 458.1 (0.959) V 0 -> 0 in 0.86s
+[refiner] rounds=13 kicks=6 discrete: 1 batches, 19 moves accepted
+[refiner] n=116 groups=89 hp 485.8 -> 467.7 (0.963) V 0 -> 0 in 0.86s
+[lsoft] s=0.86 ok=False ovl=9
+[refiner] rounds=16 kicks=6 discrete: 1 batches, 1 moves accepted
+[lsoft] s=0.93 ok=False ovl=13
+[refiner] rounds=16 kicks=6 discrete: 1 batches, 3 moves accepted
+[lsoft] s=0.86 ok=False ovl=5
+[lsoft] s=0.965 ok=False ovl=26
+[lsoft] s=0.93 ok=False ovl=8
+[lsoft] s=0.985 ok=False ovl=37
+[refiner] n=116 groups=89 hp 515.1 -> 506.9 (0.984) V 0 -> 0 in 0.86s
+[lsoft] s=0.965 ok=False ovl=17
+[refiner] n=116 groups=89 hp 445.4 -> 436.2 (0.979) V 0 -> 0 in 0.85s
+[lsoft] s=0.985 ok=False ovl=22
+[lsoft] s=1.0 ok=False ovl=67
+[lsoft] s=1.0 ok=False ovl=78
+[rp] rung FIXED failed ovl=67
+[rp] rung FIXED failed ovl=78
+[refiner] rounds=16 kicks=6 discrete: 1 batches, 4 moves accepted
+[refiner] n=116 groups=89 hp 468.0 -> 460.9 (0.985) V 0 -> 0 in 0.87s
+[lsoft] s=0.86 ok=False ovl=4
+[lsoft] s=0.93 ok=False ovl=8
+[lsoft] s=0.965 ok=False ovl=17
+[lsoft] s=0.985 ok=False ovl=29
+[refiner] rounds=13 kicks=6 discrete: 1 batches, 13 moves accepted
+[lsoft] s=1.0 ok=False ovl=73
+[rp] rung FIXED failed ovl=73
+[refiner] n=116 groups=89 hp 460.0 -> 447.2 (0.972) V 0 -> 0 in 0.87s
+[lsoft] s=0.86 ok=False ovl=6
+[lsoft] s=0.93 ok=False ovl=9
+[lsoft] s=0.965 ok=False ovl=15
+[lsoft] s=0.985 ok=False ovl=27
+[lsoft] s=1.0 ok=False ovl=69
+[rp] rung FIXED failed ovl=69
+[refiner] rounds=18 kicks=6 discrete: 1 batches, 10 moves accepted
+[refiner] n=116 groups=89 hp 515.3 -> 467.0 (0.906) V 0 -> 0 in 0.87s
+[refiner] rounds=22 kicks=6 discrete: 1 batches, 1 moves accepted
+[refiner] n=116 groups=89 hp 494.8 -> 487.7 (0.986) V 0 -> 0 in 0.88s
+[refiner] rounds=16 kicks=6 discrete: 1 batches, 3 moves accepted
+[refiner] n=116 groups=89 hp 491.4 -> 470.6 (0.958) V 0 -> 0 in 0.88s
+[lsoft] s=0.86 ok=False ovl=6
+[lsoft] s=0.93 ok=False ovl=10
+[lsoft] s=0.965 ok=False ovl=24
+[lsoft] s=0.985 ok=False ovl=41
+[lsoft] s=1.0 ok=False ovl=80
+[rp] rung FIXED failed ovl=80
+[lsoft] s=0.86 ok=False ovl=4
+[lsoft] s=0.93 ok=False ovl=10
+[lsoft] s=0.965 ok=False ovl=14
+[lsoft] s=0.985 ok=False ovl=30
+[lsoft] s=1.0 ok=False ovl=63
+[rp] rung FIXED failed ovl=63
+[lsoft] s=0.86 ok=False ovl=7
+[lsoft] s=0.93 ok=False ovl=14
+[lsoft] s=0.965 ok=False ovl=18
+[lsoft] s=0.985 ok=False ovl=32
+[lsoft] s=0.86 ok=False ovl=4
+[lsoft] s=0.86 ok=False ovl=4
+[lsoft] s=1.0 ok=False ovl=68
+[lsoft] s=0.93 ok=False ovl=7
+[lsoft] s=0.93 ok=False ovl=8
+[lsoft] s=0.965 ok=False ovl=16
+[lsoft] s=0.965 ok=False ovl=19
+[rp] rung FIXED failed ovl=68
+[lsoft] s=0.985 ok=False ovl=27
+[lsoft] s=0.86 ok=False ovl=6
+[lsoft] s=0.985 ok=False ovl=26
+[lsoft] s=1.0 ok=False ovl=61
+[lsoft] s=0.93 ok=False ovl=9
+[lsoft] s=0.965 ok=False ovl=16
+[lsoft] s=1.0 ok=False ovl=62
+[rp] rung FIXED failed ovl=61
+[lsoft] s=0.985 ok=False ovl=29
+[lsoft] s=1.0 ok=False ovl=59
+[rp] rung FIXED failed ovl=62
+[rp] rung FIXED failed ovl=59
+[lsoft] s=0.88 ok=True ovl=0
+[lsoft] s=0.94 ok=True ovl=0
+[lsoft] s=0.97 ok=True ovl=0
+[lsoft] s=0.88 ok=True ovl=0
+[lsoft] s=0.94 ok=False ovl=2
+[lsoft] s=0.97 ok=False ovl=4
+[lsoft] s=1.0 ok=False ovl=11
+[lsoft] s=1.0 ok=False ovl=4
+[lsoft-ovl] 4(k0 clu0 p00) x 16(k2 clu0 p--) ox=1.33 oy=3.66
+[lsoft-ovl] 26(k0 clu0 p00) x 48(k1 clu0 p00) ox=14.00 oy=20.94
+[lsoft-ovl] 36(k0 clu0 p00) x 95(k0 clu0 p00) ox=0.53 oy=1.29
+[lsoft-ovl] 95(k0 clu0 p00) x 103(k1 clu0 p00) ox=10.00 oy=26.00
+[psel] col hp=436.2 area=38270 V=0 score=1.0436
+[psel] col hp=458.1 area=36643 V=0 score=1.0456
+[psel] col hp=447.2 area=37829 V=0 score=1.0500
+Evaluating: 100%|██████████| 1/1 [00:04<00:00,  4.64s/it]Evaluating: 100%|██████████| 1/1 [00:04<00:00,  4.64s/it]
+
+============================================================
+EVALUATION RESULTS: contest_optimizer
+============================================================
+
+Total Score: 1.2071
+Total Score (No Runtime): 1.2071
+Tests: 1
+Feasible: 1
+Avg Cost: 1.2071
+Avg Cost (No Runtime): 1.2071
+Avg Runtime: 4.27s
+Median Runtime: 4.27s
+P90 Runtime: 4.27s
+Max Runtime: 4.27s
+
+Cost Factor Averages
+------------------------------------------------------------
+Quality Factor: 1.2071
+Violation Factor: 1.0000
+Runtime Factor: 1.0000
+Runtime Adjustment: 1.0000
+Formula Cost: 1.2071
+
+Top 5 Total-Score Contributors
+------------------------------------------------------------------------------------------------
+test_id blocks cost cost_no_rt contrib pct_total hpwl_gap area_gap v_rel runtime q_factor v_factor r_adj
+     95    116  1.2071     1.2071  1.2071    100.00%   0.3315   0.0827 0.0000    4.27   1.2071   1.0000 1.0000
+
+Best 5 by Cost
+------------------------------------------------------------------------------------------------
+test_id blocks cost cost_no_rt contrib pct_total hpwl_gap area_gap v_rel runtime q_factor v_factor r_adj
+     95    116  1.2071     1.2071  0.0000      0.00%   0.3315   0.0827 0.0000    4.27   1.2071   1.0000 1.0000
+
+Worst 5 by Cost
+------------------------------------------------------------------------------------------------
+test_id blocks cost cost_no_rt contrib pct_total hpwl_gap area_gap v_rel runtime q_factor v_factor r_adj
+     95    116  1.2071     1.2071  0.0000      0.00%   0.3315   0.0827 0.0000    4.27   1.2071   1.0000 1.0000
+
+Results saved to /nashome/NVL4/vdalab/yyds-dev/Data-Driven-SoC-Floorplanning/contest_optimizer_results.json
+Floorplan PNGs saved to /nashome/NVL4/vdalab/yyds-dev/Data-Driven-SoC-Floorplanning/artifacts/eval_v11/floorplans/contest_optimizer_results
