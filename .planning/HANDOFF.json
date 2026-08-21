@@ -48,7 +48,7 @@
     {
       "description": "GitHub push credentials are unavailable in this environment.",
       "type": "human_action",
-      "workaround": "Authenticate HTTPS or authorize an SSH key, then run git fetch origin and git push origin main without force."
+      "workaround": "Authenticate HTTPS or authorize an SSH key, then run git fetch origin and git push origin main without force. If the old server must be retired first, transfer the complete repository including .git and its 15 GB .git/lfs/objects payload store."
     },
     {
       "description": "Generated periodic flow checkpoints, artifacts, and FloorSet data cannot be migrated through ordinary Git.",

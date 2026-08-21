@@ -2,7 +2,7 @@
 
 ## Executive state
 
-The consolidated development history is now on local `main`, 509 commits ahead of `origin/main` at the last locally visible remote state. The goal service reports no active goal, so there is no API-owned goal to pause. This document is the durable pause/resume record for Codex, Claude Code, or a human on the new server.
+The consolidated development history is now on local `main`, 510 commits ahead of `origin/main` at the last locally visible remote state. The goal service reports no active goal, so there is no API-owned goal to pause. This document is the durable pause/resume record for Codex, Claude Code, or a human on the new server.
 
 The source tree contains substantial completed solver and experiment work. Do not recreate completed code or rerun killed experiment directions by default. The currently unfinished research gate is the topology-prior G1 execution, not its supporting implementation.
 
@@ -60,6 +60,7 @@ Do not add these directories to ordinary Git. They are generated, ignored by rep
 - Main worktree `artifacts/`: about 57 GB. This includes the immutable formal G0 evidence (`artifacts/icdc_g0_v2_area_full/`, about 946 MB) and topology work (`artifacts/icdc_topology/`, about 821 MB).
 - Main worktree `checkpoints/`: about 1.8 GB, excluding the separate flow worktree runs below.
 - Main worktree `wandb/`: about 624 MB.
+- Local `.git/lfs/objects/`: about 15 GB. This contains LFS payloads that are not yet on GitHub, including the requested flow-v1 checkpoint and newest submission archive.
 - `FloorSet/floorset_lite/`: 9,000 files, about 24 GB, untracked inside the FloorSet submodule.
 - Flow-matching worktree nested checkpoint runs: about 246 GB total. The full v1 final continuation checkpoint is now represented through Git LFS; the remaining periodic snapshots are still generated local-only evidence.
 
@@ -75,6 +76,8 @@ rsync -aH --info=progress2 --partial \
 ```
 
 Only transfer the remaining flow archive if historical periodic snapshots are still required. The source, recipes, and full v1 final continuation state are represented in Git/LFS; periodic checkpoints remain generated evidence.
+
+Because the push is blocked, the safest code migration is to copy the complete repository including `.git`. If the new server starts from a fresh clone instead, also transfer the old repository's Git objects/refs and `.git/lfs/objects`; a fresh clone of `origin/main` alone cannot recover the 510 local commits or the unpushed LFS payloads. Do not retire the old server until the new checkout passes `git lfs fsck` for commits `533a810` and `5153e62`, or until the old server successfully pushes them.
 
 ## Branch/worktree consolidation facts
 
