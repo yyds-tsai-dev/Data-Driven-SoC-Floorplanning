@@ -1,0 +1,90 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-08-22T00:30:47+08:00",
+  "phase": "server-migration",
+  "phase_name": "repository-consolidation",
+  "phase_dir": "docs/project-status",
+  "plan": 1,
+  "task": 3,
+  "total_tasks": 4,
+  "status": "paused",
+  "completed_tasks": [
+    {
+      "id": 1,
+      "name": "Inventory branches, worktrees, progress, and generated data",
+      "status": "done"
+    },
+    {
+      "id": 2,
+      "name": "Preserve root human-authored changes in focused commits",
+      "status": "done"
+    },
+    {
+      "id": 3,
+      "name": "Consolidate branches into main",
+      "status": "in_progress",
+      "progress": "Branch ancestry and patch equivalence are audited; small dirty-worktree evidence has been committed. Merges and final main verification remain."
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": 3,
+      "name": "Merge unique and patch-equivalent worktree branches, then fast-forward main",
+      "status": "in_progress"
+    },
+    {
+      "id": 4,
+      "name": "Run final verification, update handoff, and push main",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [
+    {
+      "description": "Full pytest has 17 pre-existing topology-prior scorer-contract failures because the evaluator module resolves from the FloorSet submodule instead of scripts/iccad2026_evaluate.py.",
+      "type": "technical",
+      "workaround": "Use targeted passing suites for scoped verification and resolve or explicitly re-baseline the scorer import before claiming full-suite green."
+    },
+    {
+      "description": "GitHub push credentials are unavailable in this environment.",
+      "type": "human_action",
+      "workaround": "Authenticate HTTPS or authorize an SSH key, then run git fetch origin and git push origin main without force."
+    },
+    {
+      "description": "Approximately 270 GB of flow checkpoints and FloorSet data cannot be migrated through ordinary Git.",
+      "type": "external",
+      "workaround": "Use resumable rsync or equivalent; commands and paths are in docs/project-status/2026-08-22-server-migration-handoff.md."
+    }
+  ],
+  "human_actions_pending": [
+    {
+      "action": "Provide working GitHub credentials for the final push.",
+      "context": "HTTPS has no credential, gh is absent, and the local SSH key is not authorized.",
+      "blocking": true
+    },
+    {
+      "action": "Decide whether to transfer the 246 GB historical flow checkpoint archive to the new server.",
+      "context": "It is generated evidence and cannot be committed to ordinary Git safely.",
+      "blocking": false
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "Use 5.6-sol-reduce-time as the integration trunk.",
+      "rationale": "It already contains flow-matching and patch-equivalent copies of five agent feature commits, minimizing conflict and duplicate implementation.",
+      "phase": "server-migration"
+    },
+    {
+      "decision": "Do not commit generated nested checkpoints or FloorSet/floorset_lite.",
+      "rationale": "Repository policy treats them as generated evidence; the data is roughly 270 GB and includes 1.72 GB files outside current LFS rules.",
+      "phase": "server-migration"
+    },
+    {
+      "decision": "Treat topology G0-v2 as complete and G1 execution as the next research gate.",
+      "rationale": "The sealed G0 result reached TARGET_GAIN_MET over all 21,081 eligible rows, while no final G1 gate artifact exists.",
+      "phase": "server-migration"
+    }
+  ],
+  "uncommitted_files": [],
+  "next_action": "Complete branch merges into 5.6-sol-reduce-time, fast-forward main, run scoped and full verification, update this handoff with final hashes, then retry a non-force push after GitHub authentication.",
+  "context_notes": "No active get_goal record exists. Continue in one session without subagents. Preserve completed/no-go experiment decisions and do not restart G0 or killed branches."
+}
