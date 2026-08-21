@@ -29,7 +29,7 @@
       "id": 4,
       "name": "Verify consolidated main and prepare remote handoff",
       "status": "in_progress",
-      "progress": "All local merges, requested LFS commits, focused verification, validation, Graphify update, and handoff updates are complete. Final full suite: 2260 passed, 5 skipped, and the same 17 pre-existing topology scorer-import failures. GitHub authentication and non-force push remain."
+      "progress": "All local merges, requested LFS commits, focused verification, validation, Graphify update, and handoff updates are complete. Final full suite: 2260 passed, 5 skipped, and the same 17 pre-existing topology scorer-import failures. A non-force push was attempted and failed before transfer because GitHub credentials are unavailable."
     }
   ],
   "remaining_tasks": [

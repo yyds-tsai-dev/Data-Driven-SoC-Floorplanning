@@ -2,7 +2,7 @@
 
 ## Executive state
 
-The consolidated development history is now on local `main` at `efafe09`, 507 commits ahead of `origin/main` at the last locally visible remote state. The goal service reports no active goal, so there is no API-owned goal to pause. This document is the durable pause/resume record for Codex, Claude Code, or a human on the new server.
+The consolidated development history is now on local `main`, 509 commits ahead of `origin/main` at the last locally visible remote state. The goal service reports no active goal, so there is no API-owned goal to pause. This document is the durable pause/resume record for Codex, Claude Code, or a human on the new server.
 
 The source tree contains substantial completed solver and experiment work. Do not recreate completed code or rerun killed experiment directions by default. The currently unfinished research gate is the topology-prior G1 execution, not its supporting implementation.
 
@@ -86,7 +86,9 @@ Only transfer the remaining flow archive if historical periodic snapshots are st
 
 ## Remote/push state
 
-The configured origin is `https://github.com/yyds-tsai-dev/Data-Driven-SoC-Floorplanning.git`. HTTPS fetch currently fails because no non-interactive GitHub credential is available. The `gh` CLI is not installed. SSH host verification was initialized, but the available key is not authorized by GitHub. Local `main` includes both requested LFS artifacts, but their LFS objects and the 507 commits cannot reach GitHub until credentials are installed. Retry with:
+The configured origin is `https://github.com/yyds-tsai-dev/Data-Driven-SoC-Floorplanning.git`. HTTPS fetch currently fails because no non-interactive GitHub credential is available. The `gh` CLI is not installed. SSH host verification was initialized, but the available key is not authorized by GitHub. Local `main` includes both requested LFS artifacts, but their LFS objects and local commits cannot reach GitHub until credentials are installed. Retry with:
+
+A final non-force `git push origin main` was attempted after verification and failed before transfer with `fatal: could not read Username for 'https://github.com': No such device or address`. No remote ref or LFS object was changed by that attempt.
 
 ```bash
 git fetch origin

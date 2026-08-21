@@ -75,4 +75,4 @@
 - [x] Run targeted tests for every newly merged experiment branch.
 - [x] Run `uv run pytest`, `bash scripts/validate.sh`, `git diff --check`, and `graphify update .`; distinguish the 17 pre-existing topology scorer-import failures from merge regressions.
 - [x] Confirm no staged/untracked human-authored files remain in any worktree; only documented generated checkpoint/FloorSet state remains.
-- [ ] Push `main`; if authentication is unavailable, preserve all commits locally and record the exact credential blocker and retry command.
+- [x] Attempt a non-force push; authentication was unavailable, so preserve all commits locally and record the exact credential blocker and retry command.
