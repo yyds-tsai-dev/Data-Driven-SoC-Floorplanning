@@ -59,6 +59,7 @@ tmp/
 *_results.json
 *.log
 artifacts/
+checkpoints/*/
 LiteTensorDataTest/*
 smoke.*
 wandb/
