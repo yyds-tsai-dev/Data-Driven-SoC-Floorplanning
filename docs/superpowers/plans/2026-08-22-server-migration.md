@@ -57,11 +57,11 @@
 - Agent branches: six `worktree-agent-*` branches
 - Destination: `main`
 
-- [ ] Merge the unique refine-kernel agent branch and its evidence into the integration trunk.
-- [ ] Merge the five patch-equivalent agent branches so their branch ancestry and any newly preserved evidence are reachable.
-- [ ] Merge all three unique `feat/*` experiment branches, preserving their no-go decisions and resolving conflicts in favor of the newest validated integration behavior.
-- [ ] Confirm `5.6-sol-flow-matching` is still an ancestor; record it as integrated without manufacturing a redundant content change.
-- [ ] Fast-forward `main` to the integration trunk, then verify every named worktree head is reachable from `main`.
+- [x] Merge the unique refine-kernel agent branch and its evidence into the integration trunk.
+- [x] Merge the five patch-equivalent agent branches so their branch ancestry and any newly preserved evidence are reachable.
+- [x] Merge all three unique `feat/*` experiment branches, preserving their no-go decisions and resolving conflicts in favor of the newest validated integration behavior.
+- [x] Confirm the original `5.6-sol-flow-matching` history is integrated, then merge its requested full-v1-checkpoint LFS commit.
+- [x] Fast-forward `main` to the integration trunk, then verify every named worktree head is reachable from `main`.
 
 ### Task 4: Final handoff and verification
 
@@ -71,8 +71,8 @@
 - Update: `docs/project-status/2026-08-22-server-migration-handoff.md`
 - Update: `graphify-out/` through `graphify update .` only
 
-- [ ] Record final commit hashes, merges, known failures, unexecuted G1 work, generated-data transfer commands, and the exact first resume action.
-- [ ] Run targeted tests for every newly merged experiment branch.
-- [ ] Run `uv run pytest`, `bash scripts/validate.sh`, `git diff --check`, and `graphify update .`; distinguish pre-existing failures from merge regressions.
-- [ ] Confirm no staged/untracked human-authored files remain in any worktree.
+- [x] Record final commit hashes, merges, known failures, unexecuted G1 work, generated-data transfer commands, and the exact first resume action.
+- [x] Run targeted tests for every newly merged experiment branch.
+- [x] Run `uv run pytest`, `bash scripts/validate.sh`, `git diff --check`, and `graphify update .`; distinguish the 17 pre-existing topology scorer-import failures from merge regressions.
+- [x] Confirm no staged/untracked human-authored files remain in any worktree; only documented generated checkpoint/FloorSet state remains.
 - [ ] Push `main`; if authentication is unavailable, preserve all commits locally and record the exact credential blocker and retry command.
