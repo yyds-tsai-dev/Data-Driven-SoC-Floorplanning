@@ -106,6 +106,11 @@ def frame_wpin_on() -> bool:
     return _flag_on("PARTNER_FRAME_WPIN")
 
 
+def col_lns_oracle_on() -> bool:
+    """G0 only: exhaust the one-step column split/merge neighborhood."""
+    return _flag_on("PARTNER_COL_LNS_ORACLE")
+
+
 def col_narrow_on() -> bool:
     """PARTNER_COL_NARROW=1 (default off): let the column-width solve shrink,
     not just grow.
@@ -2746,6 +2751,8 @@ class _ColumnOptimizer:
         cols = self._restore(best_snap)
         polish_end = deadline - refine_t
         cols = self._greedy_polish(cols, best_c, polish_end)
+        if col_lns_oracle_on():
+            cols = self._maybe_col_lns_oracle(cols)
         # `_greedy_polish` is already convergence-bounded (`while improved`),
         # so with EARLY_EXIT off its unspent tail silently inflates the
         # stage-2 refiner slice; claw it back instead.
@@ -3035,6 +3042,35 @@ class _ColumnOptimizer:
                     cur_cost = c
                     improved = True
         return cols
+
+    def _maybe_col_lns_oracle(self, cols):
+        """Run the G0 large-neighborhood oracle, or preserve the off object."""
+        if not col_lns_oracle_on():
+            return cols
+        try:
+            from column_lns import best_split_merge_neighbor
+
+            result = best_split_merge_neighbor(
+                self,
+                cols,
+                [unit.force for unit in self.units],
+            )
+            self._col_lns_result = result
+            if _os.environ.get("PARTNER_COL_LNS_DEBUG"):
+                import sys as _sys
+
+                print(
+                    f"[col-lns] n={self.n} C={len(cols)} "
+                    f"cands={result.candidate_count} "
+                    f"base={result.base_cost:.8f} "
+                    f"best={result.best_cost:.8f} "
+                    f"dt={result.elapsed_s:.6f}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+            return result.cols if result.improved else cols
+        except Exception:
+            return cols
 
     def _evaluate_bootstrap(self, cols):
         """First evaluation; establishes the HPWL normalizer."""
