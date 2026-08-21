@@ -144,11 +144,23 @@ class _Spy:
 def test_off_path_keeps_the_unbounded_rung_call(monkeypatch):
     """The shipped ladder rungs call `legalize_soft()` with no deadline at
     all.  That is the overrun source ANYTIME removes -- and the sharpest
-    available witness that the off path is the pre-flag path."""
-    spy = _Spy(monkeypatch)
+    available witness that the off path is the pre-flag path.
+
+    Stub legalization so this wiring assertion cannot depend on whether a
+    machine reaches the expand ladder before its wall-clock deadline.  The
+    real fixed-frame rung can consume the entire short test budget when the
+    suite runs under load, even though the off-path call remains unbounded.
+    """
+    deadlines = []
+
+    def _fail_fast(self_, max_sweeps=14, deadline=None, fine=False):
+        deadlines.append(deadline)
+        return False
+
+    monkeypatch.setattr(rf._Refiner, "legalize_soft", _fail_fast)
     inst, pred = _case(n=70, seed=0)
-    _refine(inst, pred, 1.0)
-    assert any(d is None for d in spy.lsoft), \
+    _refine(inst, pred, 3.0)
+    assert any(d is None for d in deadlines), \
         "off path must keep the shipped unbounded rung call"
 
 
