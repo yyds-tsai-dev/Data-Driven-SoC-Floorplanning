@@ -494,8 +494,14 @@ class MyOptimizer(FloorplanOptimizer):
                     _np.sort(_x[:60_000])
                 cpu_ms = (time.time() - _t1) * 1000.0
                 cpu_ratio = cpu_ms / _env_float("PARTNER_CPU_CALIB_REF_MS", 95.0)
-                if (os.environ.get("PARTNER_SEAT_R0_ADAPT", "1") not in
-                        ("0", "false", "False", "off") and cpu_ratio > 1.25):
+                # OPT-IN (default off, 2026-08-27): on a loaded dev box the
+                # benchmark read 1.91x and the raised R0 closed the model
+                # arms (official 1.10 -> 1.13); on a 1.3-1.45x slower CPU the
+                # arms still pay for themselves (emulation: 1.137 with arms
+                # vs 1.155 without), so closing them is the wrong trade.
+                # The ratio is printed for diagnostics only.
+                if (os.environ.get("PARTNER_SEAT_R0_ADAPT", "0") in
+                        ("1", "true", "True", "on") and cpu_ratio > 1.25):
                     r0 = _env_float("PARTNER_DIRECT_SEAT_R0", 0.125) * cpu_ratio
                     os.environ["PARTNER_DIRECT_SEAT_R0"] = f"{r0:.4f}"
                     r0_adapted = True

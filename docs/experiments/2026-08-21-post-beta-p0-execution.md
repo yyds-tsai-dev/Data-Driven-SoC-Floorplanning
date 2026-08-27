@@ -708,3 +708,8 @@ runtime avg 4/5 套降、p90 5/5 降(official 0.410→0.396 / 0.969→0.882),max
 | a1 | 1.2230/1.2051 | 1.2179/1.2221 | +0.0059 | [−0.0049, +0.0175] |
 
 runtime 持平(0.381→0.382);runtime-aware M=1.45 D=0.6 0.918→0.906。疊在 EE 上 SF 仍正(official/v6),v3/v5 wash(EE 已釋放部分 CPU 給 refine,增益重疊),無一套變差 → **兩者皆入出貨 env**。包重打(op_wrapper 含 EARLY_EXIT + SECURE_FALLBACK),乾淨 venv 演練中。
+
+### 17k. 打包演練 3/4 與一個自傷 bug
+
+- 演練 3(md5 11d7969a):包內模組是 04:27 的舊版(缺 SECURE_FALLBACK 等後續碼)→ **打包必須從工作樹重組**;已寫 `scripts/pack_cadc1013.sh`(import 閉包 + op_src + `partner/shipping/op_wrapper.py` 模板 + requirements + ckpt + synth_instances,內容與手工包逐檔 md5 相同)。
+- 演練 4(重組後,md5 eb5b1937):`[selfcheck] … cpu_ratio=1.91 seat_r0=adapted->0.2386` → **CPU 自校準在共用機負載下誤判 1.91×,把 R0 門檻抬高、關掉大半模型臂,official 1.1315**。而 ÷1.45 模擬已證明慢 CPU 上開臂仍划算(1.137 vs 關臂 1.155)→ R0 自校準改為 **opt-in(default off)**,只印 cpu_ratio 供診斷;TS 自校準(sampler 真的 1s 時關臂)維持。
