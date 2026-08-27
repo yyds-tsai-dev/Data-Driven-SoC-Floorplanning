@@ -1,0 +1,114 @@
+ICCAD 2026 FloorSet Challenge — Beta Evaluation Report
+=======================================================
+
+1. HOW BETA EVALUATION DIFFERS FROM ALPHA
+------------------------------------------
+
+Alpha evaluation was a pipeline exercise only. Submissions were tested
+on the public validation set (100 cases from LiteTensorDataTest) to
+verify that the package structure, dependencies, and optimizer interface
+worked correctly end-to-end. No hidden test cases were used.
+
+Beta evaluation runs on a separate set of 100 hidden test cases that are
+not publicly available. Key differences:
+
+  - Test cases are drawn from the same distribution as the validation
+    set (21 to 120 blocks, similar number of placement constraints and
+    similar number of nets) but with noise added, resulting in different
+    optimal placement locations and block shapes. Some instances may be
+    occasionally harder and some simpler, though the overall difficulty range is
+    comparable. As a result, the leaderboard has changed significantly,
+    with a few submitted solutions overfitting to the previous validation set
+    struggling to find feasible solutions.
+
+  - Scoring uses per-test-case MEDIAN RUNTIME across all submissions to
+    compute the runtime factor:
+
+        runtime_factor[i] = your_runtime[i] / median_runtime[i]
+
+    This means your score depends not just on your own performance but
+    also on how fast other submissions solve each test case.
+
+  - The total score is a weighted average of per-test-case costs, where
+    the weight for each test case is exp(block_count / 12). Harder
+    (larger) test cases carry more weight.
+
+  - The cost formula per test case:
+
+        cost = (1 + 0.5 * (hpwl_gap + area_gap)) * exp(2 * violations) * rt_adj
+
+    where rt_adj = max(0.7, runtime_factor ^ 0.3).
+    Infeasible solutions receive a penalty cost of 10.0.
+
+  - Submissions were run on dedicated machines with 48 CPU cores and an
+    NVIDIA A100 80GB GPU. All resources were exclusively available to
+    each submission during evaluation.
+
+
+
+
+
+2. ISSUES FOUND AND GUIDANCE FOR FINAL SUBMISSIONS
+----------------------------------------------------
+
+a) INCOMPLETE requirements.txt
+
+   Several submissions import packages
+   such as torch-geometric, torch-scatter, and scipy in their code but
+   do not list them in requirements.txt. This causes runtime failures
+   when the evaluation environment does not have these packages
+   pre-installed.
+
+   ACTION: Your requirements.txt must list EVERY package your code
+   imports, including transitive dependencies. Do not assume any package
+   beyond the Python standard library is available. If your optimizer
+   uses torch-geometric, torch-scatter, torch-sparse, scipy, or any
+   other third-party package, it MUST appear in requirements.txt.
+
+b) TORCH VERSION INCOMPATIBILITY
+
+   Some submissions pin old PyTorch versions (e.g., torch==2.1.0) that
+   are not available for the evaluation environment's Python version.
+   Others ship pre-compiled C++ extensions (.so files) that are built
+   against a specific PyTorch ABI and break with the installed version.
+
+   ACTION: Either pin a compatible torch version (>= 2.5.0 for Python
+   3.13) or use >= constraints. If you ship compiled extensions, ensure
+   they are built for the target PyTorch version, or compile them at
+   install time via setup.py.
+
+c) MISSING FILES IN ARCHIVE
+
+   One submission was missing its compiled binary executable. Another
+   had no op_wrapper.py or op_src.py at all.
+
+   ACTION: Verify your tarball contains all necessary files by
+   extracting it in a clean directory and running:
+       python iccad2026_evaluate.py --evaluate op_wrapper.py
+
+
+
+d) USERNAME / ENVIRONMENT ASSUMPTIONS
+
+   Some submissions fail because torch's caching mechanism calls
+   getpass.getuser(), which fails in containerized environments where
+   the UID is not in /etc/passwd.
+
+   ACTION: Do not rely on system username lookups. If you use
+   torchinductor or torch.compile, set TORCHINDUCTOR_CACHE_DIR
+   explicitly or handle the OSError gracefully.
+
+
+4. CHECKLIST FOR FINAL SUBMISSION
+-----------------------------------
+
+  [ ] Archive named cadc<team_id>.tar.gz with flat directory structure
+  [ ] op_wrapper.py at the top level of cadc<team_id>/
+  [ ] requirements.txt is COMPLETE — lists every dependency your code uses
+  [ ] No absolute paths in code
+  [ ] No pinned torch versions incompatible with Python 3.13 (use >= 2.5.0)
+  [ ] If shipping .so/.pyd files, they match the target torch ABI
+  [ ] Tested in a clean venv:
+        python -m venv test_env
+        test_env/bin/pip install -r requirements.txt
+        test_env/bin/python iccad2026_evaluate.py --evaluate op_wrapper.py
