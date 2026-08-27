@@ -566,3 +566,24 @@ CPU 暖機 0.996s = contest 機每案多付的 ~1s;adapt 後 runtime 回到預�
 | **polish ON**(打包 venv 的實際狀態) | **1.0886/1.0957** | **1.1401/1.1364** | **1.1946/1.1985** |
 
 → 打包環境會比本機 gate 再好一截;`PARTNER_COORD_POLISH=1` 維持,requirements 帶 scipy。本機主 venv 已 `uv add scipy`(pyproject/uv.lock 變更),之後的 gate 都是 polish ON 口徑。
+
+### 16c. 打包演練第二輪(08-27 06:40)— 乾淨 Py3.13 venv 只用新 requirements → 官方 evaluator 100 案
+
+- venv:torch **2.6.0+cu124**、`cuda_available=True`、scipy 1.18.1、numba 0.67.0、numpy 2.2.6、requests/shapely/matplotlib 齊。
+- log:`[selfcheck] cuda_available=True device=cuda flow_warm_latency=0.069s seat_ts=kept 0.148`;`loaded direct model step 18000`(v2 學生)、`loaded flow model step 1000000`;`scipy unavailable` 0 行(polish ON)。
+- 官方 evaluator:**1.0935,100/100 feasible**;逐案 runtime 與本機同組態(pOn_r1)中位差 −0.001s,tail hpwl 0.00–0.16 → 模型通道正常。
+- **抓到一個打包 bug**:worker 以 `contest_optimizer.py` 的 import 閉包組包,漏掉 `op_wrapper.py` 自己 import 的 `tests/synth_instances.py`(JIT 暖機用)→ 暖機靜默失敗,**第一案(n=21)付 10.5–11.2s numba 編譯**(beta 舊包有帶,hidden 第一案 0.08s)。補入後冷 cache 第一案 0.052s。包內 __pycache__ 清掉後重打:`cadc1013.tar.gz` 31 條目。
+- 包內無絕對路徑;tar 全部在 `cadc1013/` 下。
+
+### 16d. Chain Q — polish 時間上限掃描 + 出貨決定
+
+| 臂(polish) | official r1/r2 | v3 | a1 | paired vs 300ms(off/v3/a1) | avg rt | runtime-aware official M=1.45 D=0.7/0.8/1.0 |
+|---|---|---|---|---|---|---|
+| OFF(unset) | 1.1060/1.1060 | 1.1575/1.1582 | 1.2286/1.2121 | +0.0138 / +0.0196 / +0.0238 | 0.386 | **0.881 / 0.852 / 0.812** |
+| ON,300ms(default) | 1.0908/1.0976 | 1.1389/1.1395 | 1.2100/1.2032 | — | 0.455 | 0.935 / 0.901 / 0.849 |
+| ON,100ms | 1.1089/1.0978 | 1.1425/1.1545 | 1.2178/1.2203 | +0.0092 / +0.0093 / +0.0125 | 0.422 | 0.915 / 0.881 / 0.832 |
+| ON,40ms | 1.1035/1.1126 | 1.1542/1.1567 | 1.2223/1.2246 | +0.0139 / +0.0162 / +0.0169 | 0.420 | 0.914 / 0.881 / 0.835 |
+
+- 上限版把 raw 增益幾乎全吐回、runtime 卻只省一半 → 只有「全開」或「全關」兩個選項。
+- 全開 raw −0.014,但 total 在每個情境都輸:M=1.0/D=1.0(最樂觀)+0.010,M=1.45/D=0.7 +0.05。polish 是 post-deadline pass(tail 26 案每案 +0.25s),與 tail 預算 ×1.3 同類的 raw/total 取捨(每秒價值相近)。
+- **出貨包定為 polish OFF**(`PARTNER_COORD_POLISH` 不設;total 口徑在所有 M/D 情境勝);要換 raw 只需在 op_wrapper 加一行 `PARTNER_COORD_POLISH=1`。本機 gate 口徑自 chain P 起改為 polish 可用但 OFF = 與出貨一致。
