@@ -551,3 +551,18 @@ zFinal r1/r2:**official 1.0973 / 1.0908**、v3 1.1550 / 1.1445、a1 1.2005 / 1.1
 | **GPU**(gpuAdapt) | cuda=True, warm 0.068s → kept 0.148 | **1.0901** | 0.385 | 1.42 |
 
 CPU 暖機 0.996s = contest 機每案多付的 ~1s;adapt 後 runtime 回到預算(column-only 品質 1.27 仍差,真正的修法是 GPU torch 到位),GPU 路徑 bit-for-bit 不變(kept)。決賽包若 GPU 正常,hidden raw 期望回到 v3 水準(≈1.15–1.18);若又落到 CPU,至少 rt_adj 貼 floor。
+
+### 16a. 打包演練第一輪(08-27 04:30)發現
+
+- 乾淨 venv 只裝我們的 requirements 後,**官方 evaluator 自己 import 失敗**(`FloorSet/lite_dataset_test.py` 需要 `requests`;其 requirements 還有 matplotlib/shapely/tqdm)。Case B 規則是「venv 只用我們的檔案建」且 evaluator 也在裡面跑 → requirements 必須 = 我們的依賴 ∪ 官方 `FloorSet/iccad2026contest/requirements.txt`(torch/numpy/shapely/matplotlib/tqdm/requests)+ 指南列出的 scipy/numba/threadpoolctl。已更新 `partner/shipping/requirements.txt`。
+- 未釘版的 `torch` 在 PyPI 解成 **2.13.0+cu130**(本機 driver 580/CUDA 13.0 可用);contest A100 的 driver 未知,cu130 wheel 需 driver ≥580,否則 `cuda_available=False` → 重演 beta。改釘 **`torch==2.6.0`**(預設 wheel = cu124,driver ≥525 即可)。
+- **本機主 venv 也沒有 scipy**:08-21 遷移後所有 gate 跑都印了 `[polish] scipy unavailable; pass disabled`(每跑 26 案)→ 出貨候選的所有數字都是 coord_polish **OFF** 量的;打包 venv 有 scipy 會變 ON。已 `uv add scipy`,chain P 同鏈量 `PARTNER_COORD_POLISH=1` vs `0`(×2)決定包內設定。
+
+### 16b. Chain P — coord_polish 真 ON/OFF(scipy 裝入主 venv 後;OFF = 變數 unset,`=0` 仍為 ON)
+
+| 臂 | official r1/r2 | v3 | alpha_1 |
+|---|---|---|---|
+| polish OFF(= 08-21 以來所有 gate 的實際狀態) | 1.1060/1.1060 | 1.1575/1.1582 | 1.2286/1.2121 |
+| **polish ON**(打包 venv 的實際狀態) | **1.0886/1.0957** | **1.1401/1.1364** | **1.1946/1.1985** |
+
+→ 打包環境會比本機 gate 再好一截;`PARTNER_COORD_POLISH=1` 維持,requirements 帶 scipy。本機主 venv 已 `uv add scipy`(pyproject/uv.lock 變更),之後的 gate 都是 polish ON 口徑。
