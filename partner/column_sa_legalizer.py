@@ -4319,8 +4319,15 @@ def _worker_refine(args):
     budget (the in-process thread used to slice one budget across
     candidates, so most predictions never got refined at all)."""
     try:
+        # PARTNER_PIN_FRAME_SLOTS appends a 12th element (the pin-frame mode
+        # string) to the reserved-worker payloads.  Phase B and the offline
+        # trace probes still build 11-wide payloads, so the arity is read,
+        # not assumed -- an absent element means "shipped ladder", which is
+        # what every off-path payload wants.
+        args = tuple(args)
         (pred, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
-         deadline, seed, v_weight, tag_anchor) = args
+         deadline, seed, v_weight, tag_anchor) = args[:11]
+        pin_frame = args[11] if len(args) > 11 else ""
         from layout_refiner import refine_prediction, full_violations
         at = torch.from_numpy(areas_np)
         cons = torch.from_numpy(cons_np) if cons_np is not None else None
@@ -4332,6 +4339,11 @@ def _worker_refine(args):
         opt = _ColumnOptimizer(rect_list, at, cons, tpos, b2b, p2b, pins,
                                deadline, seed=seed, v_weight=v_weight)
         opt._tag_anchor = bool(tag_anchor)
+        if pin_frame:
+            # only set when this worker owns a pin slot, so the attribute is
+            # absent (not False) on every shipped payload and
+            # `pin_frame_flags` falls through to the global constant
+            opt._pin_frame = str(pin_frame)
         out = refine_prediction(opt, pred, deadline, seed=seed + 10)
         if out is None:
             return None
@@ -4344,6 +4356,47 @@ def _worker_refine(args):
         return (lst, hp, area, V)
     except Exception:
         return None
+
+
+def _has_tag_locks(opt1) -> bool:
+    """True when at least one PREPLACED (kind 2) block carries a boundary
+    tag.
+
+    That is exactly the condition under which `_Refiner._anchor_frame_to_tags`
+    records a `lock_*` wall line, and therefore the only condition under which
+    the PARTNER_PIN_FRAME ladder can change anything: with no lock,
+    `_pin_frame_to_locks` returns False on entry and the rung-0 corner clamp
+    is guarded by `is not None` on every side.  A reusable instance statistic
+    (preplaced structure x boundary tags), never a case identity."""
+    try:
+        kind = opt1.kind
+        return any(int(kind[int(i)]) == 2 for i in opt1._bnd_idx)
+    except Exception:
+        return False
+
+
+def _pin_slot_specs(specs, n_slots, mode: str = "1"):
+    """Convert the LAST `n_slots` reserved-refine specs to the pin-frame
+    ladder (`PARTNER_PIN_FRAME_SLOTS`).
+
+    `specs` is the `(prediction, tag_anchor, pin_mode)` list the reserved
+    workers consume.  Converting from the TAIL takes the tag-anchored extras
+    first: those already re-refine `preds[0..]`, so a converted slot costs the
+    portfolio no fresh prediction, no extra worker and no extra runtime -- the
+    worker runs the same prediction through a different ladder.  Only once the
+    extras are used up does a plain draw get converted.  At least one shipped
+    spec is always kept, so the unpinned layout is always in the pool for the
+    arbitration to prefer.
+
+    `n_slots <= 0` returns `specs` itself (bit-exact off path)."""
+    n = max(0, min(int(n_slots), len(specs) - 1))
+    if n <= 0:
+        return specs
+    out = list(specs)
+    for j in range(1, n + 1):
+        _P, _anc, _ = out[-j]
+        out[-j] = (_P, _anc, mode)
+    return out
 
 
 def _arbitrate_champion_exact_v(pool, score, opt1, min_visits: int = 4):
@@ -4640,9 +4693,40 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
             except ValueError:
                 _anchor_extra = 0
             _anchor_extra = max(0, min(_anchor_extra, n_ref - 1, len(preds)))
-            specs = [(P, bool(_anchor_mix and k % 2 == 1))
+            specs = [(P, bool(_anchor_mix and k % 2 == 1), "")
                      for k, P in enumerate(preds[:n_ref - _anchor_extra])]
-            specs += [(preds[j], True) for j in range(_anchor_extra)]
+            specs += [(preds[j], True, "") for j in range(_anchor_extra)]
+            # PARTNER_PIN_FRAME_SLOTS=k (default 0 -> bit-exact): make k of
+            # the n_ref reserved refine workers run the PIN_FRAME ladder
+            # (tag-locked wall lines as HARD frame edges,
+            # `_Refiner._pin_frame_to_locks`) while the rest run the shipped
+            # one.  Both layouts land in the SAME pool, so the arbitration
+            # below picks per case -- which is the whole point: the GLOBAL
+            # flag was measured net-negative (official -0.0022 / v3 +0.0121)
+            # not because the mechanism fails but because it is unconditional
+            # (locked cases win big, cases with zero boundary violations lose
+            # big to the narrower frame).  A losing pinned candidate simply
+            # is not selected.
+            #
+            # The slots are converted from the TAIL of `specs` -- the
+            # tag-anchored extras first.  Those already re-refine preds[0..],
+            # so a converted slot costs the portfolio no fresh prediction, no
+            # extra worker and no extra runtime; only once the extras are
+            # used up does a plain draw get converted.  At least one shipped
+            # worker is always kept so the unpinned layout stays in the pool.
+            try:
+                _pin_slots = int(float(_os.environ.get(
+                    "PARTNER_PIN_FRAME_SLOTS", "0") or 0))
+            except ValueError:
+                _pin_slots = 0
+            if _pin_slots > 0 and not _has_tag_locks(opt1):
+                # no preplaced block carries a boundary tag: every pin site
+                # would be a no-op, so leave the worker shipped rather than
+                # spend a slot re-refining a duplicate prediction
+                _pin_slots = 0
+            specs = _pin_slot_specs(
+                specs, _pin_slots,
+                _os.environ.get("PARTNER_PIN_FRAME_SLOT_MODE", "1") or "1")
             ref_payloads = [(np.asarray(P, dtype=np.float64),
                              np_of(area_targets), np_of(constraints),
                              np_of(target_positions), np_of(b2b),
@@ -4650,8 +4734,8 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                              worker_deadline, seed + 301 + 7 * k,
                              (_vw_mix if (_vw_mix > 0.0 and k % 3 == 2)
                               else 1.0),
-                             anchor)
-                            for k, (P, anchor) in enumerate(specs)]
+                             anchor, pin)
+                            for k, (P, anchor, pin) in enumerate(specs)]
             ref_res = _POOL.map_async(_worker_refine, ref_payloads)
 
         # --- GPU idle arm: second sampling wave, masked by phase A -------

@@ -603,3 +603,10 @@ CPU 暖機 0.996s = contest 機每案多付的 ~1s;adapt 後 runtime 回到預�
 - Gate(×2 交錯,polish off):official −0.0022 [−0.032,+0.028]、**v3 +0.0121**、a1 +0.0070;v_rel 降(−0.0008/−0.0018)但 HPWL 升(v3 +0.0245);runtime 反降(avg 0.394→0.377,max 1.47→1.27);M=1.45 D=0.6 runtime-aware 0.933→0.919。子模式 `min`(只修 rung-0 角)+0.006/+0.002/+0.008;`RETRY` 更差(+0.008/+0.022/+0.020)。
 - 逐案:tid 86 1.316→1.054、83 1.270→1.099 大勝;tid 99 1.187→1.318、69 1.106→1.281 大敗(無違規的案被硬夾框)。locked 26→22(official)、32→20(v3)。
 - **結論**:locked 類不是免費的 —— 夾框換來 HPWL;要拿 86/83 的贏而不吃 99/69 的輸,得走 portfolio(pinned 候選與 unpinned 同池、逐案仲裁),不是 ladder 全域改。
+
+### 17b. `PARTNER_PIN_FRAME_SLOTS=k`(portfolio 席位;deep-reasoner round 2)— 機制成立、彙總未過,default 0
+
+- 管線:pin 旗標走 payload(fork pool 繼承 env,不能用 env 區分同案兩個 worker;仿 `opt._tag_anchor`),`_worker_refine` 讀第 12 個 payload 元素;`_has_tag_locks(opt1)` 只在有 preplaced-tag 的案啟用(official 76/v3 73/a1 76 案);`_pin_slot_specs` 從 specs 尾端(tag-anchored extras)轉換 k 個 → 不多花 worker/預測/runtime。17 新測試 + 24/117 綠;off-path 8/8 bit-exact。
+- Gate(4 條鏈、22 個 GATE3、66 跑全 100/100):**SLOTS=2 合併 4+4 reps:official −0.0115 [−0.0282,+0.0003]、v3 +0.0020、a1 +0.0056**;runtime-aware(M=1.45)D=0.6/0.7/0.8 全部 −0.008;runtime ±1%。SLOTS=1/3、+PSEL_EXACT_V、+PSEL_FIX 皆不成 composite(EXACT_V 首次在 a1 為正 −0.019,但 v3 不救)。
+- 逐案:global 版的 tid 99(+0.13)/69(+0.175)損失消失;tid 86 1.297±0.048 → **1.069±0.042、bnd 0(16/16 跑)**,單案 = official 增益的 −0.0064(幾乎全部);v3 沒有這種 locked 大案,只付「拿走一個 anchored 候選」的 HPWL 成本。
+- **判定:default 0**;後續兩個便宜方向:①席位改從 plain draw 拿(不拿 anchored extra)②以 lock box utilization 門檻縮小啟用集(76/100 → 少數 binding 案)。

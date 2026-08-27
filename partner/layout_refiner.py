@@ -141,11 +141,40 @@ _PF_DBG = bool(os.environ.get("PARTNER_PINFRAME_DEBUG"))
 #                          legalize replays the shipped rung before moving
 #                          on (one extra `legalize_soft`, paid only on a
 #                          pin failure), so the pin is strictly additive
+_PIN_FRAME_ON = ("1", "true", "True", "on", "ON", "min")
 _PIN_FRAME_MODE = os.environ.get("PARTNER_PIN_FRAME", "0")
-_PIN_FRAME = _PIN_FRAME_MODE in ("1", "true", "True", "on", "ON", "min")
+_PIN_FRAME = _PIN_FRAME_MODE in _PIN_FRAME_ON
 _PIN_FRAME_RUNGS = _PIN_FRAME and _PIN_FRAME_MODE != "min"
 _PIN_FRAME_RETRY = os.environ.get("PARTNER_PIN_FRAME_RETRY", "0") in (
     "1", "true", "True", "on", "ON")
+
+
+def pin_frame_flags(opt) -> tuple:
+    """`(pin, pin_rungs)` for ONE `refine_prediction` call.
+
+    Two independent sources, either of which turns the arm on:
+
+    * `PARTNER_PIN_FRAME` -- the GLOBAL switch (module constant above): every
+      refine worker of every case runs pinned.  Measured net-negative
+      precisely because it is global (official -0.0022 / v3 +0.0121: large
+      wins on the tag-locked cases, equally large losses on cases with no
+      boundary violation at all, which the clamp can only narrow).
+    * `opt._pin_frame` -- a per-PAYLOAD mode string that
+      `column_sa_legalizer._worker_refine` sets from the
+      `PARTNER_PIN_FRAME_SLOTS=k` portfolio plumbing, so exactly k of the
+      `PARTNER_NREF` reserved refine workers run pinned and the rest run the
+      shipped ladder.  Both layouts then land in the SAME candidate pool and
+      the existing in-pool arbitration picks per case, which is the only
+      thing the global switch could not do.  This mirrors how
+      `opt._tag_anchor` carries `PARTNER_TAG_ANCHOR_EXTRA` into the worker
+      process (env is inherited by the fork pool, so the per-worker
+      distinction has to travel in the payload, not the environment).
+
+    With neither set this returns `(False, False)` and every call site
+    collapses to the shipped expression, bit for bit."""
+    mode = getattr(opt, "_pin_frame", "") or _PIN_FRAME_MODE
+    on = mode in _PIN_FRAME_ON
+    return on, (on and mode != "min")
 
 EDGE_EPS = 1e-6     # evaluator boundary-touch / overlap tolerance
 SEP_TOL = 5e-7      # projection overlap beyond this forces a separation constraint
@@ -6285,6 +6314,11 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         # capture site below one `is not None` test and changes nothing.
         _snaps = ([] if (_GUARD_ON and _depth == 0 and opt.n >= _GUARD_MIN_N)
                   else None)
+        # PARTNER_PIN_FRAME / PARTNER_PIN_FRAME_SLOTS: resolved ONCE per
+        # call (one `getattr`), then consulted at the three ladder pin
+        # sites below.  Off -> both falsy, exactly as the module constants
+        # they replace.
+        _pinf_on, _pinf_rungs = pin_frame_flags(opt)
         # reserve the violation-repair slice up front — the legalization
         # rungs and the refiner will consume every second they are given,
         # and an unrepaired candidate (drifted tags, broken clusters)
@@ -6449,7 +6483,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                     _r0_end, time.time() + _fs_frac * _fs_win)
                 r._pred_c = pred_c
                 r._anchor_frame_to_tags()
-                if _PIN_FRAME:
+                if _pinf_on:
                     # PARTNER_PIN_FRAME: the MIN-side locks are the ones the
                     # shipped rung never applies.  W/H below are measured from
                     # `r.xmin`/`r.ymin`, which are the PREDICTION's extremes,
@@ -6512,7 +6546,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         # inches from closing: give the frame 2% and finish —
                         # still far tighter than the loose-ladder path, and
                         # the tag seats survive intact
-                        if _PIN_FRAME_RUNGS and ((r.lock_xmax is None)
+                        if _pinf_rungs and ((r.lock_xmax is None)
                                                  != (r.lock_ymax is None)):
                             # PARTNER_PIN_FRAME: the salvage's 2% goes onto
                             # the max side that is still FREE (1.02**2 in area
@@ -6858,9 +6892,9 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             # legalize costs no extra legalization -- it falls through to the
             # next rung, which IS the shipped behaviour.
             _pf_snap = ((r.P.copy(), (r.xmin, r.xmax, r.ymin, r.ymax))
-                        if (_PIN_FRAME_RETRY and _PIN_FRAME_RUNGS and use_pins)
+                        if (_PIN_FRAME_RETRY and _pinf_rungs and use_pins)
                         else None)
-            if _PIN_FRAME_RUNGS and use_pins and r._pin_frame_to_locks():
+            if _pinf_rungs and use_pins and r._pin_frame_to_locks():
                 r._pull_inside_frame()
             elif _pf_snap is not None:
                 _pf_snap = None          # nothing pinned -> nothing to retry
@@ -7166,6 +7200,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             _pq = np.asarray(out, dtype=np.float64)
             print(f"[pf] cid={_TG_CUR[0]} depth={_depth} n={opt.n} "
                   f"anch={int(bool(getattr(opt, '_tag_anchor', False)))} "
+                  f"pf={int(bool(_pinf_on))}{int(bool(_pinf_rungs))} "
                   f"rung={_pf_rung} ovl[{_pf_ovl}] "
                   f"bbr={_bbox_area_of(_pq) / max(opt.area_ref, 1e-9):.4f} "
                   f"V={full_violations(opt, _pq)} "
