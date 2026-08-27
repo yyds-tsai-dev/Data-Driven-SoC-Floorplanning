@@ -713,3 +713,5 @@ runtime 持平(0.381→0.382);runtime-aware M=1.45 D=0.6 0.918→0.906。疊在 
 
 - 演練 3(md5 11d7969a):包內模組是 04:27 的舊版(缺 SECURE_FALLBACK 等後續碼)→ **打包必須從工作樹重組**;已寫 `scripts/pack_cadc1013.sh`(import 閉包 + op_src + `partner/shipping/op_wrapper.py` 模板 + requirements + ckpt + synth_instances,內容與手工包逐檔 md5 相同)。
 - 演練 4(重組後,md5 eb5b1937):`[selfcheck] … cpu_ratio=1.91 seat_r0=adapted->0.2386` → **CPU 自校準在共用機負載下誤判 1.91×,把 R0 門檻抬高、關掉大半模型臂,official 1.1315**。而 ÷1.45 模擬已證明慢 CPU 上開臂仍划算(1.137 vs 關臂 1.155)→ R0 自校準改為 **opt-in(default off)**,只印 cpu_ratio 供診斷;TS 自校準(sampler 真的 1s 時關臂)維持。
+
+- 演練 5(R0 自校準 off,`scripts/pack_cadc1013.sh` 組包,md5 **163b885410c02ec021b6c3699d8cd62d**):`[selfcheck] cuda_available=True … seat_ts=kept 0.148 cpu_ratio=0.62 seat_r0=kept`(cpu_ratio 在同一台機器上 0.62↔1.91 漂移,證明它不能當閘門)、polish off、**noRT 1.1042,100/100,avg rt 0.370,max 1.39,第一案 0.051s**(load 29)。→ `submission/cadc1013_0827_final.tar.gz` 更新為此包(含 EARLY_EXIT + SECURE_FALLBACK)。
