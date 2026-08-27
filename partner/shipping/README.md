@@ -16,7 +16,7 @@ Env on top of the canonical partner base (run_shadow.sh / g1_runtime._SOLVER_ENV
     DIRECT_CKPT=<v2 student: artifacts/icdc_topology/checkpoints_s2_20k/best.pt>
     FLOW_CKPT=<flow_matching_v1_final.pt>
     PARTNER_DIRECT_SEAT_FIX=1 PARTNER_NREF=9 PARTNER_FLOW_SLOTS=10
-    PARTNER_REFINE_RES_FRAC=0.45 PARTNER_WALL_REPAIR=1 PARTNER_FLOW_WARM=1
+    PARTNER_REFINE_RES_FRAC=0.45 PARTNER_WALL_REPAIR=1 PARTNER_FLOW_WARM=1 PARTNER_EARLY_EXIT=1
     PARTNER_OVERSAMPLE=1 PARTNER_KS_CAP=6 PARTNER_TAG_COMPRESS=1 PARTNER_GROUP_BRIDGE=1
     # PARTNER_COORD_POLISH deliberately UNSET (off): raw -0.014 but a post-deadline
     # +0.25 s on every n>=95 case -> runtime-aware total worse in every M/D scenario
