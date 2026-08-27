@@ -404,6 +404,75 @@ def anytime_frac(name: str, default: float) -> float:
     return v if 0.0 < v < 1.0 else default
 
 
+# --- PARTNER_REFINE_SECURE_FALLBACK ---------------------------------------
+_SF_DBG = bool(os.environ.get("PARTNER_SECURE_FALLBACK_DEBUG"))
+
+
+def secure_fallback_on() -> bool:
+    """PARTNER_REFINE_SECURE_FALLBACK=1 (default off).
+
+    `refine_prediction`'s ladder is all-or-nothing: when no rung legalizes it
+    returns None, the reserved pool worker contributes nothing, and the
+    violation-repair reserve carved off the top (`PARTNER_REFINE_RES_FRAC`,
+    0.45 of the worker slice) is thrown away unspent.  On the official suite
+    that is 9/9 reserved Flow workers returning None on the three cases at
+    the measured rung-0 completion boundary (see
+    `contest_optimizer._direct_rung0_projection`), which therefore ship the
+    COLUMN champion at cost 1.30-1.49 where the direct arm wins with
+    1.05-1.15 on their neighbours.
+
+    ON: exactly where the shipped ladder is about to return None, and only
+    then, spend what is left of the worker deadline on a bounded loose-frame
+    ("secure") rung -- the same pin-less rung the shipped ladder runs last,
+    with a generous frame and, unlike the shipped call, a DEADLINE -- and on
+    success fall through into the shipped refiner/repair tail with whatever
+    reserve remains.  The candidate competes in the pool arbitration like any
+    other; a poor one is simply not selected.
+
+    Runtime: the fallback is bounded by the SAME worker deadline the failed
+    ladder already owned, and the column restarts sharing the pool run to
+    that deadline anyway (one task per worker -- `len(configs) + len(specs)
+    <= _POOL_SIZE` by construction), so a fallback that runs to the end costs
+    the case no wall clock it was not already paying.
+
+    OFF -> `_sf_ran` is None, every added site is one `is not None` test, and
+    `refine_prediction` returns the shipped None, bit for bit.
+    """
+    return _flag_on("PARTNER_REFINE_SECURE_FALLBACK")
+
+
+def secure_fallback_expands(ran) -> tuple:
+    """Ascending frame expansions the fallback rung may try.
+
+    `PARTNER_SECURE_FALLBACK_EXPANDS` (default "0.12,0.28"): measured on the
+    official suite (2026-08-27 probe), a +12% frame closes 109/134 fallback
+    rungs on the FIRST attempt at a median bbox of 1.13 * area_ref, so it is
+    both the likeliest and the cheapest-in-area rung to start from; 0.28 is
+    the shipped ladder's own secure rung, kept as the escape.  An expansion a
+    shipped rung ALREADY executed and failed at is dropped (retrying it
+    verbatim can only burn the window); if that empties the list the widest
+    configured frame is kept, because a legal-but-loose candidate still beats
+    no candidate at all.
+    """
+    raw = os.environ.get("PARTNER_SECURE_FALLBACK_EXPANDS", "0.12,0.28")
+    out: List[float] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            v = float(tok)
+        except ValueError:
+            continue
+        # ascending and strictly increasing: a repeat is a wasted attempt
+        if 0.0 < v <= 3.0 and (not out or v > out[-1] + 1e-9):
+            out.append(v)
+    if not out:
+        out = [0.12, 0.28]
+    keep = [v for v in out if all(abs(v - e) > 1e-9 for e in ran)]
+    return tuple(keep) if keep else (out[-1],)
+
+
 def frame_scale_set() -> tuple:
     """PARTNER_FRAME_SCALE_LADDER=1 (default off): rung-0 frame-scale ladder.
 
@@ -6286,6 +6355,147 @@ def _pf_ov_str(opt, P: np.ndarray) -> str:
     return ",".join(out) if out else "-"
 
 
+def _sf_quality_ok(opt, P) -> bool:
+    """Quality floor for a fallback candidate.  Default: no floor at all
+    (both bounds unset -> one comparison and `True`).
+
+    The pool arbitration divides hpwl by the POOL-minimum, not by the golden
+    hpwl the evaluator uses, so a candidate that is cheap in hpwl and
+    expensive in violations is systematically OVER-valued there.  Measured on
+    the official suite: unfiltered fallback candidates carry a mean V of ~9
+    (exp(2V/n_soft) ~ 1.22) and the ones that win the arbitration lose the
+    official cost.  Both bounds are reusable instance statistics -- the area
+    reference and the soft-block denominator -- never a case identity.
+
+    `PARTNER_SECURE_FALLBACK_MAX_BBR`: bbox/area_ref ceiling.
+    `PARTNER_SECURE_FALLBACK_MAX_VREL`: violations / n_soft_den ceiling.
+    """
+    mb = _env_pos("PARTNER_SECURE_FALLBACK_MAX_BBR", 0.0, 10.0)
+    mv = _env_pos("PARTNER_SECURE_FALLBACK_MAX_VREL", 0.0, 10.0)
+    if mb <= 0.0 and mv <= 0.0:
+        return True
+    if mb > 0.0 and _bbox_area_of(P) > mb * max(opt.area_ref, 1e-9):
+        return False
+    if mv > 0.0:
+        den = max(getattr(opt, "n_soft_den", 1), 1)
+        if full_violations(opt, P) > mv * den:
+            return False
+    return True
+
+
+def _secure_fallback(opt, P0, pred_c, saved_cg, seed, t_hard, ran):
+    """One bounded loose-frame legalization, reached ONLY where the shipped
+    ladder is about to return None (`PARTNER_REFINE_SECURE_FALLBACK`; see
+    `secure_fallback_on`).
+
+    Mirrors the shipped PIN-LESS rung exactly -- expand the frame, drop every
+    pin/seat, `_anchor_frame_to_tags`, `legalize_soft`, tag recovery,
+    `_tighten`, `_assemble_clusters` -- and differs from it in only two ways:
+    the frame is generous enough that the rung actually closes, and every
+    call carries a deadline, so the fallback can never outlive the worker
+    budget the failed ladder already owned.
+
+    Returns `(positions, tag)`; `positions` is None when nothing legalized,
+    which is the shipped outcome.
+    """
+    t0 = time.time()
+    span = t_hard - t0
+    if span <= 0.0:
+        # the ladder overran the worker deadline outright: there is nothing
+        # left to spend and the shipped None is the only honest answer
+        return None, "notime"
+    expands = secure_fallback_expands(ran)
+    fb_end = t0 + anytime_frac("PARTNER_SECURE_FALLBACK_FRAC", 0.45) * span
+    rung_frac = anytime_frac("PARTNER_SECURE_FALLBACK_RUNG_FRAC", 0.5)
+    _sf_pins = _flag_on("PARTNER_SECURE_FALLBACK_PINS")
+    tag = "fail"
+    for k, expand in enumerate(expands):
+        now = time.time()
+        if now >= fb_end:
+            tag = "outoftime"
+            break
+        # the LAST attempt owns the rest of the window; the ones before it
+        # take a share, so a frame that cannot close never eats the escape
+        a_end = (fb_end if k == len(expands) - 1
+                 else min(fb_end, now + rung_frac * (fb_end - now)))
+        try:
+            opt.cluster_groups = {}
+            r = _Refiner(opt, P0, seed + 21)
+        finally:
+            opt.cluster_groups = saved_cg
+        r._pred_c = pred_c
+        r.xmax += expand * (r.xmax - r.xmin)
+        r.ymax += expand * (r.ymax - r.ymin)
+        for g in r.groups:
+            g.pin_x = g.pin_y = False
+        r.satL[:] = False
+        r.satR[:] = False
+        r.satB[:] = False
+        r.satT[:] = False
+        r._anchor_frame_to_tags()
+        # PARTNER_SECURE_FALLBACK_PINS=1 (default off): seat the boundary
+        # tags BEFORE the legalization instead of recovering them after it.
+        # The shipped ladder only pins its TIGHT rungs because pins and a
+        # tight frame together rarely close -- at a loose frame the pin is
+        # affordable, and an unseated tag is a violation the arbitration
+        # charges at exp(2V/n_soft).
+        if _sf_pins:
+            r._seed_tags()
+        # the seat recovery below needs a real share of the window: on the
+        # measured tiers the first legalization consumes all of it and the
+        # recovery then reverts every time, which is where the fallback
+        # candidates' mean V ~ 9 comes from
+        a_ls = (a_end if _sf_pins
+                else min(a_end, now + _env_pos(
+                    "PARTNER_SECURE_FALLBACK_SEED_SPLIT", 0.6, 0.99)
+                    * (a_end - now)))
+        ok = r.legalize_soft(deadline=a_ls)
+        if _SF_DBG or _SEAT_DBG:
+            import sys as _sys
+            print(f"[sf] n={opt.n} rung expand={expand} ok={int(ok)} "
+                  f"ovl={r._overlap_count()} win={a_end - now:.4f} "
+                  f"t={time.time() - now:.4f}", file=_sys.stderr, flush=True)
+        if not ok:
+            continue
+        if not _sf_pins:
+            # tag recovery, exactly as the shipped pin-less rung does: the
+            # rung closed with every boundary tag loose, so re-seat them and
+            # revert if the layout cannot absorb it
+            snap_t = r.P.copy()
+            r._seed_tags()
+            if not r.legalize_soft(10, deadline=a_end):
+                r.P[...] = snap_t
+                for g in r.groups:
+                    g.pin_x = g.pin_y = False
+                r.satL[:] = False
+                r.satR[:] = False
+                r.satB[:] = False
+                r.satT[:] = False
+        # frame anneal: a loose rung's whole cost is bbox inflation and this
+        # is the one stage that recovers it.  Sized as a share of what is
+        # LEFT of the worker deadline -- never the shipped 3.0 s constant,
+        # which at these tiers IS the whole remaining span.
+        _tg_end = time.time() + anytime_frac(
+            "PARTNER_SECURE_FALLBACK_TIGHTEN", 0.45) * max(
+                0.0, t_hard - time.time())
+        if _TG_DBG:
+            _TG_SITE[0] = f"sf{expand}"
+        r._tighten(min(t_hard, _tg_end))
+        r._assemble_clusters(saved_cg)
+        if not r._has_overlap():
+            _cand = r.P.copy()
+            if _sf_quality_ok(opt, _cand):
+                return _cand, f"sf{expand}"
+            # legal but under the quality floor: a candidate the arbitration
+            # would over-value is worse than no candidate
+            tag = "quality"
+            continue
+        # assembly re-introduced an overlap: fall through to the next (wider)
+        # frame, which is what the shipped ladder does in the same spot
+        tag = "assembly"
+    return None, tag
+
+
 def refine_prediction(opt, pred: np.ndarray, deadline: float,
                       seed: int = 0, _depth: int = 0) -> Optional[np.ndarray]:
     """Full direct-prediction pipeline glue:
@@ -6353,6 +6563,17 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         # reachable, and pays the tail out of fractions of the carved
         # reserve instead of absolute second offsets.
         _any = anytime_ladder_on()
+        # PARTNER_REFINE_SECURE_FALLBACK (default off; see
+        # `secure_fallback_on`).  Off -> `_sf_on` is False, `_sf_ran` stays
+        # None and both sites below collapse to one `is not None` test.
+        # Depth 1 (the step-7 recompression rerun) is excluded on purpose: it
+        # is handed a sliver of the tail and its None is already absorbed by
+        # the caller.  The rung log is ALSO kept for the debug instruments,
+        # so a diagnosis run can see which rungs really ran with the flag
+        # off -- that arm never reaches the fallback (`_sf_on`).
+        _sf_on = (_depth == 0 and secure_fallback_on())
+        _sf_ran = ([] if (_sf_on or ((_SF_DBG or _SEAT_DBG) and _depth == 0))
+                   else None)
         t_lad0 = time.time()
         span_lad = max(0.0, deadline - t_lad0)
         # end of the TIGHT (fixed-frame + small-expand) rungs.  Its real
@@ -6365,10 +6586,24 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         # to a repair attempt's result
         _reserve = res
 
+        # PARTNER_SECURE_FALLBACK_FRAC_TAIL (default off): set to what the
+        # secure fallback LEFT of the worker deadline, and only on the path
+        # where that fallback actually fired.  Everywhere else it stays 0.0
+        # and `_tg` below is the shipped expression, bit for bit.
+        _sf_tail = 0.0
+
         def _tg(off_val: float, frac: float) -> float:
             """Tail budget term: the shipped absolute constant, capped by a
             share of the carved reserve when ANYTIME is on (off -> the
-            shipped constant, unchanged)."""
+            shipped constant, unchanged).
+
+            On the secure-fallback path the absolute constants are all in the
+            past (they assume a multi-second reserve), so the whole repair
+            tail self-disables on exactly the candidate that needs it most;
+            `_sf_tail` re-sizes them against the reserve the fallback really
+            left."""
+            if _sf_tail > 0.0:
+                return min(off_val, frac * _sf_tail)
             return off_val if not _any else min(off_val, frac * _reserve)
         P0 = np.array(pred, dtype=np.float64, copy=True)
         # the raw prediction's centers anchor relocation landings all
@@ -6900,6 +7135,11 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                 _pf_snap = None          # nothing pinned -> nothing to retry
             if use_pins:
                 r._seed_tags()
+            if _sf_ran is not None:
+                # this rung really RAN (it was not skipped by `rung_cap` nor
+                # cut off by the ladder deadline), so the fallback must not
+                # pay to replay a frame that has already been refuted
+                _sf_ran.append(float(expand))
             # ANYTIME: the shipped call is unbounded (`deadline=None`), so a
             # single rung can and does overrun the whole worker deadline.
             # Tight rungs are bounded by the tight budget; the last (secure)
@@ -6974,6 +7214,55 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                     break
                 elif _DEBUG:
                     print("[rp] assembly created overlap", flush=True)
+        if legal is None and (_SF_DBG or _SEAT_DBG):
+            # diagnosis-only (guarded): `ran` empty means the ladder never
+            # reached an expand rung at all -- i.e. it died on TIME inside
+            # rung 0, not on geometry -- and `ovl` is where the last rung
+            # that did run stalled.
+            import sys as _sys
+            try:
+                _sf_ov = r._overlap_count()
+            except Exception:
+                _sf_ov = -1
+            print(f"[sf] n={opt.n} LADDER-FAIL depth={_depth} "
+                  f"slice={slice_:.4f} res={_reserve:.4f} "
+                  f"ran={[round(e, 3) for e in (_sf_ran or [])]} "
+                  f"ovl={_sf_ov} lad={time.time() - t_lad0:.4f} "
+                  f"left={t_hard - time.time():.4f}",
+                  file=_sys.stderr, flush=True)
+        if legal is None and _sf_on:
+            # PARTNER_REFINE_SECURE_FALLBACK: one bounded loose-frame rung,
+            # paid out of the repair reserve the failed ladder never spent.
+            legal, _sf_tag = _secure_fallback(opt, P0, pred_c, saved_cg,
+                                              seed, t_hard, _sf_ran)
+            if _SF_DBG or _SEAT_DBG:
+                import sys as _sys
+                print(f"[sf] n={opt.n} FALLBACK tag={_sf_tag} "
+                      f"ok={int(legal is not None)} "
+                      f"bbr={(_bbox_area_of(legal) / max(opt.area_ref, 1e-9)) if legal is not None else -1:.4f} "
+                      f"V={full_violations(opt, legal) if legal is not None else -1} "
+                      f"left={t_hard - time.time():.4f}",
+                      file=_sys.stderr, flush=True)
+            if legal is not None:
+                if _PF_DBG:
+                    _pf_rung = _sf_tag
+                # PARTNER_SECURE_FALLBACK_TAIL (default 0.0 = OFF): the
+                # shipped `deadline` is in the past by now, so the refiner
+                # (step 5) returns its input and only the deadline-free seats
+                # run -- which is what keeps the fallback runtime-neutral.
+                # Extending it hands `_Refiner.run` real search time, and
+                # `run` is the stage that overruns; measured +0.04 s avg /
+                # +0.23 s max on the official suite, so it is opt-in.
+                _sf_tail_f = _env_pos("PARTNER_SECURE_FALLBACK_TAIL",
+                                      0.0, 0.95)
+                if _sf_tail_f > 0.0:
+                    deadline = max(deadline, min(
+                        t_hard, time.time()
+                        + _sf_tail_f * max(0.0, t_hard - time.time())))
+                if _flag_on("PARTNER_SECURE_FALLBACK_FRAC_TAIL"):
+                    # opt-in: re-size the repair tail's absolute gates
+                    # against what the fallback left (see `_tg`)
+                    _sf_tail = max(0.0, t_hard - time.time())
         if legal is None:
             # rung (-1): the whole ladder failed to legalize.  Off -> None,
             # the shipped return, bit for bit.

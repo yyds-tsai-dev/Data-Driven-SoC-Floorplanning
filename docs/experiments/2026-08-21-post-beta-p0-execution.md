@@ -679,3 +679,20 @@ v5(quantile 0.20、零 golden-MIB、public-shift mean 0.84):**1.1287 / 1.1331**(
 | a1(4) | 1.2302 | 1.2175 | −0.0127 | [−0.0260, −0.0020] |
 
 avg runtime 0.407 → 0.383(−6%);runtime-aware M=1.45 D=0.6/0.7/0.8:0.939/0.899/0.868 → **0.912/0.873/0.844**。兩種臂順序皆同向,五套全進步,runtime 降 → **promote `PARTNER_EARLY_EXIT=1`**(出貨 env 加入;raw 增益機制推測 = 提早釋放收斂的 column restart,refine worker 少搶 CPU;contest 機獨佔時 raw 效果可能較小,runtime 效果仍在)。
+
+### 17i. `PARTNER_REFINE_SECURE_FALLBACK=1`(deep-reasoner)— **promote**
+
+- 真因(儀器化全跑):`refine_prediction` 先扣 `res=0.45·slice`,rung 0(1.02 框,95% util)在失敗帶 **522/522 次全失敗**(殘餘 overlap 1–87 塊);expand 迴圈第一個 +2% rung **無 deadline**(`_rdl=None`,:6931)吃光剩餘 → 0.05/0.08/0.12/0.18/0.28 rung 在任何出貨預算下**從未執行** → `legal is None` → 整個 reserve 丟掉。**522 次 ladder 中 120 次(23%)如此,分佈在 34 個 n**,不只 75/76/83。
+- 機制(layout_refiner.py:411 `secure_fallback_on`、:6386 `_secure_fallback`、hook :7185):ladder 全失敗且時間尚餘時,跑一個**有 deadline** 的寬框 rung(預設 expand 0.12,0.28,跳過已被駁回的),鏡像出貨的 pin-less rung(expand → anchor → legalize_soft → tag recovery → `_tighten` → clusters),只用失敗 ladder 沒花掉的 reserve,絕不超過 `t_hard`。off-path 一次 env 查詢;30 測試綠(合 186 passed)。
+- Gate(五套 ×2,臂順序對調,polish off):
+
+| 套 | paired Δ | 95% CI | 分解 |
+|---|---|---|---|
+| official | **−0.0097** | [−0.0179, −0.0020] | hpwl 0.078→0.059、area −0.004、v 持平 |
+| v3 | **−0.0077** | [−0.0161, −0.0001] | hpwl −0.013 |
+| v5 | **−0.0135** | [−0.0271, −0.0018] | hpwl −0.016、area −0.013 |
+| v6 | −0.0046 | [−0.0132, +0.0017] | — |
+| a1 | −0.0167 | [−0.0342, −0.0024] | hpwl −0.024 |
+
+runtime avg 4/5 套降、p90 5/5 降(official 0.410→0.396 / 0.969→0.882),max 三套微升(單案尾);runtime-aware M=1.45 三個 D 皆 **−0.018**;20/20 跑 100/100 feasible。tid 75/76/83 各 −0.050/−0.008/−0.059,但主要增益來自其他 ~34 個 n 的 fallback 候選勝出。品質門檻子模式(`MAX_BBR`/`MAX_VREL`)被支配,default off。
+- **附帶發現(下一個槓桿)**:出貨 ladder 的 0.05–0.28 rung 在出貨預算下是死碼,+2% rung 無界 → ladder 值得獨立重新配預算(bound 0.02 rung、讓寬 rung 可達)。
