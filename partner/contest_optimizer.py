@@ -41,7 +41,7 @@ from column_sa_legalizer import (ORACLE_PRED_ON, _ColumnOptimizer,
                               init_worker_pool, legalize_rectangles,
                               oracle_pred_override, rectangles_from_z)
 from layout_refiner import (edge_seat_v2_on, full_violations,
-                            refine_prediction)
+                            refine_prediction, wall_repair_on)
 
 # The retrieval channel (retrieval_*) is opt-in: it only runs when both
 # PARTNER_RETRIEVAL_INDEX and PARTNER_RETRIEVAL_SLOTS are set.  Its modules are
@@ -104,19 +104,118 @@ def _print_dag_bridge_diag(scorer, before_array: np.ndarray,
         return
 
 
+# =============================================================================
+# PARTNER_VAUDIT_JSONL=<path> (default unset = off): per-case violation
+# audit, one JSON line per case, buffered in memory and flushed once at
+# interpreter exit (atexit) -- same discipline as column_sa_legalizer's
+# _PSEL_DUMP_PATH: no I/O inside the timed solve().  Off: the env var is
+# never read outside `solve()`'s own guard, no import, no buffer growth.
+# =============================================================================
+_VAUDIT_BUF: List[dict] = []
+_VAUDIT_HOOKED = False
+
+
+def _vaudit_flush() -> None:
+    """Append the buffered records to PARTNER_VAUDIT_JSONL and clear them.
+
+    Exposed as a module function (not inlined in the atexit lambda) so tests
+    can call it directly instead of relying on interpreter exit."""
+    global _VAUDIT_BUF
+    path = os.environ.get("PARTNER_VAUDIT_JSONL", "").strip()
+    if not path or not _VAUDIT_BUF:
+        return
+    import json
+    with open(path, "a") as f:
+        for rec in _VAUDIT_BUF:
+            f.write(json.dumps(rec) + "\n")
+    _VAUDIT_BUF = []
+
+
+def _vaudit_record(rec: dict) -> None:
+    global _VAUDIT_HOOKED
+    if not _VAUDIT_HOOKED:
+        import atexit
+        atexit.register(_vaudit_flush)
+        _VAUDIT_HOOKED = True
+    _VAUDIT_BUF.append(rec)
+
+
 # Historical defaults; env-overridable so experiments can rescale the
 # per-case budget without editing code (defaults reproduce old behavior).
 BUDGET_SCALE = _env_float("PARTNER_BUDGET_SCALE", 0.06)
 BUDGET_TAU = _env_float("PARTNER_BUDGET_TAU", 20.0)
 BUDGET_MIN = _env_float("PARTNER_BUDGET_MIN", 0.8)
 BUDGET_MAX = _env_float("PARTNER_BUDGET_MAX", 24.0)
+# Direct/flow candidate must beat the column champion's proxy score by this
+# factor to be selected (0.985 = historical 1.5% dead zone).  PARTNER_PICK_MARGIN
+# makes it tunable; 1.0 disables the dead zone.
+PICK_MARGIN = _env_float("PARTNER_PICK_MARGIN", 0.985)
+
+
+def _parse_budget_table() -> Optional[List[float]]:
+    """PARTNER_BUDGET_TABLE: comma-separated per-n budget seconds for
+    n = 21..120 (100 entries).  Keys the budget on block_count -- a reusable
+    instance statistic -- with values derived offline from the published
+    per-testcase median runtimes.  Unset or malformed -> None (exponential
+    curve below is used, byte-identical to historical behavior)."""
+    raw = os.environ.get("PARTNER_BUDGET_TABLE", "").strip()
+    if not raw:
+        return None
+    try:
+        vals = [float(v) for v in raw.split(",") if v.strip()]
+    except ValueError:
+        return None
+    if len(vals) != 100 or any((not math.isfinite(v)) or v <= 0 for v in vals):
+        return None
+    return vals
+
+
+_BUDGET_TABLE = _parse_budget_table()
 
 
 def _time_budget(block_count: int) -> float:
     """Exponential per-case budget: ~0.8 s for the smallest cases up to
-    ~24 s for n=120; averages about 5 s over the validation set."""
+    ~24 s for n=120; averages about 5 s over the validation set.
+    PARTNER_BUDGET_TABLE (per-n seconds, n=21..120) overrides the curve."""
+    if _BUDGET_TABLE is not None:
+        return _BUDGET_TABLE[max(0, min(99, int(block_count) - 21))]
     b = BUDGET_SCALE * math.exp(block_count / BUDGET_TAU)
     return max(BUDGET_MIN, min(BUDGET_MAX, b))
+
+
+def _area_ok(rects, area_targets, n: int, tol: float = 0.01) -> bool:
+    """Evaluator-form per-block area check (|w*h - a| / a <= tol)."""
+    try:
+        at = np.asarray(area_targets, dtype=np.float64).reshape(-1)[:n]
+        P = np.asarray([list(map(float, r)) for r in rects],
+                       dtype=np.float64)
+        if P.shape[0] != n or at.shape[0] != n:
+            return False
+        area = P[:, 2] * P[:, 3]
+        return bool(np.all(np.abs(area - at) <= tol * np.abs(at)))
+    except Exception:
+        return False
+
+
+def _final_area_guard(result, fallbacks, area_targets, n: int):
+    """Return `result` unless a block violates the evaluator's 1% area
+    tolerance; then the first fallback layout that passes, else `result`.
+
+    PARTNER_FINAL_AREA_GUARD=0 disables the check (shipped behaviour before
+    2026-08-26).  On the common path this is a read-only O(n) check and the
+    SAME object is returned."""
+    if os.environ.get("PARTNER_FINAL_AREA_GUARD", "1") in ("0", "false",
+                                                           "False", "off"):
+        return result
+    if _area_ok(result, area_targets, n):
+        return result
+    for fb in fallbacks:
+        if fb is not None and fb is not result and _area_ok(fb, area_targets, n):
+            if os.environ.get("PARTNER_FINAL_AREA_GUARD_DEBUG"):
+                print(f"[area_guard] n={n} final layout failed the 1% area "
+                      f"check; shipping fallback", file=sys.stderr, flush=True)
+            return [tuple(map(float, r)) for r in fb]
+    return result
 
 
 def _direct_rung0_projection(block_count: int, remaining: float):
@@ -260,6 +359,9 @@ class MyOptimizer(FloorplanOptimizer):
         self._load_flow_model()
         self.retrieval_index = None
         self.retrieval_slots = 0
+        # PARTNER_VAUDIT_JSONL bookkeeping (see module-level _vaudit_* below)
+        self._last_pick_channel = "column"
+        self._vaudit_seq = 0
         configured_max_cost = _env_float("PARTNER_RETRIEVAL_MAX_COST", 2.0)
         self.retrieval_max_cost = configured_max_cost if math.isfinite(configured_max_cost) else 2.0
         retrieval_path = os.environ.get("PARTNER_RETRIEVAL_INDEX", "").strip()
@@ -279,6 +381,96 @@ class MyOptimizer(FloorplanOptimizer):
         init_worker_pool(N_RESTART_WORKERS)
         self._warm_tag_compress_dependencies()
         self._warm_direct_sampler()
+        self._warm_flow_sampler()
+
+    def _warm_flow_sampler(self) -> None:
+        """Optionally pay Flow's first-call CUDA cost outside ``solve()``.
+
+        Opt-in via PARTNER_FLOW_WARM=1 (default off; keeps other wrappers'
+        historical constructor behavior unchanged).  Ported verbatim from the
+        handover build."""
+        self.flow_warm_succeeded = False
+        self.flow_warm_latency = None
+        if os.environ.get("PARTNER_FLOW_WARM", "0") not in (
+                "1", "true", "True", "on", "ON"):
+            return
+        if self.flow_model is None:
+            return
+        flow_slots = _env_int("PARTNER_FLOW_SLOTS", 0)
+        if flow_slots <= 0:
+            return
+        try:
+            n = _env_int("PARTNER_FLOW_WARM_N", 100)
+            g = torch.Generator().manual_seed(23456)
+            at = torch.rand(n, generator=g) * 40.0 + 10.0
+            cons = torch.zeros(n, 5)
+            tpos = torch.full((n, 4), -1.0)
+            # Exercise the same anchored antithetic path as real FloorSet
+            # cases.  Passing a known-mask with no known nodes makes
+            # sample_flow_diff reject the warm draw because no known noise is
+            # supplied, which used to turn this warm-up into a silent no-op.
+            cons[0, 1] = 1.0
+            anchor_side = float(torch.sqrt(at[0]))
+            tpos[0] = torch.tensor([0.0, 0.0, anchor_side, anchor_side])
+            e = torch.randint(0, n, (3 * n, 2), generator=g).float()
+            b2b = torch.cat([e, torch.ones(3 * n, 1)], dim=1)
+            npin = 16
+            pe = torch.stack([
+                torch.randint(0, npin, (n,), generator=g).float(),
+                torch.arange(n, dtype=torch.float32),
+            ], dim=1)
+            p2b = torch.cat([pe, torch.ones(n, 1)], dim=1)
+            side = float(torch.sqrt(at.sum() / 0.96))
+            pins = torch.rand(npin, 2, generator=g) * side
+            samples = min(flow_slots, _env_int("PARTNER_NREF", 6) or 6)
+            produced = self._sample_flow_preds(
+                n, at, cons, tpos, b2b, p2b, pins, samples,
+            )
+            if len(produced) < samples:
+                raise RuntimeError(
+                    f"Flow warm-up returned {len(produced)}/{samples} samples"
+                )
+            self.flow_warm_succeeded = True
+            # Deployment self-check + adaptive seat gate (2026-08-27).  The
+            # official beta per-case results (docs/official/beta_test/
+            # cadc1013.tar.gz) show the model channel never delivered on the
+            # contest box: from the first n whose budget opens the arm
+            # (n=99) every case overran its budget by ~1.0 s and shipped the
+            # column fallback (tail hpwl_gap 0.14-0.69), i.e. the Flow
+            # sampler took ~1 s there (CPU torch / missing deps) against the
+            # 0.148 s @ n=100 that `PARTNER_DIRECT_SEAT_TS` assumes.  A
+            # CPU-only local run reproduces it (official 1.298 vs 1.09).
+            # Measure the WARM latency with a second draw (the first call
+            # carries the CUDA/JIT cold start) and, when it exceeds the
+            # assumed constant, raise the gate's sampler term so arms that
+            # cannot finish are not launched (no quality gain, but the
+            # ~1 s/case runtime blow-up and its rt_adj penalty disappear).
+            # PARTNER_SEAT_TS_ADAPT=0 disables the adaptation; the
+            # self-check line is always printed under PARTNER_FLOW_WARM=1.
+            _t0 = time.time()
+            self._sample_flow_preds(n, at, cons, tpos, b2b, p2b, pins, samples)
+            warm_lat = time.time() - _t0
+            self.flow_warm_latency = warm_lat
+            ts_assumed = _env_float("PARTNER_DIRECT_SEAT_TS", 0.148)
+            ts_measured = warm_lat / max(n / 100.0, 1e-6)
+            adapted = False
+            if (os.environ.get("PARTNER_SEAT_TS_ADAPT", "1") not in
+                    ("0", "false", "False", "off")
+                    and ts_measured > ts_assumed * 1.25):
+                os.environ["PARTNER_DIRECT_SEAT_TS"] = f"{ts_measured:.4f}"
+                adapted = True
+            print(f"[selfcheck] cuda_available={torch.cuda.is_available()} "
+                  f"device={self.device} flow_warm_n={n} "
+                  f"flow_warm_latency={warm_lat:.3f}s "
+                  f"seat_ts_assumed={ts_assumed:.3f} "
+                  f"seat_ts={'adapted->' if adapted else 'kept '}"
+                  f"{ts_measured if adapted else ts_assumed:.3f}",
+                  file=sys.stderr, flush=True)
+            if self.verbose:
+                print("flow sampler warmed")
+        except Exception as exc:
+            if self.verbose:
+                print(f"flow sampler warm-up skipped: {exc}")
 
     def _warm_tag_compress_dependencies(self) -> None:
         """Pay the opt-in tag-compression import cost outside `solve()`.
@@ -472,6 +664,22 @@ class MyOptimizer(FloorplanOptimizer):
         start = time.time()
         budget = _time_budget(block_count)
         deadline = start + budget
+        self._first_polish_truncated = False
+
+        # PARTNER_POST_ROUTER: one shared, time-neutral reserve for the final
+        # violation-repair + second-polish post-passes.  Ported verbatim from
+        # partner/postpass_router.py (see that module's docstring for the
+        # measurement this rests on).  Off by default; with the flag unset
+        # the module is never imported and `router` stays None, so every
+        # downstream branch below is a no-op and the pipeline is unchanged.
+        router = None
+        if os.environ.get("PARTNER_POST_ROUTER"):
+            try:
+                from postpass_router import PostPassRouter
+                router = PostPassRouter(block_count, budget, start)
+                deadline -= router.sa_reserve
+            except Exception:
+                router = None
         # Time-neutral vkill: the post-pass runs inside the SAME per-case
         # budget by carving a reserve out of the SA/refine deadline (total
         # wall-clock per case is unchanged).  VKILL_CARVE=0 restores the
@@ -550,14 +758,14 @@ class MyOptimizer(FloorplanOptimizer):
                                      self._sample_portfolio_preds(
                                          block_count, area_targets, constraints,
                                          target_positions, b2b, p2b, pins, K,
-                                         oversample=(deadline - time.time()) > 12.0,
+                                         oversample=(deadline - time.time()) > _env_float("PARTNER_OVERSAMPLE_MIN_REM", 12.0),  # noqa: E501  (PARTNER_OVERSAMPLE_MIN_REM: remaining-seconds gate for oversampling, default 12.0 = shipped)
                                          gen_seed=gen_seed))
                     else:
                         sample_fn = (lambda K, gen_seed=0:
                                      self._sample_direct_preds(
                                          block_count, area_targets, constraints,
                                          target_positions, b2b, p2b, pins, K,
-                                         oversample=(deadline - time.time()) > 12.0,
+                                         oversample=(deadline - time.time()) > _env_float("PARTNER_OVERSAMPLE_MIN_REM", 12.0),
                                          gen_seed=gen_seed))
                 else:
                     # no pool: fall back to the sliced in-process thread
@@ -578,11 +786,38 @@ class MyOptimizer(FloorplanOptimizer):
             t_legal = time.time()
             if th is not None:
                 th.join(timeout=max(0.0, deadline - time.time()) + 0.1)
+
+            # PARTNER_VAUDIT_JSONL: per-case exact-violation audit trail.
+            # Off (default, unset env var): the block below is skipped
+            # entirely -- no import, no scorer build, no buffering.
+            vaudit_path = os.environ.get("PARTNER_VAUDIT_JSONL", "").strip()
+            vaudit_scorer = None
+            vaudit_v = None
+            vaudit_stages: List[Tuple[str, int]] = []
+            if vaudit_path:
+                from violation_killer import _violations_exact
+                vaudit_scorer = (direct_box[0][1] if direct_box else
+                                 _ColumnOptimizer(
+                                     [tuple(map(float, r)) for r in column_out],
+                                     area_targets, constraints, target_positions,
+                                     b2b, p2b, pins, time.time() + 1.0, seed=0))
+
+                def vaudit_v(rects, _scorer=vaudit_scorer,
+                             _f=_violations_exact) -> int:
+                    P = np.asarray([list(r) for r in rects], dtype=np.float64)
+                    return int(_f(_scorer, P))
+
+                vaudit_stages.append(("column_pre_seat", vaudit_v(column_out)))
+
             column_out = self._column_edge_seat(
                 column_out, area_targets, constraints, target_positions,
                 b2b, p2b, pins, direct_box)
+            if vaudit_path:
+                vaudit_stages.append(("column_edge_seat", vaudit_v(column_out)))
             out = (self._pick_best(column_out, direct_box)
                    if direct_box else column_out)
+            if vaudit_path:
+                vaudit_stages.append(("pick_best", vaudit_v(out)))
             t_kill = (vk_deadline if vk_deadline is not None
                       else time.time() + _env_float("VKILL_BUDGET", 6.0))
             # PARTNER_EARLY_EXIT: the vkill reserve was carved as a FIXED
@@ -594,15 +829,65 @@ class MyOptimizer(FloorplanOptimizer):
             result = self._violation_kill(
                 out, area_targets, constraints, target_positions,
                 b2b, p2b, pins, t_kill)
+            _t_pol = time.time()
             result = self._coord_polish(
                 result, area_targets, constraints, target_positions,
-                b2b, p2b, pins)
+                b2b, p2b, pins, elapsed=_t_pol - start)
+            if router is not None:
+                # Second-polish precondition for the router: `polish_layout`
+                # is deterministic, so a second call is only worth its time
+                # when something modified the layout after this one, or when
+                # this one was cut short by its own box and therefore had not
+                # converged.
+                _pol_box = _env_float(
+                    "PARTNER_COORD_POLISH_BUDGET_MS", 600.0) / 1000.0
+                self._first_polish_truncated = (
+                    (time.time() - _t_pol) >= 0.9 * _pol_box)
+                self._post_polish_layout = [tuple(map(float, r)) for r in result]
+            if vaudit_path:
+                vaudit_stages.append(("coord_polish", vaudit_v(result)))
             result = self._final_seat(
                 result, area_targets, constraints, target_positions,
                 b2b, p2b, pins, direct_box)
+            if vaudit_path:
+                vaudit_stages.append(("final_seat", vaudit_v(result)))
             result = self._tag_compress(
                 result, area_targets, constraints, target_positions,
                 b2b, p2b, pins, direct_box)
+            result = self._wall_repair_final(
+                result, area_targets, constraints, target_positions,
+                b2b, p2b, pins, direct_box)
+            if vaudit_path:
+                vaudit_stages.append(("tag_compress", vaudit_v(result)))
+                self._vaudit_seq += 1
+                from violation_killer import (_boundary_violators,
+                                              _components, _mib_count)
+                P = np.asarray([list(r) for r in result], dtype=np.float64)
+                bnd = [(int(i), int(code))
+                       for i, code in _boundary_violators(vaudit_scorer, P)]
+                grp = []
+                for gid, idxs in vaudit_scorer.cluster_groups.items():
+                    if len(idxs) < 2:
+                        continue
+                    g = np.asarray(sorted(int(i) for i in idxs), dtype=np.int64)
+                    comps = _components(P, g)
+                    if len(comps) > 1:
+                        grp.append((int(gid), len(comps)))
+                _vaudit_record({
+                    "test_or_seq_id": self._vaudit_seq,
+                    "n": int(block_count),
+                    "channel": self._last_pick_channel,
+                    "stage_v": vaudit_stages,
+                    "final_report": {
+                        "bnd": bnd,
+                        "grp": grp,
+                        "mib_count": int(_mib_count(vaudit_scorer, P)),
+                    },
+                })
+            if router is not None:
+                result = self._routed_quality_pass(
+                    result, area_targets, constraints, target_positions,
+                    b2b, p2b, pins, router)
             if os.environ.get("PARTNER_EARLY_EXIT_DEBUG"):
                 # per-case time anatomy: serial head (heuristic seed + GPU
                 # seed-diffusion + parse), the deadline-bounded solve, and
@@ -614,7 +899,17 @@ class MyOptimizer(FloorplanOptimizer):
                       f"solve={t_legal - t_dispatch:.3f} "
                       f"post={now - t_legal:.3f} total={now - start:.3f}",
                       file=sys.stderr, flush=True)
-            return result
+            # Last-line hard-legality guard (PARTNER_FINAL_AREA_GUARD, default
+            # on; "0" disables): the evaluator treats a single block outside
+            # the 1% area tolerance as INFEASIBLE (cost 10).  Observed once in
+            # 30,800 case-runs (2026-08-26, shadow v3 tid 85, tail budget x2):
+            # an MIB member of a heterogeneous-area group shipped with the
+            # group's shared dims (24x13 = 312 vs target 650).  A pure check
+            # on the common path; on failure fall back to the post-pick
+            # layout, then to the column champion (exact-area by
+            # construction).
+            return _final_area_guard(result, (out, column_out), area_targets,
+                                     block_count)
         except Exception as exc:
             if self.verbose:
                 print(f"column optimizer failed; using row fallback: {exc}")
@@ -726,6 +1021,56 @@ class MyOptimizer(FloorplanOptimizer):
                 print(f"[fseat] n={len(out)} moved={nmoved} "
                       f"V={v0}->{v1}", file=sys.stderr, flush=True)
             return [tuple(map(float, r)) for r in seated]
+        except Exception:
+            return out
+
+    def _wall_repair_final(self, out, at, cons, tpos, b2b, p2b, pins,
+                          direct_box):
+        """Run `layout_refiner._wall_repair` on the FINAL layout
+        (PARTNER_WALL_REPAIR=1, default off).
+
+        The move it makes is the one no seat pass can make on its own: a
+        boundary-tagged CLUSTER member that could translate straight onto its
+        wall, where doing so detaches it from its cluster.  Each half is
+        exactly V-neutral, and every pass here (`_edge_seat`, `_final_seat`,
+        `_cluster_seat`, `tag_compress`) commits only on a strict drop, so
+        the pair is unreachable from any of them.  See `_wall_repair` for the
+        classification this rests on (28 of the 57 unsatisfied boundary bits
+        at n >= 76 in a shipped official-100 run are exactly this shape).
+
+        Runs LAST, after `_tag_compress`, for the same reason `_tag_compress`
+        runs after `_final_seat`: the pass is monotone (evaluator-form
+        boundary+grouping+MIB total must strictly drop, and the result must
+        introduce no new hard-legality problem), so nothing downstream can
+        undo it and nothing upstream has to anticipate it.
+
+        Off: returns the SAME list object -- no import, no scorer build,
+        byte-identical pipeline.  Contained: any failure returns `out`."""
+        if not wall_repair_on():
+            return out
+        try:
+            from layout_refiner import _wall_repair
+            scorer = direct_box[0][1] if direct_box else _ColumnOptimizer(
+                [tuple(map(float, r)) for r in out], at, cons, tpos,
+                b2b, p2b, pins, time.time() + 1.0, seed=0)
+            P = np.asarray([tuple(map(float, r)) for r in out], dtype=float)
+            R = _wall_repair(scorer, P,
+                             deadline=time.time() + _env_float(
+                                 "PARTNER_WALL_REPAIR_MS", 60.0) / 1000.0)
+            R = np.asarray(R, dtype=float)
+            if R.shape != P.shape or not np.all(np.isfinite(R)):
+                return out
+            if os.environ.get("PARTNER_WALL_REPAIR_DEBUG"):
+                # self-paired accounting, the same shape as `[fseat]`: V
+                # before and after on the SAME layout in the SAME run, so it
+                # is immune to the deadline-bounded SA's run-to-run drift.
+                from violation_killer import _violations_exact
+                print(f"[wrep] n={len(out)} "
+                      f"moved={int((np.abs(P - R) > 1e-12).any(axis=1).sum())} "
+                      f"V={_violations_exact(scorer, P)}->"
+                      f"{_violations_exact(scorer, R)}",
+                      file=sys.stderr, flush=True)
+            return [tuple(map(float, r)) for r in R]
         except Exception:
             return out
 
@@ -862,7 +1207,8 @@ class MyOptimizer(FloorplanOptimizer):
         except Exception:
             return bridged
 
-    def _coord_polish(self, out, at, cons, tpos, b2b, p2b, pins):
+    def _coord_polish(self, out, at, cons, tpos, b2b, p2b, pins,
+                      elapsed: Optional[float] = None):
         """Post-pass: order-preserving simultaneous-axis coordinate polish of
         the final layout (see partner/coord_polish.py).  Every stage upstream
         of here optimises coordinates by coordinate descent over groups, so the
@@ -875,8 +1221,17 @@ class MyOptimizer(FloorplanOptimizer):
         pipeline stays byte-identical.  The pass is time-boxed
         (PARTNER_COORD_POLISH_BUDGET_MS, default 300) and its cost is INSIDE
         the per-case timing boundary, so it is charged honestly to runtime.
-        Contained: any failure returns `out` unchanged."""
+        Contained: any failure returns `out` unchanged.
+
+        PARTNER_COORD_POLISH_HEADROOM_S (default 0, disabled): once set > 0,
+        skip the pass once the case has already spent that many seconds of
+        wall clock (measured from solve()'s `start`, passed in as `elapsed`).
+        Ported from the handover build's headroom gate; default kept at 0 so
+        this stays a no-op unless explicitly enabled."""
         if not os.environ.get("PARTNER_COORD_POLISH"):
+            return out
+        head = _env_float("PARTNER_COORD_POLISH_HEADROOM_S", 0.0)
+        if head > 0.0 and elapsed is not None and elapsed > head:
             return out
         try:
             from coord_polish import polish_layout
@@ -885,16 +1240,257 @@ class MyOptimizer(FloorplanOptimizer):
         except Exception:
             return out
 
+    def _soft_violations(self, out, cons, b2b, p2b, pins):
+        """Evaluator-faithful boundary+grouping+MIB count of `out`.
+
+        Uses `coord_polish._LiteScorer`, which is the cheap constraint-geometry
+        context the polish pass already builds, so the routing feature costs a
+        scorer build rather than a full `_ColumnOptimizer`.  Returns None when
+        it cannot be computed, which the router reads as "no precondition".
+        """
+        try:
+            import numpy as _np
+            from coord_polish import _LiteScorer
+            from violation_killer import _violations_exact
+            P = _np.asarray([[float(v) for v in r] for r in out],
+                            dtype=_np.float64)
+            scorer = _LiteScorer(len(out), cons, b2b, p2b, pins)
+            return int(_violations_exact(scorer, P))
+        except Exception:
+            return None
+
+    def _routed_quality_pass(self, out, at, cons, tpos, b2b, p2b, pins,
+                             router):
+        """Router-driven violation repair + second polish.
+
+        Opt-in via PARTNER_POST_ROUTER=1 (`router` is None otherwise, and this
+        method is never called).  Same stage order and same failure
+        containment as coord_polish/violation_kill: repair first (it can only
+        reduce violations), polish second (it re-solves both axis coordinate
+        problems for the repaired topology).  Each stage is bounded by an
+        ABSOLUTE deadline drawn from the shared reserve, so the pair cannot
+        turn the carved reserve into appended wall clock.  Ported from the
+        handover build's `_routed_quality_pass`; the stage-receipt
+        instrumentation was intentionally left out (see partner/postpass_router.py
+        for the router itself)."""
+        import postpass_router as _pr
+
+        current = out
+        # -- violation repair ------------------------------------------------
+        ok, reason = router.allow(_pr.VKILL)
+        if ok:
+            vio = self._soft_violations(current, cons, b2b, p2b, pins)
+            ok, reason = router.allow(_pr.VKILL, soft_violations=vio)
+        if ok:
+            t0 = time.time()
+            try:
+                from violation_killer import kill_violations
+                nxt = kill_violations(
+                    current, at, cons, tpos, b2b, p2b, pins,
+                    budget=router.budget_for(_pr.VKILL),
+                    verbose=self.verbose)
+            except Exception:
+                nxt = current
+            router.spend(time.time() - t0)
+            current = nxt
+        else:
+            router.note_skip(_pr.VKILL, reason)
+
+        # -- second coordinate polish ---------------------------------------
+        prev = getattr(self, "_post_polish_layout", None)
+        dirty = None
+        if prev is not None:
+            try:
+                dirty = [tuple(map(float, r)) for r in current] != prev
+            except Exception:
+                dirty = None
+        ok, reason = router.allow(
+            _pr.POLISH, layout_dirty=dirty,
+            first_polish_truncated=self._first_polish_truncated)
+        if ok:
+            t0 = time.time()
+            slice_s = router.budget_for(_pr.POLISH)
+            try:
+                from coord_polish import polish_layout
+                nxt = polish_layout(
+                    current, at, cons, tpos, b2b, p2b, pins,
+                    deadline=t0 + slice_s, verbose=self.verbose)
+            except Exception:
+                nxt = current
+            router.spend(time.time() - t0)
+            current = nxt
+        else:
+            router.note_skip(_pr.POLISH, reason)
+
+        return current
+
     def _sample_direct_raw_preds(self, n, at, cons, tpos, b2b, p2b, pins,
                                  K, oversample: bool = True,
                                  gen_seed: int = 0) -> List[np.ndarray]:
-        """Generate the baseline bounded Direct batch before prescreening.
+        """Dispatch to the legacy or quota-first source-portfolio sampler.
+
+        PARTNER_QUOTA_FIRST (default OFF, read the same way as the other
+        boolean env toggles in this module, e.g. PARTNER_FLOW_WARM) gates the
+        behavior:
+
+          OFF (default) -- byte-identical to the pre-quota-first baseline:
+          always samples the full oversampled Direct batch, then (if a flow
+          model + PARTNER_FLOW_SLOTS>0) replaces a suffix with Flow samples
+          via `candidate_supply.allocate_quotas`.  At a shipped six-candidate
+          / ten-Flow-slot operating point this means the whole Direct batch
+          is paid for in GPU latency and then thrown away.
+
+          ON -- quota-first: source quotas are allocated *before* either
+          model runs.  When the quota hands Flow the entire batch, the
+          Direct conditioning tensors are never built and the Direct sampler
+          never runs; in the mixed case Direct only samples its own quota.
+          Flow remains failure-contained: if it raises or returns fewer than
+          its quota, Direct backfills the missing capacity so the total
+          candidate count handed to the refine ladder is UNCHANGED.
+
+        Both paths populate `self._last_source_labels` / `_last_source_receipt`
+        and print the same `[sources] ...` line under PARTNER_SOURCE_DEBUG=1.
 
         `gen_seed` is an OFFSET added to the pinned generator seeds (default 0
-        -> byte-identical to the reviewed baseline).  PARTNER_GPU_ARM uses it
-        to draw a genuinely different second wave on the idle accelerator; the
-        seeds are pinned, so calling this twice with the default offset would
-        return the same batch.
+        -> byte-identical to the reviewed baseline when Flow is disabled).
+        PARTNER_GPU_ARM uses it to draw a genuinely different second wave on
+        the idle accelerator; the seeds are pinned, so calling this twice
+        with the default offset would return the same batch.
+        """
+        quota_first = os.environ.get("PARTNER_QUOTA_FIRST", "0") in (
+            "1", "true", "True", "on", "ON")
+        if quota_first:
+            return self._sample_direct_raw_preds_quota_first(
+                n, at, cons, tpos, b2b, p2b, pins, K,
+                oversample=oversample, gen_seed=gen_seed)
+        return self._sample_direct_raw_preds_legacy(
+            n, at, cons, tpos, b2b, p2b, pins, K,
+            oversample=oversample, gen_seed=gen_seed)
+
+    def _sample_direct_raw_preds_quota_first(self, n, at, cons, tpos, b2b,
+                                             p2b, pins, K,
+                                             oversample: bool = True,
+                                             gen_seed: int = 0
+                                             ) -> List[np.ndarray]:
+        """Quota-first source portfolio (PARTNER_QUOTA_FIRST=1).
+
+        See `_sample_direct_raw_preds` docstring for the full rationale.
+        """
+        # sampling is batched, so oversample cheaply and let the prescreen
+        # keep the best K for the (expensive) refine workers — but only
+        # when the budget affords the extra sampling latency (on ~6 s
+        # mid-size cases the doubled batch starved the refine workers and
+        # lost cases direct used to win)
+        # PARTNER_OVERSAMPLE: sampling is batched and runs concurrently
+        # with the already-dispatched column restarts, so a bigger batch is
+        # nearly free in wall-clock; the prescreen keeps the best K.
+        os_f = 2
+        try:
+            os_f = max(1, int(float(os.environ.get("PARTNER_OVERSAMPLE",
+                                                   "2"))))
+        except ValueError:
+            os_f = 2
+        # cap the GPU batch: sampling happens before the refine dispatch,
+        # so an oversized batch delays every refine worker (measured cliff
+        # near ~2x the validated 48-sample batch)
+        ks_cap = _env_int("PARTNER_KS_CAP", 56)
+        total = max(K, min(os_f * K, ks_cap)) if oversample else K
+        total = max(0, int(total))
+        if total == 0:
+            self._last_source_labels = []
+            self._last_source_receipt = {
+                "requested": {"direct": 0, "flow": 0},
+                "attempted": {"direct": 0, "flow": 0},
+                "produced": {"direct": 0, "flow": 0},
+                "latency_s": {"direct": 0.0, "flow": 0.0},
+                "fallback": [], "total": 0,
+            }
+            return []
+
+        # Opt-in flow-matching candidate source (default off): quota-first --
+        # the total candidate count handed to the refine ladder is UNCHANGED
+        # (replace-not-add) -- see candidate_supply.allocate_quotas.
+        flow_slots = _env_int("PARTNER_FLOW_SLOTS", 0)
+        flow_n = (min(flow_slots, total)
+                  if self.flow_model is not None and flow_slots > 0 else 0)
+        planned_direct = total - flow_n
+        receipt = {
+            "requested": {"direct": planned_direct, "flow": flow_n},
+            "attempted": {"direct": 0, "flow": 0},
+            "produced": {"direct": 0, "flow": 0},
+            "latency_s": {"direct": 0.0, "flow": 0.0},
+            "fallback": [], "total": total,
+        }
+
+        flow_preds: List[np.ndarray] = []
+        if flow_n > 0:
+            receipt["attempted"]["flow"] = flow_n
+            started = time.perf_counter()
+            try:
+                produced = self._sample_flow_preds(
+                    n, at, cons, tpos, b2b, p2b, pins, flow_n,
+                    gen_seed=gen_seed)
+                flow_preds = list(produced[:flow_n])
+                if len(flow_preds) < flow_n:
+                    receipt["fallback"].append("flow_short")
+            except Exception as exc:
+                flow_preds = []
+                receipt["fallback"].append(
+                    f"flow_error:{type(exc).__name__}")
+            receipt["latency_s"]["flow"] = time.perf_counter() - started
+        receipt["produced"]["flow"] = len(flow_preds)
+
+        # A failed/short Flow draw backfills the remaining Direct capacity;
+        # when Flow filled the whole quota, direct_n is 0 and the Direct
+        # conditioning tensors / sampler are never touched.
+        direct_n = max(0, total - len(flow_preds))
+        direct_preds: List[np.ndarray] = []
+        if direct_n > 0:
+            receipt["attempted"]["direct"] = direct_n
+            started = time.perf_counter()
+            direct_preds = self._sample_direct_only_raw_preds(
+                n, at, cons, tpos, b2b, p2b, pins, direct_n,
+                gen_seed=gen_seed)
+            receipt["latency_s"]["direct"] = time.perf_counter() - started
+
+        preds = direct_preds + flow_preds
+        labels = (["direct"] * len(direct_preds)
+                  + ["flow"] * len(flow_preds))
+        receipt["produced"]["direct"] = len(direct_preds)
+
+        self._last_source_labels = labels
+        self._last_source_receipt = receipt
+        if os.environ.get("PARTNER_SOURCE_DEBUG"):
+            print(f"[sources] n={n} requested={receipt['requested']} "
+                  f"attempted={receipt['attempted']} "
+                  f"produced={receipt['produced']} "
+                  f"latency={receipt['latency_s']} "
+                  f"fallback={receipt['fallback']}",
+                  file=sys.stderr, flush=True)
+
+        # *** PROBE ONLY, NEVER PROMOTABLE *** (PARTNER_ORACLE_PRED_FILE).
+        # With the flag unset `ORACLE_PRED_ON` is a False constant bound at
+        # import, so the production path is this one dead branch test.  When
+        # set, the raw Direct batch is replaced by a ground-truth-derived
+        # layout so the channel downstream of the sampler (prescreen ->
+        # refine_prediction -> selector) can be measured against a PERFECT
+        # prior.  See column_sa_legalizer.oracle_pred_override.
+        if ORACLE_PRED_ON:
+            preds = oracle_pred_override(preds, n)
+            self._last_source_labels = ["oracle"] * len(preds)
+        return preds
+
+    def _sample_direct_raw_preds_legacy(self, n, at, cons, tpos, b2b, p2b,
+                                        pins, K, oversample: bool = True,
+                                        gen_seed: int = 0
+                                        ) -> List[np.ndarray]:
+        """Pre-quota-first baseline (PARTNER_QUOTA_FIRST unset/0): always
+        samples the full oversampled Direct batch first, then (opt-in)
+        replaces a fixed suffix with Flow samples.  Kept byte-identical to
+        the reviewed baseline so PARTNER_QUOTA_FIRST=0 is a true no-op; only
+        the `_last_source_labels`/`_last_source_receipt` bookkeeping (and the
+        PARTNER_SOURCE_DEBUG print) is new, and is derived post-hoc without
+        touching the sampling calls or their generator consumption order.
         """
         from direct_diffusion_train import fast_condition
         from direct_diffusion_model import (known_z_channels, sample_direct,
@@ -931,6 +1527,164 @@ class MyOptimizer(FloorplanOptimizer):
         # near ~2x the validated 48-sample batch)
         ks_cap = _env_int("PARTNER_KS_CAP", 56)
         K_s = max(K, min(os_f * K, ks_cap)) if oversample else K
+        if (os.environ.get("PARTNER_NOISE_OPT") == "hybrid"
+                and self.direct_model is not None):
+            try:
+                preds = self._noise_opt_hybrid_preds(
+                    n, cond, z_known, known, scale, at_d, cons_d, tpos_d,
+                    b2b.to(dev), K_s)
+                if preds:
+                    self._last_source_labels = ["direct"] * len(preds)
+                    self._last_source_receipt = {
+                        "requested": {"direct": len(preds), "flow": 0},
+                        "attempted": {"direct": len(preds), "flow": 0},
+                        "produced": {"direct": len(preds), "flow": 0},
+                        "latency_s": {"direct": 0.0, "flow": 0.0},
+                        "fallback": [], "total": len(preds),
+                    }
+                    if os.environ.get("PARTNER_SOURCE_DEBUG"):
+                        print(f"[sources] n={n} "
+                              f"requested={self._last_source_receipt['requested']} "
+                              f"attempted={self._last_source_receipt['attempted']} "
+                              f"produced={self._last_source_receipt['produced']} "
+                              f"latency={self._last_source_receipt['latency_s']} "
+                              f"fallback={self._last_source_receipt['fallback']}",
+                              file=sys.stderr, flush=True)
+                    return preds
+            except Exception as exc:  # never harm the default channel
+                if self.verbose:
+                    print(f"noise-opt hybrid failed: {exc}", file=sys.stderr)
+        with torch.no_grad():
+            cond_k = {k: (v.expand(K_s, *v.shape[1:]).contiguous()
+                          if torch.is_tensor(v) else v)
+                      for k, v in cond.items()}
+            guide = None
+            if os.environ.get("PARTNER_PHYSICS_GUIDE") == "1":
+                from physics_guidance import (GuidanceConfig,
+                                                     build_context,
+                                                     make_guidance)
+                ctx = build_context(at_d, cons_d, b2b.to(dev), scale,
+                                    known).expand(K_s)
+                guide = make_guidance(ctx, GuidanceConfig.from_env())
+            solver = os.environ.get("PARTNER_DIRECT_SOLVER", "ddim")
+            if solver == "dpmpp" and guide is None:
+                z = sample_direct_dpmpp(
+                    self.direct_model, cond_k, self.direct_schedule,
+                    steps=_env_int("PARTNER_DDIM_STEPS", 50),
+                    generator=gen,
+                    z_known=z_known.expand(K_s, -1, -1),
+                    known_mask=known.expand(K_s, -1, -1))
+            else:
+                z = sample_direct(self.direct_model, cond_k,
+                                  self.direct_schedule,
+                                  steps=_env_int("PARTNER_DDIM_STEPS", 50),
+                                  generator=gen,
+                                  z_known=z_known.expand(K_s, -1, -1),
+                                  known_mask=known.expand(K_s, -1, -1),
+                                  guidance=guide)
+            rects = z_to_rectangles(
+                z, at_d.expand(K_s, -1),
+                target_positions=tpos_d.expand(K_s, -1, -1),
+                constraints=cons_d.expand(K_s, -1, -1),
+                z_repr=self.direct_cfg.z_repr)
+        preds = [rects[k, :n].cpu().numpy().astype(np.float64)
+                 for k in range(K_s)]
+
+        # Opt-in flow-matching candidate source (default off): replaces a
+        # fixed slice of the Direct batch with flow samples so the total
+        # candidate count handed to the refine ladder is UNCHANGED
+        # (replace-not-add) -- see candidate_supply.allocate_quotas.
+        direct_n = len(preds)
+        flow_n = 0
+        flow_preds: List[np.ndarray] = []
+        if self.flow_model is not None:
+            flow_slots = _env_int("PARTNER_FLOW_SLOTS", 0)
+            if flow_slots > 0 and preds:
+                quotas = allocate_quotas(
+                    len(preds),
+                    {"direct": max(0, len(preds) - flow_slots), "flow": flow_slots},
+                    ("direct", "flow"),
+                )
+                flow_n = quotas.get("flow", 0)
+                if flow_n > 0:
+                    try:
+                        flow_preds = self._sample_flow_preds(
+                            n, at, cons, tpos, b2b, p2b, pins, flow_n,
+                            gen_seed=gen_seed)
+                        direct_n = quotas.get("direct", len(preds) - flow_n)
+                        preds = preds[:direct_n] + flow_preds
+                    except Exception:
+                        flow_preds = []
+                        flow_n = 0
+                        direct_n = len(preds)
+                        # flow failure never harms the Direct channel
+
+        # Bookkeeping only (does not affect `preds` or generator consumption
+        # order): mirrors the quota-first receipt/labels shape so downstream
+        # consumers (PARTNER_SOURCE_DEBUG, diagnostics) work identically
+        # under either toggle setting.
+        labels = (["direct"] * direct_n) + (["flow"] * len(flow_preds))
+        receipt = {
+            "requested": {"direct": direct_n, "flow": flow_n},
+            "attempted": {"direct": direct_n,
+                          "flow": flow_n if flow_n else 0},
+            "produced": {"direct": direct_n, "flow": len(flow_preds)},
+            "latency_s": {"direct": 0.0, "flow": 0.0},
+            "fallback": [] if (flow_n == 0 or len(flow_preds) == flow_n)
+                        else ["flow_short_or_error"],
+            "total": len(preds),
+        }
+        self._last_source_labels = labels
+        self._last_source_receipt = receipt
+        if os.environ.get("PARTNER_SOURCE_DEBUG"):
+            print(f"[sources] n={n} requested={receipt['requested']} "
+                  f"attempted={receipt['attempted']} "
+                  f"produced={receipt['produced']} "
+                  f"latency={receipt['latency_s']} "
+                  f"fallback={receipt['fallback']}",
+                  file=sys.stderr, flush=True)
+
+        # *** PROBE ONLY, NEVER PROMOTABLE *** (PARTNER_ORACLE_PRED_FILE).
+        # With the flag unset `ORACLE_PRED_ON` is a False constant bound at
+        # import, so the production path is this one dead branch test.  When
+        # set, the raw Direct batch is replaced by a ground-truth-derived
+        # layout so the channel downstream of the sampler (prescreen ->
+        # refine_prediction -> selector) can be measured against a PERFECT
+        # prior.  See column_sa_legalizer.oracle_pred_override.
+        if ORACLE_PRED_ON:
+            preds = oracle_pred_override(preds, n)
+            self._last_source_labels = ["oracle"] * len(preds)
+        return preds
+
+    def _sample_direct_only_raw_preds(self, n, at, cons, tpos, b2b, p2b,
+                                      pins, K,
+                                      gen_seed: int = 0) -> List[np.ndarray]:
+        """Generate exactly ``K`` Direct candidates, with no source mixing.
+
+        `gen_seed` is an OFFSET added to the pinned generator seeds (default 0
+        -> pinned draws).  Oversampling and source quotas are owned by
+        `_sample_direct_raw_preds`, so a zero Direct quota never enters this
+        method or builds Direct conditioning tensors.
+        """
+        K_s = max(0, int(K))
+        if K_s == 0:
+            return []
+        from direct_diffusion_train import fast_condition
+        from direct_diffusion_model import (known_z_channels, sample_direct,
+                                         sample_direct_dpmpp)
+        dev = self.device
+        at_d = at.unsqueeze(0).to(dev)
+        cons_d = cons.unsqueeze(0).to(dev)
+        tpos_d = tpos.unsqueeze(0).to(dev)
+        cond = fast_condition(
+            at_d, b2b.unsqueeze(0).to(dev), p2b.unsqueeze(0).to(dev),
+            pins.unsqueeze(0).to(dev), cons_d, tpos_d,
+            relation_feat_dim=self.direct_cfg.relation_feat_dim,
+            node_feat_dim=self.direct_cfg.node_feat_dim)
+        scale = layout_scale(at_d)
+        z_known, known = known_z_channels(at_d, cons_d, tpos_d, scale)
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(17 + int(gen_seed))
         if (os.environ.get("PARTNER_NOISE_OPT") == "hybrid"
                 and self.direct_model is not None):
             try:
@@ -977,39 +1731,6 @@ class MyOptimizer(FloorplanOptimizer):
                 z_repr=self.direct_cfg.z_repr)
         preds = [rects[k, :n].cpu().numpy().astype(np.float64)
                  for k in range(K_s)]
-
-        # Opt-in flow-matching candidate source (default off): replaces a
-        # fixed slice of the Direct batch with flow samples so the total
-        # candidate count handed to the refine ladder is UNCHANGED
-        # (replace-not-add) -- see candidate_supply.allocate_quotas.
-        if self.flow_model is not None:
-            flow_slots = _env_int("PARTNER_FLOW_SLOTS", 0)
-            if flow_slots > 0 and preds:
-                quotas = allocate_quotas(
-                    len(preds),
-                    {"direct": max(0, len(preds) - flow_slots), "flow": flow_slots},
-                    ("direct", "flow"),
-                )
-                flow_n = quotas.get("flow", 0)
-                if flow_n > 0:
-                    try:
-                        flow_preds = self._sample_flow_preds(
-                            n, at, cons, tpos, b2b, p2b, pins, flow_n,
-                            gen_seed=gen_seed)
-                        direct_n = quotas.get("direct", len(preds) - flow_n)
-                        preds = preds[:direct_n] + flow_preds
-                    except Exception:
-                        pass  # flow failure never harms the Direct channel
-
-        # *** PROBE ONLY, NEVER PROMOTABLE *** (PARTNER_ORACLE_PRED_FILE).
-        # With the flag unset `ORACLE_PRED_ON` is a False constant bound at
-        # import, so the production path is this one dead branch test.  When
-        # set, the raw Direct batch is replaced by a ground-truth-derived
-        # layout so the channel downstream of the sampler (prescreen ->
-        # refine_prediction -> selector) can be measured against a PERFECT
-        # prior.  See column_sa_legalizer.oracle_pred_override.
-        if ORACLE_PRED_ON:
-            preds = oracle_pred_override(preds, n)
         return preds
 
     def _sample_flow_preds(self, n, at, cons, tpos, b2b, p2b, pins,
@@ -1600,19 +2321,50 @@ class MyOptimizer(FloorplanOptimizer):
 
     def _pick_best(self, column_out: List[Rect], box) -> List[Rect]:
         """Choose among the column result and direct candidates under the
-        same proxy score the restart pool uses (plus full cluster checks)."""
+        same proxy score the restart pool uses (plus full cluster checks).
+
+        PARTNER_PICK_EXACT_V=1 (default off) swaps the violation count fed
+        into the ranking formula from `layout_refiner.full_violations` (a
+        TOUCH_TOL=1e-7-slack, incomplete count) for
+        `violation_killer._violations_exact` (the evaluator-exact
+        boundary+grouping+MIB total).  Only the count changes -- the ranking
+        formula, hpwl/area terms, and margin test are untouched.  Off path:
+        no import, identical count source, byte-identical output.
+
+        PARTNER_PICK_SCORE_REPAIRED=1 (default off): direct candidates are
+        scored (hpwl/area/V) on their `_ensure_no_overlap`-repaired geometry
+        instead of their raw pre-repair geometry, so the layout the proxy
+        ranks is the layout that ships on a direct win (today the repair
+        runs AFTER scoring, so the two can differ).  The column candidate is
+        untouched -- it never goes through `_ensure_no_overlap` here.  On a
+        direct win, the already-repaired list is returned without a second
+        repair pass.  Off path: byte-identical (repair still runs once,
+        after selection, exactly as today)."""
         try:
             scorer = box[0][1]
+            score_repaired = bool(os.environ.get("PARTNER_PICK_SCORE_REPAIRED"))
+            locked = None
+            if score_repaired:
+                locked = [scorer.kind[i] == 2 for i in range(scorer.n)]
             cands = [(np.array([list(r) for r in column_out]), column_out, False)]
             for out, _o in box:
                 lst = [tuple(map(float, out[i])) for i in range(len(out))]
-                cands.append((np.asarray(out, dtype=np.float64), lst, True))
+                if score_repaired:
+                    lst = _ensure_no_overlap(lst, locked)
+                    pos = np.asarray([list(r) for r in lst], dtype=np.float64)
+                else:
+                    pos = np.asarray(out, dtype=np.float64)
+                cands.append((pos, lst, True))
+            exact_v = bool(os.environ.get("PARTNER_PICK_EXACT_V"))
+            if exact_v:
+                from violation_killer import _violations_exact
             hps, areas, Vs = [], [], []
             for pos, _l, _d in cands:
                 hps.append(scorer._hpwl(pos))
                 areas.append(float(((pos[:, 0] + pos[:, 2]).max() - pos[:, 0].min())
                                    * ((pos[:, 1] + pos[:, 3]).max() - pos[:, 1].min())))
-                Vs.append(full_violations(scorer, pos))
+                Vs.append(_violations_exact(scorer, pos) if exact_v
+                          else full_violations(scorer, pos))
             hp_ref = max(min(hps), 1e-9)
             scores = []
             for i in range(len(cands)):
@@ -1643,12 +2395,15 @@ class MyOptimizer(FloorplanOptimizer):
             # margin — marginal swaps are proxy-noise coin flips
             best_i = 0
             for i in range(1, len(cands)):
-                if scores[i] < scores[best_i] and scores[i] < scores[0] * 0.985:
+                if scores[i] < scores[best_i] and scores[i] < scores[0] * PICK_MARGIN:
                     best_i = i
             pos, lst, is_direct = cands[best_i]
-            if is_direct:
+            if is_direct and not score_repaired:
                 locked = [scorer.kind[i] == 2 for i in range(scorer.n)]
                 lst = _ensure_no_overlap(lst, locked)
+            # audit-only bookkeeping (PARTNER_VAUDIT_JSONL); a plain
+            # attribute write, no effect on the returned layout
+            self._last_pick_channel = "direct" if is_direct else "column"
             return lst
         except Exception:
             return column_out

@@ -106,6 +106,129 @@ def frame_wpin_on() -> bool:
     return _flag_on("PARTNER_FRAME_WPIN")
 
 
+# --- PARTNER_FRAME_CL (closed-loop frame targeting) ---------------------
+# `FRAME_WPIN_UTIL` (0.96) is an OPEN-LOOP utilisation guess used to derive H
+# from W* via H = total_area / (0.96 * W*).  Realised utilisation on actual
+# instances ranges 0.878-0.971, so the realised right edge (the sum of
+# column widths) misses W* by 0.1-5.3%.  Column width w_c = soft_area_c /
+# (H - rigid_h_c - obstacles_c) is monotonically DECREASING in H, so a 1-2
+# step secant on H closes the loop.  Property of W*-arms only
+# (`self.w_star is not None`); other restart arms are untouched.  Off:
+# `_layout_full` runs its per-column solve exactly once, byte-identical.
+FRAME_CL_ITERS_DEFAULT = 2
+FRAME_CL_TOL_DEFAULT = 3e-4
+FRAME_CL_DAMP_DEFAULT = 1.0
+FRAME_CL_SNAP_REL = 0.005
+
+
+def frame_cl_on() -> bool:
+    """PARTNER_FRAME_CL=1 (default off): close the loop on the W*-arm's
+    open-loop H guess by secant-adjusting H on the realised right edge, plus
+    a bounded hard snap that redistributes any residual across columns.
+    Gated on `self.w_star is not None`, so it only ever touches W*-arms.
+    Off: byte-identical."""
+    return _flag_on("PARTNER_FRAME_CL")
+
+
+# --- PARTNER_COL_BALANCE (exact-DP free-unit column assignment) --------
+# `_init_columns` assigns seed_x-sorted free units to columns with a
+# monotone cursor and an equal-AREA capacity (total/C), plus a rigid guard
+# that skips a column PERMANENTLY once its `rigid_used` crosses `rigid_cap`
+# -- so a column can end up empty while the last column absorbs whatever
+# is left, and the realized frame width
+#   sum_c max(A_c/(H - R_c), maxrigid_w_c)
+# (A_c/R_c/maxrigid_w_c = soft area / rigid height / max rigid width per
+# column, mirroring `_layout_full`'s own width formula) ends up far above
+# the W_est estimate.  This flag replaces ONLY the free-unit assignment
+# with an exact DP over the seed_x-sorted free-unit list, partitioned into
+# C contiguous groups, minimizing that same realized-width sum. Forced
+# pre-seating and the final in-column `unit_key` sort are untouched.  If
+# the DP's optimum is infeasible (every partition blows some column's
+# rigid budget), it falls back to the legacy cursor loop.  Off:
+# byte-identical -- the DP helper is never called.
+def col_balance_on() -> bool:
+    """PARTNER_COL_BALANCE=1 (default off): exact-DP free-unit column
+    assignment in `_init_columns`, replacing the greedy monotone-cursor
+    loop. See module comment above. Sub-flag PARTNER_COL_BALANCE_ARMS
+    (default "all") is read directly where consumed -- no clean per-arm
+    restart-index hook exists in this class, so only "all" is
+    implemented; any other value currently behaves like "all" too."""
+    return _flag_on("PARTNER_COL_BALANCE")
+
+
+def _col_balance_partition(units, free, C, H, rigid_cap, forced_soft, forced_rigid, forced_maxw):
+    """Exact DP: partition the seed_x-sorted `free` unit-index list into C
+    CONTIGUOUS groups (empty groups allowed) minimizing
+        sum_c max(A_c / (H - R_c), maxrigid_w_c)
+    where, for column c, A_c/R_c/maxrigid_w_c fold in both this column's
+    already pre-seated forced contribution (`forced_soft[c]`,
+    `forced_rigid[c]`, `forced_maxw[c]`) and the free units placed into
+    group c (using `u.eff_soft` / `u.eff_rigid_h` / `u.max_rigid_w`, the
+    same fields `_layout_full` uses for the realized column width). A
+    column whose total rigid height exceeds `rigid_cap` costs +inf.
+    Returns a list of C lists (values drawn from `free`, in order) on
+    success, or None if the DP optimum is +inf (infeasible)."""
+    m = len(free)
+    if m == 0:
+        for c in range(C):
+            if forced_rigid[c] > rigid_cap + 1e-9:
+                return None
+        return [[] for _ in range(C)]
+
+    soft = np.array([units[k].eff_soft for k in free], dtype=np.float64)
+    rigid = np.array([units[k].eff_rigid_h for k in free], dtype=np.float64)
+    mw = np.array([units[k].max_rigid_w for k in free], dtype=np.float64)
+
+    prefix_soft = np.concatenate(([0.0], np.cumsum(soft)))
+    prefix_rigid = np.concatenate(([0.0], np.cumsum(rigid)))
+
+    # MW[i, j] = max rigid width over free[i:j) (0 <= i <= j <= m); MW[i,i]=0
+    MW = np.zeros((m + 1, m + 1), dtype=np.float64)
+    for i in range(m):
+        MW[i, i + 1:] = np.maximum.accumulate(mw[i:])
+
+    A = prefix_soft[np.newaxis, :] - prefix_soft[:, np.newaxis]
+    R = prefix_rigid[np.newaxis, :] - prefix_rigid[:, np.newaxis]
+
+    INF = float("inf")
+    mask = np.triu(np.ones((m + 1, m + 1), dtype=bool))  # valid i <= j
+
+    cost_tables = []
+    for c in range(C):
+        Rc = R + forced_rigid[c]
+        Ac = A + forced_soft[c]
+        avail = H - Rc
+        safe_avail = np.where(avail > 1e-9, avail, 1.0)
+        wreq = np.where(avail > 1e-9, Ac / safe_avail, INF)
+        mwc = np.maximum(MW, forced_maxw[c])
+        cost = np.maximum(wreq, mwc)
+        cost = np.where(Rc > rigid_cap + 1e-9, INF, cost)
+        cost = np.where(mask, cost, INF)
+        cost_tables.append(cost)
+
+    f = np.full((C + 1, m + 1), INF, dtype=np.float64)
+    choice = np.zeros((C + 1, m + 1), dtype=np.int64)
+    f[0, 0] = 0.0
+    for c in range(1, C + 1):
+        prev = f[c - 1]
+        cand = prev[:, np.newaxis] + cost_tables[c - 1]
+        cand = np.where(mask, cand, INF)
+        best_i = np.argmin(cand, axis=0)
+        f[c] = cand[best_i, np.arange(m + 1)]
+        choice[c] = best_i
+
+    if not np.isfinite(f[C, m]):
+        return None
+
+    bounds = [m] * (C + 1)
+    j = m
+    for c in range(C, 0, -1):
+        i = int(choice[c, j])
+        bounds[c - 1] = i
+        j = i
+    return [free[bounds[c]:bounds[c + 1]] for c in range(C)]
+
+
 def col_lns_oracle_on() -> bool:
     """G0 only: exhaust the one-step column split/merge neighborhood."""
     return _flag_on("PARTNER_COL_LNS_ORACLE")
@@ -130,6 +253,40 @@ def col_narrow_on() -> bool:
     fallback -- so at the shipped 0.3 s operating point this flag is inert
     inside the SA search.  See `PARTNER_SA_STATS` for the counters."""
     return _flag_on("PARTNER_COL_NARROW")
+
+
+def col_narrow_pinned_on() -> bool:
+    """PARTNER_COL_NARROW_PINNED=1 (default off): the same narrow retry as
+    `PARTNER_COL_NARROW`, but scoped to arms that carry a pinned frame
+    dimension (`self.w_star is not None` -- the only pinned-frame attribute
+    the optimizer stores; a T-tagged pinned H is folded into `self.H` at
+    `_choose_frame` time and left no separate attribute).  Mechanism story:
+    narrow a column specifically to seat a pinned frame edge, rather than
+    widen the narrow search globally.  No behaviour change when both flags
+    are unset; `PARTNER_COL_NARROW=1` alone still behaves exactly as
+    today (this flag only ever ADDS narrowing on top of that, never removes
+    it)."""
+    return _flag_on("PARTNER_COL_NARROW_PINNED")
+
+
+def cluster_glue_on() -> bool:
+    """PARTNER_CLUSTER_GLUE=1 (default off): widen the anchored-cluster glue
+    search in `_stack_column`.
+
+    An anchored cluster (a grouping constraint with a preplaced member) glues
+    its movable remainder unit directly above or below the preplaced anchor.
+    When neither slot fits -- the anchor doesn't span the column's full
+    width, or both intervals are occupied -- the unit used to fall through
+    to the generic `normal` stack and land anywhere in the column, breaking
+    the cluster (the evaluator counts connected components via edge
+    contact).  This flag adds two more attempts before giving up: (1) a side
+    placement in the free x-strip beside the anchor at the anchor's own
+    y-band, so the unit still touches the anchor along a vertical edge, and
+    (2) a last-resort placement at the column's free y-interval nearest the
+    anchor's y-center.  Both reuse the existing `_band_strip` /
+    `_interval_free` helpers -- no new geometry.  Off: neither runs and the
+    anchored branch is byte-identical."""
+    return _flag_on("PARTNER_CLUSTER_GLUE")
 
 
 def sa_adaptive_on() -> bool:
@@ -273,6 +430,42 @@ def gpu_arm_on() -> bool:
     """PARTNER_GPU_ARM=1 (default off): consume the idle accelerator with a
     second sampling wave feeding an auto-sized phase-B round."""
     return _flag_on("PARTNER_GPU_ARM")
+
+
+def _fastsa_mix_schedule(idx: int, frac: float) -> bool:
+    """Pure selection rule for PARTNER_FASTSA_MIX: does restart config index
+    `idx` use the fastsa cooling schedule (True) or geometric (False)?
+
+    frac<=0.5: fastsa iff (idx % max(1, round(1/frac))) == 1
+               (frac=0.5 -> odd indices fastsa, matching the spec example).
+    frac>0.5:  geometric iff (idx % max(1, round(1/(1-frac)))) == 1,
+               fastsa otherwise (i.e. fastsa is now the majority schedule).
+    Deterministic by config index only -- no seed/time/rng involved, so the
+    restart portfolio's schedule mix is reproducible run to run.
+    """
+    if frac <= 0.5:
+        period = max(1, round(1.0 / frac)) if frac > 0 else 1
+        return (idx % period) == 1
+    period = max(1, round(1.0 / (1.0 - frac)))
+    return not ((idx % period) == 1)
+
+
+def _fastsa_mix_frac() -> float:
+    """PARTNER_FASTSA_MIX float in (0,1), or 0.0 (off) when unset/invalid/
+    out of range, or when PARTNER_FASTSA_TEMP is already on (that flag means
+    all-fastsa and takes priority over the mix)."""
+    if _flag_on("PARTNER_FASTSA_TEMP"):
+        return 0.0
+    raw = _os.environ.get("PARTNER_FASTSA_MIX")
+    if not raw:
+        return 0.0
+    try:
+        frac = float(raw)
+    except ValueError:
+        return 0.0
+    if not (0.0 < frac < 1.0):
+        return 0.0
+    return frac
 
 
 def phase_b_min_budget_default(gpu_arm: bool) -> float:
@@ -685,8 +878,11 @@ class _ColumnOptimizer:
         self._dc_recompute = 0
 
         # PARTNER_COL_NARROW (default off): read once per optimizer, never in
-        # the `_layout` inner loop.
-        self._col_narrow = col_narrow_on()
+        # the `_layout` inner loop.  PARTNER_COL_NARROW_PINNED (default off)
+        # is the same retry scoped to W*-pinned frame arms only; it is a
+        # pure addition on top of PARTNER_COL_NARROW, never a restriction.
+        self._col_narrow = col_narrow_on() or (
+            self.w_star is not None and col_narrow_pinned_on())
 
         # -- adaptive move mix (PARTNER_SA_ADAPTIVE=1, default off) ----------
         # See `sa_adaptive_on`.  `_move_cum` holds the CURRENT family
@@ -1111,17 +1307,38 @@ class _ColumnOptimizer:
             put(k, ci)
 
         free.sort(key=lambda k: units[k].seed_x)
-        ci = 0
-        for k in free:
-            u = units[k]
-            while ci < C - 1 and (cap[ci] <= 0.0 or rigid_used[ci] + u.rigid_h > rigid_cap):
-                ci += 1
-            # spill rigid-heavy units to the least-loaded feasible column
-            if rigid_used[ci] + u.rigid_h > rigid_cap:
-                ci2 = min(range(C), key=lambda c: rigid_used[c])
-                put(k, ci2)
-            else:
-                put(k, ci)
+
+        dp_groups = None
+        if free and col_balance_on():
+            forced_soft = [0.0] * C
+            forced_rigid = [0.0] * C
+            forced_maxw = [0.0] * C
+            for c in range(C):
+                for k in cols[c]:
+                    fu = units[k]
+                    forced_soft[c] += fu.eff_soft
+                    forced_rigid[c] += fu.eff_rigid_h
+                    if fu.max_rigid_w > forced_maxw[c]:
+                        forced_maxw[c] = fu.max_rigid_w
+            dp_groups = _col_balance_partition(
+                units, free, C, self.H, rigid_cap, forced_soft, forced_rigid, forced_maxw)
+
+        if dp_groups is not None:
+            for c in range(C):
+                for k in dp_groups[c]:
+                    put(k, c)
+        else:
+            ci = 0
+            for k in free:
+                u = units[k]
+                while ci < C - 1 and (cap[ci] <= 0.0 or rigid_used[ci] + u.rigid_h > rigid_cap):
+                    ci += 1
+                # spill rigid-heavy units to the least-loaded feasible column
+                if rigid_used[ci] + u.rigid_h > rigid_cap:
+                    ci2 = min(range(C), key=lambda c: rigid_used[c])
+                    put(k, ci2)
+                else:
+                    put(k, ci)
 
         def unit_key(k):
             u = units[k]
@@ -1545,6 +1762,78 @@ class _ColumnOptimizer:
                         placed.append((k, y1, yt))
                         done = True
                         break
+            if not done and u.anchors and has_locked and cluster_glue_on():
+                # PARTNER_CLUSTER_GLUE: the above/below slots failed. If the
+                # anchor doesn't span the column's full width, try the free
+                # x-strip beside it at the anchor's own y-band -- the unit
+                # still touches the anchor along a vertical edge, which
+                # unary_union merges into one connected component.
+                for (ax, ay, aw, ah) in u.anchors:
+                    if not (ax < x + w - 1e-9 and ax + aw > x + 1e-9):
+                        continue
+                    if ax <= x + 1e-9 and ax + aw >= x + w - 1e-9:
+                        continue  # anchor spans the full column: no side strip
+                    sw = None
+                    probe_h = ah
+                    for _ in range(3):
+                        strip = self._band_strip(x, w, ay, ay + probe_h, placed)
+                        if strip is None:
+                            sw = None
+                            break
+                        sw = strip
+                        nh = self._unit_h(u, strip[1])
+                        if abs(nh - probe_h) < 1e-6:
+                            probe_h = nh
+                            break
+                        probe_h = nh
+                    if sw is None or u.max_rigid_w > sw[1] + 1e-9:
+                        continue
+                    final = self._band_strip(x, w, ay, ay + probe_h, placed)
+                    if final is None or final[1] < sw[1] - 1e-6:
+                        continue
+                    if final[0] < x - 1e-9 or final[0] + final[1] > x + w + 1e-9:
+                        continue
+                    yt = self._place_unit_up(u, final[0], final[1], ay, pos)
+                    self._add_interval(occupied, ay, yt)
+                    placed.append((k, ay, yt))
+                    done = True
+                    break
+                if not done:
+                    # Last resort: no glue slot fit at all. Place the unit at
+                    # the column's free y-interval nearest the anchor's
+                    # y-center instead of dropping it into the generic
+                    # `normal` stack, where it would land anywhere and break
+                    # the cluster.
+                    overlapping = [(ax, ay, aw, ah) for (ax, ay, aw, ah) in u.anchors
+                                   if ax < x + w - 1e-9 and ax + aw > x + 1e-9]
+                    ref = overlapping or u.anchors
+                    target_y = sum(ay + ah / 2.0 for (_ax, ay, _aw, ah) in ref) / len(ref)
+                    uh = self._unit_h(u, w)
+                    occ_sorted = sorted(occupied)
+                    gaps = []
+                    cur = 0.0
+                    for s, e in occ_sorted:
+                        if s > cur + 1e-9:
+                            gaps.append((cur, s))
+                        cur = max(cur, e)
+                    gaps.append((cur, float('inf')))
+                    best = None
+                    for gs, ge in gaps:
+                        if ge != float('inf') and ge - gs < uh - 1e-9:
+                            continue
+                        if ge == float('inf'):
+                            cand = target_y if target_y >= gs else gs
+                        else:
+                            cand = min(max(target_y, gs), ge - uh)
+                        dist = abs(cand - target_y)
+                        if best is None or dist < best[0]:
+                            best = (dist, cand)
+                    if best is not None:
+                        y0 = best[1]
+                        yt = self._place_unit_up(u, x, w, y0, pos)
+                        self._add_interval(occupied, y0, yt)
+                        placed.append((k, y0, yt))
+                        done = True
             if not done:
                 normal.append(k)
 
@@ -1750,13 +2039,117 @@ class _ColumnOptimizer:
         return self._layout_full(cols)
 
     def _layout_full(self, cols: List[List[int]]) -> Tuple[np.ndarray, float, float]:
+        pos, x_right, y_top, col_records = self._layout_full_core(cols)
+        if self.w_star is not None and self.w_star > 1.0 and frame_cl_on():
+            pos, x_right, y_top = self._frame_closed_loop(
+                cols, pos, x_right, y_top, col_records)
+        return pos, x_right, y_top
+
+    # ------------------------------------------------------------------
+    # PARTNER_FRAME_CL (default off): closed-loop H targeting for W*-arms.
+    # See `frame_cl_on` for the design rationale.  H is the only knob
+    # mutated; the layout is always regenerated from scratch via
+    # `_layout_full_core` -- coordinates are never patched.
+    # ------------------------------------------------------------------
+    def _frame_closed_loop(
+        self,
+        cols: List[List[int]],
+        pos: np.ndarray,
+        x_right: float,
+        y_top: float,
+        col_records,
+    ) -> Tuple[np.ndarray, float, float]:
+        w_star = self.w_star
+        orig_pos, orig_x_right, orig_y_top = pos, x_right, y_top
+        # snapshot the column-span bookkeeping the base (self.H) pass left
+        # behind, so a non-convergent loop can restore exact state instead
+        # of re-solving.
+        orig_col_spans = list(self._col_spans)
+
+        iters = int(_os.environ.get("PARTNER_FRAME_CL_ITERS", str(FRAME_CL_ITERS_DEFAULT)))
+        tol = float(_os.environ.get("PARTNER_FRAME_CL_TOL", str(FRAME_CL_TOL_DEFAULT)))
+        damp = float(_os.environ.get("PARTNER_FRAME_CL_DAMP", str(FRAME_CL_DAMP_DEFAULT)))
+
+        H = self.H
+        r = x_right / w_star
+        converged = abs(r - 1.0) <= tol
+        for _it in range(iters):
+            if converged:
+                break
+            H = H * (r ** damp)
+            pos, x_right, y_top, col_records = self._layout_full_core(cols, H_override=H)
+            r = x_right / w_star
+            converged = abs(r - 1.0) <= tol
+
+        if not converged:
+            # revert entirely to the original-H layout, and restore the
+            # column-span bookkeeping a failed later iteration left behind.
+            self._col_spans = orig_col_spans
+            return orig_pos, orig_x_right, orig_y_top
+
+        snapped = self._frame_snap(cols, col_records, pos, x_right, y_top, w_star, H)
+        if snapped is not None:
+            return snapped
+        return pos, x_right, y_top
+
+    def _frame_snap(
+        self,
+        cols: List[List[int]],
+        col_records,
+        pos: np.ndarray,
+        x_right: float,
+        y_top: float,
+        w_star: float,
+        H: float,
+    ):
+        """Redistribute the residual `x_right - w_star` across columns
+        proportionally to their widths and re-stack each column at its new
+        width.  Accepted only if every column's realised top stays within
+        the existing overflow guard (`H * 1.0005`); otherwise returns None
+        and the pre-snap (post closed-loop) layout is kept."""
+        delta = x_right - w_star
+        if delta == 0.0 or abs(delta) > FRAME_CL_SNAP_REL * w_star:
+            return None
+        total_w = sum(rec[1] for rec in col_records if rec is not None)
+        if total_w <= 0.0:
+            return None
+
+        pos_snap = pos.copy()
+        new_col_records = []
+        new_col_spans = []
+        x = 0.0
+        for ci, rec in enumerate(col_records):
+            if rec is None:
+                new_col_records.append(None)
+                new_col_spans.append(None)
+                continue
+            _x0, w, _placed, _occupied = rec
+            w_new = w - delta * (w / total_w)
+            if w_new < 0.5:
+                w_new = 0.5
+            placed2, occupied2, col_top2 = self._stack_column(
+                cols[ci], x, w_new, pos_snap)
+            if col_top2 > H * 1.0005:
+                return None
+            new_col_records.append((x, w_new, placed2, occupied2))
+            new_col_spans.append((x, x + w_new))
+            x += w_new
+
+        self._col_spans = new_col_spans
+        pos_snap, x_right_snap, y_top_snap = self._finish_columns(
+            new_col_records, pos_snap)
+        return pos_snap, x_right_snap, y_top_snap
+
+    def _layout_full_core(
+        self, cols: List[List[int]], H_override: Optional[float] = None,
+    ) -> Tuple[np.ndarray, float, float, list]:
         n = self.n
         pos = np.zeros((n, 4))
         for i in range(n):
             if self.kind[i] == 2:
                 pos[i] = (self.lx[i], self.ly[i], self.rw[i], self.rh[i])
 
-        H = self.H
+        H = self.H if H_override is None else H_override
         x = 0.0
         col_records = []  # (x0, w, [(unit, y_bot, y_top)], occupied)
 
@@ -1859,7 +2252,22 @@ class _ColumnOptimizer:
             x += w
         self._col_spans = col_spans
 
-        x_right = x
+        pos, x_right, y_top = self._finish_columns(col_records, pos)
+        return pos, x_right, y_top, col_records
+
+    # ------------------------------------------------------------------
+    # Shared tail of `_layout_full_core`: compute the frame's right/top
+    # edges from the per-column stacking result, then apply the top-tag
+    # lift and right-tag alignment.  Factored out so `_frame_snap` (a pure
+    # W*-arm addition, PARTNER_FRAME_CL) can re-run it after re-stacking
+    # columns at snapped widths without duplicating this logic.
+    # ------------------------------------------------------------------
+    def _finish_columns(self, col_records, pos: np.ndarray) -> Tuple[np.ndarray, float, float]:
+        x_right = 0.0
+        for rec in col_records:
+            if rec is None:
+                continue
+            x_right = max(x_right, rec[0] + rec[1])
         y_top = 0.0
         for rec in col_records:
             if rec is None:
@@ -3823,17 +4231,31 @@ def _psel_record(seq, opt1, hp_ref, n_soft, cands, win) -> None:
 def _worker_solve(args):
     """One independent (orientation, column count, seed) restart."""
     try:
-        # PARTNER_FRAME_WPIN appends a 14th field (the arm's W*, or None).
-        # Pre-flag payloads are 13-wide and take the historical branch, so
-        # the off path is byte-identical.
-        if len(args) == 14:
+        # PARTNER_FRAME_WPIN appends a 14th field (the arm's W*, or None);
+        # the config index used by PARTNER_FASTSA_MIX is always appended
+        # last on top of that, so payloads are 14-wide (no w_star) or
+        # 15-wide (with w_star). Pre-flag payloads (13-wide, no index) take
+        # the historical branch, so the off path is byte-identical.
+        if len(args) == 15:
             (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
              orient, c_force, seed, deadline, v_weight, h_scale,
-             w_star) = args
+             w_star, cfg_idx) = args
+        elif len(args) == 14:
+            (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
+             orient, c_force, seed, deadline, v_weight, h_scale,
+             cfg_idx) = args
+            w_star = None
         else:
             (rects, areas_np, cons_np, tpos_np, b2b_np, p2b_np, pins_np,
              orient, c_force, seed, deadline, v_weight, h_scale) = args
             w_star = None
+            cfg_idx = None
+        _fastsa_mix_frac_val = _fastsa_mix_frac()
+        def _apply_fastsa_mix(o):
+            if cfg_idx is not None and _fastsa_mix_frac_val > 0.0 \
+                    and _fastsa_mix_schedule(cfg_idx, _fastsa_mix_frac_val):
+                o._sa_schedule = "fastsa"
+            return o
         at = torch.from_numpy(areas_np)
         cons = torch.from_numpy(cons_np) if cons_np is not None else None
         tpos = torch.from_numpy(tpos_np) if tpos_np is not None else None
@@ -3846,6 +4268,7 @@ def _worker_solve(args):
         opt = _ColumnOptimizer(rs, at, cons, tpos, b2b, p2b, pins, deadline,
                                seed=seed, v_weight=v_weight, h_scale=h_scale,
                                w_star=w_star)
+        opt = _apply_fastsa_mix(opt)
         if orient == 'P':
             got = _perimeter_pack(opt, rs)
             if got is not None and got[0]:
@@ -3853,6 +4276,7 @@ def _worker_solve(args):
                                        deadline, seed=seed,
                                        v_weight=v_weight, h_scale=h_scale,
                                        pinned=got[0], w_star=w_star)
+                opt = _apply_fastsa_mix(opt)
         if opt.locked_only():
             out = opt.locked_positions()
             return (out, 0.0, 0.0, 0)
@@ -3920,6 +4344,40 @@ def _worker_refine(args):
         return (lst, hp, area, V)
     except Exception:
         return None
+
+
+def _arbitrate_champion_exact_v(pool, score, opt1, min_visits: int = 4):
+    """PARTNER_PSEL_EXACT_V=1 (default off): re-rank a cross-restart pool
+    using `violation_killer._violations_exact` (the evaluator-exact
+    boundary+grouping+MIB total) in place of the tolerant `full_violations`
+    count `score()` normally consumes via `o[3]`.
+
+    Visits candidates in increasing TOLERANT-score order, exact-scoring each
+    one, and tracks `m` = the best exact score seen so far.  Stops early once
+    the next candidate's tolerant score exceeds `m` -- sound IFF exact V >=
+    tolerant V elementwise for every candidate (measured 2400/2400 on the
+    calibration audit's dump, but not proven), so the early exit is floored
+    at a minimum of `min(min_visits, len(pool))` visited candidates
+    regardless of `m`.
+
+    `pool` holds `(out, hp, area, V)` worker-result tuples; `score` is the
+    caller's tolerant-V proxy formula (only the V term changes here)."""
+    from violation_killer import _violations_exact
+
+    ordered = sorted(pool, key=score)
+    floor = min(min_visits, len(ordered))
+    best = None
+    m = math.inf
+    for j, o in enumerate(ordered):
+        if j >= floor and score(o) > m:
+            break
+        out, hp, area, _V = o
+        v_exact = _violations_exact(opt1, np.asarray(out))
+        s = score((out, hp, area, v_exact))
+        if s < m:
+            m = s
+            best = o
+    return best
 
 
 def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
@@ -4099,6 +4557,12 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
             print(f"[wpin] n={opt1.n} W*={next(iter(_ws_map.values())):.2f} "
                   f"arms={sorted(_ws_map)} of {len(configs)}",
                   file=_sys.stderr, flush=True)
+    # PARTNER_FASTSA_MIX: thread the config index through so each worker can
+    # select its own cooling schedule deterministically (see
+    # _fastsa_mix_schedule).  Appended last regardless of the w_star arity
+    # above, so _worker_solve's existing 13/14-wide branch stays intact and
+    # this is purely additive.
+    payloads = [p + (k,) for k, p in enumerate(payloads)]
     res = _POOL.map_async(_worker_solve, payloads)
 
     # column restarts are already running; sample on the GPU now and hand
@@ -4271,8 +4735,14 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
             for o in sorted(lst, key=score)[:3]:
                 print(f"[psel] {tag} hp={o[1]:.1f} area={o[2]:.0f} "
                       f"V={o[3]} score={score(o):.4f}", flush=True)
-    best_col = min(outs, key=score) if outs else None
-    best_dir = min(ref_outs, key=score) if ref_outs else None
+    if _flag_on("PARTNER_PSEL_EXACT_V"):
+        best_col = (_arbitrate_champion_exact_v(outs, score, opt1)
+                    if outs else None)
+        best_dir = (_arbitrate_champion_exact_v(ref_outs, score, opt1)
+                    if ref_outs else None)
+    else:
+        best_col = min(outs, key=score) if outs else None
+        best_dir = min(ref_outs, key=score) if ref_outs else None
     # a direct candidate must beat the column result by a clear margin —
     # marginal swaps are proxy-noise coin flips
     if best_dir is not None and (

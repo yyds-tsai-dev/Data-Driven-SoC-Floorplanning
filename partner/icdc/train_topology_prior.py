@@ -666,6 +666,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     model.load_state_dict(source["ema"], strict=True)
     ema = EMA(model, decay=args.ema_decay)
     ema.load_state_dict(source["ema"])
+    # The shared EMA codec clones the loaded shadow on its source device (CPU).
+    # `EMA.update` mutates the shadow in place against live model tensors, so the
+    # shadow must live on the training device.  Device placement only; values,
+    # dtypes and key order are unchanged (no-op when device is CPU).
+    ema.shadow = {key: value.to(device) for key, value in ema.shadow.items()}
     base_anchor = {
         name: parameter.detach().clone()
         for name, parameter in model.named_parameters()

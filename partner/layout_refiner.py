@@ -5562,6 +5562,257 @@ def _edge_seat(opt, out):
     return out
 
 
+def wall_repair_on() -> bool:
+    """PARTNER_WALL_REPAIR=1 (default off): enable `_wall_repair`.
+
+    Off, the flag is a single dict lookup at the call site and
+    `_wall_repair` is never entered -- no import, no array copy, no scorer
+    work -- so the shipped pipeline stays byte-identical."""
+    return _flag_on("PARTNER_WALL_REPAIR")
+
+
+def _wall_clash(Q: np.ndarray, i: int) -> bool:
+    """True iff block `i`'s current rect overlaps any other block by more
+    than `SEP_TOL` on both axes (the seat pass's own separation test)."""
+    x0, y0, w, h = (float(Q[i, 0]), float(Q[i, 1]),
+                    float(Q[i, 2]), float(Q[i, 3]))
+    cx = np.minimum(x0 + w, Q[:, 0] + Q[:, 2]) - np.maximum(x0, Q[:, 0])
+    cy = np.minimum(y0 + h, Q[:, 1] + Q[:, 3]) - np.maximum(y0, Q[:, 1])
+    hit = (cx > SEP_TOL) & (cy > SEP_TOL)
+    hit[i] = False
+    return bool(hit.any())
+
+
+def _wall_hard_ok(opt, P0: np.ndarray, R: np.ndarray) -> bool:
+    """Hard legality of a repair result, judged AGAINST ITS INPUT.
+
+    `_guard_hard_ok`'s absolute soft-area tolerance is 0.005, but shipped
+    layouts legitimately spend up to the evaluator's full 1% (`_edge_seat`'s
+    dilate caps at 1.009) -- measured: 7 of 20 official-100 layouts fail the
+    absolute form on blocks this repair never touches.  So the test here is
+    "introduces no NEW hard-legality problem": no overlap at all, hard-shape
+    dims and preplaced origins bit-unchanged, and every soft block either
+    inside the evaluator's 1% (with margin) or no worse than it already
+    was."""
+    if R.shape != P0.shape or not np.isfinite(R).all():
+        return False
+    if (R[:, 2] <= 0).any() or (R[:, 3] <= 0).any():
+        return False
+    kind = np.asarray(opt.kind)
+    hard = kind != 0
+    if hard.any():
+        # fixed-shape and MIB-rigid blocks keep their dims; preplaced blocks
+        # keep their origin too (this move never translates a kind-2 block,
+        # but the re-weld reaches every block of the group)
+        if (np.abs(R[hard, 2] - P0[hard, 2]) > _GUARD_DIM_TOL).any() \
+                or (np.abs(R[hard, 3] - P0[hard, 3]) > _GUARD_DIM_TOL).any():
+            return False
+    lock = kind == 2
+    if lock.any():
+        if (np.abs(R[lock, 0] - P0[lock, 0]) > _GUARD_DIM_TOL).any() \
+                or (np.abs(R[lock, 1] - P0[lock, 1]) > _GUARD_DIM_TOL).any():
+            return False
+    soft = kind == 0
+    if soft.any():
+        areas = np.asarray(opt.areas, dtype=np.float64)[soft]
+        dev_in = np.abs(P0[soft, 2] * P0[soft, 3] - areas) \
+            / np.maximum(areas, 1e-9)
+        dev_out = np.abs(R[soft, 2] * R[soft, 3] - areas) \
+            / np.maximum(areas, 1e-9)
+        if (dev_out > np.maximum(dev_in, _WALL_AREA_TOL)).any():
+            return False
+    return not _guard_overlap(R)
+
+
+# soft-area headroom the repair may spend on its own (the evaluator's hard
+# tolerance is 1%; 0.9% leaves float margin, matching `_edge_seat`'s dilate)
+_WALL_AREA_TOL = 0.009
+
+
+def _wall_repair(opt, out, deadline: Optional[float] = None):
+    """Seat a CLUSTER-COUPLED boundary tag and re-weld its group as ONE
+    transaction.
+
+    Evidence (2026-08-26; `scripts/probes/wall_seat_diag.py` classified every
+    unsatisfied boundary-tag bit in the shipped official-100 layouts of the
+    shipping candidate).  Of the 57 unsatisfied bits at n >= 76:
+
+      * 22 sit on a PREPLACED block (kind 2).  It cannot move at all -- the
+        bbox wall would have to come back to its tag line, past 6-14
+        overshooting blocks, at 91-95% frame utilisation.  That is the
+        dead-space problem, not a seating problem; no local move reaches it.
+      * 28 sit on a block that can translate straight onto its wall with NO
+        clash -- and every single one of those 28 is a cluster member.  For
+        27 of them the translate is exactly V-NEUTRAL: it removes one
+        boundary violation and creates one grouping violation, because the
+        block leaves its cluster's contact.
+      * the remaining 7 are genuinely blocked by 1-6 neighbours already
+        standing on the wall.
+
+    `_edge_seat` (like every other seat site) commits a move only on a STRICT
+    drop of the violation count, so it evaluates the V-neutral translate,
+    finds no gain and reverts -- and the re-weld that would have paid for it
+    never happens.  It is the trap `_edge_seat`'s v2 corner seat documents
+    for two-bit tags, one level up: here the second half of the move belongs
+    to a different pass (`_cluster_seat`), which by then sees an intact
+    cluster and does nothing.
+
+    This runs the pair under ONE gate: translate the tag onto its wall
+    (absolute target, so the evaluator's boundary test sees a bit-equal
+    edge), then rigidly re-attach the detached pieces of its cluster to the
+    piece that now holds the seat, and keep the result only when the
+    evaluator-form violation count STRICTLY drops and no NEW hard-legality
+    problem appeared.
+
+    Bounded: at most `PARTNER_WALL_REPAIR_MAX_SITES` seats (default 6), each
+    re-weld capped at `PARTNER_WALL_REPAIR_SITE_MS` (default 25 ms), the
+    whole call inside `PARTNER_WALL_REPAIR_MS` (default 60 ms) and inside
+    `deadline` -- the caller's repair reserve -- whichever is tighter.  The
+    re-weld calls `_piece_land` with an ALREADY-EXPIRED dig deadline unless
+    the site budget still holds, which caps it at its 16 rigid landings plus
+    one reshape: the dig/evict tail is the only unbounded-in-time branch and
+    it cost 0.69 s on one measured site.  Preplaced blocks are never
+    translated.  Returns the input object unchanged when nothing is
+    accepted."""
+    if getattr(opt, "n", 0) < 2:
+        return out
+    if deadline is not None and time.time() >= deadline:
+        # the reserve is already spent: leave without even counting V
+        return out
+    groups = getattr(opt, "cluster_groups", None) or {}
+    if not groups:
+        return out
+    # only cluster-coupled, movable tags: an UNcoupled tag that can reach its
+    # wall is a strict win that `_edge_seat` already takes, so there is
+    # nothing here for it (0 such sites in the measured 100 cases).
+    bnd = [(int(i), int(opt.boundary[i])) for i in range(opt.n)
+           if opt.boundary[i] > 0 and opt.cluster[i] > 0 and opt.kind[i] != 2]
+    if not bnd:
+        return out
+    try:
+        # evaluator-faithful counter; the whole acceptance test rests on it,
+        # so a missing module means "do nothing", never a looser gate
+        from violation_killer import _violations_exact
+    except Exception:
+        return out
+
+    P0 = np.asarray(out, dtype=np.float64)
+    best = P0.copy()
+    V0 = int(_violations_exact(opt, best))
+    if V0 <= 0:
+        return out
+    max_sites = int(_env_pos("PARTNER_WALL_REPAIR_MAX_SITES", 6.0, 64.0))
+    site_cap = _env_pos("PARTNER_WALL_REPAIR_SITE_MS", 25.0, 5000.0) / 1000.0
+    t_end = time.time() + _env_pos("PARTNER_WALL_REPAIR_MS",
+                                   60.0, 20000.0) / 1000.0
+    if deadline is not None:
+        t_end = min(t_end, deadline)
+
+    gid_of = {}
+    for gid, idxs in groups.items():
+        for v in idxs:
+            gid_of[int(v)] = gid
+
+    # (bit, axis, side): side 0 = min edge, side 1 = max edge
+    edges = ((1, 0, 0), (2, 0, 1), (4, 1, 1), (8, 1, 0))
+    Vbest = V0
+    tried = 0
+    for _round in range(max_sites):
+        if tried >= max_sites or time.time() >= t_end:
+            break
+        # walls are re-read every round: an accepted seat can move an extreme
+        # block and so redefine the wall the next site aims at
+        walls = ((float(best[:, 0].min()),
+                  float((best[:, 0] + best[:, 2]).max())),
+                 (float(best[:, 1].min()),
+                  float((best[:, 1] + best[:, 3]).max())))
+        sites = []
+        for i, code in bnd:
+            gid = gid_of.get(i)
+            if gid is None:
+                continue
+            for bit, axis, side in edges:
+                if not (code & bit):
+                    continue
+                lo = float(best[i, axis])
+                hi = lo + float(best[i, axis + 2])
+                g = (lo - walls[axis][0]) if side == 0 \
+                    else (walls[axis][1] - hi)
+                if g > EDGE_EPS:
+                    sites.append((g, i, axis, side, gid))
+        if not sites:
+            break
+        # smallest hover first: it perturbs the least geometry and is the
+        # cheapest re-weld, so the site budget buys the most seats
+        sites.sort()
+        progress = False
+        for g, i, axis, side, gid in sites:
+            if tried >= max_sites or time.time() >= t_end:
+                break
+            tried += 1
+            Q = best.copy()
+            Q[i, axis] = (walls[axis][0] if side == 0
+                          else walls[axis][1] - Q[i, axis + 2])
+            if _wall_clash(Q, i):
+                continue
+            t_site = min(t_end, time.time() + site_cap)
+            _wall_reweld(opt, Q, sorted(int(v) for v in groups[gid]), i,
+                         t_site)
+            V1 = int(_violations_exact(opt, Q))
+            if V1 < Vbest and _wall_hard_ok(opt, P0, Q):
+                best = Q
+                Vbest = V1
+                progress = True
+                break          # walls may have moved; re-scan
+        if not progress:
+            break
+    if Vbest < V0:
+        if _DEBUG:
+            print(f"[wallrep] n={opt.n} V {V0}->{Vbest} sites={tried}",
+                  flush=True)
+        return best
+    return out
+
+
+def _wall_reweld(opt, Q: np.ndarray, g: List[int], keep: int,
+                 deadline: float) -> None:
+    """Re-attach the pieces of cluster `g` that the seat detached, in place.
+
+    Mirrors `_cluster_seat`'s merge loop with two deliberate narrowings:
+    only THIS group is touched, and the piece holding `keep` (the block that
+    was just seated on its wall) is never the one that moves -- moving it
+    would undo the seat the whole transaction is for.  Every landing is
+    collision-checked and V-guarded inside `_piece_land`, so a bad merge
+    reverts itself; this function therefore has no accept/revert of its own
+    and the caller's single gate arbitrates the finished layout."""
+    if not 2 <= len(g) <= 16:
+        return
+    for _merge in range(3):
+        if time.time() >= deadline:
+            return
+        pieces = _touch_components(Q, np.asarray(g, dtype=np.int64))
+        if len(pieces) < 2:
+            return
+        anchor = next((p for p in pieces if keep in p), None)
+        if anchor is None:
+            return
+        movable = [p for p in pieces if p is not anchor]
+        movable.sort(key=lambda p: sum(Q[i, 2] * Q[i, 3] for i in p))
+        progress = False
+        for piece in movable:
+            if time.time() >= deadline:
+                return
+            rigid_ok = (len(piece) <= 6
+                        and not any(opt.kind[i] == 2 for i in piece))
+            rest = [b for p in pieces for b in p if p is not piece]
+            if _piece_land(opt, Q, piece, rest, rigid_ok=rigid_ok,
+                           deadline=deadline):
+                progress = True
+                break
+        if not progress:
+            return
+
+
 def _lock_compact(opt, out, deadline: float, seed: int = 0,
                   pred=None):
     """Discrete area-compaction toward the tag-locked frame, accepted on
@@ -5877,7 +6128,18 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
         # loses the cross-pipeline pick no matter how good its HPWL is
         t_hard = deadline
         slice_ = max(0.0, deadline - time.time())
-        res = min(3.5, 0.3 * slice_)
+        # PARTNER_REFINE_RES_FRAC (default 0.3 = the shipped constant): share
+        # of the worker slice reserved for violation repair.  Mid-band
+        # slices (0.2-0.3 s) leave the repair 0.06-0.09 s, and the [psel]
+        # audit (2026-08-26) shows refined candidates there losing the
+        # arbitration on V=6-10 despite 10-25% lower HPWL.
+        _rf = _env_pos("PARTNER_REFINE_RES_FRAC", 0.3, 0.9)
+        # PARTNER_REFINE_RES_FRAC_SHORT / PARTNER_REFINE_RES_SHORT_S: a
+        # separate share for SHORT slices (mid-band seats, slice < S);
+        # default = RES_FRAC -> bit-exact.
+        if slice_ < _env_pos("PARTNER_REFINE_RES_SHORT_S", 0.0, 10.0):
+            _rf = _env_pos("PARTNER_REFINE_RES_FRAC_SHORT", _rf, 0.9)
+        res = min(3.5, _rf * slice_)
         if _depth == 0 and slice_ > 8.0:
             # the recompression retry (step 7) reruns the whole pipeline
             # on the legal layout — give it a real share of the slice,
@@ -6565,6 +6827,20 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
 
         out = _cluster_seat(opt, _edge_seat(opt, out),
                             deadline=t_hard - _tg(0.9, 0.1))
+        # PARTNER_WALL_REPAIR (default off): the composite seat + re-weld the
+        # two passes above cannot reach, because each of them commits only on
+        # a strict V drop and the first half of the move is V-neutral.  See
+        # `_wall_repair`.  Bounded by the repair reserve (and by its own
+        # 60 ms cap), so it can only spend time the stages below would
+        # otherwise leave on the table.  Off: not called at all.
+        # PARTNER_WALL_REPAIR_NO_LADDER=1 (default off) keeps the move but
+        # drops THIS call site, leaving only the final-layout one in
+        # `contest_optimizer._wall_repair_final`.  Attribution knob: the
+        # ladder site also changes which candidate wins the cross-pipeline
+        # arbitration (a lower-V candidate scores better), so its effect is
+        # not monotone the way the final site's is.
+        if wall_repair_on() and not _flag_on("PARTNER_WALL_REPAIR_NO_LADDER"):
+            out = _wall_repair(opt, out, deadline=t_hard - _tg(0.05, 0.02))
         if _snaps is not None:
             _snaps.append(("repair", np.asarray(out, dtype=np.float64).copy()))
 
