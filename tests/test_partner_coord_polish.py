@@ -44,7 +44,8 @@ _ENV = ("PARTNER_COORD_POLISH", "PARTNER_COORD_POLISH_MIN_N",
         "PARTNER_COORD_POLISH_BUDGET_MS", "PARTNER_COORD_POLISH_BACKEND",
         "PARTNER_COORD_POLISH_BOUNDARY", "PARTNER_COORD_POLISH_CONTACTS",
         "PARTNER_COORD_POLISH_FREE_FALLBACK", "PARTNER_COORD_POLISH_MAX_ROWS",
-        "PARTNER_COORD_POLISH_LP", "PARTNER_COORD_POLISH_DEBUG")
+        "PARTNER_COORD_POLISH_LP", "PARTNER_COORD_POLISH_DEBUG",
+        "PARTNER_COORD_POLISH_HEADROOM_S")
 
 
 @pytest.fixture(autouse=True)
@@ -131,6 +132,78 @@ def test_min_n_gate_blocks_small_instances(monkeypatch):
     rects, at, cons, tpos, b2b, p2b, pins = _grid_case(side=5)   # n = 25 < 95
     got = cp.polish_layout(rects, at, cons, tpos, b2b, p2b, pins)
     assert [tuple(r) for r in got] == [tuple(r) for r in rects]
+
+
+# ---------------------------------------------------------------------------
+# PARTNER_COORD_POLISH_HEADROOM_S -- ported elapsed-time gate
+# ---------------------------------------------------------------------------
+
+def test_headroom_gate_off_by_default_even_with_polish_on(monkeypatch):
+    """Default 0 disables the gate: a large `elapsed` must not by itself
+    suppress the pass when PARTNER_COORD_POLISH_HEADROOM_S is unset."""
+    import contest_optimizer as co
+
+    opt = co.MyOptimizer.__new__(co.MyOptimizer)
+    opt.verbose = False
+    monkeypatch.setenv("PARTNER_COORD_POLISH", "1")
+    rects, at, cons, tpos, b2b, p2b, pins = _grid_case(side=5)   # n=25 < 95
+    # polish_layout itself no-ops below its MIN_N gate, so use it only to
+    # confirm the headroom check does not short-circuit before that call --
+    # i.e. `_coord_polish` still reaches `polish_layout` (same result either
+    # way here, so assert the module WAS reached via a spy).
+    called = {}
+    real_import = __import__
+
+    def spy_polish(*a, **k):
+        called["hit"] = True
+        return list(a[0])
+
+    monkeypatch.setattr(cp, "polish_layout", spy_polish)
+    out = list(rects)
+    opt._coord_polish(out, at, cons, tpos, b2b, p2b, pins, elapsed=999.0)
+    assert called.get("hit") is True
+
+
+def test_headroom_gate_skips_polish_once_elapsed_exceeds_it(monkeypatch):
+    import contest_optimizer as co
+
+    opt = co.MyOptimizer.__new__(co.MyOptimizer)
+    opt.verbose = False
+    monkeypatch.setenv("PARTNER_COORD_POLISH", "1")
+    monkeypatch.setenv("PARTNER_COORD_POLISH_HEADROOM_S", "1.0")
+    rects, at, cons, tpos, b2b, p2b, pins = _grid_case(side=5)
+    called = {}
+
+    def spy_polish(*a, **k):
+        called["hit"] = True
+        return list(a[0])
+
+    monkeypatch.setattr(cp, "polish_layout", spy_polish)
+    out = list(rects)
+    got = opt._coord_polish(out, at, cons, tpos, b2b, p2b, pins,
+                            elapsed=1.5)
+    assert got is out                  # identity: gated before import/call
+    assert "hit" not in called
+
+
+def test_headroom_gate_allows_polish_within_the_window(monkeypatch):
+    import contest_optimizer as co
+
+    opt = co.MyOptimizer.__new__(co.MyOptimizer)
+    opt.verbose = False
+    monkeypatch.setenv("PARTNER_COORD_POLISH", "1")
+    monkeypatch.setenv("PARTNER_COORD_POLISH_HEADROOM_S", "1.0")
+    rects, at, cons, tpos, b2b, p2b, pins = _grid_case(side=5)
+    called = {}
+
+    def spy_polish(*a, **k):
+        called["hit"] = True
+        return list(a[0])
+
+    monkeypatch.setattr(cp, "polish_layout", spy_polish)
+    out = list(rects)
+    opt._coord_polish(out, at, cons, tpos, b2b, p2b, pins, elapsed=0.5)
+    assert called.get("hit") is True
 
 
 # ---------------------------------------------------------------------------
