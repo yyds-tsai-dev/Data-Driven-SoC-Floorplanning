@@ -78,6 +78,74 @@ _TG_CUR = ["-"]
 # a parameter on purpose: `_tighten`'s signature is monkeypatched by the
 # rung-0 tests, so adding a keyword to it would break every existing spy.
 _TG_SITE = ["?"]
+# PARTNER_PINFRAME_DEBUG=1 (default off, read once at import): diagnosis
+# instrument for the `locked` residual boundary class (a boundary tag carried
+# by a PREPLACED block whose wall line the final bbox overshoots).  Emits one
+# `[pf]` line per direct candidate: which ladder rung closed it, the
+# tag-implied frame locks and the candidate's own per-side overshoot past
+# them.  Join to `[cl]`/`[fin]` (PARTNER_TIGHTEN_DEBUG) by `cid`.  Off, every
+# site is one `if` on a falsy module constant.
+_PF_DBG = bool(os.environ.get("PARTNER_PINFRAME_DEBUG"))
+# PARTNER_PIN_FRAME=1 (default off, read once at import).
+#
+# A boundary tag carried by a PREPLACED (kind 2) block can only ever be
+# satisfied if the layout's extreme on that side coincides with the block's
+# own edge -- the block cannot move, so the WALL has to come to it.
+# `scripts/probes/wall_seat_diag.py` on the shipped official/shadow-v3 runs
+# (2026-08-27) attributes 28 of the 36/37 residual boundary bits at n >= 76 to
+# exactly this `locked` class, at frame utilizations of 0.80-0.97 -- i.e. the
+# packing had room, the ladder simply legalized into a frame whose wall sits
+# PAST the pinned line.
+#
+# `_Refiner._anchor_frame_to_tags` already computes those wall lines
+# (`lock_*`), but the shipped ladder only ever consults them as a FLOOR for
+# shrinking (`_tighten`, `_try_squeeze`, `compact_to_locks`); nothing stops a
+# rung from legalizing into a frame that overshoots them, and the min-side
+# locks (`lock_xmin` / `lock_ymin`) are never applied to the frame at all
+# outside the opt-in `PARTNER_TAG_ANCHOR` seeding path.
+#
+# PIN_FRAME makes the locked wall lines HARD frame edges for the tight rungs
+# (rung 0 and the `use_pins` expand rungs) and redirects the frame area the
+# clamp removes onto the sides that are still free, so a pinned rung stays a
+# different frame from rung 0's rather than a re-run of it.  The loose
+# (`use_pins=False`) rungs are left exactly as shipped: a pinned rung that
+# cannot legalize costs NO extra legalization, it falls through to the next
+# rung, which is the shipped ladder.
+#
+# MEASURED (2026-08-27, interleaved GATE3 x2 per arm, shipping env, polish
+# off).  The mechanism does what it was built for -- `wall_seat_diag` locked
+# bits official 26 -> 22, shadow-v3 32 -> 20 (n >= 102: 15 -> 12 and 21 -> 11)
+# -- but the pinned frame COSTS wire length, and the exp(2V/n_soft) saving
+# does not pay for it:
+#   PIN_FRAME=1        off -0.0022 | v3 +0.0121 | a1 +0.0070   (v_rel -0.0008
+#                      / -0.0018, hpwl_gap -0.0109 / +0.0245 / +0.0178)
+#   PIN_FRAME=min      off +0.0062 | v3 +0.0017 | a1 +0.0076
+#   PIN_FRAME=1+RETRY  off +0.0075 | v3 +0.0221 | a1 +0.0195, and +0.015 s
+#                      avg runtime
+# The promotion rule (official AND v3 raw improve) is not met by any arm, so
+# the flag stays DEFAULT OFF.  Kept in the tree because the diagnosis it
+# encodes is reusable: the overshoot is created in the ladder and no
+# post-ladder stage ever removes it (`PARTNER_PINFRAME_DEBUG` prints the
+# ladder-time and final overshoot side by side, and they are equal on every
+# candidate of every locked case measured).
+#
+# Off -> `_PIN_FRAME` is a falsy module constant and every site collapses to
+# the shipped expression bit for bit (verified against `git show HEAD` on 6
+# synthetic tagged-preplaced instances: 6/6 bit-identical output arrays).
+# `_flag_on` is defined below, so the env reads are spelled out here.
+#   PARTNER_PIN_FRAME=1    both arms (rung-0 corner + tight expand rungs)
+#   PARTNER_PIN_FRAME=min  ONLY the rung-0 min-side corner -- the arm that
+#                          adds no attempt and removes none, so it cannot
+#                          cost the ladder a rung it would have closed
+#   PARTNER_PIN_FRAME_RETRY=1  a tight rung whose PINNED frame fails to
+#                          legalize replays the shipped rung before moving
+#                          on (one extra `legalize_soft`, paid only on a
+#                          pin failure), so the pin is strictly additive
+_PIN_FRAME_MODE = os.environ.get("PARTNER_PIN_FRAME", "0")
+_PIN_FRAME = _PIN_FRAME_MODE in ("1", "true", "True", "on", "ON", "min")
+_PIN_FRAME_RUNGS = _PIN_FRAME and _PIN_FRAME_MODE != "min"
+_PIN_FRAME_RETRY = os.environ.get("PARTNER_PIN_FRAME_RETRY", "0") in (
+    "1", "true", "True", "on", "ON")
 
 EDGE_EPS = 1e-6     # evaluator boundary-touch / overlap tolerance
 SEP_TOL = 5e-7      # projection overlap beyond this forces a separation constraint
@@ -1993,6 +2061,54 @@ class _Refiner:
                 self.lock_ymax = float((P[k2, 1] + P[k2, 3]).max())
             if code & 8:
                 self.lock_ymin = float(P[k2, 1].min())
+
+    def _pin_frame_to_locks(self) -> bool:
+        """PARTNER_PIN_FRAME: turn every tag-locked wall line into a HARD
+        frame edge for this legalization.
+
+        `_anchor_frame_to_tags` must have filled `lock_*` first.  Each locked
+        side is clamped onto its line (min sides up, max sides down); the
+        frame AREA the clamp removes is then given back to whichever max side
+        is still free, so a pinned rung searches a different frame SHAPE
+        instead of replaying rung 0's frame.  When no side is free the frame
+        simply shrinks -- that is the geometry the tags demand, and the rung
+        either closes in it or falls through to the next (shipped) rung.
+
+        Returns True when the frame actually moved (so the caller knows to
+        run `_pull_inside_frame`), False when there is nothing to pin or the
+        clamp would degenerate the frame (then the rung stays as shipped)."""
+        if (self.lock_xmin is None and self.lock_xmax is None
+                and self.lock_ymin is None and self.lock_ymax is None):
+            return False
+        x0, x1 = self.xmin, self.xmax
+        y0, y1 = self.ymin, self.ymax
+        a0 = max((x1 - x0) * (y1 - y0), 1e-9)
+        if self.lock_xmin is not None:
+            x0 = max(x0, self.lock_xmin)
+        if self.lock_xmax is not None:
+            x1 = min(x1, self.lock_xmax)
+        if self.lock_ymin is not None:
+            y0 = max(y0, self.lock_ymin)
+        if self.lock_ymax is not None:
+            y1 = min(y1, self.lock_ymax)
+        if x1 - x0 <= 1e-9 or y1 - y0 <= 1e-9:
+            return False
+        if (x0, x1, y0, y1) == (self.xmin, self.xmax, self.ymin, self.ymax):
+            return False
+        grow = a0 / max((x1 - x0) * (y1 - y0), 1e-9)
+        if grow > 1.0 + 1e-9:
+            free_x = self.lock_xmax is None
+            free_y = self.lock_ymax is None
+            if free_x and free_y:
+                g = math.sqrt(grow)
+                x1 = x0 + (x1 - x0) * g
+                y1 = y0 + (y1 - y0) * g
+            elif free_x:
+                x1 = x0 + (x1 - x0) * grow
+            elif free_y:
+                y1 = y0 + (y1 - y0) * grow
+        self.xmin, self.xmax, self.ymin, self.ymax = x0, x1, y0, y1
+        return True
 
     def _seed_tags(self):
         """Snap movable tagged blocks flush to the frame edge and pin that
@@ -6094,6 +6210,53 @@ def _guard_pick(opt, out, snaps, pred):
         return out
 
 
+def _tag_frame_locks(opt, P: np.ndarray):
+    """Frame edges implied by boundary tags carried by PREPLACED blocks.
+
+    Array-level mirror of `_Refiner._anchor_frame_to_tags`: a kind-2 block
+    cannot move, so its tag can only be satisfied when the layout extreme on
+    that side coincides with the preplaced extreme there.  Returns
+    (xmin, xmax, ymin, ymax); a side with no tagged preplaced block is None.
+    Used by the PARTNER_PINFRAME_DEBUG instrument and by PARTNER_PIN_FRAME."""
+    kind = np.asarray(opt.kind)
+    k2 = np.nonzero(kind == 2)[0]
+    out = [None, None, None, None]
+    if not len(k2):
+        return tuple(out)
+    for i, code in zip(opt._bnd_idx, opt._bnd_codes):
+        if kind[int(i)] != 2:
+            continue
+        code = int(code)
+        if code & 1:
+            out[0] = float(P[k2, 0].min())
+        if code & 2:
+            out[1] = float((P[k2, 0] + P[k2, 2]).max())
+        if code & 4:
+            out[3] = float((P[k2, 1] + P[k2, 3]).max())
+        if code & 8:
+            out[2] = float(P[k2, 1].min())
+    return tuple(out)
+
+
+def _pf_ov_str(opt, P: np.ndarray) -> str:
+    """PARTNER_PINFRAME_DEBUG helper: per-side overshoot past the tag locks."""
+    lk = _tag_frame_locks(opt, P)
+    out = []
+    for si, nm in enumerate(("xmin", "xmax", "ymin", "ymax")):
+        if lk[si] is None:
+            continue
+        if si == 0:
+            d = lk[0] - float(P[:, 0].min())
+        elif si == 1:
+            d = float((P[:, 0] + P[:, 2]).max()) - lk[1]
+        elif si == 2:
+            d = lk[2] - float(P[:, 1].min())
+        else:
+            d = float((P[:, 1] + P[:, 3]).max()) - lk[3]
+        out.append(f"{nm}={d:.4f}")
+    return ",".join(out) if out else "-"
+
+
 def refine_prediction(opt, pred: np.ndarray, deadline: float,
                       seed: int = 0, _depth: int = 0) -> Optional[np.ndarray]:
     """Full direct-prediction pipeline glue:
@@ -6208,6 +6371,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
 
         saved_cg = opt.cluster_groups
         legal = None
+        _pf_rung = "none"
 
         # -- rung 0: fixed-frame legalization ---------------------------
         # The tagged-preplaced edges LEAK the true frame (user insight);
@@ -6285,6 +6449,22 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                     _r0_end, time.time() + _fs_frac * _fs_win)
                 r._pred_c = pred_c
                 r._anchor_frame_to_tags()
+                if _PIN_FRAME:
+                    # PARTNER_PIN_FRAME: the MIN-side locks are the ones the
+                    # shipped rung never applies.  W/H below are measured from
+                    # `r.xmin`/`r.ymin`, which are the PREDICTION's extremes,
+                    # so a single block predicted left of (or below) the
+                    # leftmost preplaced block silently defines that wall and
+                    # the tag on the preplaced block can never be satisfied --
+                    # the `xmin`/`ymin` half of the `locked` class (7 of 28
+                    # bits on the shipped official run).  Raising the corner
+                    # here keeps the frame AREA: with the matching max side
+                    # locked, W = lock_xmax - xmin shrinks and H = aref / W
+                    # grows; with it free, W comes from `aref` unchanged.
+                    if r.lock_xmin is not None:
+                        r.xmin = max(r.xmin, r.lock_xmin)
+                    if r.lock_ymin is not None:
+                        r.ymin = max(r.ymin, r.lock_ymin)
                 W = (r.lock_xmax - r.xmin) if r.lock_xmax is not None else None
                 H = (r.lock_ymax - r.ymin) if r.lock_ymax is not None else None
                 # rung-0 frame area.  `_fs` is the shipped 1.08 unless the
@@ -6332,8 +6512,22 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         # inches from closing: give the frame 2% and finish —
                         # still far tighter than the loose-ladder path, and
                         # the tag seats survive intact
-                        r.xmax += 0.02 * W
-                        r.ymax += 0.02 * H
+                        if _PIN_FRAME_RUNGS and ((r.lock_xmax is None)
+                                                 != (r.lock_ymax is None)):
+                            # PARTNER_PIN_FRAME: the salvage's 2% goes onto
+                            # the max side that is still FREE (1.02**2 in area
+                            # on one side = +4.04%), so the pinned wall line
+                            # survives the last-chance close.  With both max
+                            # sides locked there is nowhere to put it and the
+                            # shipped growth is kept -- a legal candidate with
+                            # a small overshoot still beats no candidate.
+                            if r.lock_xmax is None:
+                                r.xmax += 0.0404 * W
+                            else:
+                                r.ymax += 0.0404 * H
+                        else:
+                            r.xmax += 0.02 * W
+                            r.ymax += 0.02 * H
                         _r0_salv = 1
                         # the salvage is the fixed-frame rung's last chance and
                         # the highest-value branch in the ladder: under ANYTIME
@@ -6443,6 +6637,8 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         r._assemble_clusters(saved_cg)
                         if not r._has_overlap():
                             legal = r.P.copy()
+                            if _PF_DBG:
+                                _pf_rung = f"r0fs{_fs:.3f}s{_r0_salv}"
                         elif _r0tg_snap is not None:
                             # the anneal's layout could not be assembled:
                             # replay the shipped (un-annealed) assembly, which
@@ -6453,6 +6649,8 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                             r._assemble_clusters(saved_cg)
                             if not r._has_overlap():
                                 legal = r.P.copy()
+                                if _PF_DBG:
+                                    _pf_rung = f"r0rev{_fs:.3f}s{_r0_salv}"
                             if _R0TG_DBG:
                                 import sys as _sys
                                 print(f"[r0tg] n={opt.n} REVERTED "
@@ -6571,6 +6769,8 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                                     r._assemble_clusters(saved_cg)
                                     if not r._has_overlap():
                                         legal = r.P.copy()
+                                        if _PF_DBG:
+                                            _pf_rung = "r05"
                                         if _DEBUG:
                                             print(f"[rp] rung 0.5 salvage legal"
                                                   f" ({len(offenders)} moved)",
@@ -6650,6 +6850,20 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             r.satB[:] = False
             r.satT[:] = False
             r._anchor_frame_to_tags()
+            # PARTNER_PIN_FRAME: on the TIGHT rungs only, the tag-locked wall
+            # lines become hard frame edges (the rung's expansion is
+            # redirected onto the sides that are still free).  The loose
+            # (`use_pins=False`) rungs stay exactly as shipped, so the ladder
+            # keeps its guaranteed escape and a pinned rung that cannot
+            # legalize costs no extra legalization -- it falls through to the
+            # next rung, which IS the shipped behaviour.
+            _pf_snap = ((r.P.copy(), (r.xmin, r.xmax, r.ymin, r.ymax))
+                        if (_PIN_FRAME_RETRY and _PIN_FRAME_RUNGS and use_pins)
+                        else None)
+            if _PIN_FRAME_RUNGS and use_pins and r._pin_frame_to_locks():
+                r._pull_inside_frame()
+            elif _pf_snap is not None:
+                _pf_snap = None          # nothing pinned -> nothing to retry
             if use_pins:
                 r._seed_tags()
             # ANYTIME: the shipped call is unbounded (`deadline=None`), so a
@@ -6664,7 +6878,23 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                         * max(0.0, deadline - time.time()))
                 else:
                     _rdl = min(deadline, t_tight)
-            if r.legalize_soft(deadline=_rdl):
+            _pf_ok = r.legalize_soft(deadline=_rdl)
+            if not _pf_ok and _pf_snap is not None:
+                # PARTNER_PIN_FRAME_RETRY: the pinned frame could not close.
+                # Replay the SHIPPED rung from the same snapshot so the pin
+                # can never cost the ladder a rung it would have closed --
+                # one extra `legalize_soft`, paid only on a pin failure.
+                r.P[...] = _pf_snap[0]
+                (r.xmin, r.xmax, r.ymin, r.ymax) = _pf_snap[1]
+                for g in r.groups:
+                    g.pin_x = g.pin_y = False
+                r.satL[:] = False
+                r.satR[:] = False
+                r.satB[:] = False
+                r.satT[:] = False
+                r._seed_tags()
+                _pf_ok = r.legalize_soft(deadline=_rdl)
+            if _pf_ok:
                 if not use_pins:
                     # tag recovery: the pin-less rung legalized but every
                     # boundary tag is loose — try to re-seat them; revert
@@ -6705,6 +6935,8 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                 r._assemble_clusters(saved_cg)
                 if not r._has_overlap():
                     legal = r.P.copy()
+                    if _PF_DBG:
+                        _pf_rung = f"e{expand}p{int(use_pins)}"
                     break
                 elif _DEBUG:
                     print("[rp] assembly created overlap", flush=True)
@@ -6715,6 +6947,7 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                     if _depth == 0 else None)
         if _snaps is not None:
             _snaps.append(("legal", legal.copy()))
+        _pf_ovl = _pf_ov_str(opt, legal) if _PF_DBG else "-"
 
         # -- 5. fresh refiner on the legal layout ----------------------
         r2 = _Refiner(opt, legal, seed + 1)
@@ -6928,6 +7161,16 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             # matrix and never pays for a cost evaluation at all.
             if _admit_legal_input(opt, pred, "cmp") is not None:
                 out = _guard_pick(opt, out, (), pred)
+        if _PF_DBG:
+            import sys as _sys
+            _pq = np.asarray(out, dtype=np.float64)
+            print(f"[pf] cid={_TG_CUR[0]} depth={_depth} n={opt.n} "
+                  f"anch={int(bool(getattr(opt, '_tag_anchor', False)))} "
+                  f"rung={_pf_rung} ovl[{_pf_ovl}] "
+                  f"bbr={_bbox_area_of(_pq) / max(opt.area_ref, 1e-9):.4f} "
+                  f"V={full_violations(opt, _pq)} "
+                  f"ov[{_pf_ov_str(opt, _pq)}]",
+                  file=_sys.stderr, flush=True)
         if _TG_DBG:
             import sys as _sys
             _fq = np.asarray(out, dtype=np.float64)

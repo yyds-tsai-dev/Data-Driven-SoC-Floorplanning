@@ -593,3 +593,13 @@ CPU 暖機 0.996s = contest 機每案多付的 ~1s;adapt 後 runtime 回到預�
 全新解壓 + 乾淨 Py3.13 venv(torch 2.6.0+cu124)+ 官方 evaluator:`[selfcheck] cuda_available=True … flow_warm_latency=0.069s`;direct step 18000 / flow step 1000000 載入;**noRT 1.1147,100/100 feasible,avg rt 0.406s,p90 0.91,max 1.48,第一案 0.057s**(JIT 已在載入期)。與本機 polish-OFF 口徑(1.09–1.106)同帶。
 
 週五上傳前只剩:①若要 raw 優先,op_wrapper 加 `"PARTNER_COORD_POLISH": "1"` 重打;②branch 推上 GitHub(需憑證)。
+
+## 17. 目標 official 1.08 / v3 1.10(08-27 使用者裁定;悲觀評估 M=1.45、D=0.6;A100+Icelake)
+
+### 17a. `PARTNER_PIN_FRAME`(deep-reasoner)— 機制成立、分數未過,**default off**
+
+- 診斷(`PARTNER_PINFRAME_DEBUG=1`,`[pf]` 逐候選):`locked` 類的超出在 ladder rung 內產生,之後任何 post-pass 都不會移除;`lock_*` 在出貨路徑只當「縮框下限」(`_tighten`/`_try_squeeze`/`compact_to_locks`),從不當上限;min 側 lock 在主路徑完全沒用到(rung 0 的 W 用預測 bbox 的 xmin 算)。tid 75/76/83 無 direct 候選(column 勝),機制碰不到。
+- 機制:`_Refiner._pin_frame_to_locks()`(layout_refiner.py:2065)把鎖側夾到牆線、把面積補到另一自由邊;三個呼叫點(rung 0、rung-0 salvage、tight expand rungs)。off-path 6/6 bit-exact;10 測試綠(共 41)。
+- Gate(×2 交錯,polish off):official −0.0022 [−0.032,+0.028]、**v3 +0.0121**、a1 +0.0070;v_rel 降(−0.0008/−0.0018)但 HPWL 升(v3 +0.0245);runtime 反降(avg 0.394→0.377,max 1.47→1.27);M=1.45 D=0.6 runtime-aware 0.933→0.919。子模式 `min`(只修 rung-0 角)+0.006/+0.002/+0.008;`RETRY` 更差(+0.008/+0.022/+0.020)。
+- 逐案:tid 86 1.316→1.054、83 1.270→1.099 大勝;tid 99 1.187→1.318、69 1.106→1.281 大敗(無違規的案被硬夾框)。locked 26→22(official)、32→20(v3)。
+- **結論**:locked 類不是免費的 —— 夾框換來 HPWL;要拿 86/83 的贏而不吃 99/69 的輸,得走 portfolio(pinned 候選與 unpinned 同池、逐案仲裁),不是 ladder 全域改。
