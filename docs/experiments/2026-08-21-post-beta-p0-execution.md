@@ -635,3 +635,21 @@ alpha_1 manifest:GT 幾何/pins/B2B/constraints/每 pin 的 P2B 度數皆保留,
 anchu:三套 mean −0.008,official/a1 3/3 同向,v3 wash;runtime 持平(0.378→0.383);M=1.45 runtime-aware D=0.6/0.7/0.8 base 0.904/0.867/0.838 → 0.899/0.861/0.832。判準「official 與 v3 皆進步」在 v3 上是 wash 而非進步;依使用者較早判準(v3+a1 mean −0.008、official 不退)可促轉。**暫列出貨候選 B**,待 deep-reasoner 報告確認 live-case 數與機制後決定是否入包。
 
 Deep-reasoner round-3 報告補充:①`MIN_UTIL`(只在緊的 lock box 開席)剛好殺掉會贏的案(tid 86 util 0.696);有效的是 **`MAX_UTIL`**(lock box 還有鬆弛才開席):official/v3/a1 live 案 50/40/15(u≤0.75),pipeline 內 official 實際 28 案開席。門檻是寬平台(u=0.70–0.90 皆 −0.006~−0.008),leave-one-suite-out 皆勝 ungated。②anchu 增益是 **HPWL 驅動**(−0.006/−0.008/−0.018)、v_rel 持平 —— 門檻把「用 wirelength 換 boundary」的案擋掉了。③runtime avg +1.3%、max +4%(re-ladder 既有 worker,在漂移內)。④**地雷**:`legalize_rectangles` 把 `_parallel_solve` 的任何例外吞掉(`except Exception: pass`)靜默退回 sequential → 一個 debug 行的 NameError 讓 official 變 1.328 而無任何錯誤;已在該 except 加 stderr 警告(見下)。⑤未關閉的 caveat:anchu 每 rep 都排第 4 位(位置混淆);u=0.75 是 in-sample 選的;a1 的 util 分佈與 official 不同(開席比例 50/40/15)。**下一步:反序鏈(anchu 先、base 後)×2 才能促轉。**
+
+### 17e. p2b 保險 gate(`PARTNER_COND_P2B=off`:模型條件不看 pin,legalizer/refiner 仍優化真 p2b;×2 交錯)
+
+| | official | v3 | alpha_1 |
+|---|---|---|---|
+| base | 1.0918/1.0903 | 1.1482/1.1514 | 1.1994/1.2012 |
+| p2b off | 1.1459/1.1527 | 1.2012/1.1996 | **1.1307/1.1419** |
+| paired Δ | **+0.054** | **+0.051** | **−0.064** |
+
+- 模型的 pin 條件在真實生成器分佈(pin 接最近 block)上值 0.05;在 alpha_1(pin 隨機化)上反而害 0.06–0.07 → alpha_1 分數差的真因就是「模型相信會說謊的 pin」。
+- 全域關閉不可出貨;若 hidden 真有 pin 偏移(需朋友的 official/alpha_1/beta 三數證實),可做 portfolio 席位版(少數 worker 用 p2b-off 候選)當對沖,估 official +0.01 換 a1 −0.04。未證實前不做。
+- 悲觀模擬(預算 ÷1.45,×2):official 1.1526/1.1560、v3 1.2600/1.2489、a1 1.2285/1.2255 —— 上界(門檻也被縮,中段過罰);門檻同比例縮的修正版 emu145b 排隊中。
+
+### 17f. anchu 反序確認 → **不促轉**
+
+反序(anchu 先、base 後)×2:official +0.0024 [−0.004,+0.009]、v3 +0.0006、a1 −0.0098。**合併 5 reps**(3 正序 + 2 反序):official −0.0044 [−0.0132,+0.0043](1.0957±0.0054 → 1.0913±0.0029)、v3 +0.0011、a1 −0.0140 [−0.031,−0.000];runtime-aware M=1.45 三個 D 完全相同(0.899/0.861/0.832)。正序 3 reps 的 official −0.009 是位置混淆(anchu 固定排第 4)。只有 a1(合成 pin 偏移套)真有增益 → 依「hidden 像 official/v3」的判定,**default 0,不入包**;若朋友的三數證實 hidden 有 pin 偏移,可與 p2b-off 席位一起重新考慮。
+
+修正版悲觀模擬 emu145b(預算 ÷1.45 + 門檻同比例縮):official 1.1374 / v3 1.1661 / a1 1.2279 → contest 機 raw 期望區間 official 1.11–1.14、v3 1.15–1.17(M 1.2–1.45)。
