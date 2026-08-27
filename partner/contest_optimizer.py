@@ -218,6 +218,24 @@ def _final_area_guard(result, fallbacks, area_targets, n: int):
     return result
 
 
+def _cond_p2b(p2b):
+    """PARTNER_COND_P2B (default unset = shipped): what the MODEL conditioning
+    sees as pin-to-block connectivity.  `off` invalidates every p2b row for
+    the conditioning only (pin index -1 -> `fast_condition` drops it: zero
+    degree/weight/pin-centroid features), so the Flow/Direct prior ignores
+    pins while the legalizer, refiner and proxy still optimise the true p2b
+    HPWL.  Insurance against a pin-distribution shift in the hidden set
+    (alpha_1-type: P2B distance rank 0.37 vs 0.04 on official/v3, see
+    docs/experiments/2026-08-21-post-beta-p0-execution.md §17c), where the
+    models fall back to column layouts.  Off path returns the same tensor."""
+    mode = os.environ.get("PARTNER_COND_P2B", "")
+    if mode != "off" or p2b is None or p2b.numel() == 0:
+        return p2b
+    q = p2b.clone()
+    q[..., 0] = -1.0
+    return q
+
+
 def _direct_rung0_projection(block_count: int, remaining: float):
     """Project what a RESERVED refine worker will actually get, and what
     `refine_prediction`'s rung 0 (fixed-frame legalization) costs.
@@ -454,6 +472,35 @@ class MyOptimizer(FloorplanOptimizer):
             ts_assumed = _env_float("PARTNER_DIRECT_SEAT_TS", 0.148)
             ts_measured = warm_lat / max(n / 100.0, 1e-6)
             adapted = False
+            # CPU-speed self-calibration for the gate's refine term.  The
+            # rung-0 cost constant (PARTNER_DIRECT_SEAT_R0, 0.125 s @ n=100)
+            # was measured on this dev box (Xeon Silver 4510, 4.1 GHz turbo);
+            # the contest box is an Icelake 48-core.  A fixed single-thread
+            # numpy micro-benchmark (reference 1.0 = dev box, quiet) scales
+            # R0 up when the host is slower, so seats are not reserved for
+            # refines that cannot finish there.  PARTNER_SEAT_R0_ADAPT=0
+            # disables; only ratios > 1.25 change anything.
+            cpu_ratio = float("nan")
+            r0_adapted = False
+            try:
+                import numpy as _np
+                # element-wise + sort only: no BLAS, so the number reflects
+                # ONE core's speed, not the thread pool
+                _rng = _np.random.default_rng(0)
+                _x = _rng.random(200_000)
+                _t1 = time.time()
+                for _ in range(30):
+                    _x = _np.sin(_x) * 1.1 + _np.sqrt(_np.abs(_x))
+                    _np.sort(_x[:60_000])
+                cpu_ms = (time.time() - _t1) * 1000.0
+                cpu_ratio = cpu_ms / _env_float("PARTNER_CPU_CALIB_REF_MS", 95.0)
+                if (os.environ.get("PARTNER_SEAT_R0_ADAPT", "1") not in
+                        ("0", "false", "False", "off") and cpu_ratio > 1.25):
+                    r0 = _env_float("PARTNER_DIRECT_SEAT_R0", 0.125) * cpu_ratio
+                    os.environ["PARTNER_DIRECT_SEAT_R0"] = f"{r0:.4f}"
+                    r0_adapted = True
+            except Exception:
+                pass
             if (os.environ.get("PARTNER_SEAT_TS_ADAPT", "1") not in
                     ("0", "false", "False", "off")
                     and ts_measured > ts_assumed * 1.25):
@@ -464,7 +511,9 @@ class MyOptimizer(FloorplanOptimizer):
                   f"flow_warm_latency={warm_lat:.3f}s "
                   f"seat_ts_assumed={ts_assumed:.3f} "
                   f"seat_ts={'adapted->' if adapted else 'kept '}"
-                  f"{ts_measured if adapted else ts_assumed:.3f}",
+                  f"{ts_measured if adapted else ts_assumed:.3f} "
+                  f"cpu_ratio={cpu_ratio:.2f} "
+                  f"seat_r0={'adapted->' + os.environ.get('PARTNER_DIRECT_SEAT_R0', '?') if r0_adapted else 'kept'}",
                   file=sys.stderr, flush=True)
             if self.verbose:
                 print("flow sampler warmed")
@@ -1500,7 +1549,7 @@ class MyOptimizer(FloorplanOptimizer):
         cons_d = cons.unsqueeze(0).to(dev)
         tpos_d = tpos.unsqueeze(0).to(dev)
         cond = fast_condition(
-            at_d, b2b.unsqueeze(0).to(dev), p2b.unsqueeze(0).to(dev),
+            at_d, b2b.unsqueeze(0).to(dev), _cond_p2b(p2b.unsqueeze(0).to(dev)),
             pins.unsqueeze(0).to(dev), cons_d, tpos_d,
             relation_feat_dim=self.direct_cfg.relation_feat_dim,
             node_feat_dim=self.direct_cfg.node_feat_dim)
@@ -1677,7 +1726,7 @@ class MyOptimizer(FloorplanOptimizer):
         cons_d = cons.unsqueeze(0).to(dev)
         tpos_d = tpos.unsqueeze(0).to(dev)
         cond = fast_condition(
-            at_d, b2b.unsqueeze(0).to(dev), p2b.unsqueeze(0).to(dev),
+            at_d, b2b.unsqueeze(0).to(dev), _cond_p2b(p2b.unsqueeze(0).to(dev)),
             pins.unsqueeze(0).to(dev), cons_d, tpos_d,
             relation_feat_dim=self.direct_cfg.relation_feat_dim,
             node_feat_dim=self.direct_cfg.node_feat_dim)
@@ -1754,7 +1803,7 @@ class MyOptimizer(FloorplanOptimizer):
         cons_d = cons.unsqueeze(0).to(dev)
         tpos_d = tpos.unsqueeze(0).to(dev)
         cond = fast_condition(
-            at_d, b2b.unsqueeze(0).to(dev), p2b.unsqueeze(0).to(dev),
+            at_d, b2b.unsqueeze(0).to(dev), _cond_p2b(p2b.unsqueeze(0).to(dev)),
             pins.unsqueeze(0).to(dev), cons_d, tpos_d,
             relation_feat_dim=self.flow_cfg.relation_feat_dim,
             node_feat_dim=self.flow_cfg.node_feat_dim)

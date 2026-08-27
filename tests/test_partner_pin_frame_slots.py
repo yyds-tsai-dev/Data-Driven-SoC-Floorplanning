@@ -267,3 +267,148 @@ def test_has_tag_locks_false_when_only_soft_blocks_are_tagged():
     assert all(v is None for v in (r.lock_xmin, r.lock_xmax,
                                    r.lock_ymin, r.lock_ymax))
     assert r._pin_frame_to_locks() is False
+
+
+# ---------------------------------------------------------------------------
+# PARTNER_PIN_FRAME_SLOT_FROM=plain -- which worker pays for the slot
+#
+# The anchored source was measured to cost the shadow suites (v3 +0.0020 /
+# a1 +0.0056, hpwl-driven with flat v_rel): the pool loses the tag-anchored
+# candidate that used to win.  `plain` gives the slot the weakest PLAIN draw
+# instead, so all PARTNER_TAG_ANCHOR_EXTRA anchored workers survive.
+# ---------------------------------------------------------------------------
+
+def test_plain_source_converts_the_weakest_plain_draw():
+    """6 plain + 3 anchored, k=1: `specs[n_base-1]` is the one converted and
+    every anchored extra is still shipped."""
+    out = CSL._pin_slot_specs(_specs(6, 3), 1, source="plain", n_base=6)
+    assert [p for _P, _a, p in out] == ["", "", "", "", "", "1", "", "", ""]
+    assert [a for _P, a, _p in out] == [False] * 6 + [True] * 3
+
+
+def test_plain_source_walks_downward_and_never_touches_the_extras():
+    out = CSL._pin_slot_specs(_specs(6, 3), 2, source="plain", n_base=6)
+    assert [p for _P, _a, p in out] == ["", "", "", "", "1", "1", "", "", ""]
+    # k larger than the plain block still leaves one shipped PLAIN draw
+    out = CSL._pin_slot_specs(_specs(6, 3), 99, source="plain", n_base=6)
+    assert [p for _P, _a, p in out] == [""] + ["1"] * 5 + ["", "", ""]
+
+
+def test_plain_source_keeps_positions_so_seeds_and_vw_mix_are_untouched():
+    """A converted spec keeps its INDEX: `seed + 301 + 7*k` and the
+    every-third-worker PARTNER_REFINE_VW_MIX rule are index-based."""
+    base = _specs(6, 3)
+    out = CSL._pin_slot_specs(base, 2, source="plain", n_base=6)
+    assert [P for P, _a, _p in out] == [P for P, _a, _p in base]
+    assert [a for _P, a, _p in out] == [a for _P, a, _p in base]
+
+
+def test_plain_source_with_no_room_is_identity():
+    """One plain draw only: converting it would leave the pool with no
+    shipped plain draw at all, so nothing is converted."""
+    s = _specs(1, 3)
+    assert CSL._pin_slot_specs(s, 2, source="plain", n_base=1) is s
+
+
+def test_default_source_is_the_measured_anchored_behaviour():
+    assert (CSL._pin_slot_specs(_specs(6, 3), 2)
+            == CSL._pin_slot_specs(_specs(6, 3), 2, source="anchored"))
+    # an unrecognised value falls back to anchored rather than failing shut
+    assert (CSL._pin_slot_specs(_specs(6, 3), 2, source="typo")
+            == CSL._pin_slot_specs(_specs(6, 3), 2))
+
+
+def test_plain_mode_is_carried_through():
+    out = CSL._pin_slot_specs(_specs(6, 3), 1, "min", source="plain", n_base=6)
+    assert out[5][2] == "min"
+
+
+# ---------------------------------------------------------------------------
+# `_tag_lock_box_util` -- the lock-box utilization instance statistic
+# ---------------------------------------------------------------------------
+
+def _boxed(pred_span=40.0):
+    """Block 0 preplaced at x=[0,20], y=[0,40] and tagged LEFT+BOTTOM; two
+    soft blocks predicted to the RIGHT.  The lock box is
+    [0, pred_xmax] x [0, pred_ymax]: xmin/ymin come from the preplaced
+    block's edges, xmax/ymax stay on the prediction bbox."""
+    rects = [
+        (0.0, 0.0, 20.0, 40.0),
+        (20.0, 0.0, 20.0, 20.0),
+        (20.0, 20.0, 20.0, pred_span - 20.0),
+    ]
+    cons = torch.zeros((len(rects), 5))
+    cons[0, 1] = 1.0                # preplaced
+    cons[0, 4] = 1.0 + 8.0          # boundary: left | bottom
+    tpos = torch.full((len(rects), 4), -1.0)
+    tpos[0] = torch.tensor([0.0, 0.0, 20.0, 40.0])
+    return _opt(rects, cons, tpos)
+
+
+def test_lock_box_util_matches_the_hand_computed_box():
+    opt = _boxed()
+    # blocks: 800 + 400 + 400 = 1600; lock box = 40 x 40 = 1600
+    assert opt.total_area == pytest.approx(1600.0)
+    assert CSL._tag_lock_box_util(opt) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_lock_box_util_falls_with_a_looser_prediction_bbox():
+    """Free sides come from the prediction bbox: stretching the prediction
+    to twice the height (1600 -> 2400 of block area in a 40x80 lock box)
+    drops the utilization from 1.00 to 0.75."""
+    opt = _boxed(pred_span=80.0)
+    assert opt.total_area == pytest.approx(2400.0)
+    assert CSL._tag_lock_box_util(opt) == pytest.approx(0.75, abs=1e-9)
+
+
+def test_lock_box_util_is_zero_without_a_tagged_preplaced_block():
+    opt, _P = _soft_tagged()
+    assert CSL._tag_lock_box_util(opt) == 0.0
+
+
+def test_lock_box_util_never_raises_on_a_malformed_optimizer():
+    class _Broken:
+        n = 3
+        kind = [2, 0, 0]
+    assert CSL._tag_lock_box_util(_Broken()) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# `_pin_slot_gate` -- the instance-statistic gate itself
+# ---------------------------------------------------------------------------
+
+def test_gate_is_open_by_default_on_a_tag_locked_instance():
+    opt = _boxed()
+    assert CSL._pin_slot_gate(opt, 2) == 2
+    assert CSL._pin_slot_gate(opt, 2, 0.0, 0.0) == 2
+
+
+def test_gate_is_shut_without_tag_locks_whatever_the_bounds():
+    opt, _P = _soft_tagged()
+    assert CSL._pin_slot_gate(opt, 2) == 0
+    assert CSL._pin_slot_gate(opt, 2, 0.0, 2.0) == 0
+
+
+def test_max_util_gate_drops_the_tight_lock_boxes():
+    """util 1.0: a MAX bound below it shuts the gate, one above keeps it."""
+    opt = _boxed()
+    assert CSL._pin_slot_gate(opt, 2, 0.0, 0.80) == 0
+    assert CSL._pin_slot_gate(opt, 2, 0.0, 1.50) == 2
+
+
+def test_min_util_gate_drops_the_loose_lock_boxes():
+    opt = _boxed(pred_span=80.0)          # util 0.75
+    assert CSL._pin_slot_gate(opt, 2, 0.80, 0.0) == 0
+    assert CSL._pin_slot_gate(opt, 2, 0.50, 0.0) == 2
+
+
+def test_bounds_compose_into_a_band():
+    tight, loose = _boxed(), _boxed(pred_span=80.0)
+    assert CSL._pin_slot_gate(tight, 2, 0.40, 0.80) == 0   # util 1.00
+    assert CSL._pin_slot_gate(loose, 2, 0.40, 0.80) == 2   # util 0.75
+
+
+def test_zero_slots_stays_zero_through_the_gate():
+    opt = _boxed()
+    assert CSL._pin_slot_gate(opt, 0, 0.0, 2.0) == 0
+    assert CSL._pin_slot_gate(opt, -1) == 0

@@ -4375,28 +4375,154 @@ def _has_tag_locks(opt1) -> bool:
         return False
 
 
-def _pin_slot_specs(specs, n_slots, mode: str = "1"):
-    """Convert the LAST `n_slots` reserved-refine specs to the pin-frame
-    ladder (`PARTNER_PIN_FRAME_SLOTS`).
+def _pin_slot_specs(specs, n_slots, mode: str = "1",
+                    source: str = "anchored", n_base=None):
+    """Convert `n_slots` reserved-refine specs to the pin-frame ladder
+    (`PARTNER_PIN_FRAME_SLOTS`).
 
     `specs` is the `(prediction, tag_anchor, pin_mode)` list the reserved
-    workers consume.  Converting from the TAIL takes the tag-anchored extras
-    first: those already re-refine `preds[0..]`, so a converted slot costs the
-    portfolio no fresh prediction, no extra worker and no extra runtime -- the
-    worker runs the same prediction through a different ladder.  Only once the
-    extras are used up does a plain draw get converted.  At least one shipped
-    spec is always kept, so the unpinned layout is always in the pool for the
-    arbitration to prefer.
+    workers consume: `n_base` plain draws first, then the
+    `PARTNER_TAG_ANCHOR_EXTRA` tag-anchored extras.
+
+    `source` (`PARTNER_PIN_FRAME_SLOT_FROM`) picks WHICH worker pays:
+
+    * `anchored` (default = the measured SLOTS behaviour, bit-exact with the
+      pre-flag code) converts from the TAIL, i.e. the anchored extras first.
+      A converted slot costs no fresh prediction, but the pool loses one
+      ANCHORED candidate -- measured as the entire shadow cost of SLOTS=2
+      (v3 +0.0020 / a1 +0.0056, hpwl-driven with flat v_rel: the anchored
+      candidate that used to win is simply gone).
+    * `plain` converts the WEAKEST plain draws instead (`specs[n_base-1]` and
+      downward), so all `PARTNER_TAG_ANCHOR_EXTRA` anchored workers stay in
+      the pool and the candidate given up is the lowest-ranked model draw.
+
+    A converted spec keeps its INDEX, so the per-worker seed
+    (`seed + 301 + 7*k`) and the `PARTNER_REFINE_VW_MIX` every-third-worker
+    rule are untouched by the conversion; only the ladder changes.
+
+    At least one shipped spec always survives, and in `plain` mode at least
+    one shipped PLAIN spec survives too, so the emergent-tag strategy stays
+    represented in the pool whatever `k` is.
 
     `n_slots <= 0` returns `specs` itself (bit-exact off path)."""
     n = max(0, min(int(n_slots), len(specs) - 1))
     if n <= 0:
         return specs
     out = list(specs)
-    for j in range(1, n + 1):
-        _P, _anc, _ = out[-j]
-        out[-j] = (_P, _anc, mode)
+    if str(source) == "plain":
+        nb = len(out) if n_base is None else max(0, min(int(n_base), len(out)))
+        n = min(n, nb - 1)
+        if n <= 0:
+            return specs
+        idx = range(nb - 1, nb - 1 - n, -1)
+    else:
+        idx = range(len(out) - 1, len(out) - 1 - n, -1)
+    for j in idx:
+        _P, _anc, _ = out[j]
+        out[j] = (_P, _anc, mode)
     return out
+
+
+def _tag_lock_box_util(opt1) -> float:
+    """Utilization of the frame the boundary-tagged PREPLACED blocks imply
+    (`PARTNER_PIN_FRAME_SLOT_MAX_UTIL` / `_MIN_UTIL`).
+
+    A preplaced (kind 2) block carrying a boundary tag can only satisfy it
+    when the layout extreme on that side coincides with the preplaced extreme
+    there -- so the tagged sides of the final frame are known BEFORE any
+    search: they are exactly the wall lines `_Refiner._anchor_frame_to_tags`
+    (and its array mirror `layout_refiner._tag_frame_locks`) records, and
+    exactly the lines `_pin_frame_to_locks` clamps onto.  Taking the tagged
+    sides from the preplaced coordinates and the free sides from the incoming
+    prediction bbox gives the LOCK BOX -- the frame the tags demand -- and its
+    utilization
+
+        total block area / lock box area
+
+    says how much room the pinned ladder is left with.  MEASURED direction
+    (4-rep paired SLOTS=2 data, sum of weighted per-case deltas by band):
+    HIGH utilization is where the slot LOSES -- the tags cut the frame down
+    to nearly the block area, the clamped frame has no slack, the pinned
+    candidate comes out poor and the sacrificed candidate is gone for
+    nothing (a1 util>=0.8: +0.0063; v3 util in [0.9,1.0): +0.0016).  LOW
+    utilization is where it pays -- the loose box absorbs the clamp, so the
+    tag can be seated without buying it in HPWL (official tid 86, util 0.70:
+    -0.0070 on its own, the single largest per-case effect in the whole
+    experiment).  Note this is the OPPOSITE of the "tight = binding = worth
+    searching" reading of the `wall_seat_diag` `locked` class (util
+    0.80-0.97): those cases are structurally locked, and the pin cannot buy
+    them anything.
+
+    A reusable instance statistic (preplaced coordinates x boundary tags x
+    total block area), never a case identity.  Returns 0.0 -- a closed gate --
+    when there is no lock or the box degenerates."""
+    try:
+        kind = opt1.kind
+        k2 = [i for i in range(opt1.n) if int(kind[i]) == 2]
+        if not k2:
+            return 0.0
+        locks = [None, None, None, None]      # xmin, xmax, ymin, ymax
+        for i, code in zip(opt1._bnd_idx, opt1._bnd_codes):
+            i = int(i)
+            if int(kind[i]) != 2:
+                continue
+            code = int(code)
+            if code & 1:
+                locks[0] = min(float(opt1.lx[j]) for j in k2)
+            if code & 2:
+                locks[1] = max(float(opt1.lx[j]) + float(opt1.rw[j])
+                               for j in k2)
+            if code & 8:
+                locks[2] = min(float(opt1.ly[j]) for j in k2)
+            if code & 4:
+                locks[3] = max(float(opt1.ly[j]) + float(opt1.rh[j])
+                               for j in k2)
+        if all(v is None for v in locks):
+            return 0.0
+        R = opt1.rects
+        x0 = min(float(r[0]) for r in R)
+        x1 = max(float(r[0]) + float(r[2]) for r in R)
+        y0 = min(float(r[1]) for r in R)
+        y1 = max(float(r[1]) + float(r[3]) for r in R)
+        lo_x = x0 if locks[0] is None else locks[0]
+        hi_x = x1 if locks[1] is None else locks[1]
+        lo_y = y0 if locks[2] is None else locks[2]
+        hi_y = y1 if locks[3] is None else locks[3]
+        box = (hi_x - lo_x) * (hi_y - lo_y)
+        if not (box > 1e-9):
+            return 0.0
+        return float(opt1.total_area / box)
+    except Exception:
+        return 0.0
+
+
+def _pin_slot_gate(opt1, n_slots: int, min_util: float = 0.0,
+                   max_util: float = 0.0) -> int:
+    """How many pin-frame portfolio slots THIS INSTANCE gets.
+
+    Two reusable instance statistics, in order of cost:
+
+    1. `_has_tag_locks` -- with no boundary-tagged preplaced block there is
+       no `lock_*` line at all, so every pin site is a no-op and the slot
+       would just re-refine a duplicate prediction.
+    2. `_tag_lock_box_util` against `PARTNER_PIN_FRAME_SLOT_MIN_UTIL` /
+       `PARTNER_PIN_FRAME_SLOT_MAX_UTIL` (both 0 = no gate) -- how binding
+       the tag-implied frame is.  The MAX bound is the measured one: the
+       pinned candidate is worth a slot only where the lock box still has
+       slack (see the call site for the per-suite numbers).  A degenerate
+       box (`_tag_lock_box_util` -> 0.0) is gated out by either bound.
+
+    Never a case identity."""
+    if n_slots <= 0 or not _has_tag_locks(opt1):
+        return 0
+    if min_util <= 0.0 and max_util <= 0.0:
+        return int(n_slots)
+    u = _tag_lock_box_util(opt1)
+    if min_util > 0.0 and u < min_util:
+        return 0
+    if max_util > 0.0 and not (0.0 < u <= max_util):
+        return 0
+    return int(n_slots)
 
 
 def _arbitrate_champion_exact_v(pool, score, opt1, min_visits: int = 4):
@@ -4719,14 +4845,44 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                     "PARTNER_PIN_FRAME_SLOTS", "0") or 0))
             except ValueError:
                 _pin_slots = 0
-            if _pin_slots > 0 and not _has_tag_locks(opt1):
-                # no preplaced block carries a boundary tag: every pin site
-                # would be a no-op, so leave the worker shipped rather than
-                # spend a slot re-refining a duplicate prediction
-                _pin_slots = 0
+            # SLOTS=2 banked its official win on ONE case while 73-76/100
+            # cases each paid a slot, so the slot needs a reusable instance
+            # statistic to spend itself on (never a case id).  That statistic
+            # is the utilization of the tag-implied lock box (total block
+            # area / lock box area, `_tag_lock_box_util`), bounded from
+            # either side by PARTNER_PIN_FRAME_SLOT_MIN_UTIL /
+            # PARTNER_PIN_FRAME_SLOT_MAX_UTIL (both default 0 = no gate).
+            #
+            # MAX_UTIL is the bound that MEASURED: on the 4-rep paired
+            # SLOTS=2 data the slot is a net LOSS wherever the lock box is
+            # tight and neutral-to-positive where it is loose (per-suite sum
+            # of weighted per-case deltas over the live cases,
+            # official/v3/a1: -0.0108/+0.0025/+0.0055 ungated vs
+            # -0.0084/+0.0005/-0.0008 at u<=0.75).  Mechanism: a tight lock
+            # box leaves the pinned frame no slack, so the pinned candidate
+            # is poor and the slot is spent for nothing, while a loose box
+            # absorbs the clamp -- official tid 86 (util 0.70) is the one
+            # case that banks a real win.  MIN_UTIL is the opposite bound,
+            # kept so a BAND is expressible; on its own it gates out exactly
+            # the case that wins.
+            _pin_slots = _pin_slot_gate(
+                opt1, _pin_slots,
+                _env_num("PARTNER_PIN_FRAME_SLOT_MIN_UTIL", 0.0),
+                _env_num("PARTNER_PIN_FRAME_SLOT_MAX_UTIL", 0.0))
+            if _os.environ.get("PARTNER_PINFRAME_DEBUG"):
+                import sys as _sys
+                print(f"[pfslot] n={opt1.n} locks={_has_tag_locks(opt1)} "
+                      f"util={_tag_lock_box_util(opt1):.4f} "
+                      f"slots={_pin_slots}", file=_sys.stderr, flush=True)
+            # PARTNER_PIN_FRAME_SLOT_FROM=anchored|plain: which worker pays
+            # for the slot (see `_pin_slot_specs`).  `anchored` (default) is
+            # the measured behaviour and keeps the off path bit-exact.
             specs = _pin_slot_specs(
                 specs, _pin_slots,
-                _os.environ.get("PARTNER_PIN_FRAME_SLOT_MODE", "1") or "1")
+                _os.environ.get("PARTNER_PIN_FRAME_SLOT_MODE", "1") or "1",
+                source=(_os.environ.get("PARTNER_PIN_FRAME_SLOT_FROM",
+                                        "anchored") or "anchored"),
+                n_base=len(specs) - _anchor_extra)
             ref_payloads = [(np.asarray(P, dtype=np.float64),
                              np_of(area_targets), np_of(constraints),
                              np_of(target_positions), np_of(b2b),
@@ -5083,8 +5239,13 @@ def legalize_rectangles(
                                    target_positions, b2b_connectivity,
                                    p2b_connectivity, pins_pos, deadline, seed,
                                    sample_fn=sample_fn)
-        except Exception:
-            pass  # fall back to the sequential path below
+        except Exception as _exc:
+            # Silent fallback used to hide a total collapse (2026-08-27: a
+            # NameError in a debug line dropped official 1.099 -> 1.328 with
+            # no error anywhere).  Keep the fallback, make it visible.
+            import sys as _sys
+            print(f"[pool-fallback] _parallel_solve failed: {type(_exc).__name__}: "
+                  f"{str(_exc)[:120]} -> sequential path", file=_sys.stderr, flush=True)
 
     if budget < 4.0:
         return opt1.run()

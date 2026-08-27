@@ -610,3 +610,28 @@ CPU 暖機 0.996s = contest 機每案多付的 ~1s;adapt 後 runtime 回到預�
 - Gate(4 條鏈、22 個 GATE3、66 跑全 100/100):**SLOTS=2 合併 4+4 reps:official −0.0115 [−0.0282,+0.0003]、v3 +0.0020、a1 +0.0056**;runtime-aware(M=1.45)D=0.6/0.7/0.8 全部 −0.008;runtime ±1%。SLOTS=1/3、+PSEL_EXACT_V、+PSEL_FIX 皆不成 composite(EXACT_V 首次在 a1 為正 −0.019,但 v3 不救)。
 - 逐案:global 版的 tid 99(+0.13)/69(+0.175)損失消失;tid 86 1.297±0.048 → **1.069±0.042、bnd 0(16/16 跑)**,單案 = official 增益的 −0.0064(幾乎全部);v3 沒有這種 locked 大案,只付「拿走一個 anchored 候選」的 HPWL 成本。
 - **判定:default 0**;後續兩個便宜方向:①席位改從 plain draw 拿(不拿 anchored extra)②以 lock box utilization 門檻縮小啟用集(76/100 → 少數 binding 案)。
+
+### 17c. alpha_1 是不是 hidden 的樣子?(08-27,使用者朋友回報「alpha_1 ≈ 他們的 beta」)
+
+alpha_1 manifest:GT 幾何/pins/B2B/constraints/每 pin 的 P2B 度數皆保留,只把每個 pin 連到哪個 block 用 P∝(1−z)(z=pin→GT block 中心的正規化曼哈頓距離)重抽。量 P2B 距離結構(連線 block 在該 pin 距離排序的百分位;越小越近):
+
+| 套 | mean_rank_pct | 連到最近 10% 的比例 |
+|---|---|---|
+| official(LiteTensorDataTest) | **0.038** | **91.6%** |
+| v3(官方生成器新生成) | **0.039** | 90.9% |
+| alpha_1 | 0.366 | 18.1% |
+
+→ 官方生成器幾乎把 pin 接到最近的 block,v3(同生成器新 instance)完全一致;alpha_1 是我們造的 10× 隨機化**合成偏移**,不是生成器會產出的分佈。hidden 用同一生成器 → pin 結構應像 official/v3。中段(n=76–98,beta 預算下三套皆 column-only)hpwl gap:hidden 0.321、official@canonical 0.408、alpha_1 0.299、v3 0.478 —— 跨套 hpwl_gap 受 golden 基準變動干擾,不能單獨判別;P2B 統計是主證據。朋友的「像」需三個數(local official / local alpha_1 / beta)才能分辨是 solver 對 pin 不敏感(official≈alpha_1≈beta)還是真有偏移。**保險**(deadline 延至 8/31):把模型條件中的 p2b 中性化/降權,三套 gate,official/v3 不掉且 a1 大進才上。
+
+### 17d. Round 3 — 席位來源 + lock-box utilization 門檻(×3 交錯,polish off)
+
+| 臂(SLOTS=2) | official r1/r2/r3 | v3 | a1 | paired Δ off / v3 / a1(3 reps) |
+|---|---|---|---|---|
+| base | 1.0985/1.0967/1.1026 | 1.1430/1.1460/1.1435 | 1.2128/1.2072/1.2119 | — |
+| plain 來源 | 1.1003/1.1037/1.0986 | 1.1602/1.1497/1.1500 | 1.2323/1.2100/1.1956 | +0.0016 / **+0.0091 [+0.002,+0.015]** / +0.0020 → 否決 |
+| plain + MAX_UTIL 0.75 | 1.1150/1.0979/1.0933 | 1.1558/1.1474/1.1465 | 1.2183/1.2033/1.1979 | +0.0028 / +0.0057 / −0.0042 → wash |
+| **anchored + MAX_UTIL 0.75**(`PARTNER_PIN_FRAME_SLOTS=2 PARTNER_PIN_FRAME_SLOT_MAX_UTIL=0.75`) | **1.0923/1.0899/1.0889** | 1.1450/1.1400/1.1520 | **1.1903/1.1976/1.1937** | **−0.0089 [−0.022,+0.003] / +0.0015 [−0.004,+0.007] / −0.0168 [−0.035,−0.003]** |
+
+anchu:三套 mean −0.008,official/a1 3/3 同向,v3 wash;runtime 持平(0.378→0.383);M=1.45 runtime-aware D=0.6/0.7/0.8 base 0.904/0.867/0.838 → 0.899/0.861/0.832。判準「official 與 v3 皆進步」在 v3 上是 wash 而非進步;依使用者較早判準(v3+a1 mean −0.008、official 不退)可促轉。**暫列出貨候選 B**,待 deep-reasoner 報告確認 live-case 數與機制後決定是否入包。
+
+Deep-reasoner round-3 報告補充:①`MIN_UTIL`(只在緊的 lock box 開席)剛好殺掉會贏的案(tid 86 util 0.696);有效的是 **`MAX_UTIL`**(lock box 還有鬆弛才開席):official/v3/a1 live 案 50/40/15(u≤0.75),pipeline 內 official 實際 28 案開席。門檻是寬平台(u=0.70–0.90 皆 −0.006~−0.008),leave-one-suite-out 皆勝 ungated。②anchu 增益是 **HPWL 驅動**(−0.006/−0.008/−0.018)、v_rel 持平 —— 門檻把「用 wirelength 換 boundary」的案擋掉了。③runtime avg +1.3%、max +4%(re-ladder 既有 worker,在漂移內)。④**地雷**:`legalize_rectangles` 把 `_parallel_solve` 的任何例外吞掉(`except Exception: pass`)靜默退回 sequential → 一個 debug 行的 NameError 讓 official 變 1.328 而無任何錯誤;已在該 except 加 stderr 警告(見下)。⑤未關閉的 caveat:anchu 每 rep 都排第 4 位(位置混淆);u=0.75 是 in-sample 選的;a1 的 util 分佈與 official 不同(開席比例 50/40/15)。**下一步:反序鏈(anchu 先、base 後)×2 才能促轉。**
