@@ -587,3 +587,9 @@ CPU 暖機 0.996s = contest 機每案多付的 ~1s;adapt 後 runtime 回到預�
 - 上限版把 raw 增益幾乎全吐回、runtime 卻只省一半 → 只有「全開」或「全關」兩個選項。
 - 全開 raw −0.014,但 total 在每個情境都輸:M=1.0/D=1.0(最樂觀)+0.010,M=1.45/D=0.7 +0.05。polish 是 post-deadline pass(tail 26 案每案 +0.25s),與 tail 預算 ×1.3 同類的 raw/total 取捨(每秒價值相近)。
 - **出貨包定為 polish OFF**(`PARTNER_COORD_POLISH` 不設;total 口徑在所有 M/D 情境勝);要換 raw 只需在 op_wrapper 加一行 `PARTNER_COORD_POLISH=1`。本機 gate 口徑自 chain P 起改為 polish 可用但 OFF = 與出貨一致。
+
+### 16e. 最終包演練(polish OFF,含 synth_instances;`submission/cadc1013_0827_final.tar.gz`,md5 `ee7628ff225317e1b9f02f35ad854f54`,1.20 GB,34 條目)
+
+全新解壓 + 乾淨 Py3.13 venv(torch 2.6.0+cu124)+ 官方 evaluator:`[selfcheck] cuda_available=True … flow_warm_latency=0.069s`;direct step 18000 / flow step 1000000 載入;**noRT 1.1147,100/100 feasible,avg rt 0.406s,p90 0.91,max 1.48,第一案 0.057s**(JIT 已在載入期)。與本機 polish-OFF 口徑(1.09–1.106)同帶。
+
+週五上傳前只剩:①若要 raw 優先,op_wrapper 加 `"PARTNER_COORD_POLISH": "1"` 重打;②branch 推上 GitHub(需憑證)。
