@@ -473,6 +473,72 @@ def secure_fallback_expands(ran) -> tuple:
     return tuple(keep) if keep else (out[-1],)
 
 
+# --- PARTNER_LADDER_REBUDGET ----------------------------------------------
+_LAD_DBG = bool(os.environ.get("PARTNER_LADDER_DEBUG"))
+
+
+def ladder_rebudget_on() -> bool:
+    """PARTNER_LADDER_REBUDGET=1 (default off).
+
+    `refine_prediction`'s expand ladder reads as "try wider frames in order
+    until one legalizes", but only its FIRST rung is ever budgeted: rung 0
+    (the fixed frame) is capped at 0.35 of the ladder span, while the +2%
+    rung behind it calls `legalize_soft(deadline=None)` -- unbounded.  At the
+    shipping worker slices (0.25-1.1 s, with `PARTNER_REFINE_RES_FRAC` carved
+    off the top first) that single call owns every second the ladder has
+    left, so
+
+      * when it cannot close, the ladder returns None -- 23% of the attempts
+        on the official suite (120/522, 2026-08-26 census) -- and the rungs
+        behind it (0.05/0.08/0.12/0.18/0.28) are dead code at every shipping
+        budget: they are never reached at all; and
+      * when it does close, it closes LATE, so the frame anneal
+        (`_tighten`), the refiner and the repair tail inherit milliseconds.
+
+    ON: the +2% rung gets a deadline of `PARTNER_LADDER_R1_FRAC` (0.5) of the
+    ladder span left when it starts; the rungs behind it
+    (`PARTNER_LADDER_EXPANDS`, default "0.05,0.12,0.28") split the rest, the
+    last one owning the remainder; and the global 45% `rung_cap` -- whose
+    only remaining effect under per-rung deadlines would be to `continue`
+    past the very rungs this flag funds -- is retired.  Rung 0 is untouched:
+    it is cheap, it keeps its own 0.35 share, and a rung-0 success returns
+    the identical layout on either arm.
+
+    Independent of `PARTNER_REFINE_SECURE_FALLBACK`, which rescues the
+    ladder's None *after* the fact: with the rungs rebudgeted the ladder
+    reaches its own pin-less escape, so the fallback should fire rarely.
+
+    OFF -> `_reb` is False, every added site is one boolean test, and the
+    ladder is the shipped one bit for bit."""
+    return _flag_on("PARTNER_LADDER_REBUDGET")
+
+
+def ladder_expand_set() -> tuple:
+    """Frame expansions the REBUDGET ladder runs AFTER its +2% rung.
+
+    `PARTNER_LADDER_EXPANDS` (default "0.05,0.12,0.28"): three rungs where
+    the shipped ladder lists five, because the time freed from the +2% rung
+    has to buy each of them a window big enough to build a `_Refiner` and
+    close -- 0.05 is the next tight frame, 0.12 is the expansion that closes
+    109/134 of the measured fallback rungs on the first attempt (2026-08-27
+    probe), and 0.28 is the shipped ladder's own pin-less escape.  Ascending
+    and strictly increasing; malformed -> the default."""
+    raw = os.environ.get("PARTNER_LADDER_EXPANDS", "0.05,0.12,0.28")
+    out: List[float] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            v = float(tok)
+        except ValueError:
+            continue
+        # a repeated or shrinking rung is a wasted window
+        if 0.0 < v <= 3.0 and (not out or v > out[-1] + 1e-9):
+            out.append(v)
+    return tuple(out) if out else (0.05, 0.12, 0.28)
+
+
 def frame_scale_set() -> tuple:
     """PARTNER_FRAME_SCALE_LADDER=1 (default off): rung-0 frame-scale ladder.
 
@@ -7081,6 +7147,17 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
 
         rungs = ((0.02, True), (0.05, True), (0.08, True), (0.12, True),
                  (0.18, False), (0.28, False))
+        # PARTNER_LADDER_REBUDGET (default off; see `ladder_rebudget_on`).
+        # The +2% rung keeps the head of the ladder -- it is the rung that
+        # closes most often -- and everything behind it is replaced by the
+        # configured set, so each surviving rung can be handed a real window
+        # instead of staying unreachable.  `use_pins` follows the shipped
+        # split (tight frames seat their tags, the loose escape does not),
+        # which reproduces the shipped flags on the shipped values.
+        _reb = ladder_rebudget_on()
+        if _reb:
+            rungs = ((0.02, True),) + tuple((e, e <= 0.12 + 1e-9)
+                                            for e in ladder_expand_set())
         if _any:
             # escape rung: reached only when the secure rung above failed and
             # time is left.  A legal-but-loose candidate loses the
@@ -7099,11 +7176,34 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             # ... and, under ANYTIME, never past the tight-rung budget: the
             # `continue` below then jumps straight to the secure rung.
             rung_cap = min(rung_cap, t_tight)
+        _rb_r1 = 0.0
+        if _reb:
+            # per-rung deadlines replace the global cap: left in place it
+            # would `continue` past 0.05/0.12 -- the rungs this flag exists
+            # to fund -- the instant the +2% rung spent its own share.
+            rung_cap = deadline
+            _rb_t0 = time.time()
+            _rb_span = max(0.0, deadline - _rb_t0)
+            _rb_r1 = _rb_t0 + anytime_frac("PARTNER_LADDER_R1_FRAC", 0.5) \
+                * _rb_span
+            # PARTNER_LADDER_SECURE_MIN (default 0.0 = OFF -> `_rb_keep` is
+            # 0.0 and every cap below is `min(x, deadline)`, i.e. unchanged).
+            # ON: a share of the expand-ladder span that no rung but the LAST
+            # one may spend.  The census (2026-08-27, official, shipping env)
+            # shows why it exists: the shipped ladder skips its way to the
+            # 0.28 escape and closes it 98% of the time, while the rebudgeted
+            # ladder hands that same rung only what three earlier rungs left
+            # and closes it 42% -- the whole of the flag's added ladder-fail
+            # rate.  A floor buys the escape back without giving up the
+            # tight-frame conversion the earlier rungs deliver.
+            _rb_keep = anytime_frac("PARTNER_LADDER_SECURE_MIN", 0.0) \
+                * _rb_span
         for ridx, (expand, use_pins) in enumerate(rungs):
             if legal is not None or time.time() >= deadline:
                 break
             if time.time() > rung_cap and ridx < i_secure:
                 continue
+            _lad_t0 = time.time() if _LAD_DBG else 0.0
             try:
                 opt.cluster_groups = {}
                 r = _Refiner(opt, P0, seed)
@@ -7145,7 +7245,30 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
             # Tight rungs are bounded by the tight budget; the last (secure)
             # rung keeps a share back for the frame anneal and the refiner.
             _rdl = None
-            if _any:
+            if _reb:
+                # REBUDGET supersedes ANYTIME's expand-rung bounding (both
+                # size the same call; this one also funds the rungs behind
+                # it).  Every other ANYTIME effect -- rung 0's `t_tight`, the
+                # `_tg` tail caps, the TIGHTEN share -- is untouched.
+                _rb_now = time.time()
+                if ridx == 0:
+                    _rdl = min(deadline, _rb_r1)
+                elif ridx >= len(rungs) - 1:
+                    # the last rung owns the remainder: it is the pin-less
+                    # escape, and a legal-but-loose candidate beats none
+                    _rdl = deadline
+                else:
+                    # equal split of what is left across the rungs still to
+                    # come, so a frame that cannot close never eats the
+                    # escape rung's window
+                    _rdl = min(deadline, _rb_now
+                               + (deadline - _rb_now) / (len(rungs) - ridx))
+                if _rb_keep > 0.0 and ridx < len(rungs) - 1:
+                    # ... and the escape rung's floor is off limits to every
+                    # rung before it (`_rb_keep` is 0.0 by default, which
+                    # leaves this line a no-op)
+                    _rdl = min(_rdl, deadline - _rb_keep)
+            elif _any:
                 if ridx >= i_secure:
                     _rdl = min(deadline, time.time() + anytime_frac(
                         "PARTNER_ANYTIME_SECURE", 0.55)
@@ -7168,6 +7291,22 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                 r.satT[:] = False
                 r._seed_tags()
                 _pf_ok = r.legalize_soft(deadline=_rdl)
+            if (_reb and not _pf_ok and _sf_ran and _rdl is not None
+                    and time.time() >= _rdl
+                    and abs(_sf_ran[-1] - float(expand)) < 1e-9):
+                # cut off by its REBUDGET window rather than refuted by its
+                # geometry: `secure_fallback_expands` drops the expansions a
+                # rung already REFUTED, and a rung that merely ran out of
+                # clock has refuted nothing.
+                _sf_ran.pop()
+            if _LAD_DBG:
+                import sys as _sys
+                print(f"[lad] p={os.getpid()} n={opt.n} d={_depth} "
+                      f"ridx={ridx} e={expand} "
+                      f"pins={int(use_pins)} ok={int(bool(_pf_ok))} "
+                      f"win={(-1.0 if _rdl is None else _rdl - _lad_t0):.4f} "
+                      f"t={time.time() - _lad_t0:.4f}",
+                      file=_sys.stderr, flush=True)
             if _pf_ok:
                 if not use_pins:
                     # tag recovery: the pin-less rung legalized but every
@@ -7214,6 +7353,14 @@ def refine_prediction(opt, pred: np.ndarray, deadline: float,
                     break
                 elif _DEBUG:
                     print("[rp] assembly created overlap", flush=True)
+        if _LAD_DBG:
+            import sys as _sys
+            print(f"[lad] p={os.getpid()} n={opt.n} d={_depth} END "
+                  f"legal={int(legal is not None)} reb={int(_reb)} "
+                  f"slice={slice_:.4f} res={_reserve:.4f} "
+                  f"lad={time.time() - t_lad0:.4f} "
+                  f"left={t_hard - time.time():.4f}",
+                  file=_sys.stderr, flush=True)
         if legal is None and (_SF_DBG or _SEAT_DBG):
             # diagnosis-only (guarded): `ran` empty means the ladder never
             # reached an expand rung at all -- i.e. it died on TIME inside
