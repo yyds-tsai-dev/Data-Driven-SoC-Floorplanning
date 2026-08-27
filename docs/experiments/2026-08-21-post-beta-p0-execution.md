@@ -715,3 +715,34 @@ runtime 持平(0.381→0.382);runtime-aware M=1.45 D=0.6 0.918→0.906。疊在 
 - 演練 4(重組後,md5 eb5b1937):`[selfcheck] … cpu_ratio=1.91 seat_r0=adapted->0.2386` → **CPU 自校準在共用機負載下誤判 1.91×,把 R0 門檻抬高、關掉大半模型臂,official 1.1315**。而 ÷1.45 模擬已證明慢 CPU 上開臂仍划算(1.137 vs 關臂 1.155)→ R0 自校準改為 **opt-in(default off)**,只印 cpu_ratio 供診斷;TS 自校準(sampler 真的 1s 時關臂)維持。
 
 - 演練 5(R0 自校準 off,`scripts/pack_cadc1013.sh` 組包,md5 **163b885410c02ec021b6c3699d8cd62d**):`[selfcheck] cuda_available=True … seat_ts=kept 0.148 cpu_ratio=0.62 seat_r0=kept`(cpu_ratio 在同一台機器上 0.62↔1.91 漂移,證明它不能當閘門)、polish off、**noRT 1.1042,100/100,avg rt 0.370,max 1.39,第一案 0.051s**(load 29)。→ `submission/cadc1013_0827_final.tar.gz` 更新為此包(含 EARLY_EXIT + SECURE_FALLBACK)。
+
+### 17l. `PARTNER_LADDER_REBUDGET`(deep-reasoner)— 機制成立、分數部分過,**hold**
+
+- 機制(layout_refiner.py:480 `ladder_rebudget_on`、rung 列表改寫 :7157、預算計畫 :7180、逐 rung deadline :7248):+2% rung 綁 `R1_FRAC·span`,後續 rung(預設 0.05,0.12,0.28)平分剩餘、最後一級拿餘量;rung 0 不動;被時間截斷的 rung 不向 SECURE_FALLBACK 報「已駁回」。43 測試綠、off-path bit-exact。附加 `PARTNER_LADDER_SECURE_MIN`(default 0 = inert):保留給 escape rung 的最小 span。
+- Census(official 522 次 ladder):base 的 45% `rung_cap` 其實直接跳到 0.28 escape(0.28 跑 168 次、成交 165);REBUDGET 把 ~126 次 loose-frame 成交換成 0.05/0.12 的 tight-frame 成交(增益來源),代價是 escape rung 只剩殘餘時間、成交率 98%→42%,ladder 失敗 124→149(由 fallback 接手)。
+- Gate(五套、4 輪交錯、順序對調;`R1_FRAC=0.35` 勝 0.5):4 輪 official −0.016 但**全靠一輪 base 吃 load 尖峰**(avg_rt 0.484);去掉那輪:official −0.000、v3 −0.007、v5 +0.001、**v6 −0.012 [−0.023,−0.001]**、a1 −0.012 [−0.028,−0.001];runtime 不升,runtime-aware 中性(+0.0015)。
+- → public/v5 持平、v3/v6/a1 進步 = 部分達標。缺的一塊 = escape rung 視窗:chain L3 測 `REBUDGET=1 R1_FRAC=0.35 SECURE_MIN=0.30` vs base(×2 對調)。
+
+### 17m. Chain L3 — `REBUDGET=1 R1_FRAC=0.35 SECURE_MIN=0.30` vs base(五套 ×2 對調,load 27–47)
+
+| 套 | base r1/r2 | RS r1/r2 | paired Δ | 95% CI |
+|---|---|---|---|---|
+| official | 1.1003/1.0914 | 1.1217/1.0903 | **+0.0102** | [−0.0046, +0.0259] |
+| v3 | 1.1554/1.1473 | 1.1503/1.1453 | −0.0035 | [−0.0154, +0.0072] |
+| v5 | 1.1152/1.1098 | 1.1001/1.1083 | −0.0083 | [−0.0183, +0.0035] |
+| v6 | 1.1353/1.1417 | 1.1226/1.1185 | **−0.0180** | [−0.0301, −0.0091] |
+| a1 | 1.2250/1.2202 | 1.2290/1.2176 | +0.0007 | — |
+
+runtime avg 0.394→0.383;runtime-aware official 混合(r1 +0.018、r2 −0.013)。**public 不進反退(rep 1 +0.021 主導,rep 2 −0.001)、v6 大進、v3/v5 小進** → 未達「public 不退」判準,hold;再排 2 rep(chain L4)解 public 的歧義。
+
+### 17n. Chain L4(再 2 rep,順序對調)→ 合併 4 reps 判定:**hold(不入包)**
+
+| 套 | base(4) | RS(4) | paired Δ | 95% CI |
+|---|---|---|---|---|
+| official | 1.0989 ± 0.0052 | 1.1005 ± **0.0143** | +0.0017 | [−0.0094, +0.0115] |
+| v3 | 1.1531 | 1.1465 | −0.0066 | [−0.0185, +0.0038] |
+| v5 | 1.1121 | 1.1097 | −0.0024 | [−0.0118, +0.0087] |
+| v6 | 1.1343 | **1.1250** | **−0.0094** | [−0.0192, −0.0022] |
+| a1 | 1.2217 | 1.2185 | −0.0032 | — |
+
+runtime 持平(0.384→0.382);runtime-aware official 中性(+0.002)。public wash 且 RS 臂 rep 間變異是 base 的 3 倍(1.090–1.122)→ 對單次 hidden 評分是風險;只有 v6 顯著。依「public 不退且 v3/v5/v6 進步」判準不足,**保留 default off**。出貨包維持 md5 163b8854(EE + SF)。
