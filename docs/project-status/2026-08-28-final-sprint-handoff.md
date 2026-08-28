@@ -72,10 +72,10 @@ LADDER_REBUDGET (+SECURE_MIN): v6 −0.009 but public wash with 3× rep variance
 
 ## 5. Running / open (updated 08-28 12:00)
 
-- Nothing is running. GPU 2/3 are free; the fine-tune finished at step 300000
+- Nothing is running and nothing is queued. Ladder/seat track closed (§17ad: ≤0.002 headroom); slow-CPU emulation confirms the 300k swap is safe (§17ac). GPU 2/3 are free; the fine-tune finished at step 300000
   (`artifacts/flow_ft_0828/flow_ft0828_ftv1_tailT24_w0-89_lr2e-5_wu1k_bs12_s300k/`, recipe in
   `scratchpad/flow_ft_0828/STATUS.md`; launcher/exporters copied to `scratchpad/flow_ft_0828/`).
-- **Open: a classmate's model reportedly scores 1.005–1.02 on the official 100 (evaluator-run).**
+- (Closed 08-28 13:00: user decided to focus on our own solver; the classmate-model thread is dropped.) For the record: a classmate's model reportedly scores 1.005–1.02 on the official 100.
   Interface cannot leak (target_positions carries only preplaced xywh / fixed wh); the validation
   container has 0/100 exact duplicates in the 1M corpus (`…/jobs/06af0e53/tmp/valcheck/`). Decisive
   check = their beta hidden raw (leaderboard best is 1.084) and whether `LiteTensorDataTest` was in
@@ -89,10 +89,13 @@ tail (n≥102) ≈0.07 = violations 0.03 (locked class: preplaced-tag wall lines
 them; frame pinning trades HPWL for it) + area 0.018 (rung-0 frame 1.02·area_ref; constants 1.00/1.01 worse)
 + HPWL 0.015; mid band ≈0.025; n<76 ≈0.005. Model quality (Flow) is the remaining big lever, hence the fine-tune.
 
-## 7. State at session close (08-28 ~12:00)
+## 7. State at session close (08-28 ~13:30)
 
 - Ship `submission/cadc1013_0828_final.tar.gz` (md5 `b25aaa7e…`); before uploading (8/30–31) re-run the
   dry-run recipe above once more on a quiet box and check the selfcheck line. Fallback = 0827 package.
+- Where the last ≈0.02 to the 1.08 target would have to come from: the column-shipped class (official 27/100,
+  v3 31/100, weighted excess ≈+0.009 each; §17ad) — a candidate-quality (model) problem. Every solver-side
+  knob family has now been measured to the noise floor; do not re-open them.
 - Evidence for every decision today: `docs/experiments/2026-08-21-post-beta-p0-execution.md` §17o–17ab;
   gate JSONs + full logs in `artifacts/shadow/{p3*,n*,ft*,rt*,fc*,fd*,po*,pl300*}_*.{json,log}`;
   chain scripts archived in `scratchpad/gate_chains_0828/`.

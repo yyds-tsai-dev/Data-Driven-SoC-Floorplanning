@@ -903,3 +903,21 @@ runtime avg:polish +1%(off)~+10%(v6);anti0 off −8%、其他持平。official �
 | official 合併 7+7(FT2+RT2+PO,兩種 env) | 1.1102 ± 0.0054 | 1.1070 ± 0.0043 | −0.0032 [−0.023, +0.016] | 0.399 → 0.407 | hpwl −0.0055、area −0.0024、v_rel +0.0007 |
 
 合併今日全部對 v1 的配對證據:official −0.003~−0.006(7 reps,wash 偏正、**rep 間變異只有 v1 的 1/3**)、v3 −0.008(4)、v5 −0.012(4)、v6 wash(4);runtime +0–2%,runtime-aware 持平;四套 ×(2–7) reps 無一災難案(90k 的 tid 84 類已消失);載入路徑與 v1 完全相同(同 loader、同架構、EMA 張量)。v1 訓練看過 shadow 資料列而 300k 沒有 → v3/v5 的增益是保守估計。**判定:換模型**(`FLOW_CKPT` → `checkpoints/flow_matching_ft0828_tailT24_300k_ema.pt`,430 MB,包大小不變),重打包 + 乾淨 venv 演練後成為出貨包;路由(`FLOW_CKPT_TAIL`)維持 off。
+
+### 17ac. Chain EM — 慢 CPU 悲觀模擬(`budget_table_mid_m145`,預算 ÷1.45)下 v1 vs 300k EMA(official + v3 ×2 對調;load 26–51)→ 換模型在慢機上不吃虧
+
+| 套 | v1 r1/r2 | 300k r1/r2 | paired Δ [95% CI] | runtime avg / p90 |
+|---|---|---|---|---|
+| official | 1.1481/1.1559 | **1.1464/1.1409** | −0.0084 [−0.035, +0.015] | 0.275→0.276 / 0.66→0.60 |
+| v3 | 1.2605/1.2507 | 1.2584/1.2599 | +0.0035 [−0.010, +0.017] | 0.283→0.272 / 0.69→0.59 |
+
+預算縮 1/1.45 時 official −0.008、v3 wash,p90 反降(300k 候選 rung-0 成功率較高、少走 fallback)→ 出貨包的模型交換在 contest 機速度下沒有下行風險。(此表為上界版 emu145,絕對值 1.15/1.26 不代表 contest 期望;§17f 的 emu145b 才是。)
+
+### 17ad. 席位回收/自適應 rung-0 可行性普查(deep-reasoner,08-28 下午)— **無機制可過噪音下限,ladder 軌收工**
+
+- 三次普查跑(GPU 0,現包 env,`PARTNER_LADDER_DEBUG=1 PARTNER_SECURE_FALLBACK_DEBUG=1 PARTNER_SEAT_DEBUG=1`):official/300k 1.1026、official/v1 1.1041、v3/300k 1.1547(單 rep,只用計數統計)。
+- 席位供給不是瓶頸:direct 候選/派席 = 96/90/88/99%(四帶,official 300k),**0 個空 direct 案**,每案最少 2、中位 8。
+- rung-0 失敗 ≠ 浪費:522 次 ladder 中 rung 0 成交 87(16.7%)、expand 成交 311、失敗 124(23.8%)、`_secure_fallback` 救回 103 → **只有 19 席(3.6%)回 None**,且無一案關鍵。方向 (b)(回收)沒有東西可回收。
+- 真正的缺陷是「鬆框」:51% 的 direct 候選來自 e=0.28 escape 或 sf0.12/0.28 fallback;12/61 段(300k)沒有任何席位成交在 ≤0.12 的框,該類佔權重 9.6%、平均 1.254 vs 其餘 1.086 → 加權超額 +0.016。但 REBUDGET(唯一能收緊的機制)在同一普查上:loose8 −0.0018、other92 +0.0018、合計 +0.00002 —— **完美瞄準的上限也只有 −0.002**,與 §17n 的 4-rep wash 一致;重案是 HPWL-limited(hpwl_gap 0.43–0.52、area 0.09–0.11),框只動 area(權重 0.5)。
+- 方向 (a)(每席自適應 rung 0)不可行:rung-0 成功/失敗的時間分佈(median 0.26–0.45 vs 0.35–0.41 span)重疊,只有 p90 尾可分;砍 0.55·span 會丟 15–20% 的 rung-0 成交,省下的時間落到無界的 e=0.02 rung 與 escape,把 sf0.12 成交換成更鬆的 e=0.28。把 expand rung 綁 ladder deadline 也不行(成交 rung 常在 deadline 後 30–46% 才完成)。
+- **判定:不改碼、不 gate;出貨包 0828 維持。** 剩下最大的可重用類別 = **column 出貨案**(official 27/100、v3 31/100,加權超額各 ≈+0.009,含 official 最重的 n=100/101 兩案)—— 是候選品質(模型)問題,不是排程;若還有時間只能往模型走。普查腳本與分析器在 `~/.claude/jobs/06af0e53/tmp/seatfix/`(an1–an6.py 可讀任何 `[lad]/[sf]/[rp0]` dump)。
