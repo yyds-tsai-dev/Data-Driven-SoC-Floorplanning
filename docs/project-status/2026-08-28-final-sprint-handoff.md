@@ -77,3 +77,9 @@ LADDER_REBUDGET (+SECURE_MIN): v6 −0.009 but public wash with 3× rep variance
 tail (n≥102) ≈0.07 = violations 0.03 (locked class: preplaced-tag wall lines with 5–14 blocks past
 them; frame pinning trades HPWL for it) + area 0.018 (rung-0 frame 1.02·area_ref; constants 1.00/1.01 worse)
 + HPWL 0.015; mid band ≈0.025; n<76 ≈0.005. Model quality (Flow) is the remaining big lever, hence the fine-tune.
+
+## 7. State at session close (08-28 ~01:00)
+
+- Flow fine-tune: the agent had built the data index (`scratchpad/flow_ft_0828/{build_file_n_index.py,file_n_index.json,ft_launch.py}`) but **training had not started yet** (GPU 2 idle). Check `scratchpad/flow_ft_0828/STATUS.md` and `artifacts/flow_ft_0828/train.log`; if absent, the next session must decide whether to launch `ft_launch.py` (read it first) — a gated checkpoint is needed by 8/30 evening or the model track is dropped.
+- chain P3 (running) → chain N (queued) on GPU 3; analyse results from `artifacts/shadow/` with `scripts/gate/analyze_pairs.py` (base tags `p3Base_r*`, `nBase_r*`).
+- Bundle of the branch: `submission/final-sprint-0827.bundle` (21 commits over origin/main).
