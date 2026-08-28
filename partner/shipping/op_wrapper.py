@@ -15,9 +15,19 @@ _BUDGET_TABLE_MID = "0.050,0.050,0.050,0.050,0.050,0.050,0.050,0.050,0.050,0.050
 
 for k, v in {
     # Checkpoints: DIRECT_CKPT is the v2 student (s2, 20k) checkpoint;
-    # FLOW_CKPT is the flow-matching v1 final checkpoint.
+    # FLOW_CKPT is the tail-tilted fine-tune of flow v1 (300k-step cosine
+    # anneal, EMA-only export; 2026-08-28, docs Sec.17x-17ab): vs v1 official
+    # -0.003..-0.006 (7 paired reps, 1/3 the rep variance), v3 -0.008,
+    # v5 -0.012, v6 wash; runtime +0-2%; same loader/architecture as v1.
     "DIRECT_CKPT": str(HERE / "checkpoints" / "direct_v2_student_s2.pt"),
-    "FLOW_CKPT": str(HERE / "checkpoints" / "flow_matching_v1_final.pt"),
+    "FLOW_CKPT": str(HERE / "checkpoints" / "flow_matching_ft0828_tailT24_300k_ema.pt"),
+    # Block-count-routed SECOND flow prior (docs/experiments/
+    # 2026-08-21-post-beta-p0-execution.md Sec.17t).  DISABLED: uncomment both
+    # lines only if the routed arm passes the five-suite gate; with them
+    # commented out the primary FLOW_CKPT model serves every case, exactly as
+    # the packaged build does today.
+    # "FLOW_CKPT_TAIL": str(HERE / "checkpoints" / "flow_matching_tail.pt"),
+    # "PARTNER_FLOW_TAIL_MIN_N": "95",
     "VKILL_OFF": "1",
     "PARTNER_POOL": "24",
     "PARTNER_NREF": "9",
@@ -30,6 +40,8 @@ for k, v in {
     "PARTNER_DDIM_STEPS": "2",
     "PARTNER_FLOW_SOLVER": "euler",
     "PARTNER_FLOW_STEPS": "8",
+    # ANTITHETIC=0 gated -0.011 alone (2026-08-28 chains N+N2) but was
+    # withdrawn with polish after the combined same-chain check (FC1+FC2).
     "PARTNER_FLOW_ANTITHETIC": "1",
     "PARTNER_FLOW_SLOTS": "10",
     "PARTNER_PRESCREEN_V": "1",
@@ -56,8 +68,11 @@ for k, v in {
     "PARTNER_SEAT_FINAL": "1",
     "PARTNER_TAG_COMPRESS": "1",
     "PARTNER_GROUP_BRIDGE": "1",
-    # PARTNER_COORD_POLISH deliberately unset: raw -0.014 but +0.25 s post-deadline
-    # on every n>=95 case -> runtime-aware total worse in every scenario (2026-08-27).
+    # PARTNER_COORD_POLISH deliberately unset: the unbounded 300 ms pass was
+    # raw -0.014 but +0.25 s on every n>=95 case (2026-08-27); the 0.6 s
+    # headroom-gated variant gated -0.008 alone (2026-08-28 chains P3+P4) but
+    # the combined polish+ANTITHETIC=0 env measured +0.005 / runtime +8%
+    # against this exact env in the same chain (chains FC1+FC2) -> withdrawn.
     "PARTNER_GPU_ARM": "0",
     "PARTNER_RETRIEVAL_SLOTS": "0",
     "PARTNER_REFINE_RES_FRAC": "0.45",
@@ -99,7 +114,23 @@ def _warm_jit_kernels() -> None:
         pass
 
 
+def _warm_coord_polish() -> None:
+    """Pre-import the polish module and its scipy LP backend in the untimed
+    module-load window, so the first polished case does not pay the scipy
+    import (~0.3 s) inside its runtime.  Contained: any failure leaves the
+    lazy in-case import in place (polish then silently no-ops if scipy is
+    genuinely unavailable)."""
+    if not os.environ.get("PARTNER_COORD_POLISH"):
+        return
+    try:
+        import coord_polish  # noqa: F401
+        from scipy.optimize import linprog  # noqa: F401
+    except Exception:
+        pass
+
+
 if os.environ.get("PARTNER_JIT_WARM", "1") in ("1", "true", "True", "yes"):
     _warm_jit_kernels()
+    _warm_coord_polish()
 
 MyOptimizer = ContestOptimizer

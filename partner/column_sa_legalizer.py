@@ -4559,6 +4559,67 @@ def _arbitrate_champion_exact_v(pool, score, opt1, min_visits: int = 4):
     return best
 
 
+def psel_selector_params(base_dz: float = 0.985):
+    """Calibration of the pool arbitration in `_parallel_solve`.
+
+    Returns `(hp_ref_divisor, dead_zone)`.  With none of the environment
+    variables below set the return value is exactly `(1.0, 0.985)`, the
+    caller skips the division entirely, and the selection is bit-identical
+    to the shipped constant expression.
+
+    Why this exists as a function: `PARTNER_PICK_MARGIN`
+    (`contest_optimizer.py`, "direct/flow candidate must beat the column
+    champion's proxy score by this factor") reaches ONLY the no-pool
+    `_pick_best` path -- on the production pool path the dead zone was the
+    hard-coded 0.985 below and no environment variable could move it
+    without also moving `hp_ref` (`PARTNER_PSEL_FIX`).  The two are
+    independent calibrations and are now independently addressable.
+
+      PARTNER_PSEL_DZ   (default = the shipped 0.985, or PSEL_FIX's value
+                        when that flag is on): the channel-swap dead zone.
+                        1.0 removes the column channel's handicap.
+      PARTNER_PSEL_G    (default 0.0 = off): divide `hp_ref` (the POOL
+                        minimum hpwl) by (1 + G).  The evaluator's hpwl
+                        denominator is the GOLDEN hpwl, which is smaller by
+                        a factor (1 + g); dividing restores the official
+                        hpwl / area / violation weighting.  `g` is a
+                        calibration CONSTANT, never a per-case lookup.
+                        Measured median g under the shipping config
+                        (official tail, 46 cases, flow v1) is ~0.07 -- the
+                        0.29 that `PARTNER_PSEL_FIX` assumes was measured
+                        at the old 0.3 s / column-only operating point.
+      PARTNER_PSEL_FIX  legacy combined flag; unchanged semantics.
+
+    MEASURED (2026-08-28, shipping env, official tail n>=76, PSEL dump,
+    every pool candidate re-scored under the OFFICIAL cost): the WHOLE
+    in-pool selection regret is +0.00009 weighted and `dz=1.0` recovers
+    -0.00003 of it.  These knobs are documentation and re-testability, NOT
+    promotion candidates.
+    """
+    div = 1.0
+    dz = base_dz
+    if _flag_on("PARTNER_PSEL_FIX"):
+        div = 1.0 + _env_num("PARTNER_PSEL_FIX_G", 0.29)
+        dz = _env_num("PARTNER_PSEL_FIX_DZ", 1.0)
+    g = _env_num("PARTNER_PSEL_G", 0.0)
+    if g > 0.0:
+        div *= (1.0 + g)
+    return div, _env_num("PARTNER_PSEL_DZ", dz)
+
+
+def psel_pick(best_col, best_dir, score, dz):
+    """Channel arbitration: `(winner, winner_is_direct)`.
+
+    Verbatim extraction of the shipped expression -- a direct/flow
+    candidate replaces the column champion only when it beats it by the
+    dead-zone factor `dz`."""
+    if best_dir is not None and (
+            best_col is None
+            or score(best_dir) < dz * score(best_col)):
+        return best_dir, True
+    return best_col, False
+
+
 def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                     b2b, p2b, pins, deadline, seed, sample_fn=None):
     avg_area = opt1.total_area / max(opt1.n, 1)
@@ -4959,10 +5020,9 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
     # compete for is G1 = 0.0005 weighted (see the T1 probe), i.e. an order of
     # magnitude under the single-rep measurement floor -- the flag exists so
     # the defect is documented and re-testable, NOT as a promotion candidate.
-    _dz = 0.985
-    if _flag_on("PARTNER_PSEL_FIX"):
-        hp_ref = hp_ref / (1.0 + _env_num("PARTNER_PSEL_FIX_G", 0.29))
-        _dz = _env_num("PARTNER_PSEL_FIX_DZ", 1.0)
+    _div, _dz = psel_selector_params()
+    if _div != 1.0:
+        hp_ref = hp_ref / _div
 
     def score(o):
         _out, hp, area, V = o
@@ -4985,12 +5045,7 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         best_dir = min(ref_outs, key=score) if ref_outs else None
     # a direct candidate must beat the column result by a clear margin —
     # marginal swaps are proxy-noise coin flips
-    if best_dir is not None and (
-            best_col is None
-            or score(best_dir) < _dz * score(best_col)):
-        win, win_is_ref = best_dir, True
-    else:
-        win, win_is_ref = best_col, False
+    win, win_is_ref = psel_pick(best_col, best_dir, score, _dz)
 
     if sa_stats_on():
         # P4 channel-resolved dead space.  Measured on the COLUMN champion

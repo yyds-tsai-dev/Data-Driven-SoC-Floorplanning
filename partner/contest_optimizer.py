@@ -375,6 +375,10 @@ class MyOptimizer(FloorplanOptimizer):
         self._load_direct_model()
         self.flow_model = None
         self._load_flow_model()
+        self.flow_tail_model = None
+        self.flow_tail_cfg = None
+        self.flow_tail_min_n = 0
+        self._load_flow_tail_model()
         self.retrieval_index = None
         self.retrieval_slots = 0
         # PARTNER_VAUDIT_JSONL bookkeeping (see module-level _vaudit_* below)
@@ -409,6 +413,7 @@ class MyOptimizer(FloorplanOptimizer):
         handover build."""
         self.flow_warm_succeeded = False
         self.flow_warm_latency = None
+        self.flow_tail_warm_latency = None
         if os.environ.get("PARTNER_FLOW_WARM", "0") not in (
                 "1", "true", "True", "on", "ON"):
             return
@@ -469,8 +474,41 @@ class MyOptimizer(FloorplanOptimizer):
             self._sample_flow_preds(n, at, cons, tpos, b2b, p2b, pins, samples)
             warm_lat = time.time() - _t0
             self.flow_warm_latency = warm_lat
+            # Block-count router (FLOW_CKPT_TAIL): the tail prior is a second
+            # 107.5M model and pays its own CUDA/JIT cold start, so it must be
+            # warmed in the SAME untimed constructor window -- otherwise the
+            # first tail-band case of a run eats it.  Its warm latency then
+            # feeds the SAME seat gate: `PARTNER_DIRECT_SEAT_TS` is a single
+            # global constant, so the gate must be sized by the SLOWER of the
+            # two samplers or a slow tail model would open arms it cannot
+            # finish.  Off (no tail model) -> this block is skipped and
+            # `warm_lat` reaches the gate exactly as before.
+            self.flow_tail_warm_latency = None
+            if self._flow_route(max(n, self.flow_tail_min_n)) is not None:
+                try:
+                    _saved = (self.flow_model, self.flow_cfg)
+                    self.flow_model, self.flow_cfg = (self.flow_tail_model,
+                                                      self.flow_tail_cfg)
+                    try:
+                        self._sample_flow_preds(
+                            n, at, cons, tpos, b2b, p2b, pins, samples)
+                        _t1 = time.time()
+                        self._sample_flow_preds(
+                            n, at, cons, tpos, b2b, p2b, pins, samples)
+                        self.flow_tail_warm_latency = time.time() - _t1
+                    finally:
+                        self.flow_model, self.flow_cfg = _saved
+                except Exception as exc:
+                    # a tail model that cannot sample is worse than no router
+                    self.flow_tail_model = None
+                    self.flow_tail_cfg = None
+                    self.flow_tail_min_n = 0
+                    self.flow_tail_warm_latency = None
+                    print(f"[flowtail] warm-up failed, router disabled: {exc}",
+                          file=sys.stderr, flush=True)
+            gate_lat = max(warm_lat, self.flow_tail_warm_latency or 0.0)
             ts_assumed = _env_float("PARTNER_DIRECT_SEAT_TS", 0.148)
-            ts_measured = warm_lat / max(n / 100.0, 1e-6)
+            ts_measured = gate_lat / max(n / 100.0, 1e-6)
             adapted = False
             # CPU-speed self-calibration for the gate's refine term.  The
             # rung-0 cost constant (PARTNER_DIRECT_SEAT_R0, 0.125 s @ n=100)
@@ -515,6 +553,9 @@ class MyOptimizer(FloorplanOptimizer):
             print(f"[selfcheck] cuda_available={torch.cuda.is_available()} "
                   f"device={self.device} flow_warm_n={n} "
                   f"flow_warm_latency={warm_lat:.3f}s "
+                  f"flow_tail_warm_latency="
+                  f"{'-' if self.flow_tail_warm_latency is None else format(self.flow_tail_warm_latency, '.3f') + 's'} "
+                  f"flow_tail_min_n={self.flow_tail_min_n} "
                   f"seat_ts_assumed={ts_assumed:.3f} "
                   f"seat_ts={'adapted->' if adapted else 'kept '}"
                   f"{ts_measured if adapted else ts_assumed:.3f} "
@@ -674,6 +715,76 @@ class MyOptimizer(FloorplanOptimizer):
             self.flow_model = None
             if self.verbose:
                 print(f"flow model unavailable: {exc}")
+
+    def _load_flow_tail_model(self) -> None:
+        """Block-count-routed SECOND flow prior (default off).
+
+        `FLOW_CKPT_TAIL=<path>` + `PARTNER_FLOW_TAIL_MIN_N=<int>`: cases with
+        `block_count >= MIN_N` sample from this checkpoint, every other case
+        from the primary `FLOW_CKPT` model.  ONE model is sampled per case, so
+        no per-case runtime is added; the second checkpoint costs load time
+        and VRAM in the constructor, which the evaluator runs OUTSIDE its
+        per-case timer.
+
+        Why block count: a tail-tilted fine-tune trades mid-band
+        legalizability for tail quality.  Measured 2026-08-28 (Sec.17t,
+        shipping env, PSEL dump, paired same-process, arm order alternated):
+        the refined-candidate supply of the direct/flow channel moved 7.36 ->
+        4.57 at n=76-89 (4 of 14 cases lost the channel entirely and shipped
+        a column layout worth +0.15 to +2.0 cost) while it moved 5.87 -> 7.67
+        at n=90-104 and 8.12 -> 8.75 at n=105-120.  Block count is a reusable
+        instance statistic -- never a case id.
+
+        OFF PATH (default): `FLOW_CKPT_TAIL` unset/empty/missing, or
+        `PARTNER_FLOW_TAIL_MIN_N <= 0` -> `self.flow_tail_model` stays None,
+        `_flow_route` returns None on every call, and `_sample_flow_preds`
+        runs the primary model exactly as today.  Any load failure disables
+        the tail model only; the primary is never touched.
+        """
+        self.flow_tail_model = None
+        self.flow_tail_cfg = None
+        self.flow_tail_min_n = _env_int("PARTNER_FLOW_TAIL_MIN_N", 0)
+        path = os.environ.get("FLOW_CKPT_TAIL", "").strip()
+        slots = _env_int("PARTNER_FLOW_SLOTS", 0)
+        if (self.flow_model is None or self.flow_tail_min_n <= 0
+                or not path or slots <= 0 or not Path(path).exists()):
+            self.flow_tail_min_n = 0
+            return
+        try:
+            from flow_matching_train import checkpoint_method
+            ckpt = torch.load(path, map_location=self.device, weights_only=False)
+            checkpoint_method(ckpt)
+            from direct_diffusion_model import DirectDenoiser, DirectModelConfig
+            cfg = DirectModelConfig(**{k: v for k, v in ckpt["model_config"].items()
+                                       if k in DirectModelConfig.__dataclass_fields__})
+            model = DirectDenoiser(cfg).to(self.device)
+            model.load_state_dict(ckpt.get("ema") or ckpt["model"])
+            model.eval()
+            self.flow_tail_model = model
+            self.flow_tail_cfg = cfg
+            if self.verbose:
+                print(f"loaded flow TAIL model step {ckpt.get('step')} from "
+                      f"{path} (min_n={self.flow_tail_min_n})")
+        except Exception as exc:
+            self.flow_tail_model = None
+            self.flow_tail_cfg = None
+            self.flow_tail_min_n = 0
+            print(f"[flowtail] tail model unavailable, primary only: {exc}",
+                  file=sys.stderr, flush=True)
+
+    def _flow_route(self, block_count: int):
+        """`(model, cfg)` of the TAIL prior for this case, else None.
+
+        None on every call when the router is off, and also while the tail
+        model is already installed (identity test) so `_sample_flow_preds`
+        cannot recurse."""
+        if (self.flow_tail_model is None
+                or self.flow_tail_min_n <= 0
+                or self.flow_model is self.flow_tail_model):
+            return None
+        if int(block_count) < self.flow_tail_min_n:
+            return None
+        return (self.flow_tail_model, self.flow_tail_cfg)
 
     def _load_model(self) -> None:
         if not self.checkpoint_path.exists():
@@ -1801,6 +1912,20 @@ class MyOptimizer(FloorplanOptimizer):
         (default 0 -> unchanged).  The ZORDER / NOPT sub-samplers keep their
         own pinned seeds, so under those opt-in flags a PARTNER_GPU_ARM second
         wave can repeat wave-1 flow candidates; the legalizer de-duplicates."""
+        # Block-count router (default off -> `_flow_route` returns None and
+        # nothing below changes).  The tail prior is installed for the
+        # duration of ONE call, so every sub-sampler that reads
+        # `self.flow_model` / `self.flow_cfg` sees it without duplicating a
+        # line of the sampling body.
+        _route = self._flow_route(n)
+        if _route is not None:
+            _saved = (self.flow_model, self.flow_cfg)
+            self.flow_model, self.flow_cfg = _route
+            try:
+                return self._sample_flow_preds(
+                    n, at, cons, tpos, b2b, p2b, pins, K, gen_seed=gen_seed)
+            finally:
+                self.flow_model, self.flow_cfg = _saved
         from direct_diffusion_train import fast_condition
         from direct_diffusion_model import known_z_channels
         from flow_matching_model import sample_flow

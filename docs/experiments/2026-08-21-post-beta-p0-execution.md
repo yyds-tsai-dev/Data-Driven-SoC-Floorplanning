@@ -746,3 +746,160 @@ runtime avg 0.394→0.383;runtime-aware official 混合(r1 +0.018、r2 −0.013)
 | a1 | 1.2217 | 1.2185 | −0.0032 | — |
 
 runtime 持平(0.384→0.382);runtime-aware official 中性(+0.002)。public wash 且 RS 臂 rep 間變異是 base 的 3 倍(1.090–1.122)→ 對單次 hidden 評分是風險;只有 v6 顯著。依「public 不退且 v3/v5/v6 進步」判準不足,**保留 default off**。出貨包維持 md5 163b8854(EE + SF)。
+
+### 17o. Chain P3 — polish 兩種限時變體(五套 ×2 對調,load 40–47;08-28 02:05–03:25)
+
+臂:base = 出貨 env(polish off);Carve = polish on + 預算表 ×0.85(把 polish 時間從 SA 預算裡刻出來);Head = polish on + `PARTNER_COORD_POLISH_HEADROOM_S=0.6`(案已花 >0.6 s 就跳過 polish;每案 polish ≤300 ms)。
+
+| 套 | base(2) | Carve(2) | Head(2) | Δ Carve | Δ Head [95% CI] |
+|---|---|---|---|---|---|
+| official | 1.1066 ± 0.0058 | 1.1134 | **1.0993** | +0.0069 | **−0.0073** [−0.020, +0.006] |
+| v3 | 1.1622 | 1.1756 | **1.1471** | +0.0134 | **−0.0152** [−0.026, −0.006] |
+| v5 | 1.1058 | 1.1257 | 1.1113 | +0.0199 | +0.0055 [−0.003, +0.013] |
+| v6 | 1.1285 | 1.1356 | **1.1222** | +0.0071 | −0.0063 [−0.017, +0.003] |
+| a1 | 1.2224 | 1.2237 | 1.2185 | +0.0014 | −0.0039 |
+
+- Carve:五套全退(hpwl +0.014~+0.034;tid 78/79/80/81/82 級大敗 = 預算 ×0.85 讓中段案掉臂)→ **否決**。
+- Head:official/v3/v6/a1 進、v5 退(hpwl +0.008、area +0.007;tid 80/96/97/98);v3 顯著(v_rel −0.006)。runtime avg:official 0.411→0.402、v3 0.409→0.417、v5 0.392→0.413、v6 0.385→0.406(+3–5%);max 持平。runtime-aware official(M=1.45,D=0.6/0.7/0.8):0.9324/0.8918/0.8603 → **0.9222/0.8813/0.8484(−0.010/−0.010/−0.012)**。
+- 判定:未達「v3/v5/v6 皆進」(v5 反向);但為目前唯一 official+v3 同向且 runtime-aware 為正的非模型 knob → **hold,排 chain P4(反序 ×2)合併 4 reps 再判**;若入包,op_wrapper 需加 `PARTNER_COORD_POLISH=1 PARTNER_COORD_POLISH_HEADROOM_S=0.6`,且乾淨 venv 演練必須確認 scipy 可 import(beta 真因)。
+
+### 17p. 主辦回覆(08-28):hidden 的 p2b / b2b **沒有移動** → alpha_1 退場
+
+§17c 的判定被主辦證實:hidden 與 official/v3 同生成器、pin 結構一致。alpha_1(合成 pin 偏移)自此不列入判準,`run_gate5.sh` 不再跑 a1(省 ~1.5 min/gate);判準 = official + v3 + v5/v6。§17b/17d/17f 中「只有 a1 增益」的 knob(PIN_FRAME_SLOTS、anchu、p2b-off 席位)確定不入包。
+
+### 17q. Chain N — Flow sampler 三 knob(×2 對調;load 37→17→64,**base r2 排最後吃到 load 50–64 尖峰**)
+
+| 套 | base r1/r2 | heun r1/r2 | T108 r1/r2 | anti0 r1/r2 | Δ T108 (2 reps) | Δ anti0 (2 reps) |
+|---|---|---|---|---|---|---|
+| official | 1.1000/**1.1147** | 1.2761/1.3056 | 1.0940/1.1055 | 1.1009/1.0917 | −0.0076 [−0.018,+0.003] | −0.0110 [−0.023,−0.001] |
+| v3 | 1.1479/1.1560 | 1.3697/1.3707 | 1.1487/1.1473 | 1.1468/1.1437 | −0.0040 | −0.0067 |
+| v5 | 1.1038/1.1187 | 1.2868/1.3019 | 1.1008/1.1111 | 1.1115/1.0982 | −0.0053 | −0.0064 |
+| v6 | 1.1245/1.1318 | 1.3366/1.3492 | 1.1201/1.1264 | 1.1266/1.1223 | −0.0049 | −0.0037 |
+
+- `PARTNER_FLOW_SOLVER=heun`:+0.18–0.22 全套災難(每步 2 次 NFE,sampler 時間翻倍 → 模型臂關閉/預算被吃)→ **否決**。
+- 預算表 ×1.08(`budget_table_mid108`):raw 四套小賺 −0.004~−0.008,但 runtime avg v3 +8%、v5 +6%、v6 +4%(official 持平);runtime-aware official(M=1.45)0.9221→0.9153(−0.007)幾乎全來自 base r2 的 load 尖峰。只看 r1 配對:off −0.006、v3 +0.001、v5 −0.003、v6 −0.004。加預算換分在慢機上更貴 → **否決**(與 §15n tail ×1.3–2.0 同結論)。
+- `PARTNER_FLOW_ANTITHETIC=0`:2-rep 四套同向(official 顯著)、runtime avg −6%(off)…但 anti0 兩 rep 排第 4/5 位(load 20–33),base r2 排第 8(load 50–64);只看 r1 配對:off +0.001、v3 −0.001、v5 +0.008、v6 +0.002 = wash。位置混淆未解 → **chain N2(anti0 先、base 後 ×2)合併 4 reps 再判**。
+
+### 17r. Flow fine-tune gate #1 — step 90k EMA vs v1(四套 ×2 對調;load 56→28 遞減,base r1 吃到 56–61)
+
+Fine-tune 配方見 `scratchpad/flow_ft_0828/STATUS.md`(tail-tilt 檔案抽樣 T=24、worker 0–89、lr 2e-5 cosine 300k、目標函數與 v1 bit-exact)。候選 = `artifacts/flow_ft_0828/flow_ft0828_tailT24_lr2e-5_step90k.pt`(EMA;preflight 用 `_load_flow_model` 同路徑載入 OK,`flow_matching_v3`)。
+
+| 套 | v1 r1/r2 | ft90k r1/r2 | paired Δ [95% CI] | 分解 |
+|---|---|---|---|---|
+| official | 1.1177/1.1022 | **1.0996/1.0941** | **−0.0131** [−0.031, +0.004] | hpwl −0.018、area −0.004;r2 對 r2(load 同級)−0.008 |
+| v3 | 1.1557/1.1508 | 1.1869/**1.1374** | +0.0089 [−0.034, +0.077] | v_rel −0.005 但 hpwl +0.015、area +0.020;r1 被 tid 84 一案(1.12→**3.13**)吃掉 |
+| v5 | 1.1125/1.1090 | 1.1108/1.1143 | +0.0018 | v_rel −0.006、hpwl +0.018、area +0.008 |
+| v6 | 1.1360/1.1371 | **1.1295/1.1240** | −0.0098 [−0.035, +0.012] | hpwl −0.008 |
+
+runtime avg 四套皆降 1–6%(off 0.397→0.386、v6 0.406→0.382),max 持平;runtime-aware official(M=1.45)0.9256→**0.9078(−0.018)**。
+
+**逐案災難類(base 兩 rep 穩定、ft 兩 rep 皆爆)**:v3 tid 84(n=105)1.12 → 3.13/1.29(hpwl_gap 1.82、area_gap 1.25、bnd 5);v3 tid 82 1.146→1.246×2(grp 1→4);v3 tid 93(n=114)1.005→1.072×2;off tid 58(n=79)1.04→1.31/1.18(hpwl_gap 0.20);off tid 89(n=110)1.25→1.37×2(bnd 4→6);v5 tid 90(n=111)1.185→1.33/1.38(hpwl_gap 0.17/0.48);v5 tid 95 1.07→1.17/1.21;v6 tid 66(n=87)1.117→1.34/1.36(hpwl_gap 0.30);v6 tid 91 1.19/1.12→1.27/1.33。共同點:**hpwl_gap 0.2–1.8 的候選仍贏得仲裁** —— 「column 冠軍當地板」的假設在這些案失效(proxy 盲點或 ft 候選讓 ladder 全失敗後寬框 fallback 勝出)。
+
+判定:off/v6 尾段真有增益(HPWL 驅動、runtime 反降),v3/v5 被少數災難案抵銷 → **不促轉 90k;不殺訓練**(300k 退火 ≈08:10);災難機制交 deep-reasoner 診斷(仲裁哪一級選了 hpwl_gap>0.2 的候選、可否加 guard),300k 再 gate。第二臂 fine-tune 暫緩,等診斷。
+
+### 17s. Chain P4(polish HEADROOM 0.6 反序 ×2)→ 合併 4 reps:**promote `PARTNER_COORD_POLISH=1 PARTNER_COORD_POLISH_HEADROOM_S=0.6`**
+
+| 套 | base(4) | Head(4) | paired Δ | 95% CI | P4-only Δ(反序) | 分解 |
+|---|---|---|---|---|---|---|
+| official | 1.1068 ± 0.0034 | **1.0987 ± 0.0029** | **−0.0081** | [−0.0154, −0.0009] | −0.0090 | hpwl −0.008、area −0.007 |
+| v3 | 1.1574 | **1.1486** | **−0.0089** | [−0.0145, −0.0042] | −0.0026 | v_rel −0.002、area −0.006 |
+| v5 | 1.1124 | 1.1106 | −0.0019 | [−0.0098, +0.0053] | −0.0092 | wash(P3 正序 +0.006、P4 反序 −0.009 = 位置效應) |
+| v6 | 1.1303 | **1.1242** | **−0.0060** | [−0.0123, −0.0003] | −0.0058 | area −0.007 |
+
+runtime avg:official 0.404→0.409(+1%)、v3/v5/v6 +3–4.5%(polish ≤300 ms 只加在 elapsed ≤0.6 s 的案);max 持平(off 1.40→1.43、v5 1.81→1.56);runtime-aware official(M=1.45,4 reps 平均)D=0.6/0.7/0.8:0.9287/0.8883/0.8570 → **0.9252/0.8842/0.8511(−0.004/−0.004/−0.006)**。兩種臂順序皆同向、三套顯著、v5 不退 → 達判準,**入出貨 env**。失效模式有界:contest 機若 scipy import 失敗,`_coord_polish` 的 try/except 回傳原 layout(= 現包行為);打包演練需確認乾淨 venv 內 scipy 可 import 且 polish 真的有跑。
+
+### 17t. FT 災難案真因(deep-reasoner,08-28 05:30)— **不是仲裁,是 ft 預測在 n=76–89 過不了 rung 0 → direct 通道空 → column 冠軍出貨**
+
+- 通道判別(gate JSON 的 `positions`,distinct left-x 數:column ≈14–26、refined direct ≈0.6n):v3 tid 84 base nx=83/util 0.906/1.122 → ft nx=21/util 0.428/**3.128**;off 58 nx 63→16;v6 66 nx 69→21。四個 gate JSON 720 個尾段 case-run:column 出貨 73 次平均 **1.256**,direct 出貨 647 次平均 **1.116**。每個「災難」都是 direct→column 翻轉;反向翻轉(off 68 1.58→1.32、off 86 1.343→1.062、v6 76 1.584→1.391)都是大賺。
+- 仲裁 proxy 無罪(量的):46 個 official n≥76 案 `PARTNER_PSEL_DUMP` 全池候選以官方 cost 重評 —— 出貨 selector 1.09725 vs 池內 oracle 1.09716(regret +0.00009);「一律 column 冠軍」= 1.28863(**+0.191**,即原本想加的 guard 會是災難);「一律 direct 冠軍」+0.009。post-pass 鏈(edge_seat→final_seat→tag_compress→wall_repair→area_guard)46 案改善 10、不變 36、變差 0。
+- 真因 = tail tilt 的鏡像成本:T=24 抽樣讓 P(n≤89) 從 0.42 掉到 0.15;direct 供給(9 席回傳的 refined 候選數,同 process 配對、臂序對調):n 76–89 base 7.36/7.14 → ft **4.57/4.86**,空 direct 案 0/1 → **4/3**(每 14 案);n 90–104 5.87/7.40 → 7.67/7.73;n 105–120 8.12 → 8.75(column 出貨 0 both)。ft 預測 `[rp0] r0=0` → LADDER-FAIL → `[sf] FALLBACK ok=0` → `refine_prediction` 回 None → column 出貨。
+- v3 tid 84 的 +2.0:該案有 6 個內部 preplaced 障礙 + 14 個 fixed-shape,column slicing 繞不過去,15 個 restart 全落在 bbox 2.27×area_ref(true cost 3.17–3.23,**兩臂皆然**)—— 出貨組態的潛在地雷,v1 只是靠「總有 direct 候選」蓋住;在該類實例上模型通道不是加分而是唯一可行通道。
+- 歸因:v3 的 +0.0089 全是 tid 84(+0.0249 weighted),扣掉 = **−0.0160**;各套扣前三大退步案:off −0.018、v3 −0.021、v5 −0.012、v6 −0.019。
+- 附帶發現:①`PARTNER_PICK_MARGIN`(contest_optimizer.py:152)只在無 pool 的 `_pick_best` 路徑被讀,從未進入 production pool selector → §9b 那筆 PICK_MARGIN=1.0 量測其實量了空氣。②新 knob `PARTNER_PSEL_DZ`(default 0.985 = 出貨)/`PARTNER_PSEL_G`(default 0 = off)把 dead zone 與 hp_ref 分母分開可調(`column_sa_legalizer.py` `psel_selector_params`/`psel_pick`;`tests/test_partner_psel_selector.py` 9/9);量得價值 ≤0.00004,**不建議開**。③n=76–89 預算帶 24 席中 9 席給 rung-0 直接失敗的 direct 通道(`[rp0] r0=0` 8/9 席 @ n=103)= §17i 的 ladder rebudget 開放項,現在有逐席證據。
+- **判定**:300k 退火不會修好中段(cosine 剩餘 LR 質量 <1/3,鏡像傷害已定型);不開第二臂。**走 block-count 路由的雙 checkpoint prior**:n ≥ N0(≈92–95)用 ft、其下用 v1 —— 只依可重用的實例統計量,每案只採樣一個模型 = 零 per-case runtime,代價 +410 MB 包 + init 多一次 warm forward。gate 判讀加看每帶 direct 供給 / column 出貨數(噪音比總分低 ~10×)。
+
+### 17u. 官方 QA 0827 版新增 Q17–Q29(`docs/official/C_QA_20260827.{pdf,txt}`)— 對出貨的意義
+
+- A17 beta 重算 = 部分隊伍環境問題(PyTorch/CUDA 版本)重跑;公式、hidden 資料不變。A21 **final 用同一組 hidden**。
+- A20 **op_wrapper.py 原樣使用、可自由改** → 出貨的 env 預設、numba/flow/scipy 暖機都靠它,合法。A28 `__init__` 暖機不計時,只計 `solve()`。
+- A22 評測機 **driver 580.82.07、CUDA 13.0、PyTorch 2.12.0+cu130**(guidelines 的 CUDA 12.5 是筆誤)。我們 requirements 釘 `torch==2.6.0`(PyPI 預設 cu124 wheel,driver ≥R525 即可)→ 在 580 driver 上相容;本機 driver 580.173.02 的乾淨 venv 演練 `cuda_available=True` 即同級證據。
+- A25/A27/A29 **requirements.txt 非空就一定建 venv,所有依賴要自己 pin**(含 numba/llvmlite);我們的 requirements 已含 torch/numpy/scipy/numba/shapely/matplotlib/tqdm/requests/threadpoolctl,且 evaluator 本身也能在其中跑(dry run 5 驗過)。
+- A23/A24 hidden 連線用同一距離法生成,噪音只加在 block shape/placement → alpha_1 無關(§17p)。
+- A19 座標「不得為負」是描述性回答(bbox 原點 = 左下角);出貨 layout 有不少案 min x/y 落在 −0.1~−3.4(edge seat / wall repair 對 pin 貼邊的結果),官方 evaluator 已把它算進分數,且 final 同 evaluator → 不改(平移不是免費:p2b 端點固定,會動 HPWL/boundary)。
+
+### 17v. Chain N2(`PARTNER_FLOW_ANTITHETIC=0` 反序 ×2)→ 合併 4 reps:**promote**
+
+| 套 | base(4) | anti0(4) | paired Δ | 95% CI | N2-only Δ(反序) |
+|---|---|---|---|---|---|
+| official | 1.1099 ± 0.0068 | **1.0992 ± 0.0062** | **−0.0107** | [−0.0185, −0.0022] | −0.0105 |
+| v3 | 1.1564 | 1.1536 | −0.0028 | [−0.0121, +0.0054] | +0.0010 |
+| v5 | 1.1157 | **1.1068** | **−0.0089** | [−0.0155, −0.0027] | −0.0114 |
+| v6 | 1.1322 | **1.1261** | **−0.0061** | [−0.0121, −0.0015] | −0.0086 |
+
+runtime avg official 0.397→0.376(−5%)、其他持平;max 持平;runtime-aware official(M=1.45,4 reps)D=0.6/0.7/0.8:0.9248/0.8848/0.8543 → **0.9057/0.8669/0.8374(−0.019/−0.018/−0.017)**。兩種臂序同向、三套顯著、v3 不退 → 達判準。機制推測:antithetic 把 10 席變成 5 對鏡像噪音,候選多樣性減半;獨立抽樣 best-of-10 更好,且少一次鏡像運算。**入出貨 env**(op_wrapper `PARTNER_FLOW_ANTITHETIC=0`);打包前的最終確認鏈(polish + anti0 [+ 路由] vs 現包 env ×2)一併驗交互作用。
+
+### 17w. Chain RT1 — n 路由(v1 for n<95、ft90k for n≥95)vs base(四套 ×2 對調;兩臂皆 polish headroom on;load 33–75,**rt r1 吃到 65–75 尖峰**)
+
+| 套 | base r1/r2 | routed r1/r2 | paired Δ [95% CI] | 105–120 帶 Δ / column 出貨 A→B |
+|---|---|---|---|---|
+| official | 1.1043/1.1050 | 1.1021/**1.0982** | −0.0045 [−0.025, +0.014] | −0.0032 / 2→0 |
+| v3 | 1.1469/1.1405 | 1.1452/1.1455 | +0.0017 | −0.0013 / 0→0 |
+| v5 | 1.1232/1.1065 | **1.1428**(load 75)/1.1089 | +0.0110 | +0.0052 / 1→4(尖峰下 ladder 超時 → column) |
+| v6 | 1.1343/1.1222 | 1.1326/1.1336 | +0.0048 | +0.0015 / 3→0 |
+
+runtime avg 持平或降(off 0.421→0.412、max 1.59→1.27);runtime-aware official(M=1.45)0.9431→0.9300(−0.013)。路由確認生效(selfcheck `flow_tail_min_n=95`、tail 暖機 0.07–0.08 s;n<95 帶 Δ≈0)。**判讀**:90k 路由版 official 小賺、v3/v6 wash、v5 被 load-75 rep 打壞;尾帶 column 出貨數如預期下降(2→0、3→0),但 2 reps 分數噪音蓋過 → 不足以促轉;等 300k(退火)的 FT2 分帶讀 + RT2 ×2–3 再判。若 300k 路由仍不能三套同向,模型軌放棄,只出 polish + anti0。
+
+### 17x. Chain FT2 — Flow fine-tune **300k 退火 EMA**(plain,整段替換 v1)vs v1(四套 ×2 對調;兩臂皆 polish headroom on、antithetic 1;load 24–51)
+
+| 套 | v1 r1/r2 | ft300k r1/r2 | paired Δ [95% CI] | 分帶 Δ(<76 / 76–89 / 90–104 / 105–120)| column 出貨 105–120 A→B |
+|---|---|---|---|---|---|
+| official | 1.1084/1.1107 | **1.1025/1.1055** | −0.0055 [−0.028, +0.015] | −0.0005 / −0.0029 / +0.0023 / −0.0044 | 2→0 |
+| v3 | 1.1387/1.1500 | **1.1422/1.1270** | −0.0097 [−0.022, +0.001] | −0.0005 / −0.0016 / −0.0035 / −0.0042 | 0→0 |
+| v5 | 1.1069/1.1167 | **1.0962/1.1059** | −0.0107 [−0.032, +0.011] | −0.0006 / ±0 / +0.0001 / −0.0102 | 0→1 |
+| v6 | 1.1403/1.1325 | 1.1239/1.1402 | −0.0044 [−0.026, +0.016] | −0.0002 / +0.0008 / −0.0081 / +0.0032 | 2→3 |
+
+runtime avg 持平(off 0.424→0.423;v5 +0.016、v6 +0.007)、max 持平。**四套同向(mean4 −0.0076)**,而且 90k 的中段崩塌不見了:76–89 帶 column 出貨 10→7、6→4、0→2、4→5(混合,非崩塌),舊災難案全部回正 —— v3 tid 84 1.11/1.18→1.21/1.10、off 58 1.16/1.22→1.10/1.10、off 86 1.33→1.05/1.08、off 89 1.25→1.19/1.15。殘餘退步是中度、兩 rep 一致的模型偏好:v5 tid 90 1.185→1.276、v5 92 1.10→1.19、v5 83 1.07→1.18、v6 91 1.12→1.21/1.31、off 90 1.18→1.23。→ 300k 退火(LR→0.01×、EMA)把 tilt 的鏡像傷害磨平了;**plain 替換 v1 看起來比 N0=95 路由更好**(路由只留尾帶:off −0.004/v3 −0.004/v5 −0.010/v6 +0.003)。Chain RT2 改為三臂 ×2:base / plain300k(EMA-only 匯出 = 出貨工件)/ routed N0=95,合併 FT2 的 2 reps 判定。
+
+### 17y. Chain FC1+FC2 — 合併候選 env(polish headroom 0.6 + ANTITHETIC=0)vs 現包 env(四套 ×4,兩序;load 18–57)→ **不入包(兩項促轉撤回)**
+
+| 套 | 現包 env(4) | 合併候選(4) | paired Δ | 95% CI | FC2-only(低 load 18–37) |
+|---|---|---|---|---|---|
+| official | **1.0970 ± 0.0114** | 1.1017 ± 0.0143 | +0.0047 | [−0.0030, +0.0127] | +0.0042 |
+| v3 | **1.1451** | 1.1514 | +0.0063 | [−0.0005, +0.0131] | **+0.0092 [+0.001, +0.017]** |
+| v5 | **1.1117** | 1.1159 | +0.0042 | [−0.0038, +0.0111] | +0.0027 |
+| v6 | **1.1269** | 1.1302 | +0.0033 | [−0.0035, +0.0110] | −0.0008 |
+
+runtime avg **+8%**(0.376→0.406,四套皆升)、max +0.1;hpwl_gap 四套 +0.003~+0.007;runtime-aware official(M=1.45)0.9020→0.9294(**+0.027**)。四套同向變差,與 §17s(polish 4 reps −0.008/−0.009/−0.002/−0.006)與 §17v(anti0 4 reps −0.011/−0.003/−0.009/−0.006)矛盾 —— 兩個「各自顯著」的促轉疊在一起直接對現包量,不但沒有 −0.015 反而 +0.005。教訓:bootstrap-over-cases 的 CI 沒把 rep 層(load)變異算進去,本機 ±0.01 級的效應 4 reps 分不出真假;跨鏈比較 base 臂更不可靠。**處置**:op_wrapper 撤回 `PARTNER_COORD_POLISH`/`HEADROOM_S` 與 `ANTITHETIC=0`(包 env 回到 163b8854 的設定;`_warm_coord_polish` 留著,flag unset 時 no-op);排 chain FD(old / polish-only / anti0-only 各 ×2 同鏈)做最後一次分離判定,只有在同鏈勝出且與原鏈同向才重新考慮。
+
+### 17z. Chain RT2 — 現包 env 上:plain 300k(EMA-only 匯出)與 n 路由 N0=95 vs v1(四套 ×2 對調;load 26→70 遞增,base r2 吃到 57–70)
+
+| 套 | v1 r1/r2 | plain300k r1/r2 | Δ plain | routed r1/r2 | Δ routed |
+|---|---|---|---|---|---|
+| official | 1.1032/1.1151 | 1.1133/1.1128 | +0.0039 [−0.015, +0.023] | 1.1102/1.0960 | −0.0061 |
+| v3 | 1.1414/1.1479 | **1.1298**/1.1462 | −0.0067 [−0.020, +0.005] | 1.1636/**1.1898** | **+0.0321** [+0.009, +0.065] |
+| v5 | 1.1108/1.1116 | **1.0977/1.1000** | **−0.0123** [−0.034, +0.010] | 1.0993/1.1133 | −0.0049 |
+| v6 | 1.1280/1.1415 | 1.1404/1.1358 | +0.0033 | 1.1316/1.1404 | +0.0012 |
+
+runtime avg:plain +3–5%(off 0.388→0.407;r1 同 load 級 0.368→0.405 = +10%)、routed +1–6%;runtime-aware official(M=1.45)base 0.917 → plain **0.943(+0.026)**、routed 0.922。
+- **路由版否決**:v3 兩 rep 皆爆(+0.032,兩模型同載下 sampler/仲裁在 load 47–64 更脆),且被 plain 支配;`FLOW_CKPT_TAIL` 程式碼留著(default off、結構性 bit-exact),op_wrapper 只留註解。
+- **plain 300k 合併 FT2+RT2(4 reps,兩種 env)**:official −0.0055/+0.0039 = **wash**;v3 −0.0097/−0.0067;v5 −0.0107/−0.0123;v6 −0.0044/+0.0033 = wash;runtime FT2 持平、RT2 +5%。注意 v1 訓練時看過 shadow 的 worker 90–99 資料列而 ft 沒有(§STATUS.md §4)→ shadow 套對模型比較有偏(v1 佔便宜),但 official(兩者皆未見)才是乾淨讀數,而 official 是 wash + runtime 疑似上升。→ 依「public 不退、runtime 不升」判準**目前不換模型**;排 chain PO(official-only,v1 / 300k 各 ×3 交錯,~12 min)把 official 的 raw 與 runtime 補到 5 reps 再定案:official raw ≤ −0.005 且 runtime ≤ +2% 才換。
+
+### 17aa. Chain FD — 同鏈分離判定:現包 env / polish-headroom-only / ANTITHETIC=0-only(四套 ×2 鏡像序;load 27–62,**fdOld_r2 off 吃到 62**)→ **兩項皆關閉,包 env 定案 = 163b8854 設定**
+
+| 套 | old r1/r2 | polish r1/r2 | Δ polish | anti0 r1/r2 | Δ anti0 |
+|---|---|---|---|---|---|
+| official | 1.1021/**1.1258**(load 62) | 1.1061/1.1026 | −0.0096(r1 對 r1:+0.004) | 1.1066/1.1081 | −0.0066(r1 對 r1:+0.0045) |
+| v3 | 1.1477/1.1434 | 1.1476/1.1565 | +0.0065 | 1.1506/1.1465 | +0.0030 |
+| v5 | 1.1147/1.1011 | 1.1107/1.1165 | +0.0057 | 1.0995/1.1144 | −0.0010 |
+| v6 | 1.1365/1.1250 | 1.1319/1.1391 | +0.0048 | 1.1331/1.1410 | +0.0063 |
+
+runtime avg:polish +1%(off)~+10%(v6);anti0 off −8%、其他持平。official 的「賺」全來自 old r2 的 load-62 rep;v3/v5/v6 兩個 knob 都不進。合併今天所有對現包 env 的直接量測(FC ×4 + FD ×2 = polish 6 reps、anti0 6 reps):沒有一個在 v3/v5/v6 同向為負。**結論:polish headroom 與 ANTITHETIC=0 皆維持 off;§17s/§17v 的促轉是跨鏈 base 臂比較 + load 混淆造成的假陽性。**
+
+### 17ab. Chain PO — official-only,plain 300k(EMA-only)vs v1 各 ×3 交錯(現包 env;load 29–50)→ **promote:FLOW_CKPT 換成 300k EMA**
+
+| | v1 r3/r4/r5 | 300k r3/r4/r5 | paired Δ [95% CI] | runtime avg | runtime-aware D=0.6/0.7/0.8 |
+|---|---|---|---|---|---|
+| official(PO 3+3) | 1.1041/1.1180/1.1118 = **1.1113 ± 0.0070** | 1.1058/1.1059/1.1033 = **1.1050 ± 0.0014** | **−0.0063** [−0.028, +0.014] | 0.390 → 0.397(+1.8%) | 0.9251/0.8850/0.8552 → 0.9235/0.8839/0.8533(持平) |
+| official 合併 7+7(FT2+RT2+PO,兩種 env) | 1.1102 ± 0.0054 | 1.1070 ± 0.0043 | −0.0032 [−0.023, +0.016] | 0.399 → 0.407 | hpwl −0.0055、area −0.0024、v_rel +0.0007 |
+
+合併今日全部對 v1 的配對證據:official −0.003~−0.006(7 reps,wash 偏正、**rep 間變異只有 v1 的 1/3**)、v3 −0.008(4)、v5 −0.012(4)、v6 wash(4);runtime +0–2%,runtime-aware 持平;四套 ×(2–7) reps 無一災難案(90k 的 tid 84 類已消失);載入路徑與 v1 完全相同(同 loader、同架構、EMA 張量)。v1 訓練看過 shadow 資料列而 300k 沒有 → v3/v5 的增益是保守估計。**判定:換模型**(`FLOW_CKPT` → `checkpoints/flow_matching_ft0828_tailT24_300k_ema.pt`,430 MB,包大小不變),重打包 + 乾淨 venv 演練後成為出貨包;路由(`FLOW_CKPT_TAIL`)維持 off。

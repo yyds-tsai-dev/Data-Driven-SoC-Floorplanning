@@ -103,9 +103,17 @@ def test_fix_moves_both_constants(monkeypatch):
 
 def test_fix_source_uses_the_named_knobs():
     import inspect
-    src = inspect.getsource(csl._parallel_solve)
+    # 2026-08-28 (Sec.17t): both constants moved OUT of `_parallel_solve`
+    # into the pure helpers `psel_selector_params` / `psel_pick` so they can
+    # be unit-tested directly and so PARTNER_PSEL_DZ / PARTNER_PSEL_G can
+    # address the dead zone and the hp_ref calibration independently.  The
+    # invariant this test owns is unchanged: the knobs are read BY NAME, and
+    # the dead zone multiplies the COLUMN champion's score.
+    src = (inspect.getsource(csl._parallel_solve)
+           + inspect.getsource(csl.psel_selector_params)
+           + inspect.getsource(csl.psel_pick))
     assert 'PARTNER_PSEL_FIX' in src
-    assert '_dz * score(best_col)' in src
+    assert 'dz * score(best_col)' in src
     assert '0.985 * score(' not in src
 
 
