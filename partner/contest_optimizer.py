@@ -218,6 +218,159 @@ def _final_area_guard(result, fallbacks, area_targets, n: int):
     return result
 
 
+def _overlap_count(rects, n: int, tol: float = 1e-6) -> int:
+    """Evaluator-form pairwise overlap count (`iccad2026_evaluate.check_overlap`:
+    an overlap counts only when BOTH axes overlap by more than 1e-6; touching
+    edges are legal).  Vectorised O(n^2) -- 7,140 pairs at n=120, sub-millisecond
+    -- so it is affordable on the common path.  Reimplemented here rather than
+    imported: nothing under FloorSet/ may be imported at contest runtime."""
+    P = np.asarray([list(map(float, r)) for r in rects], dtype=np.float64)
+    if P.shape[0] != n or P.shape[1] != 4:
+        return -1
+    x1 = P[:, 0]
+    y1 = P[:, 1]
+    x2 = P[:, 0] + P[:, 2]
+    y2 = P[:, 1] + P[:, 3]
+    ox = np.minimum(x2[:, None], x2[None, :]) - np.maximum(x1[:, None], x1[None, :])
+    oy = np.minimum(y2[:, None], y2[None, :]) - np.maximum(y1[:, None], y1[None, :])
+    hit = (ox > tol) & (oy > tol)
+    return int(np.count_nonzero(np.triu(hit, 1)))
+
+
+def _hard_dims_ok(rects, constraints, target_positions, n: int,
+                  tol: float = 1e-4) -> bool:
+    """Mirror of `iccad2026_evaluate.check_dimension_hard_constraints`:
+    fixed-shape blocks must keep (w, h); preplaced blocks must keep
+    (x, y, w, h).  Absent constraints/targets -> nothing to check (the
+    evaluator returns 0 violations there too)."""
+    if constraints is None or target_positions is None:
+        return True
+    C = np.asarray(constraints, dtype=np.float64)
+    if C.ndim != 2 or C.shape[0] < n:
+        return True
+    T = np.asarray(target_positions, dtype=np.float64)
+    P = np.asarray([list(map(float, r)) for r in rects], dtype=np.float64)
+    m = min(n, P.shape[0], T.shape[0])
+    if m <= 0:
+        return True
+    is_fixed = (C[:m, 0] != 0.0) if C.shape[1] > 0 else np.zeros(m, bool)
+    is_pre = (C[:m, 1] != 0.0) if C.shape[1] > 1 else np.zeros(m, bool)
+    hard = is_fixed | is_pre
+    if not np.any(hard):
+        return True
+    if np.any(np.abs(P[:m, 2][hard] - T[:m, 2][hard]) > tol) or \
+            np.any(np.abs(P[:m, 3][hard] - T[:m, 3][hard]) > tol):
+        return False
+    if np.any(is_pre):
+        if np.any(np.abs(P[:m, 0][is_pre] - T[:m, 0][is_pre]) > tol) or \
+                np.any(np.abs(P[:m, 1][is_pre] - T[:m, 1][is_pre]) > tol):
+            return False
+    return True
+
+
+def _soft_area_ok(rects, area_targets, constraints, n: int,
+                  tol: float = 0.01) -> bool:
+    """Evaluator-form 1% area tolerance, applied to SOFT blocks only --
+    `evaluate_solution` passes the fixed/preplaced indices as `skip_indices`
+    because those carry the stricter exact-dimension test instead.  (The
+    older `_area_ok` checks every block; it is deliberately left alone so
+    `_final_area_guard` keeps its shipped semantics.)"""
+    at = np.asarray(area_targets, dtype=np.float64).reshape(-1)
+    P = np.asarray([list(map(float, r)) for r in rects], dtype=np.float64)
+    if P.shape[0] != n or at.shape[0] < n:
+        return False
+    soft = np.ones(n, dtype=bool)
+    if constraints is not None:
+        C = np.asarray(constraints, dtype=np.float64)
+        if C.ndim == 2 and C.shape[0] >= n:
+            if C.shape[1] > 0:
+                soft &= (C[:n, 0] == 0.0)
+            if C.shape[1] > 1:
+                soft &= (C[:n, 1] == 0.0)
+    if not np.any(soft):
+        return True
+    a = P[:n, 2][soft] * P[:n, 3][soft]
+    return bool(np.all(np.abs(a - at[:n][soft]) <= tol * np.abs(at[:n][soft])))
+
+
+def _legal_ok(rects, n: int, area_targets, constraints, target_positions) -> bool:
+    """The evaluator's whole feasibility predicate
+    (`evaluate_solution`: overlap_violations == 0 and area_violations == 0
+    and dimension_violations == 0), plus the structural sanity the evaluator
+    assumes (n rectangles, finite, strictly positive extents)."""
+    try:
+        if rects is None or len(rects) != n:
+            return False
+        P = np.asarray([list(map(float, r)) for r in rects], dtype=np.float64)
+        if P.shape != (n, 4) or not np.all(np.isfinite(P)):
+            return False
+        if np.any(P[:, 2] <= 0.0) or np.any(P[:, 3] <= 0.0):
+            return False
+        if _overlap_count(rects, n) != 0:
+            return False
+        if not _hard_dims_ok(rects, constraints, target_positions, n):
+            return False
+        return _soft_area_ok(rects, area_targets, constraints, n)
+    except Exception:
+        return False
+
+
+def _final_legal_guard(result, fallbacks, n: int, area_targets, constraints,
+                       target_positions, row_fallback=None):
+    """Return `result` unless it violates a HARD evaluator constraint; then
+    the first fallback that is itself verified legal, else `result`.
+
+    Rationale: an infeasible layout is scored at the x8 `M_PENALTY`, so it
+    costs more than any quality knob can ever win back.  The column-slicing
+    backbone is overlap-free by construction and every post-pass is supposed
+    to preserve that, but the pipeline has many stages (edge seat -> pick ->
+    vkill -> polish -> final seat -> tag compress -> wall repair -> area
+    guard) and this is the one place where a single check covers all of them.
+
+    Semantics:
+      * `PARTNER_FINAL_LEGAL_GUARD=0` (`false`/`False`/`off`) disables it.
+      * On a legal layout it is a PURE CHECK: the SAME object is returned,
+        so the shipped output is bit-exact.  Cost is one vectorised O(n^2)
+        overlap scan plus two O(n) tests.
+      * It can only ever REPLACE an illegal layout with a VERIFIED-LEGAL
+        one.  When no candidate passes -- e.g. an input whose preplaced
+        obstacles overlap each other, which no layout can satisfy -- the
+        original `result` is returned untouched, so the guard can never make
+        an output worse than it already was.
+      * `row_fallback` is a zero-argument callable, evaluated ONLY on the
+        failing path, so the guaranteed-feasible row layout costs nothing on
+        the common path.
+      * Prints `[legal-guard]` on stderr only when it fires."""
+    if os.environ.get("PARTNER_FINAL_LEGAL_GUARD", "1") in ("0", "false",
+                                                            "False", "off"):
+        return result
+    try:
+        if _legal_ok(result, n, area_targets, constraints, target_positions):
+            return result
+        cands = list(fallbacks)
+        if row_fallback is not None:
+            try:
+                cands.append(row_fallback())
+            except Exception:
+                pass
+        for fb in cands:
+            if fb is None or fb is result:
+                continue
+            if _legal_ok(fb, n, area_targets, constraints, target_positions):
+                print(f"[legal-guard] n={n} final layout failed the hard "
+                      f"legality check (overlap={_overlap_count(result, n)}); "
+                      f"shipping a verified-legal fallback",
+                      file=sys.stderr, flush=True)
+                return [tuple(map(float, r)) for r in fb]
+        print(f"[legal-guard] n={n} final layout failed the hard legality "
+              f"check (overlap={_overlap_count(result, n)}) and NO fallback "
+              f"is legal either; keeping the original layout",
+              file=sys.stderr, flush=True)
+        return result
+    except Exception:
+        return result
+
+
 def _cond_p2b(p2b):
     """PARTNER_COND_P2B (default unset = shipped): what the MODEL conditioning
     sees as pin-to-block connectivity.  `off` invalidates every p2b row for
@@ -1074,8 +1227,19 @@ class MyOptimizer(FloorplanOptimizer):
             # on the common path; on failure fall back to the post-pick
             # layout, then to the column champion (exact-area by
             # construction).
-            return _final_area_guard(result, (out, column_out), area_targets,
-                                     block_count)
+            # Last-line HARD-LEGALITY guard (PARTNER_FINAL_LEGAL_GUARD,
+            # default on; "0" disables).  See `_final_legal_guard`: an
+            # infeasible layout costs the evaluator's x8 M_PENALTY, so the
+            # very last thing solve() does is verify the shipped rectangles
+            # against the evaluator's own hard-constraint tests and, only if
+            # they fail, ship the first fallback that passes them.
+            return _final_legal_guard(
+                _final_area_guard(result, (out, column_out), area_targets,
+                                  block_count),
+                (out, column_out), block_count, area_targets, constraints,
+                target_positions,
+                row_fallback=lambda: _fallback_row(
+                    area_targets, constraints, target_positions))
         except Exception as exc:
             if self.verbose:
                 print(f"column optimizer failed; using row fallback: {exc}")

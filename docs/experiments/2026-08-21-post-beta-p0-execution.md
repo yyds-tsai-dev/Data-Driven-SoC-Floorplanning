@@ -921,3 +921,25 @@ runtime avg:polish +1%(off)~+10%(v6);anti0 off −8%、其他持平。official �
 - 真正的缺陷是「鬆框」:51% 的 direct 候選來自 e=0.28 escape 或 sf0.12/0.28 fallback;12/61 段(300k)沒有任何席位成交在 ≤0.12 的框,該類佔權重 9.6%、平均 1.254 vs 其餘 1.086 → 加權超額 +0.016。但 REBUDGET(唯一能收緊的機制)在同一普查上:loose8 −0.0018、other92 +0.0018、合計 +0.00002 —— **完美瞄準的上限也只有 −0.002**,與 §17n 的 4-rep wash 一致;重案是 HPWL-limited(hpwl_gap 0.43–0.52、area 0.09–0.11),框只動 area(權重 0.5)。
 - 方向 (a)(每席自適應 rung 0)不可行:rung-0 成功/失敗的時間分佈(median 0.26–0.45 vs 0.35–0.41 span)重疊,只有 p90 尾可分;砍 0.55·span 會丟 15–20% 的 rung-0 成交,省下的時間落到無界的 e=0.02 rung 與 escape,把 sf0.12 成交換成更鬆的 e=0.28。把 expand rung 綁 ladder deadline 也不行(成交 rung 常在 deadline 後 30–46% 才完成)。
 - **判定:不改碼、不 gate;出貨包 0828 維持。** 剩下最大的可重用類別 = **column 出貨案**(official 27/100、v3 31/100,加權超額各 ≈+0.009,含 official 最重的 n=100/101 兩案)—— 是候選品質(模型)問題,不是排程;若還有時間只能往模型走。普查腳本與分析器在 `~/.claude/jobs/06af0e53/tmp/seatfix/`(an1–an6.py 可讀任何 `[lad]/[sf]/[rp0]` dump)。
+
+### 17ae. hidden 到底偏不偏離 public?(08-28 下午;beta 逐案 JSON vs 本機用同一個 0812 包 + CPU torch 重放 official)
+
+- **n 分佈逐 test_id 完全相同**(四帶 55/14/15/16、n 21–120、n≥105 權重 0.74)→ hidden = 同一組 config 重新加噪(A23);按 n 查表的預算與閘門直接適用。
+- 同一包、同一失效模式(CPU torch)下的逐帶比較:
+
+| 帶 | hidden cost / hpwl / area / viol | 本機 official cost / hpwl / area / viol | 差 |
+|---|---|---|---|
+| <76 | 1.3415 / 0.276 / 0.065 / 0.066 | 1.3540 / 0.326 / 0.101 / 0.051 | hidden **較易** |
+| 76–89 | 1.3444 / 0.324 / 0.064 / 0.058 | 1.3544 / 0.403 / 0.096 / 0.039 | hidden 較易 |
+| 90–104 | 1.3481 / 0.316 / 0.077 / 0.056 | 1.3519 / 0.431 / 0.074 / 0.037 | 持平 |
+| **105–120** | 1.3228 / 0.308 / **0.077** / **0.050** | 1.2804 / 0.318 / 0.059 / 0.035 | hidden **較難 +0.042/案**(area +0.018、viol +0.015,HPWL 相同) |
+
+加權總分 hidden 1.3141 vs 本機 1.2910(+0.023),**全部來自尾帶**(0.042 × 權重 0.74 ≈ 0.031,扣掉低帶較易)。尾帶在 column-only 狀態下 area/violations 較高 → hidden 的尾段實例對 column SA 稍難(或 contest 機 SA 略慢;本機該帶 rt 1.90 s vs hidden 1.53 s 反而更多時間)。GPU 正常時尾帶由 direct 通道主導,這個差距預期只剩一部分 → **final 包 hidden raw 期望 ≈ 本機 +0.01~0.02(1.11–1.13)**,與 §17f 的估計一致。所謂「hidden 偏離 public」對我們的 solver 只成立在尾帶的 area/violations,量級 0.02,不是分佈級的偏移。
+- **對抗性合成壓力測試(出貨包、乾淨 venv、evaluator 的 `evaluate_solution`)**:106 案(n∈{21,60,90,105,120}、fixed/preplaced/boundary/cluster/MIB/pins 各推到極端)→ 0 例外、runtime 有界(n=120 max 1.33 s、首案 0.05 s);37 案 infeasible 中 ~36 是產生器把 preplaced 障礙互相重疊(輸入本身不可行,`synth_instances` 的問題),**1 案真實**:`fixedheavy_n21_s1`(n=21、60% fixed-shape)出貨包輸出兩對非 fixed block 重疊 → infeasible。infeasible = ×8 罰,交 deep-reasoner 追根因 + 在 `solve()` 末端加 evaluator-faithful 最終合法性守門(非法才介入,合法時 bit-exact)。工件:`~/.claude/jobs/06af0e53/tmp/stress/`。
+
+### 17af. `fixedheavy_n21_s1` 追根因(deep-reasoner)→ **不是 solver bug**;加 `PARTNER_FINAL_LEGAL_GUARD`(default on)當最後防線
+
+- 該案 block 15/20 都是 **preplaced**(constraints[:,1]=1),`build_instance` 預設 `n_preplaced=2` 把兩個強制矩形撒成互相重疊(15:(15.66,22.47,9.47,9.47)、20:(21.63,13.76,11.46,11.46),重疊 3.50×2.76 = 輸出裡看到的那個重疊);solver 只是照辦。全 106 案:輸入 preplaced 互疊對數 ≥1 的集合 **恰好等於** infeasible 集合(37 = 37),**solver 自己引入的重疊 = 0**。7/12 那對在兩個入口皆無法重現(只有 15/20)。對所有 post-pass knob(WALL_REPAIR/SECURE_FALLBACK/FLOW_SLOTS=0/TAG_COMPRESS/SEAT_FINAL/EDGE_SEAT_V2/GROUP_BRIDGE 關掉)輸出 byte-identical。
+- 守門(defence-in-depth,`partner/contest_optimizer.py` +166):`solve()` 末端 `_final_legal_guard` = evaluator 的 `is_feasible` 謂詞鏡像(overlap >1e-6、fixed/preplaced 尺寸 tol 1e-4、1% area 含 skip_indices)+ 結構檢查;合法 → 回傳**同一物件**(bit-exact);非法 → 依序取第一個「自身驗證合法」的備援(post-pick `out` → column 冠軍 → 惰性建的 row fallback);全都不合法(輸入本身不可行)→ 保留原輸出(row fallback 也會違反 preplaced,換了只會更差)。`PARTNER_FINAL_LEGAL_GUARD=0` 關;觸發時 stderr `[legal-guard]`。成本 83/161/324 µs(n=21/60/120)。
+- 測試 `tests/test_partner_final_legal_guard.py` 13/13(含把該案釘為「輸入不可滿足」);與 psel/router 測試合跑 40 passed;所有 import contest_optimizer 的 22 個測試檔 208 passed。全 grid 經工作樹重跑:可滿足 69/69 feasible、不可滿足 37/37 如預期,守門在 69 案 0 次觸發;official 100 過去每跑 overlap=0 → 輸出不變。
+- 決定:重打包(dry run 7)讓守門入包;官方 100 案應 100/100 且 `[legal-guard]` 0 次。

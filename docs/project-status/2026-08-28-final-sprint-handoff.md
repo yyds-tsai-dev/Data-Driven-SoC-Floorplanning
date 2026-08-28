@@ -6,23 +6,31 @@ Full evidence log: `docs/experiments/2026-08-21-post-beta-p0-execution.md` §15�
 
 ## 1. Shipping package (verified)
 
-- **`submission/cadc1013_0828_final.tar.gz` — md5 `b25aaa7e2c457e5f9e62843cb3514bb0`, 1.197 GB, 34 entries (SHIP THIS).**
-  Only change vs the 0827 package: the Flow prior is the tail-tilted fine-tune of v1
+- **`submission/cadc1013_0828b_final.tar.gz` — md5 `751f7e37e18c603262c15b04a7f4b066`, 1.197 GB, 34 entries (SHIP THIS).**
+  Changes vs the 0827 package: (1) the Flow prior is the tail-tilted fine-tune of v1
   (`checkpoints/flow_matching_ft0828_tailT24_300k_ema.pt`, 300k-step cosine anneal, EMA-only,
   same loader/architecture; §17x–17ab: official −0.003…−0.006 over 7 paired reps with 1/3 of v1's
-  rep variance, v3 −0.008, v5 −0.012, v6 wash, runtime +0–2%) plus today's default-off code
-  (psel helpers, `FLOW_CKPT_TAIL` router — both inert). Fallback: `cadc1013_0827_final.tar.gz`
-  (md5 `163b885410c02ec021b6c3699d8cd62d`, flow v1).
+  rep variance, v3 −0.008, v5 −0.012, v6 wash, runtime +0–2%; slow-CPU emulation safe, §17ac);
+  (2) `PARTNER_FINAL_LEGAL_GUARD` (default on, §17af): evaluator-faithful feasibility check at the end
+  of `solve()`, bit-exact when the layout is legal (it always was on official: 0 fires), swaps in a
+  verified-legal fallback only if not; 0.3 ms. Plus default-off inert code (psel helpers, `FLOW_CKPT_TAIL`).
+  Fallbacks: `cadc1013_0828_final.tar.gz` (md5 `b25aaa7e…`, same minus the guard) and
+  `cadc1013_0827_final.tar.gz` (md5 `163b8854…`, flow v1).
 - Built by `bash scripts/pack_cadc1013.sh <out_dir>` from the working tree (import closure of
   `partner/contest_optimizer.py` → `op_src.py`, `partner/shipping/op_wrapper.py`,
   `partner/shipping/requirements.txt`, `tests/synth_instances.py`, flow ckpt + v2 student ckpt).
   **Always rebuild with the script; a hand-assembled package once shipped stale modules.**
-- Dry run 6 (08-28 11:50, fresh extract, NEW Python 3.13 venv from requirements.txt only —
-  torch 2.6.0+cu124 / scipy 1.18.1 / numba 0.67.0 — official evaluator, load 36–43):
-  `[selfcheck] cuda_available=True … flow_warm_latency=0.068s … seat_ts=kept 0.148 cpu_ratio=1.11 seat_r0=kept`,
-  `loaded flow model step 300000`, no `[pool-fallback]`/`[flowtail]`, **1.1102, 100/100 feasible,
-  avg 0.40 s, max 1.63 s, first case 0.055 s** (JSON: `artifacts/shadow/dryrun6_pack_off.json`).
-  Dry run 5 (0827 package, load 29) was 1.1042 — the two are within the box's ±0.01 rep noise.
+- Dry run 7 (08-28 ~15:00, fresh extract, clean Python 3.13 venv built today from requirements.txt only —
+  torch 2.6.0+cu124 / scipy 1.18.1 / numba 0.67.0 — official evaluator, load 24–28):
+  `[selfcheck] cuda_available=True … flow_warm_latency=0.068s … seat_ts=kept 0.148 cpu_ratio=0.61 seat_r0=kept`,
+  `loaded flow model step 300000`, `[legal-guard]` fired 0×, no `[pool-fallback]`/`[flowtail]`,
+  **1.1009, 100/100 feasible, avg 0.37 s, max 1.21 s, first case 0.052 s** (`artifacts/shadow/dryrun7_pack_off.json`).
+  Dry run 6 (same minus guard, load 36–43) was 1.1102; dry run 5 (0827 package, load 29) 1.1042 — all within ±0.01 rep noise.
+- Robustness evidence (§17ae/§17af): hidden has the SAME block-count distribution as public per test_id;
+  under the same failure signature hidden is ≈ public except the n≥105 band (+0.04/case in area+violations,
+  column-only regime) → expect hidden raw ≈ local +0.01–0.02. Adversarial synthetic sweep of the package
+  (106 instances): 0 exceptions, runtime bounded (n=120 max 1.33 s), the solver introduced zero overlaps
+  (all 37 infeasibles were unsatisfiable inputs from the synthetic generator).
 - Shipping env (in `partner/shipping/op_wrapper.py` and README): mid budget table +
   Flow-only (`FLOW_SLOTS=10 NREF=9`) + `DIRECT_SEAT_FIX=1` + `REFINE_RES_FRAC=0.45` +
   `WALL_REPAIR=1` + `FLOW_WARM=1` + `EARLY_EXIT=1` + `REFINE_SECURE_FALLBACK=1`,
@@ -91,8 +99,8 @@ them; frame pinning trades HPWL for it) + area 0.018 (rung-0 frame 1.02·area_re
 
 ## 7. State at session close (08-28 ~13:30)
 
-- Ship `submission/cadc1013_0828_final.tar.gz` (md5 `b25aaa7e…`); before uploading (8/30–31) re-run the
-  dry-run recipe above once more on a quiet box and check the selfcheck line. Fallback = 0827 package.
+- Ship `submission/cadc1013_0828b_final.tar.gz` (md5 `751f7e37…`); before uploading (8/30–31) re-run the
+  dry-run recipe above once more on a quiet box and check the selfcheck line. Fallbacks = 0828 (no guard) / 0827 packages.
 - Where the last ≈0.02 to the 1.08 target would have to come from: the column-shipped class (official 27/100,
   v3 31/100, weighted excess ≈+0.009 each; §17ad) — a candidate-quality (model) problem. Every solver-side
   knob family has now been measured to the noise floor; do not re-open them.
