@@ -20,7 +20,7 @@ for k, v in {
     # -0.003..-0.006 (7 paired reps, 1/3 the rep variance), v3 -0.008,
     # v5 -0.012, v6 wash; runtime +0-2%; same loader/architecture as v1.
     "DIRECT_CKPT": str(HERE / "checkpoints" / "direct_v2_student_s2.pt"),
-    "FLOW_CKPT": str(HERE / "checkpoints" / "flow_matching_ft0828_tailT24_300k_ema.pt"),
+    "FLOW_CKPT": str(HERE / "checkpoints" / "flow_matching_ft0829_tailT12_250k_ema.pt"),
     # Block-count-routed SECOND flow prior (docs/experiments/
     # 2026-08-21-post-beta-p0-execution.md Sec.17t).  DISABLED: uncomment both
     # lines only if the routed arm passes the five-suite gate; with them
@@ -30,7 +30,7 @@ for k, v in {
     # "PARTNER_FLOW_TAIL_MIN_N": "95",
     "VKILL_OFF": "1",
     "PARTNER_POOL": "24",
-    "PARTNER_NREF": "9",
+    "PARTNER_NREF": "12",
     "PARTNER_NREF_MIN_N": "95",
     "PARTNER_DIRECT_MIN": "0.3",
     "PARTNER_DIRECT_SEAT_FIX": "1",
@@ -43,7 +43,7 @@ for k, v in {
     # ANTITHETIC=0 gated -0.011 alone (2026-08-28 chains N+N2) but was
     # withdrawn with polish after the combined same-chain check (FC1+FC2).
     "PARTNER_FLOW_ANTITHETIC": "1",
-    "PARTNER_FLOW_SLOTS": "10",
+    "PARTNER_FLOW_SLOTS": "16",
     "PARTNER_PRESCREEN_V": "1",
     "PARTNER_TAG_ANCHOR_EXTRA": "3",
     # Budget curve: mid budget table (per-n seconds, n=21..120).

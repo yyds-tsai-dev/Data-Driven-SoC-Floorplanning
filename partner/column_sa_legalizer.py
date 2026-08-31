@@ -4734,6 +4734,15 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
     def np_of(t):
         return None if t is None else t.detach().cpu().numpy()
 
+    # The six instance tensors are converted ONCE per case and the same
+    # arrays are handed to every payload below; they used to be re-converted
+    # inside each payload comprehension (6 conversions x up to 36 payloads).
+    # Identical values, and read-only here -- each task is pickled on its own
+    # (chunksize 1: tasks ~ pool size), so workers still get private copies.
+    _np_at, _np_cons, _np_tpos = (np_of(area_targets), np_of(constraints),
+                                  np_of(target_positions))
+    _np_b2b, _np_p2b, _np_pins = np_of(b2b), np_of(p2b), np_of(pins)
+
     # PARTNER_PHASE_B (fraction, default 0=off): reserve the tail of the
     # case budget for a parallel exploitation round that re-refines the
     # phase-A winner with seed/v_weight/anchor variants.  The serial form
@@ -4785,8 +4794,8 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
     # would eat the whole worker window, so scale it down proportionally
     # (bit-identical for remaining >= 2.0 s, i.e. every pre-POOL_GATE case).
     worker_deadline = deadline_A - min(0.30, 0.15 * max(0.0, deadline_A - t_pb))
-    payloads = [(list(rects), np_of(area_targets), np_of(constraints),
-                 np_of(target_positions), np_of(b2b), np_of(p2b), np_of(pins),
+    payloads = [(list(rects), _np_at, _np_cons,
+                 _np_tpos, _np_b2b, _np_p2b, _np_pins,
                  orient, cf, sd, worker_deadline, vw, hs)
                 for (orient, cf, sd, vw, hs) in configs]
     if _ws_map:
@@ -4945,9 +4954,9 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                                         "anchored") or "anchored"),
                 n_base=len(specs) - _anchor_extra)
             ref_payloads = [(np.asarray(P, dtype=np.float64),
-                             np_of(area_targets), np_of(constraints),
-                             np_of(target_positions), np_of(b2b),
-                             np_of(p2b), np_of(pins),
+                             _np_at, _np_cons,
+                             _np_tpos, _np_b2b,
+                             _np_p2b, _np_pins,
                              worker_deadline, seed + 301 + 7 * k,
                              (_vw_mix if (_vw_mix > 0.0 and k % 3 == 2)
                               else 1.0),
@@ -5141,9 +5150,9 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
                     (1.0, False))[:_pb_nvar]
         wd2 = deadline - (min(0.30, 0.15 * max(0.0, deadline - time.time()))
                           if gpu_auto else 0.30)
-        pb_payloads = [(Wnp.copy(), np_of(area_targets),
-                        np_of(constraints), np_of(target_positions),
-                        np_of(b2b), np_of(p2b), np_of(pins),
+        pb_payloads = [(Wnp.copy(), _np_at,
+                        _np_cons, _np_tpos,
+                        _np_b2b, _np_p2b, _np_pins,
                         wd2, seed + 401 + 11 * k, vw, anc)
                        for k, (vw, anc) in enumerate(variants)]
         # second-wave GPU candidates ride the SAME round on the pool slots
@@ -5151,9 +5160,9 @@ def _parallel_solve(opt1, rects, area_targets, constraints, target_positions,
         # They enter as raw predictions, so they get their own light
         # v_weight / anchor mix -- selection below is still true cost.
         pb_payloads += [(np.asarray(P, dtype=np.float64),
-                         np_of(area_targets), np_of(constraints),
-                         np_of(target_positions), np_of(b2b), np_of(p2b),
-                         np_of(pins), wd2, seed + 601 + 13 * k,
+                         _np_at, _np_cons,
+                         _np_tpos, _np_b2b, _np_p2b,
+                         _np_pins, wd2, seed + 601 + 13 * k,
                          (2.5 if k % 4 == 3 else 1.0), bool(k % 3 == 2))
                         for k, P in enumerate(preds2)]
         if _os.environ.get("PARTNER_GPU_ARM_DEBUG"):

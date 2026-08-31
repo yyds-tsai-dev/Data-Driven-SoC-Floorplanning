@@ -1,4 +1,37 @@
-# 決賽出貨摘要(給隊友)— 2026-08-29
+# 決賽出貨摘要(給隊友)— 2026-08-29(**08-31 05:20 UTC 上傳定版**)
+
+> **上傳這個檔:`submission/FINAL_UPLOAD/cadc1013.tar.gz`(檔名已正確,直接上傳)。md5 = `3f2cda42c88338fbb32d7670052fc895`。**
+> 最終演練(乾淨 py3.13 venv、官方 evaluator):**1.0858、100/100、avg 0.363 s、max 1.31 s、首案 0.050 s、`[selfcheck] cuda_available=True`、flow step 250000、`legal-guard fires: 0`**。QA 合規逐條核對過(A14/A20/A21/A22/A25/A27、48 核/128GB、無絕對路徑、34 檔、requirements 全 pin 含 scipy)。
+> 註:md5 與 0830b 的 `6949e99d…` 不同**只因 tar 內 mtime**(apply 腳本重寫過 op_wrapper.py);兩包內容逐檔 diff 完全相同。重新演練若再重組,md5 又會變——**以上傳當下那個檔的 md5 為準**,內容驗證用 `diff -r` 解壓比對。D′(k20)不上傳(48 核專用機 M≈1.0 已貼 floor,k20 只付 raw)。
+
+> **最終候選包(工作樹 = FT2 模型 + FLOW_SLOTS16/NREF12 + 守門面積修復 + runtime 微優化;皆乾淨 Python 3.13 venv 官方 evaluator 演練:100/100、`[legal-guard]` 0 次、Flow step 250000 載入)**
+>
+> | 包 | md5 | 演練(本機 load 40–55,絕對值偏高)|
+> |---|---|---|
+> | **B′ `submission/cadc1013_0830b_ft2s16_final.tar.gz`**(建議:raw 優先) | `6949e99d832a40169907ec399f9c08c0` | 1.0914 / avg 0.392 s / max 1.45 s |
+> | **D′ `submission/cadc1013_0830b_ft2k20s16_final.tar.gz`**(押 field 加速) | `46ec2c8264c86a28c82f783032c8c255` | 1.1047 / avg 0.359 s / max 1.19 s |
+> | 後備 0828b | `751f7e37…` | 1.1009 |
+>
+> 安靜機期望(×4 gate 平均):B′ public 1.087 / v3 1.111 / v5 1.086 / v6 1.100(三套 shadow 全 <1.12);D′ raw +0.002~+0.009 但 runtime-aware total 在 D≤0.8 賺 0.008–0.03。**B′ 或 D′ 由隊長裁定。**
+> 上傳前演練(8/31):B′ `bash scratchpad/rtaware/apply_pack_variant.sh ft2 s16 && bash scratchpad/rtaware/dryrun12.sh`;D′ `... ft2 k20 s16 && bash scratchpad/rtaware/dryrun13.sh`;md5 應一致;看 `[selfcheck] cuda_available=True`、`legal-guard fires: 0`、`feasible=100`;只上傳 `cadc1013.tar.gz`。
+> 08-30 全日結論(§18a–18s):對手 1.005 的差距 = 模型 seed 品質(golden 餵我們的 ladder → 1.013);round 3 / round 4 fine-tune 皆 gate 否決 → 模型定案 FT2;runtime 98% deadline-bound,微優化省 4–11 ms/案;殘餘 violations 為結構性。**舊 0830 包(b7f73fb2 / 0ec983a4 / 2ee934a9 / dd4198c8)已被 0830b 取代,不要上傳。**
+>
+> 以下為 08-30 早上的歷史內容(其 0830 包名與 md5 已過期)。
+
+> (歷史 08:20 版)**08-30 候選包(都在乾淨 Python 3.13 venv 用官方 evaluator 演練:100/100 feasible、`[legal-guard]` 0 次、Flow step 250000 載入)**
+>
+> | 包 | 內容 | md5 | 演練 noRT / avg rt / max rt |
+> |---|---|---|---|
+> | **B′ `submission/cadc1013_0830_ft2s16_final.tar.gz`**(建議:raw 優先) | Flow round-2 T=12 250k EMA + FLOW_SLOTS 16 / NREF 12 + 守門面積修復 | `2ee934a99b7e5e3209e9edc156f7ce94` | 1.0916 / 0.374 s / 1.27 s |
+> | **D′ `submission/cadc1013_0830_ft2k20s16_final.tar.gz`**(建議:押 field 加速) | B′ + 尾帶預算 k20 | `dd4198c8f2b70cefc4c4fa8ccf6747da` | 1.0861 / 0.348 s / 1.07 s |
+> | 後備 `cadc1013_0830_ft2_final.tar.gz` | FT2 only(無 s16、無守門修復) | `b7f73fb2…` | 1.0958 |
+> | 後備 0828b | 08-28 版 | `751f7e37…` | 1.1009 |
+>
+> 四套 ×4 同鏈證據(experiments doc §18d/§18i/§18j):FT2 vs 0828b official wash、v3/v5/v6 −0.014~−0.019;s16 vs FT2 官方 −0.010、v3 −0.006、v5 −0.004、v6 −0.011、runtime 持平;k20 疊 s16 後 official/v3/v5 持平、v6 +0.028,但 runtime-aware total 在 D≤0.8 領先 0.005–0.02。四個完整 env 4-rep 平均:B′ off 1.087 / v3 1.111 / v5 1.086 / v6 1.100;D′ 1.090 / 1.111 / 1.089 / 1.128。
+> **上傳哪個由隊長裁定:排名看 raw 就 B′,信 final field 會比 beta 快 ≥20% 就 D′。** 上傳前再演練:B′ `bash scratchpad/rtaware/apply_pack_variant.sh ft2 s16 && bash scratchpad/rtaware/dryrun10.sh`;D′ `... ft2 k20 s16 && bash scratchpad/rtaware/dryrun11.sh`,md5 應一致。
+> 守門修復根因:`layout_refiner.py` MIB shape unification 覆寫 soft 成員尺寸不檢查面積,只在「面積異質 MIB 群組」觸發(official/v5/v6 0 個、v3 20 個,hidden 用官方產生器 → 幾乎不會遇到);守門現在失敗時先修面積再走 fallback(合法路徑 bit-exact)。
+>
+> 以下為 08-29 版原文(0828b 的描述仍有效)。
 
 > 一句話:**上傳 `submission/cadc1013_0828b_final.tar.gz`(md5 `751f7e37e18c603262c15b04a7f4b066`)**,上傳前照第 2 節再演練一次。deadline 2026-08-31 23:59。
 

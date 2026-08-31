@@ -943,3 +943,211 @@ runtime avg:polish +1%(off)~+10%(v6);anti0 off −8%、其他持平。official �
 - 守門(defence-in-depth,`partner/contest_optimizer.py` +166):`solve()` 末端 `_final_legal_guard` = evaluator 的 `is_feasible` 謂詞鏡像(overlap >1e-6、fixed/preplaced 尺寸 tol 1e-4、1% area 含 skip_indices)+ 結構檢查;合法 → 回傳**同一物件**(bit-exact);非法 → 依序取第一個「自身驗證合法」的備援(post-pick `out` → column 冠軍 → 惰性建的 row fallback);全都不合法(輸入本身不可行)→ 保留原輸出(row fallback 也會違反 preplaced,換了只會更差)。`PARTNER_FINAL_LEGAL_GUARD=0` 關;觸發時 stderr `[legal-guard]`。成本 83/161/324 µs(n=21/60/120)。
 - 測試 `tests/test_partner_final_legal_guard.py` 13/13(含把該案釘為「輸入不可滿足」);與 psel/router 測試合跑 40 passed;所有 import contest_optimizer 的 22 個測試檔 208 passed。全 grid 經工作樹重跑:可滿足 69/69 feasible、不可滿足 37/37 如預期,守門在 69 案 0 次觸發;official 100 過去每跑 overlap=0 → 輸出不變。
 - 決定:重打包(dry run 7)讓守門入包;官方 100 案應 100/100 且 `[legal-guard]` 0 次。
+
+## 18. 08-29/30 收官:Flow fine-tune round 2(T=12)促轉;尾帶 runtime 校準 k20 待裁定
+
+### 18a. Runtime factor 在尾帶沒貼 floor(現包 dry run 7 逐案重算)
+
+`cost = quality × max(0.7,(rt/median)^0.3)`,floor 需 rt ≤ 0.305×median(0823 更新版 median 按 test_id;四套 shadow 的 n↔test_id 對映與 official 完全相同)。現包(M=1.0):D=1.0 total 0.769 / floor 0.771(貼);D=0.8 0.778、D=0.7 0.792、D=0.6 0.816;M=1.45 時 D=1.0 0.794。損失集中 tid 90–99(n=111–120,rt 0.8–1.2 s vs median 2.2–5.5 s)。solver 是 wall-clock 預算制(`deadline = start + budget`,尾帶 rt = 0.82–0.99×budget),所以 contest 機 runtime ≈ 同秒數,M 合理值 ≈1.0–1.2,M=1.45 是 beta 壞包(CPU sampler 不受預算約束)反推的悲觀上界。工具 `scratchpad/rtaware/rt_total.py`、`rt_pairs.py`。
+
+### 18b. Chain RT — 尾帶表 k20/k25 vs mid 表(四套 ×2 同鏈反序;16:20–17:00 UTC,load 14–20)
+
+`budget_n = min(mid_n, κ·median_tid(n))`,只動 n≥105。k20:n=112–114/117–120 縮 23–41%;k25 只縮 113/114 24–26%、117–119 13–18%。
+
+| 套 | base raw | k20 raw Δ | tail rt | total(M=1.0)Δ @ D=1.0/0.8/0.7/0.6 | M=1.45 @ D=1.0/0.7 |
+|---|---|---|---|---|---|
+| official | 1.0984 | +0.008 | 0.880→0.757 | +0.005/−0.003/−0.013/−0.024 | −0.015/−0.027 |
+| v3 | 1.1331 | +0.010 | 0.886→0.727 | +0.007/−0.003/−0.014/−0.030 | −0.016/−0.034 |
+| v5 | 1.1010 | ±0 | 0.873→0.753 | ±0/−0.006/−0.017/−0.031 | −0.019/−0.034 |
+| v6 | 1.1256 | +0.005 | 0.881→0.778 | +0.004/−0.004/−0.012/−0.021 | −0.013/−0.023 |
+
+k25 幾乎不省時間只付 raw,淘汰。k20 = 押 field 加速(D):M=1.0 損益兩平 D≈0.85。
+
+### 18c. Flow fine-tune round 2(deep-reasoner 設計;`scratchpad/flow_ft_0829/STATUS.md`)
+
+從 round-1 300k 退火 EMA 續訓,只改一個變數:tilt 溫度 T=24→**12**(= evaluator 權重 exp((n−120)/12) 的精確重要性抽樣;尾帶抽樣占比 0.50→0.74、n<76 0.145→0.024);lr 1e-5(round 1 的一半)、warmup 1k、cosine 到 0.01×、250k 步(確保退火完成)、EMA 0.9998、目標函數與 v1 bit-exact。GPU0,10–15 it/s,16:25–22:57 UTC。工件 `artifacts/flow_ft_0829/flow_ft0829_tailT12_lr1e-5_250k_ema.pt`(EMA-only 匯出,step 250000,preflight OK)。
+
+### 18d. Chain Final — 四臂 ×4 輪序(ABCD/DCBA/BDAC/CADB)× 四套;22:58–00:09 UTC,load 8→26
+
+A = 現包 env(ft0828 300k EMA + mid 表)、B = FT2、C = k20、D = FT2+k20。配對 Δ(4 reps,bootstrap 95% CI over cases):
+
+| 候選 vs A | official | v3 | v5 | v6 | tail rt |
+|---|---|---|---|---|---|
+| **B FT2** | −0.0012 [−0.015,+0.010] | **−0.0185** [−0.042,+0.000] | **−0.0140** [−0.024,−0.005] | **−0.0158** [−0.030,−0.002] | 0.887→0.885 |
+| C k20 | +0.0048 [−0.002,+0.010] | +0.0134 [+0.002,+0.025] | −0.0018 | +0.0052 | →0.735 |
+| D FT2+k20 | +0.0012 [−0.013,+0.015] | −0.0166 [−0.041,+0.002] | −0.0096 [−0.021,+0.001] | −0.0064 [−0.021,+0.007] | →0.750 |
+
+絕對值(4-rep 平均):A off 1.0970 / v3 1.1330 / v5 1.1013 / v6 1.1254;B 1.0958 / 1.1145 / 1.0873 / 1.1096;D 1.0981 / 1.1164 / 1.0917 / 1.1190。
+- FT2 分帶:增益全在 105–120(v3 −0.013、v5 −0.012、v6 −0.018 wDelta;official +0.001),76–89 帶 column 出貨數 A→B:off 11→10、v3 10→8、v5 1→3、v6 5→5(4 reps 合計)→ **無 §17t 崩塌**;尾帶 column 出貨 v5 4→0、v6 5→3。runtime 持平。
+- **判定:FT2 促轉**(public 不退、三套 shadow −0.014~−0.019 且兩套 CI 不含 0、runtime 持平、mid band 安全)。v3/v5/v6 全部進到 <1.12 目標;public 1.096 未達 1.08。
+- k20 疊在 FT2 上(D vs B):raw off +0.002 / v3 +0.002 / v5 +0.004 / v6 +0.009;runtime-aware official(M=1.0)D 臂 EV 最佳:D=1.0 +0.001(wash)、D=0.8 −0.008、D=0.7 −0.019、D=0.6 −0.032 vs A;M=1.45 全 D −0.03。**待使用者裁定**(排名用 total 就選 D;堅持 raw 就選 B)。兩個包都打好、都演練(dry run 8 = B、dry run 9 = D)。
+
+### 18e. 預算極限診斷(08-30 02:40–06:25 UTC;FT2 + 現包 env,只換預算表;official 單 rep;load 25–37)
+
+| 預算 | noRT | avg / max rt | hpwl | area | v_rel |
+|---|---|---|---|---|---|
+| ×1(mid 表) | 1.0973 | 0.40 / 1.4 s | 0.046 | 0.045 | 0.0235 |
+| ×3 | 1.0826 | 1.03 / 4.4 | 0.028 | 0.035 | 0.0232 |
+| ×10 | 1.0776 | 3.1 / 13.8 | 0.029 | 0.033 | 0.0215 |
+| ×10,EARLY_EXIT=0 | 1.0807 | 3.2 / 14.0 | 0.031 | 0.033 | 0.0224 |
+| **×10 + FLOW_SLOTS 20 / NREF 18** | **1.0678** | 3.1 / 13.9 | **0.020** | 0.032 | 0.0195 |
+| ×30 | 1.0727 | 7.6 / 32.6 | 0.028 | 0.034 | 0.0196 |
+
+純加時間極限 ≈1.07;剩餘 ≈0.07 = violations 0.04(結構性)+ area 0.017 + HPWL 0.014。逐案:tid 97/95/94/87/86 五種預算解完全相同(pool 收斂);tid 89/88/90 在兩個 basin 間隨機跳(1.19↔1.27),更多時間不單調改善;候選加倍才是有效軸(tid 99 1.115→1.085、88 1.211→1.080)。
+- **v3 ×10 = 1.312:legal-guard 觸發**(tid 85 n=106,`overlap=0` → area/尺寸檢查失敗;post-pick 與 column 冠軍皆不合法,出了 row fallback,單案 9.999999)。×1 從未觸發;守門關閉重現鏈(`chainGuardRepro.sh`)排隊查哪個硬檢查失敗。
+
+### 18f. 殘餘 violations 卡點(×10 版面、n≥96;探針 `scripts/probes/wall_seat_diag.py`、`scratchpad/rtaware/group_diag.py`、`bridge_budget_probe.py`)
+
+- Boundary 23 bit:locked 20(preplaced 帶 tag,牆外 6–14 塊、超出 ≤6 單位、util 0.93–0.96)、block9 1、free 2(cluster 成員,貼牆 boundary −1 / grouping +1)。
+- Grouping 30 bit:packed 28(子塊 5+4 / 6+3 / 8+1,常含 preplaced 錨點;bbox 內無單顆補位)、free 2。
+- deep-reasoner 讀碼:建欄只保證全可動 cluster 連通(preplaced 成員當障礙,`_stack_column` 只貼同欄上下;`PARTNER_CLUSTER_GLUE` 有碼但未出貨);`_cluster_seat` 整組平移要求 ≤6 顆且無 preplaced;`_fix_grouping` 只 1-D 推擠;`VKILL_OFF=1` 使 LNS 不跑;出貨路徑 grouping 修補 = 一次 20 ms `bridge_grouping_violations`。
+- **離線預算探針**:對 77 案 91 個 grouping bit,`bridge_grouping_violations` 在 0.02 / 0.2 / 1 / 10 s **修掉 0 個**,wall 2–32 ms 與預算無關(候選耗盡退出)。→ move set 極限,預算旋鈕與新 LNS(+0.005 期望,低於噪音)皆不做。
+
+### 18g. Chain Wide — ×1 預算候選寬度(official ×2 反序,load 30+)
+
+| 臂 | raw(2 rep) | Δ | tail rt | runtime-aware EV(M=1.0)Δ |
+|---|---|---|---|---|
+| base(slots 10 / nref 9) | 1.0972 | — | 0.898 | — |
+| **slots 16 / nref 12** | 1.0914 | **−0.0057**(尾帶 −0.0067) | 0.936(+4%) | −0.0005(wash) |
+| slots 20 / nref 18 | 1.0934 | −0.0038 | 1.074(+20%) | +0.021(否決) |
+
+slots 16 送四套 ×4 交替序確認鏈(`chainW16.sh`,結果 `artifacts/shadow/w16{A,W}_r{1..4}_*.json`)。
+
+### 18h. 守門觸發根因 + 守門強化(deep-reasoner,08-30 07:00–08:10 UTC)
+
+- **重現**:v3 tid 85(n=106)×10 預算、守門關 → evaluator `area_violations=1`:block 32(soft、cluster 3、boundary tag 2)出貨 24×13 = 312 vs 目標 650。
+- **根因**:`partner/layout_refiner.py:6688-6702`(`refine_prediction` 的「MIB shape unification」)與 `:7469-7480`:MIB 群組取第一個 fixed/preplaced 成員的 (rw, rh) 直接覆寫所有 soft 成員,**沒有面積一致性檢查**。v3 tid 85 的 MIB 群組 {6, 32, 53} 面積異質(6 fixed 24×13=312;32/53 soft 650)→ 32 被寫成 312。只在 direct 臂勝出且長預算分支(`:7469` 在 `t_hard − _tg(0.4,0.25)` 之後、`V0>0`)才浮現;單案冷啟動(direct 臂關)不重現。
+- **資料面**:面積異質 MIB 群組數:official 0/100、v5 0、v6 0、**v3 20**(v3 產生器的工件)。official 與 hidden 用同一官方產生器、public 已含噪音仍 0 → hidden 觸發機率極低。**MIB 修法(跳過面積不同的成員)不入包**(對 official/v5/v6 逐位元相同、零期望值、純風險)。
+- **守門強化(入包;`partner/contest_optimizer.py:318-479`)**:失敗路徑先 `_repair_soft_areas`(對 >1% 的 soft block 依 keep-w / keep-h / 等比、兩個錨角共 6 種變體,`_clear_of_others` 不重疊才收)→ 通過原 `_legal_ok` 才出貨;合法路徑同物件 bit-exact。另修 fallback 接線:原本 fallbacks 裡的「column 冠軍」是 edge-seat 之後的版面,exact-area 的 raw 冠軍 `column_raw` 根本不在清單(`:1255-1262, :1374`),現已加為第三個 fallback。測試 `tests/test_partner_final_legal_guard.py` 13→18 passed;`-k "guard or legal or partner_final"` 151 passed。
+- 工件:`~/.claude/jobs/06af0e53/tmp/wt_areabug`(worktree,`PARTNER_AREA_TRACE`)、`atrace85.sh`;`artifacts/shadow/guardOff_x10_v3.json`。
+
+### 18i. Chain W16 — FLOW_SLOTS=16 / NREF=12 vs FT2 現包 env(四套 ×4 交替序;06:40–07:16 UTC)→ **promote**
+
+| 套 | A(FT2 env)4-rep | W(+slots16) | paired Δ | tail rt A→W |
+|---|---|---|---|---|
+| official | 1.0973 | 1.0873 | **−0.0100** | 0.888→0.894 |
+| v3 | 1.1167 | 1.1108 | −0.0059 | 0.871→0.885 |
+| v5 | 1.0900 | 1.0856 | −0.0044 | 0.882→0.896 |
+| v6 | 1.1111 | 1.0998 | **−0.0113** | 0.901→0.905 |
+
+四套同向、avg rt 持平(0.374→0.370)、尾帶 rt +0.7~1.6%;runtime-aware official(M=1.0)每個 D 都好(EV −0.007)。與 §18e 的 ×10 診斷一致(候選寬度才是有效軸;slots 20 / nref 18 在 ×1 runtime +20% 否決)。疊加互動:chain K16(k20 表下 slots16 是否仍有效)接著跑;包 = `apply_pack_variant.sh ft2 s16` / `ft2 k20 s16`。
+
+### 18j. Chain K16 — k20 表下 s16 是否仍有效(四套 ×4 交替序;07:20–07:51 UTC)+ 四個完整 env 的絕對值
+
+K16 配對(FT2+k20+s16 − FT2+k20):off −0.0132、v3 −0.0107、v5 −0.0040、v6 +0.0022 → s16 在 k20 表下仍成立(v6 wash)。
+
+| 完整 env(皆 FT2)| official | v3 | v5 | v6 | mean4 | runtime-aware official EV(M=1.0)|
+|---|---|---|---|---|---|---|
+| mid 表(現 B 包) | 1.0973 | 1.1167 | 1.0900 | 1.1111 | 1.1038 | 0.7851 |
+| **mid + s16(B′)** | **1.0873** | 1.1108 | **1.0856** | **1.0998** | **1.0959** | 0.7782 |
+| k20 | 1.1028 | 1.1214 | 1.0925 | 1.1260 | 1.1107 | 0.7774 |
+| **k20 + s16(D′)** | 1.0896 | **1.1107** | 1.0885 | 1.1282 | 1.1042 | **0.7677** |
+
+(各 4 reps 平均,w16/k16 兩鏈;絕對值受 load 漂移 ±0.01。)B′ = raw 最佳;D′ = runtime-aware 最佳(D≤0.8 時領先 0.005–0.02,D=1.0 持平),代價 v6 +0.028、official +0.002。
+
+### 18k. alpha_1(合成 pin 偏移套,僅參考)— 0828b env / B′ / D′ ×2 交錯反序(08-30 08:30 UTC)
+
+| 臂 | r1 / r2 | 平均 | paired Δ vs 0828b | avg rt / max |
+|---|---|---|---|---|
+| 0828b env | 1.2078 / 1.2047 | 1.206 | — | 0.35 / 1.29 |
+| B′ FT2+s16 | 1.2038 / 1.2071 | 1.205 | −0.0008(wash) | 0.35 / 1.19 |
+| D′ FT2+k20+s16 | 1.2182 / 1.2253 | 1.222 | **+0.0155**(尾帶 +0.020) | 0.33 / 0.97 |
+
+alpha_1 是 HPWL 驅動的合成偏移套(§17c/§17p 已退出判準),尾帶預算縮減在這裡的 raw 代價比 official/v3/v5 大;B′ 不退。
+
+### 18l. 「對手 1.005」的診斷:golden 餵進我們的 ladder(oracle 探針,deep-reasoner;`scratchpad/rtaware/golden_probe.py`)
+
+事實:golden 本身在 official 100 加權 **1.108**(違反 ~5% 軟約束;tid 89 1.30);我們 1.087 已優於 golden。1.005 = V≈0 且 HPWL/area 在 golden 1% 內。
+oracle 探針(tid 81–99,n=102–120,加權;`refine_prediction` + 出貨 post-pass 鏈 `_coord_polish→_final_seat→_tag_compress→_wall_repair_final`):
+
+| 階段 | cost | hpwl_gap | area_gap | V_rel |
+|---|---|---|---|---|
+| golden 原樣 | 1.1074 | 0 | 0 | 0.0500 |
+| 出貨候選(w16W_r1,同 19 案) | 1.0724 | 0.0185 | 0.0343 | 0.0214 |
+| golden → refine 5 s | 1.0162 | 0.0014 | 0.0084 | 0.0054 |
+| + post-pass 鏈 | **1.0129** | 0.0002 | 0.0032 | 0.0054 |
+
+- ladder **不 lossy**(HPWL 貼平 golden、area +0.3%),且把 golden 自己的違規從 0.050 修到 0.0054(14/19 案 V=0):golden 的違規多屬 `free`(平移貼牆即可),golden 只是沒做軟約束最佳化。5 s 與 30 s 結果相同(ladder 自行收斂)。
+- 殘餘 5 個 `locked` bit(tid 88/89/99:preplaced 帶 tag、牆得往它靠)= 我們 column backbone「先定框再貼」做不到,要 slicing-tree / constraints-by-construction 的表示法。
+- **結論:1.087→1.005 的差距幾乎全在候選(seed)品質**(出貨候選 hpwl 0.0185 / area 0.0343 vs golden-seeded 0.0002 / 0.0032),不在 ladder、post-pass、預算或 knob。對手若無資料重疊,就是預測器準得多(例如直接預測 `tree_sol`)。我們的 Flow 模型 fine-tune 一輪只賺 ~0.005,追不上;決賽前無法換架構。
+- 待確認對手兩件事:beta hidden raw(榜上最好 1.0845);v3/v5/v6 來自訓練集 worker 90–99 的資料列,全 1M 訓練的模型看過 → <1.02 可能是記憶,official 也要問是否進過訓練資料。
+
+### 18m. seed 品質 test-time knob(B′ env 之上,official ×2 配對反序;08-30 09:30–09:54 UTC)
+
+| 候選 | paired Δ | 備註 |
+|---|---|---|
+| FLOW_SLOTS 24(pool 全 Flow seed,NREF 12) | +0.0010 | wash,不上 |
+| oversample ×3 + prescreen(`PARTNER_OVERSAMPLE=3 KS_CAP=48 OVERSAMPLE_MIN_REM=0`;現包在 ×1 下 MIN_REM=12 s 等於關閉) | **+0.0138** | 兩 rep 皆差(area +0.01):prescreen 挑得比全精煉差、48 批次拖慢派工 |
+| `PARTNER_FLOW_STEPS=16`(8→16) | **+0.0075** | HPWL 反而升;sampler 時間 ×2 |
+
+→ 出貨維持 s16(slots 16 / NREF 12 / steps 8 / 無 oversample)。seed 品質只能靠模型(round 3 訓練中)。
+
+### 18n. Flow fine-tune round 3(08-30 09:55 UTC 起,GPU0;`scratchpad/flow_ft_0830/STATUS.md`)
+
+從 round-2 250k 續訓,T=12 不變,lr 5e-6、warmup 1k、cosine→0.01×、150k 步、EMA 0.9998,**x0_loss 1.0→2.0、hpwl_loss 0.3→0.6**(對準 §18l 的缺口:尾帶預測座標精度)。種子用 `make_seed_checkpoint.py` 重建(lr 才會生效;loss 權重每步讀 args,resume-safe,已用 smoke jsonl 反證權重生效)。9.5–12 it/s,ETA 14:05–15:00 UTC。ckpt `artifacts/flow_ft_0830/flow_ft0830_ft250k_tailT12_lr5e-6_x02_hp06_s150k/step_00150000.pt`;匯出 `export_ema_only.py` → `artifacts/flow_ft_0830/flow_ft0830_tailT12_lr5e-6_x02_hp06_150k_ema.pt`。
+Gate 已排隊 `scratchpad/rtaware/chainFT3.sh`:B′ env(FT2+s16)vs FT3+s16,四套 ×4 交替序,鏈尾印配對 Δ 與 76–89 帶 column 出貨數。風險:objective 改動(v2 postmortem +0.027 的類別),gate 沒過就不上。
+
+### 18o. 解析式(LS / quadratic)seed 探針(deep-reasoner;`scratchpad/rtaware/ls_seed_probe.py`,同 §18l 的 19 案與 ladder 鏈)→ **否決,0/19 勝**
+
+| seed | seed hpwl_gap / area_gap / overlap | post cost | post V |
+|---|---|---|---|
+| golden | 0 / 0 / 0 | 1.0129 | 0.017 |
+| 出貨 Flow 候選 | — | 1.0724 | — |
+| LS(pins+preplaced 錨、b2b 彈簧、quantile spread) | +0.026 / +0.022 / 0.46 | 1.783 | 0.105 |
+| LS + boundary tag + cluster 彈簧 | +0.313 / +0.025 / 0.60 | 2.778 | 0.361 |
+| LS(affine spread) | −0.231 / +0.012 / 1.45 | 2.431 | 0.126 |
+
+LS 的原始幾何不差(hpwl +2.6%),但 ladder 無法從純線長版面重建 boundary/grouping 結構(post V 0.105 vs golden seed 0.017)——與已否決的 ePlace 臂同一機制(§早期紀錄 :66-73,21/21 經 refine 後輸)。單案最好 tid 97 1.183 vs 出貨 1.075,沒有任何案能進 pool。另 LS 解未綁執行緒時 429 ms(OpenBLAS),也不預算中性。
+
+### 18p. 對手提供的面板(`shadow_hidden/self_gen_v2_1x_2x_3x.tar.gz`、`proxy.tar.gz`)— B′(FT2+s16)單 rep,08-30 13:50–14:07 UTC,load ~30
+
+| 面板 | B′ noRT | hpwl / area / v_rel | 對手 A / B / C |
+|---|---|---|---|
+| public | 1.0922 | 0.034 / 0.041 / 0.025 | <1.01 ×3 |
+| selfgen 1x(σ 0.05 / jitter 0.08) | **1.0764** | 0.046 / 0.077 / 0.007 | 1.0422 / 1.0411 / 1.0432 |
+| selfgen 2x | 1.1802 | 0.136 / 0.172 / 0.011 | 1.126 / 1.0652 / 1.0713 |
+| selfgen 3x | 1.3067 | 0.245 / 0.269 / 0.019 | 1.2678 / 1.1733 / 1.2278 |
+| proxy bbox50 short / flat | 1.1960 / 1.1505 | 0.192 / 0.072 / 0.027 ; 0.081 / 0.066 / 0.033 | — |
+| proxy blockarea50 short / flat | 1.1934 / 1.1360 | 0.192 / 0.066 / 0.027 ; 0.082 / 0.056 / 0.029 | — |
+| proxy blockar50 short / flat | 1.1957 / 1.1320 | 0.179 / 0.071 / 0.029 ; 0.047 / 0.054 / 0.036 | — |
+| v3 / v5 / v6 | 1.1078 / 1.0867 / 1.0987 | | 對手稱 <1.02 |
+
+- selfgen 面板工件:golden 利用率 1x 0.898 / 2x 0.812 / 3x 0.700(official 0.966),我們版面利用率 0.903 / 0.834 / 0.784 **高於 golden** 但 area gap +0.077 / +0.18 / +0.28 → area_targets 總和比 golden 方塊實際面積大 ≈7% / 21% / 43%(噪音 + rounding 膨脹);所有隊同受影響,只能相對比較。golden 皆無重疊(有重合法化)。
+- 相對落差:public 0.077 → 1x 0.034 → 2x 0.05–0.11 → 3x 0.04–0.13(B 隊最穩)。加噪音他們 +0.03、我們 −0.01:他們的 public 有一部分貼合 public golden,但 B 隊在強噪音下仍領先 → 真實差距 ≈0.03–0.05。
+- proxy(SA 生成、<5% 白空間):short 連線(強鄰近抽樣)HPWL gap 0.18–0.19,flat 連線 0.05–0.08。
+
+### 18q. Chain FT3 — round 3(x0 2.0 / hpwl 0.6)+s16 vs FT2+s16(四套 ×4 交替序;14:10–14:48 UTC)→ **否決**
+
+| 套 | FT2+s16(4-rep) | FT3+s16 | paired Δ | 76–89 帶 column 出貨 A→B |
+|---|---|---|---|---|
+| official | 1.0920 | 1.0830 | **−0.0091** | 8→13 |
+| v3 | 1.1079 | 1.1199 | **+0.0120** | 8→5 |
+| v5 | 1.0838 | 1.0826 | −0.0011 | 2→1 |
+| v6 | 1.1008 | 1.1181 | **+0.0173** | 0→9 |
+
+official 進但 v3/v6 四 rep 一致退、v6 mid band column 出貨 0→9(§17t 型態輕微重現)→ 依「public + v3 + v5/v6」判準不上。x0/hpwl 加權讓模型更貼 public 分佈、shadow 退步。
+違規來源探針(deep-reasoner,`scratchpad/rtaware/vprobe.py`):Flow 原始樣本 V_rel **0.80**(bnd 29.6 / grp 15.0 / mib 3.6 加權計數),幾何卻貼 golden(hpwl −0.0006、area +0.013、overlap 0.45%);ladder 修掉 97.4% → 0.021(bnd 1.05 / grp 0.23 / mib 0),代價 hpwl 0.020 / area 0.041。訓練 loss 對齊審計:boundary_touch 對齊;cluster_gap 是弱代理(cluster 裂 15 塊仍 3.8e-5,加權無效);mib_aspect 對齊但 ladder 已修到 0。
+Round 4(`artifacts/flow_ft_0830b/`,bd 1.5 / cg 1.5 / mib 0.5,從 round-2 續訓,lr 5e-6,140k,ETA ~18:00 UTC)gate 鏈 `chainFT4.sh` 已排隊。
+
+### 18r. Runtime 剖析與微優化(deep-reasoner,08-30 16:00–16:56 UTC;patch `~/.claude/jobs/06af0e53/tmp/runtime_opt.patch`,備份 `backup_runtime/`)
+
+剖析(B′ env、GPU0、sampler 已暖):n=61 總 60 ms(預算 0.05 s;head 4.5 ms、尾 12 ms)、n=100 456–518 ms(預算 0.454;sampler 160–245 ms 與 column 派工重疊;尾 13–17 ms)、n=120 1214–1283 ms(預算 1.439;尾 25–30 ms)。**deadline-bound 佔 79% / 97% / 98%**,預算外固定開銷只有尾段 12–27 ms。worker pool 每 process 建一次、模型只 `.to(device)` 一次、熱路徑無無條件 print、無 sleep 輪詢。
+改動(2 檔,+58/−25):
+1. `contest_optimizer.py:1408` `_post_scorer()`:四個 post-pass 原本各自重建 `_ColumnOptimizer`(2–4.5 ms),改共用一個;7 個真實版面重放**逐位元相同**,鏈成本 10–24 ms → 6–13 ms(**每案 −4.4~−11 ms 純 runtime**)。
+2. `column_sa_legalizer.py:4742`:六個 `np_of()` tensor→array 轉換提出 payload comprehension(216 次/案 → 6 次),省 0.4–0.8 ms head(預算內 → 品質,統計等價非逐位元)。
+28 rep 交錯量測:n=61 60.1→55.6 ms、n=120 1249.7→1232.9 ms(n=100 在噪音內)。測試 1269 passed(1 個既有失敗 `test_partner_ladder_rebudget.py::test_early_ladder_success_is_identical` 與改動無關)、守門 18 passed。
+未動(需 gate 或風險):refine worker 超過 `worker_deadline` 45–105 ms(n=100)是最大尾段項,但砍它 = 砍 refine 工作;每案 IPC 3.2 MB(需 shared memory);sampler 內 `b2b.to(dev)` 重複(50 µs);post-pass scorer 的 `try_attach`(0.4 ms);dead code 皆 env-gated,不刪。
+
+### 18s. Chain FT4 — round 4(bd 1.5 / cg 1.5 / mib 0.5)+s16 vs FT2+s16(六套 ×4 交替序;18:10–19:4x UTC,load 35–55)→ **否決**
+
+配對 Δ(FT4−FT2):off **+0.0120**、v3 +0.0010、v5 +0.0029、v6 +0.0029、sg1x −0.0007、sg2x +0.0083。76–89 帶 column 出貨 A→B:off 13→25、v6 12→17、v3 12→14(§17t 型態:constraint 加權讓 mid-band 預測過不了 rung 0)。
+→ 模型定案 **FT2**(round-2 T=12 250k EMA)。round 3(x0/hpwl)與 round 4(constraint 權重)皆否決;訓練軌收工。若賽後再訓:cluster loss 要換連通性項、boundary 要能把殘距壓進 ε(§18q 審計)。
+
+### 18t. Chain PF — pin-frame portfolio 席位重測(B′ env;`PIN_FRAME_SLOTS=2 MAX_UTIL=0.75`;四套 ×4 交替序;08-31 01:45–02:24 UTC,load 24)→ **不促轉**
+
+配對 Δ(PF−base):off −0.0017、v3 +0.0033(r3 一個 1.1264 外點)、v5 −0.0027、v6 −0.0038。三套小負一套小正,全部在 ±0.004 = 噪音級;依 §17y 鐵律(±0.01 效應 4 reps 分不出真假、不疊噪音級 knob)不入包。locked 牆線類正式收案:賽後才有解(由 tag 線定框的表示法)。
+
+### 18u. 最後 adversarial pass(deep-reasoner,08-31,T−5 h)→ **無任何 ≥0.01 機制級候選;鎖定上傳**
+
+掃過 B′ env 下從未 gate 的 knob:`PARTNER_FLOW_ZORDER`(會靜默跳過 antithetic、prescreen 機制 §18m 已量 +0.014)、`PARTNER_FLOW_NOPT`(10 輪 backprop ≈1.6–2.5 s vs 0.454 s 預算)、`PARTNER_NREF_MIN_N=76`(mid band 版 s16;EV ≈0.003–0.004 且有 §17t 型下檔)、WALL_REPAIR/GROUP_BRIDGE 預算(§18f 普查已封頂)、RUNG0_TIGHTEN(~0.002)。runtime 面:M=1.0 時已貼 floor(0.769 vs 0.771),refine worker 超時 45–105 ms 修了也不加分。
+**建議 B′**(mid 表;M=1.0 已貼 floor,k20 用 raw 換不到 factor)。殘留已知風險(不動):op_wrapper `PARTNER_POOL=24` 無條件,cgroup 限核容器下會超訂——selfcheck `cpu_ratio` 可觀察,七次演練皆此設定,臨時改風險更大。

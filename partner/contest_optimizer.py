@@ -315,6 +315,111 @@ def _legal_ok(rects, n: int, area_targets, constraints, target_positions) -> boo
         return False
 
 
+def _soft_mask(constraints, n: int):
+    """Blocks the evaluator subjects to the 1% area tolerance: everything
+    that is neither fixed-shape nor preplaced.
+
+    Deliberately a MIRROR of `_soft_area_ok`'s own mask rather than a shared
+    helper: `_soft_area_ok` runs on the common path and must stay byte-frozen.
+    Drift is harmless by construction -- the repair below is only ever
+    accepted after the untouched `_legal_ok` re-verifies the whole layout, so
+    a wrong mask can only make the repair fail, never ship something illegal."""
+    soft = np.ones(n, dtype=bool)
+    if constraints is not None:
+        C = np.asarray(constraints, dtype=np.float64)
+        if C.ndim == 2 and C.shape[0] >= n:
+            if C.shape[1] > 0:
+                soft &= (C[:n, 0] == 0.0)
+            if C.shape[1] > 1:
+                soft &= (C[:n, 1] == 0.0)
+    return soft
+
+
+def _clear_of_others(P, i: int, cand, n: int, tol: float = 1e-6) -> bool:
+    """Does rectangle `cand` (replacing block `i`) overlap any OTHER block of
+    `P`?  Same predicate and tolerance as `_overlap_count` -- both axes must
+    overlap by more than 1e-6 -- so an accepted variant cannot introduce an
+    overlap the evaluator would count.  Vectorised O(n)."""
+    x, y, w, h = cand
+    x1 = P[:n, 0]
+    y1 = P[:n, 1]
+    ox = np.minimum(x1 + P[:n, 2], x + w) - np.maximum(x1, x)
+    oy = np.minimum(y1 + P[:n, 3], y + h) - np.maximum(y1, y)
+    hit = (ox > tol) & (oy > tol)
+    hit[i] = False
+    return not bool(np.any(hit))
+
+
+def _repair_soft_areas(rects, n: int, area_targets, constraints,
+                       area_tol: float = 0.01, ov_tol: float = 1e-6):
+    """Resize every SOFT block that is outside the evaluator's 1% area
+    tolerance back to its exact area target, in free space.  Returns the
+    repaired layout, or None when nothing could be repaired.
+
+    Why: an infeasible layout is scored at the x8 `M_PENALTY` (cost ~10), and
+    the fallback chain can only rescue it when some OTHER whole layout is
+    legal -- which fails exactly when the defect is inherited by every
+    candidate (observed 2026-08-30, shadow v3 tid 85 at a x10 diagnostic
+    budget: block 32 shipped 24x13 = 312 against a 650 target in the picked
+    layout AND in the column champion, so the guard could only fall back to
+    the row layout at cost 9.999999).  Rewriting one block's extents is a far
+    smaller perturbation than discarding the whole layout.
+
+    Per offender, the first variant that is clear of every other block wins,
+    in order of increasing disturbance: keep w / keep h / uniform rescale,
+    each anchored first at the block's own (x, y) (growth extends right and
+    up) and then at its far corner (growth extends left and down).  Fixed and
+    preplaced blocks are never touched, so `_hard_dims_ok` is unaffected;
+    already-repaired blocks are part of the obstacle set for later ones.
+    Bounded: at most 6 O(n) overlap scans per offender, n <= 120.
+
+    This function DECIDES nothing -- `_final_legal_guard` only ships its
+    output after the untouched `_legal_ok` passes on it."""
+    at = np.asarray(area_targets, dtype=np.float64).reshape(-1)
+    if at.shape[0] < n:
+        return None
+    P = np.asarray([list(map(float, r)) for r in rects], dtype=np.float64)
+    if P.shape != (n, 4) or not np.all(np.isfinite(P)):
+        return None
+    soft = _soft_mask(constraints, n)
+    area = P[:, 2] * P[:, 3]
+    bad = np.where(soft & (np.abs(area - at[:n]) >
+                           area_tol * np.abs(at[:n])))[0]
+    if bad.size == 0:
+        return None                      # the area test is not what failed
+    Q = P.copy()
+    for i in bad:
+        i = int(i)
+        A = float(at[i])
+        x, y, w, h = (float(v) for v in Q[i])
+        if not (A > 0.0 and w > 0.0 and h > 0.0):
+            return None
+        nh = A / w
+        nw = A / h
+        sc = math.sqrt(A / (w * h))
+        sw = w * sc
+        sh = h * sc
+        variants = (
+            (x, y, w, nh),                      # keep w, extend up
+            (x, y, nw, h),                      # keep h, extend right
+            (x, y, sw, sh),                     # uniform, anchored at (x, y)
+            (x, y + h - nh, w, nh),             # keep w, extend down
+            (x + w - nw, y, nw, h),             # keep h, extend left
+            (x + w - sw, y + h - sh, sw, sh),   # uniform, far-corner anchor
+        )
+        for cand in variants:
+            if not all(math.isfinite(v) for v in cand):
+                continue
+            if cand[2] <= 0.0 or cand[3] <= 0.0:
+                continue
+            if _clear_of_others(Q, i, cand, n, ov_tol):
+                Q[i] = cand
+                break
+        else:
+            return None                  # boxed in on every side
+    return [tuple(map(float, r)) for r in Q]
+
+
 def _final_legal_guard(result, fallbacks, n: int, area_targets, constraints,
                        target_positions, row_fallback=None):
     """Return `result` unless it violates a HARD evaluator constraint; then
@@ -337,6 +442,11 @@ def _final_legal_guard(result, fallbacks, n: int, area_targets, constraints,
         obstacles overlap each other, which no layout can satisfy -- the
         original `result` is returned untouched, so the guard can never make
         an output worse than it already was.
+      * On the failing path it FIRST tries `_repair_soft_areas` on a copy of
+        `result` (soft blocks outside the 1% area tolerance resized back to
+        their exact target in free space) and ships that if the untouched
+        `_legal_ok` then passes -- keeping the layout's quality instead of
+        discarding it for a fallback.
       * `row_fallback` is a zero-argument callable, evaluated ONLY on the
         failing path, so the guaranteed-feasible row layout costs nothing on
         the common path.
@@ -347,6 +457,23 @@ def _final_legal_guard(result, fallbacks, n: int, area_targets, constraints,
     try:
         if _legal_ok(result, n, area_targets, constraints, target_positions):
             return result
+        # (a) repair before replace: when the only defect is a soft block off
+        # its area target, resizing that ONE block in free space keeps all the
+        # quality this layout earned, where the fallback chain would throw the
+        # whole layout away (and has nothing to offer when every candidate
+        # inherited the same defect).  Contained: any failure -> None -> the
+        # fallback chain below runs exactly as before.
+        try:
+            repaired = _repair_soft_areas(result, n, area_targets, constraints)
+        except Exception:
+            repaired = None
+        if repaired is not None and _legal_ok(repaired, n, area_targets,
+                                              constraints, target_positions):
+            print(f"[legal-guard] n={n} final layout failed the hard "
+                  f"legality check (soft-block area); "
+                  f"shipping area-repaired layout",
+                  file=sys.stderr, flush=True)
+            return repaired
         cands = list(fallbacks)
         if row_fallback is not None:
             try:
@@ -536,6 +663,8 @@ class MyOptimizer(FloorplanOptimizer):
         self.retrieval_slots = 0
         # PARTNER_VAUDIT_JSONL bookkeeping (see module-level _vaudit_* below)
         self._last_pick_channel = "column"
+        # per-case cache for `_post_scorer` (reset at the top of every solve)
+        self._post_scorer_cache = None
         self._vaudit_seq = 0
         configured_max_cost = _env_float("PARTNER_RETRIEVAL_MAX_COST", 2.0)
         self.retrieval_max_cost = configured_max_cost if math.isfinite(configured_max_cost) else 2.0
@@ -984,6 +1113,7 @@ class MyOptimizer(FloorplanOptimizer):
         budget = _time_budget(block_count)
         deadline = start + budget
         self._first_polish_truncated = False
+        self._post_scorer_cache = None
 
         # PARTNER_POST_ROUTER: one shared, time-neutral reserve for the final
         # violation-repair + second-polish post-passes.  Ported verbatim from
@@ -1128,6 +1258,14 @@ class MyOptimizer(FloorplanOptimizer):
 
                 vaudit_stages.append(("column_pre_seat", vaudit_v(column_out)))
 
+            # The raw legalizer champion, kept as an EXTRA fallback for the
+            # final legality guard only: `column_out` is rebound below, so the
+            # pre-edge-seat layout -- overlap-free and exact-area by
+            # construction -- was previously unreachable when a post-pass
+            # broke both arms.  A pure alias (`_edge_seat` copies its input
+            # into a fresh array and `_column_edge_seat` rebuilds the list, so
+            # nothing mutates this one in place); zero cost on the fast path.
+            column_raw = column_out
             column_out = self._column_edge_seat(
                 column_out, area_targets, constraints, target_positions,
                 b2b, p2b, pins, direct_box)
@@ -1236,7 +1374,8 @@ class MyOptimizer(FloorplanOptimizer):
             return _final_legal_guard(
                 _final_area_guard(result, (out, column_out), area_targets,
                                   block_count),
-                (out, column_out), block_count, area_targets, constraints,
+                (out, column_out, column_raw), block_count, area_targets,
+                constraints,
                 target_positions,
                 row_fallback=lambda: _fallback_row(
                     area_targets, constraints, target_positions))
@@ -1266,6 +1405,31 @@ class MyOptimizer(FloorplanOptimizer):
         except Exception:
             return out
 
+    def _post_scorer(self, direct_box, rects, at, cons, tpos, b2b, p2b, pins):
+        """The scorer the FINAL post-passes share, built at most once a case.
+
+        Every post-pass below (`_column_edge_seat`, `_final_seat`,
+        `_tag_compress`, `_wall_repair_final`) used to build its own
+        `_ColumnOptimizer` over the layout it had just received -- four
+        constructions of 2-4.5 ms each on the column-only path, all of them
+        AFTER the solve deadline, i.e. pure runtime.  The passes only read
+        constraint-derived state (`n`, `areas`, `kind`, `boundary`,
+        `cluster`, `mib`, `mib_groups`, `cluster_groups`, `n_soft_den`, the
+        hpwl arrays and `_hpwl`) and never mutate the scorer, which is the
+        same property `_column_edge_seat` already relied on when it reused
+        the direct channel's scorer; those attributes are identical for
+        scorers built from ANY layout of one instance (verified by
+        construction from two disjoint layouts).  So one build serves them
+        all.  Precedence is unchanged: with a direct candidate in the box its
+        scorer still wins and nothing is constructed."""
+        if direct_box:
+            return direct_box[0][1]
+        if self._post_scorer_cache is None:
+            self._post_scorer_cache = _ColumnOptimizer(
+                [tuple(map(float, r)) for r in rects], at, cons, tpos,
+                b2b, p2b, pins, time.time() + 1.0, seed=0)
+        return self._post_scorer_cache
+
     def _column_edge_seat(self, column_out, at, cons, tpos, b2b, p2b, pins,
                           direct_box):
         """Path coverage for `layout_refiner._edge_seat`.
@@ -1291,9 +1455,8 @@ class MyOptimizer(FloorplanOptimizer):
             # reuse the direct channel's scorer when there is one -- it is
             # constraint-derived, so it scores any layout of this instance
             # (this is exactly what `_pick_best` already does with it)
-            scorer = direct_box[0][1] if direct_box else _ColumnOptimizer(
-                [tuple(map(float, r)) for r in column_out], at, cons, tpos,
-                b2b, p2b, pins, time.time() + 1.0, seed=0)
+            scorer = self._post_scorer(direct_box, column_out, at, cons,
+                                       tpos, b2b, p2b, pins)
             seated = _edge_seat(scorer, column_out)
             return [tuple(map(float, r)) for r in seated]
         except Exception:
@@ -1326,9 +1489,8 @@ class MyOptimizer(FloorplanOptimizer):
             return out
         try:
             from layout_refiner import _edge_seat
-            scorer = direct_box[0][1] if direct_box else _ColumnOptimizer(
-                [tuple(map(float, r)) for r in out], at, cons, tpos,
-                b2b, p2b, pins, time.time() + 1.0, seed=0)
+            scorer = self._post_scorer(direct_box, out, at, cons, tpos,
+                                       b2b, p2b, pins)
             seated = _edge_seat(scorer, out)
             if os.environ.get("PARTNER_SEAT_FINAL_DEBUG"):
                 # self-paired accounting: V before and after, on the SAME
@@ -1380,9 +1542,8 @@ class MyOptimizer(FloorplanOptimizer):
             return out
         try:
             from layout_refiner import _wall_repair
-            scorer = direct_box[0][1] if direct_box else _ColumnOptimizer(
-                [tuple(map(float, r)) for r in out], at, cons, tpos,
-                b2b, p2b, pins, time.time() + 1.0, seed=0)
+            scorer = self._post_scorer(direct_box, out, at, cons, tpos,
+                                       b2b, p2b, pins)
             P = np.asarray([tuple(map(float, r)) for r in out], dtype=float)
             R = _wall_repair(scorer, P,
                              deadline=time.time() + _env_float(
@@ -1431,9 +1592,8 @@ class MyOptimizer(FloorplanOptimizer):
             return out
         scorer = None
         try:
-            scorer = direct_box[0][1] if direct_box else _ColumnOptimizer(
-                [tuple(map(float, r)) for r in out], at, cons, tpos,
-                b2b, p2b, pins, time.time() + 1.0, seed=0)
+            scorer = self._post_scorer(direct_box, out, at, cons, tpos,
+                                       b2b, p2b, pins)
         except Exception:
             return out
         current = out

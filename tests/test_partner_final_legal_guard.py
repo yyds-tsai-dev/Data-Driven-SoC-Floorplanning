@@ -298,3 +298,94 @@ def test_fixedheavy_n21_s1_input_is_unsatisfiable():
     mandated = [tuple(float(v) for v in tp[i]) if cons[i, 1] != 0.0
                 else (0.0, 0.0, 1.0, 1.0) for i in range(21)]
     assert CO._overlap_count([mandated[15], mandated[20]], 2) == 1
+
+
+# --------------------------------------------------------------------------
+# area repair: rescue the layout instead of discarding it
+#
+# Provenance (2026-08-30, shadow v3 tid 85 at a x10 diagnostic budget): the
+# shipped layout had soft block 32 at 24x13 = 312 against a 650 target, and
+# BOTH fallbacks had inherited the same defect, so the guard could only reach
+# the row layout (cost 9.999999).  Resizing the one offending block in free
+# space keeps everything the layout earned.
+# --------------------------------------------------------------------------
+def _boxed_in_instance():
+    """Block 0 (area target 8) sits at 2x2 = 4 with a neighbour flush against
+    each of its four sides, so every resize variant -- keep w / keep h /
+    uniform, anchored at (x, y) and at the far corner -- clashes."""
+    areas = np.array([8.0, 4.0, 4.0, 4.0, 4.0])
+    cons = np.zeros((5, 5))
+    tpos = np.full((5, 4), -1.0)
+    lay = [(10.0, 10.0, 2.0, 2.0),      # offender: 4 vs 8
+           (8.0, 10.0, 2.0, 2.0),       # left
+           (12.0, 10.0, 2.0, 2.0),      # right
+           (10.0, 8.0, 2.0, 2.0),       # below
+           (10.0, 12.0, 2.0, 2.0)]      # above
+    return areas, cons, tpos, lay
+
+
+def test_area_repair_resizes_the_offender_and_leaves_the_rest_alone(capsys):
+    areas, cons, tpos = _instance()
+    bad = _legal_layout()
+    bad[0] = (0.0, 0.0, 3.0, 2.0)               # 6.0 against a 12.0 target
+    assert not CO._legal_ok(bad, 4, areas, cons, tpos)
+
+    sentinel = _legal_layout()                  # a legal fallback exists ...
+    sentinel[3] = (0.0, 6.0, 3.0, 2.0)          # ... distinguishable from it
+    assert CO._legal_ok(sentinel, 4, areas, cons, tpos)
+    out = CO._final_legal_guard(bad, (sentinel,), 4, areas, cons, tpos)
+
+    # ... and must NOT be what ships: the repair outranks the fallback chain
+    assert [tuple(r) for r in out] != [tuple(r) for r in sentinel]
+    assert CO._legal_ok(out, 4, areas, cons, tpos)
+    # keep w = 3.0, grow upward into the free space below block 3
+    assert tuple(out[0]) == pytest.approx((0.0, 0.0, 3.0, 4.0))
+    assert [tuple(r) for r in out[1:]] == [tuple(r) for r in bad[1:]]
+    assert "shipping area-repaired layout" in capsys.readouterr().err
+
+
+def test_area_repair_never_moves_fixed_or_preplaced_blocks():
+    """The 1% test skips them, so they are never offenders; the repair must
+    not resize them into legality either (that would break `_hard_dims_ok`)."""
+    areas, cons, tpos = _instance()
+    bad = _legal_layout()
+    bad[0] = (0.0, 0.0, 3.0, 2.0)
+    fixed = CO._repair_soft_areas(bad, 4, areas, cons)
+    assert fixed is not None
+    assert tuple(fixed[1]) == tuple(bad[1])     # fixed-shape 2x8 untouched
+    assert tuple(fixed[2]) == tuple(bad[2])     # preplaced untouched
+    assert CO._hard_dims_ok(fixed, cons, tpos, 4)
+
+
+def test_area_repair_declines_when_the_offender_is_boxed_in(capsys):
+    areas, cons, tpos, lay = _boxed_in_instance()
+    assert not CO._legal_ok(lay, 5, areas, cons, tpos)
+    assert CO._repair_soft_areas(lay, 5, areas, cons) is None
+
+    # -> the pre-existing fallback behaviour, unchanged
+    good = [(0.0, 0.0, 2.0, 4.0), (4.0, 0.0, 2.0, 2.0), (7.0, 0.0, 2.0, 2.0),
+            (10.0, 0.0, 2.0, 2.0), (13.0, 0.0, 2.0, 2.0)]
+    assert CO._legal_ok(good, 5, areas, cons, tpos)
+    out = CO._final_legal_guard(lay, (good,), 5, areas, cons, tpos)
+    assert [tuple(r) for r in out] == [tuple(r) for r in good]
+    err = capsys.readouterr().err
+    assert "verified-legal fallback" in err
+    assert "area-repaired" not in err
+
+
+def test_area_repair_declines_when_the_defect_is_not_area():
+    """An overlap is not an area violation: the repair must report failure
+    rather than hand `_legal_ok` a layout that still overlaps."""
+    areas, cons, _tpos = _instance()
+    assert CO._repair_soft_areas(_overlapping_layout(), 4, areas, cons) is None
+
+
+def test_area_repair_is_never_reached_on_the_legal_path(monkeypatch):
+    """Bit-exactness of the shipped path: the fast path returns the SAME
+    object without so much as consulting the repair."""
+    def _boom(*_a, **_k):
+        raise AssertionError("repair must not run on a legal layout")
+
+    monkeypatch.setattr(CO, "_repair_soft_areas", _boom)
+    lay = _legal_layout()
+    assert _guard(lay, fallbacks=(_legal_layout(),)) is lay
