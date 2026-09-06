@@ -22,17 +22,17 @@
 
 ## File Structure
 
-- Create `partner/flow_matching_claude.py`: straight-path objective helpers and Euler/Heun samplers.
-- Create `partner/flow_train_claude.py`: Direct-v2-compatible trainer override and tagged checkpoints.
+- Create `src/solver/flow_matching_claude.py`: straight-path objective helpers and Euler/Heun samplers.
+- Create `src/solver/flow_train_claude.py`: Direct-v2-compatible trainer override and tagged checkpoints.
 - Create `scripts/probes/flow_candidate_probe.py`: candidate-only NFE/quality/latency matrix.
-- Modify `partner/my_opt_claude.py`: opt-in flow checkpoint and fixed-quota candidate source.
+- Modify `src/solver/my_opt_claude.py`: opt-in flow checkpoint and fixed-quota candidate source.
 - Create `scripts/probes/run_flow_matching_gate.sh`: smoke, candidate-only, and end-to-end gate runner.
 - Create `tests/test_partner_flow_matching.py`, `tests/test_partner_flow_training.py`, and `tests/test_partner_flow_integration.py`.
 
 ### Task 1: Straight-Path Objective and Samplers
 
 **Files:**
-- Create: `partner/flow_matching_claude.py`
+- Create: `src/solver/flow_matching_claude.py`
 - Test: `tests/test_partner_flow_matching.py`
 
 **Interfaces:**
@@ -201,14 +201,14 @@ Expected: `4 passed`.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add partner/flow_matching_claude.py tests/test_partner_flow_matching.py
+git add src/solver/flow_matching_claude.py tests/test_partner_flow_matching.py
 git commit -m "feat: add conditional flow matching sampler"
 ```
 
 ### Task 2: Direct-v2-Compatible Flow Training
 
 **Files:**
-- Create: `partner/flow_train_claude.py`
+- Create: `src/solver/flow_train_claude.py`
 - Test: `tests/test_partner_flow_training.py`
 
 **Interfaces:**
@@ -343,7 +343,7 @@ Expected: all tests PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add partner/flow_train_claude.py tests/test_partner_flow_training.py
+git add src/solver/flow_train_claude.py tests/test_partner_flow_training.py
 git commit -m "feat: train direct architecture with flow matching"
 ```
 
@@ -418,7 +418,7 @@ git commit -m "feat: compare flow and DDIM candidate efficiency"
 ### Task 4: Opt-In Partner Flow Candidate Source
 
 **Files:**
-- Modify: `partner/my_opt_claude.py`
+- Modify: `src/solver/my_opt_claude.py`
 - Test: `tests/test_partner_flow_integration.py`
 
 **Interfaces:**
@@ -495,7 +495,7 @@ Expected: interface validation succeeds with Flow disabled by default.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add partner/my_opt_claude.py tests/test_partner_flow_integration.py
+git add src/solver/my_opt_claude.py tests/test_partner_flow_integration.py
 git commit -m "feat: add time-neutral flow candidates"
 ```
 
@@ -517,7 +517,7 @@ uv run pytest tests/test_partner_flow_matching.py \
   tests/test_partner_flow_training.py tests/test_partner_flow_probe.py \
   tests/test_partner_flow_integration.py -q
 
-uv run python partner/flow_train_claude.py \
+uv run python src/solver/flow_train_claude.py \
   --data-path FloorSet --checkpoint-dir checkpoints/flow_matching_overfit \
   --num-samples 256 --batch-size 16 --max-steps 2000 \
   --d-model 128 --layers 2 --heads 4 --device cuda --amp
@@ -538,7 +538,7 @@ Expected: training loss and position error decrease; 8/16-NFE samples are finite
 Run one Flow job matched to Direct-v2 by 800,000 updates:
 
 ```bash
-uv run python partner/flow_train_claude.py \
+uv run python src/solver/flow_train_claude.py \
   --data-path FloorSet --checkpoint-dir checkpoints/flow_matching_v1 \
   --batch-size 12 --max-steps 800000 --d-model 640 --layers 14 \
   --heads 10 --node-feat-dim 32 --lr 8e-5 --warmup 4000 \
@@ -548,11 +548,11 @@ uv run python partner/flow_train_claude.py \
 For the fixed-wall-clock comparison, launch fresh Direct-v2 and Flow runs with the same GPU duty cap, batch size, and 24-hour external scheduler allocation; terminate both with SIGTERM so their interruption-safe checkpoints are written:
 
 ```bash
-uv run python partner/direct_train_v2_claude.py \
+uv run python src/solver/direct_train_v2_claude.py \
   --data-path FloorSet --checkpoint-dir checkpoints/direct_v2_24h --fresh \
   --batch-size 12 --max-steps 800000 --gpu-util-cap 0.75 --amp
 
-uv run python partner/flow_train_claude.py \
+uv run python src/solver/flow_train_claude.py \
   --data-path FloorSet --checkpoint-dir checkpoints/flow_matching_24h --fresh \
   --batch-size 12 --max-steps 800000 --gpu-util-cap 0.75 --amp
 ```

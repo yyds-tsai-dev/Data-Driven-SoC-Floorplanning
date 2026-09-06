@@ -4,7 +4,7 @@
 
 **Goal:** 在 beta(7/31 17:00)前把三個正交槓桿落地:(A) 尾段 runtime 預算重塑(投影 −0.23~−0.30)、(B) training-free physics-guided sampling(抬預測品質天花板、降 refine 成本)、(C) flow matching 整合準備(S-1 修復 + my_opt 接線),外加品質補償(POOL 46)、GPU 減步與 beta 打包。
 
-**Architecture:** 全部改動 opt-in、預設關閉(bare defaults = 現役行為);promotion 一律走 evaluator evidence(full-100 `total_score_no_runtime` + runtime tail)。guidance 是純採樣端(不動任何訓練/checkpoint):在 `sample_direct` 的 DDIM 每步 x̂₀ 上做小步能量梯度下降再反推 eps;能量自含於新模組 `partner/physics_guidance_claude.py`(不 import v11 的 layout_losses,因其綁 `DiffusionGraphInputs`)。
+**Architecture:** 全部改動 opt-in、預設關閉(bare defaults = 現役行為);promotion 一律走 evaluator evidence(full-100 `total_score_no_runtime` + runtime tail)。guidance 是純採樣端(不動任何訓練/checkpoint):在 `sample_direct` 的 DDIM 每步 x̂₀ 上做小步能量梯度下降再反推 eps;能量自含於新模組 `src/solver/physics_guidance_claude.py`(不 import v11 的 layout_losses,因其綁 `DiffusionGraphInputs`)。
 
 **Tech Stack:** Python 3.12 / PyTorch / numpy / pytest(`uv run pytest`,repo root)。評測經 `FloorSet/iccad2026contest/../scripts/iccad2026_evaluate.py`(見 Task 1 腳本)。
 
@@ -61,7 +61,7 @@ for MAX in 8 6 4; do
   echo "=== PARTNER_BUDGET_MAX=$MAX ==="
   PARTNER_BUDGET_MAX=$MAX uv run python "$ROOT/scripts/iccad2026_evaluate.py" \
     --data-path ../ \
-    --evaluate "$ROOT/partner/my_opt_claude.py" \
+    --evaluate "$ROOT/src/solver/my_opt_claude.py" \
     --output "$ROOT/artifacts/partner_eval/budget_scan_max${MAX}.json" \
     2>&1 | tail -3
 done
@@ -84,7 +84,7 @@ git commit -m "feat: add budget tail scan runner"
 ### Task 2: Flow S-1 修復 — worktree 一行(立即)
 
 **Files:**
-- Modify: `/nashome/NVL4/vdalab/yyds-dev/codex-worktrees/flow-matching-f1-f3/partner/flow_matching_claude.py:115`(`self_condition = endpoint_from_velocity(...).detach()` 之後、`if has_known:` 之前)
+- Modify: `/nashome/NVL4/vdalab/yyds-dev/codex-worktrees/flow-matching-f1-f3/src/solver/flow_matching_claude.py:115`(`self_condition = endpoint_from_velocity(...).detach()` 之後、`if has_known:` 之前)
 - Test: 同 worktree `tests/test_partner_flow_matching.py`
 
 **Interfaces:**
@@ -140,16 +140,16 @@ Expected: 全部 PASS(原 4 + 新 1 + training 測試)。
 - [ ] **Step 5: Commit(worktree branch)**
 
 ```bash
-git add partner/flow_matching_claude.py tests/test_partner_flow_matching.py
+git add src/solver/flow_matching_claude.py tests/test_partner_flow_matching.py
 git commit -m "fix: clamp sampler self-cond aspect channel"
 ```
 
 ---
 
-### Task 3: `partner/physics_guidance_claude.py` — 能量核(TDD)
+### Task 3: `src/solver/physics_guidance_claude.py` — 能量核(TDD)
 
 **Files:**
-- Create: `partner/physics_guidance_claude.py`
+- Create: `src/solver/physics_guidance_claude.py`
 - Test: `tests/test_partner_physics_guidance.py`
 
 **Interfaces:**
@@ -414,7 +414,7 @@ Expected: 5 passed。
 - [ ] **Step 5: Commit**
 
 ```bash
-git add partner/physics_guidance_claude.py tests/test_partner_physics_guidance.py
+git add src/solver/physics_guidance_claude.py tests/test_partner_physics_guidance.py
 git commit -m "feat: add physics guidance energy core"
 ```
 
@@ -423,7 +423,7 @@ git commit -m "feat: add physics guidance energy core"
 ### Task 4: `guide_x0` 內迴圈(TDD)
 
 **Files:**
-- Modify: `partner/physics_guidance_claude.py`(追加)
+- Modify: `src/solver/physics_guidance_claude.py`(追加)
 - Test: `tests/test_partner_physics_guidance.py`(追加)
 
 **Interfaces:**
@@ -515,7 +515,7 @@ def make_guidance(ctx: GuidanceContext, cfg: GuidanceConfig):
 Run: `uv run pytest tests/test_partner_physics_guidance.py -q` → 9 passed
 
 ```bash
-git add partner/physics_guidance_claude.py tests/test_partner_physics_guidance.py
+git add src/solver/physics_guidance_claude.py tests/test_partner_physics_guidance.py
 git commit -m "feat: add guided x0 inner loop"
 ```
 
@@ -524,7 +524,7 @@ git commit -m "feat: add guided x0 inner loop"
 ### Task 5: `sample_direct` guidance 注入 + steps 參數化(TDD)
 
 **Files:**
-- Modify: `partner/direct_model_claude.py:213-256`(`sample_direct`)
+- Modify: `src/solver/direct_model_claude.py:213-256`(`sample_direct`)
 - Test: `tests/test_partner_physics_guidance.py`(追加)
 
 **Interfaces:**
@@ -632,7 +632,7 @@ def test_sample_direct_guidance_changes_output_and_keeps_anchors():
 Run: `uv run pytest tests/test_partner_physics_guidance.py -q`
 
 ```bash
-git add partner/direct_model_claude.py tests/test_partner_physics_guidance.py
+git add src/solver/direct_model_claude.py tests/test_partner_physics_guidance.py
 git commit -m "feat: add optional x0 guidance hook to DDIM sampler"
 ```
 
@@ -641,8 +641,8 @@ git commit -m "feat: add optional x0 guidance hook to DDIM sampler"
 ### Task 6: my_opt 接線(`PARTNER_PHYSICS_GUIDE` / `PARTNER_DDIM_STEPS`)
 
 **Files:**
-- Modify: `partner/my_opt_claude.py:376-429`(`_sample_direct_raw_preds`)
-- Modify: `partner/physics_guidance_claude.py`(追加 `build_context`)
+- Modify: `src/solver/my_opt_claude.py:376-429`(`_sample_direct_raw_preds`)
+- Modify: `src/solver/physics_guidance_claude.py`(追加 `build_context`)
 - Test: `tests/test_partner_physics_guidance.py`(追加)
 
 **Interfaces:**
@@ -724,7 +724,7 @@ Expected: 測試 PASS;validate(bare defaults,guidance off)通過 = 現役行為�
 - [ ] **Step 5: Commit**
 
 ```bash
-git add partner/my_opt_claude.py partner/physics_guidance_claude.py tests/test_partner_physics_guidance.py
+git add src/solver/my_opt_claude.py src/solver/physics_guidance_claude.py tests/test_partner_physics_guidance.py
 git commit -m "feat: wire opt-in physics guidance into direct sampling"
 ```
 
@@ -923,7 +923,7 @@ git commit -m "docs: physics guidance full-100 gate verdict"
 ### Task 10: Flow my_opt 整合(gate plan Task 4;立即可做,overfit ckpt 驗證)
 
 **Files:**
-- Modify: `partner/my_opt_claude.py`
+- Modify: `src/solver/my_opt_claude.py`
 - Test: `tests/test_partner_flow_integration.py`(new)
 
 **Interfaces:**
@@ -934,8 +934,8 @@ git commit -m "docs: physics guidance full-100 gate verdict"
 - [ ] **Step 0: 同步 F1/F2 模組進 main repo(不含訓練中 checkpoint)**
 
 ```bash
-cp /nashome/NVL4/vdalab/yyds-dev/codex-worktrees/flow-matching-f1-f3/partner/flow_matching_claude.py partner/
-cp /nashome/NVL4/vdalab/yyds-dev/codex-worktrees/flow-matching-f1-f3/partner/flow_train_claude.py partner/
+cp /nashome/NVL4/vdalab/yyds-dev/codex-worktrees/flow-matching-f1-f3/src/solver/flow_matching_claude.py partner/
+cp /nashome/NVL4/vdalab/yyds-dev/codex-worktrees/flow-matching-f1-f3/src/solver/flow_train_claude.py partner/
 cp /nashome/NVL4/vdalab/yyds-dev/codex-worktrees/flow-matching-f1-f3/tests/test_partner_flow_matching.py tests/
 uv run pytest tests/test_partner_flow_matching.py -q   # 5 passed
 ```
@@ -1049,7 +1049,7 @@ PARTNER_FLOW_SLOTS=3 bash scripts/eval_single.sh 21   # 單案跑通、feasible 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add partner/flow_matching_claude.py partner/flow_train_claude.py partner/my_opt_claude.py tests/
+git add src/solver/flow_matching_claude.py src/solver/flow_train_claude.py src/solver/my_opt_claude.py tests/
 git commit -m "feat: add opt-in flow candidate source (replace-not-add)"
 ```
 
@@ -1060,7 +1060,7 @@ git commit -m "feat: add opt-in flow candidate source (replace-not-add)"
 ### Task 11: guided-FM(`sample_flow` 加 guidance 參數)
 
 **Files:**
-- Modify: `partner/flow_matching_claude.py`(main repo 副本;worktree 訓練端不動)
+- Modify: `src/solver/flow_matching_claude.py`(main repo 副本;worktree 訓練端不動)
 - Test: `tests/test_partner_flow_matching.py`(追加)
 
 **Interfaces:**
@@ -1081,7 +1081,7 @@ git commit -m "feat: add opt-in flow candidate source (replace-not-add)"
 - [ ] **Step 3: 跑測試 PASS + Commit**
 
 ```bash
-git add partner/flow_matching_claude.py tests/test_partner_flow_matching.py
+git add src/solver/flow_matching_claude.py tests/test_partner_flow_matching.py
 git commit -m "feat: add endpoint guidance hook to flow sampler"
 ```
 
@@ -1092,7 +1092,7 @@ git commit -m "feat: add endpoint guidance hook to flow sampler"
 ### Task 12: numba SA 內迴圈(profile 先行;獨立軌)
 
 **Files:**
-- Create: `scripts/probes/profile_partner_sa.py`;視 profile 結果 Modify `partner/legalizer_claude.py`
+- Create: `scripts/probes/profile_partner_sa.py`;視 profile 結果 Modify `src/solver/legalizer_claude.py`
 - Test: `tests/test_partner_sa_numba_equiv.py`(new)
 
 - [ ] **Step 1: Profile 單案(n=120)找熱點**
@@ -1104,7 +1104,7 @@ uv run python - <<'EOF'
 import cProfile, pstats, sys
 sys.path.insert(0, "partner")
 # 直接呼叫 legalizer 的單 restart 入口(_layout / anneal)於 case 99 輸入
-# (實作者:grep -n "def _anneal\|def _layout" partner/legalizer_claude.py 取入口)
+# (實作者:grep -n "def _anneal\|def _layout" src/solver/legalizer_claude.py 取入口)
 EOF
 ```
 
@@ -1128,7 +1128,7 @@ def _pack_cost_nb(order, widths, heights, col_break, frame_w):
 - [ ] **Step 5: Commit**
 
 ```bash
-git add partner/legalizer_claude.py scripts/probes/profile_partner_sa.py tests/test_partner_sa_numba_equiv.py
+git add src/solver/legalizer_claude.py scripts/probes/profile_partner_sa.py tests/test_partner_sa_numba_equiv.py
 git commit -m "perf: numba-accelerate SA inner loop"
 ```
 

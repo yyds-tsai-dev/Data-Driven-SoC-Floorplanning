@@ -4,9 +4,9 @@ Status: implemented, **default off**, no evaluator evidence yet (single-thread
 anatomy + single-case pool micro-benchmark + bit-exactness evidence only; the
 paired full-100 A/B is the scheduler's).
 Flag surface: `PARTNER_FAST_SETUP=1`.
-Code: `partner/column_sa_legalizer.py` (`fast_setup_on`, the anneal-span floor
+Code: `src/solver/column_sa_legalizer.py` (`fast_setup_on`, the anneal-span floor
 in `_ColumnOptimizer.finish`, `_pin_centroids_np`, `_b2b_smooth_np`),
-`partner/contest_optimizer.py` (`_heuristic_init`).
+`src/solver/contest_optimizer.py` (`_heuristic_init`).
 Tests: `tests/test_partner_fast_setup.py` (18).
 Instruments: `scratchpad/floor_anatomy.py`,
 `scratchpad/floor_finish_profile.py`, `scratchpad/floor_seed_probe.py`,
@@ -67,7 +67,7 @@ Verdicts:
 
 ## 2. Root cause
 
-`finish` (`partner/column_sa_legalizer.py`):
+`finish` (`src/solver/column_sa_legalizer.py`):
 
 ```python
 refine_t = min(0.30 * rem, 7.0) if rem > 1.0 else 0.0

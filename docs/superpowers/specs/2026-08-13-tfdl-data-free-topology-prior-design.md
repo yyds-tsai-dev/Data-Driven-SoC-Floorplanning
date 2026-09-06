@@ -226,7 +226,7 @@ must not be rerun.
 
 ## Why the previous approach cannot work
 
-`partner/icdc/tfdl.py::extract_topology` runs under `no_grad` and returns
+`src/icdc_engine/tfdl.py::extract_topology` runs under `no_grad` and returns
 detached topology features. Axis, order, and contact decisions therefore
 cannot receive gradient. Pins are lower bounds, and frozen chains drift; the
 saturated auxiliary terms only prevent an infinite bounding box. Relaxed
@@ -597,7 +597,7 @@ runtime rows enter the binding Alpha-projected combined score.
 
 ### Canonical checkpoint identity (shared Task 4/5 contract)
 
-The sole codec owner is `partner/icdc/checkpoint_identity.py`; Task 4 probes
+The sole codec owner is `src/icdc_engine/checkpoint_identity.py`; Task 4 probes
 may import/re-export its private helper aliases as needed, and Task 5 imports
 and re-exports `canonical_checkpoint_identity` rather than implementing a
 second encoder. Its API is `IDENTITY_SCHEMA="icdc_canonical_state_v1"`,
@@ -746,9 +746,9 @@ the freeze gate rejects unless both identities equal the frozen candidate.
 
 Later Track-B work may create only:
 
-- `partner/icdc/topology_prior.py`
-- `partner/icdc/topology_data.py`
-- `partner/icdc/train_topology_prior.py`
+- `src/icdc_engine/topology_prior.py`
+- `src/icdc_engine/topology_data.py`
+- `src/icdc_engine/train_topology_prior.py`
 - `tests/test_icdc_topology_prior.py`
 - Track-B scripts and their generated artifacts.
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "partner"))
+sys.path.insert(0, str(ROOT / "src" / "solver"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 for key, value in {

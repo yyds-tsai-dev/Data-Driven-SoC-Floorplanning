@@ -12,8 +12,8 @@ PARTNER_DIRECT_SOLVER=dpmpp PARTNER_DDIM_STEPS=10
 
 ## 實作
 
-- `partner/direct_model_claude.py::sample_direct_dpmpp`：DPM-Solver++(2M)，data-prediction multistep 二階，midpoint 修正；一階步與 DDIM 代數等價，首步（無歷史）與最後積分步降一階（lower_order_final——少步時終端 h 大，二階外推會 overshoot）。保留 `sample_direct` 的逐步契約：anchor imposition → model call → aspect clamp → known 覆寫 → self-conditioning。無 guidance hook（guidance 已判死；`guide` 非 None 時呼叫端自動 fallback DDIM）。
-- `partner/my_opt_claude.py`：`PARTNER_DIRECT_SOLVER` env 白名單分支（default `ddim` 不變）。
+- `src/solver/direct_model_claude.py::sample_direct_dpmpp`：DPM-Solver++(2M)，data-prediction multistep 二階，midpoint 修正；一階步與 DDIM 代數等價，首步（無歷史）與最後積分步降一階（lower_order_final——少步時終端 h 大，二階外推會 overshoot）。保留 `sample_direct` 的逐步契約：anchor imposition → model call → aspect clamp → known 覆寫 → self-conditioning。無 guidance hook（guidance 已判死；`guide` 非 None 時呼叫端自動 fallback DDIM）。
+- `src/solver/my_opt_claude.py`：`PARTNER_DIRECT_SOLVER` env 白名單分支（default `ddim` 不變）。
 - `tests/test_partner_dpmpp.py` 7/7 綠：steps=1 與 DDIM bit 級一致、few-step 誤差不劣於同步數 DDIM（二階收斂）、anchor 精確、aspect clamp、NFE==steps、mask 歸零、同 seed 決定性。
 
 ## 全部 13 輪 full-100 數字（同期串行成對；環境含 flow v3 訓練佔 GPU 的已知爭用——因此**只採信同期 Δ**，不與歷史點 1.1385/0.8859 直接比絕對值）
@@ -39,7 +39,7 @@ PARTNER_DIRECT_SOLVER=dpmpp PARTNER_DDIM_STEPS=10
 1. **dpmpp10 的收益 = DDIM50→25 同機制的延伸**：GPU 段 25→10 steps（~0.39s→~0.16s）→ 序列 GPU 段縮短 → refine workers 更早開工；二階 solver 在 10 steps 保持 25-step 解品質（一階=DDIM 等價性保證下界）。改善集中 60-100（−0.006）與 tail（−0.009~−0.012），小案持平——收益來自時間再分配，不是 raw 樣本品質。
 2. **dpmpp8 開始退化**（+0.002 vs dpmpp10）：8 步以下二階截斷誤差進入可見區。10 = 甜點。
 3. **flow few-step Gate 0 判負**：st2 +0.024、st1 +0.041，退化集中 tail（+0.026/+0.043）。機制：flow few-step 的 raw overlap 缺口（st1/st8 = 8.25×，st2 = 3.18×；位置 L1 僅 1.15×/1.05×——flow worktree 蒸餾設計文件 M1 測量）在 tail 案 refine 時間最緊處修不完。「自洽性>成分品質」定律的邊界：**成分品質差到一定程度（raw overlap 8×）就會穿透 refine 的修復能力**，st8 的成分品質確實承重。
-4. **SCFM 蒸餾線降優先級**：Gate 0 判負後蒸餾的角色從「免費減時」變「補 st2 缺口」，但 flow 段省時上限實測 <0.1s/case（st8 warm 0.117s），投報不足。蒸餾腳本已落地留存（flow worktree `partner/flow_distill_claude.py`，22 tests 綠，SCFM arXiv 2510.17858 方案，設計文件 `docs/superpowers/plans/2026-07-29-flow-distill-design.md`）——若 final 期 flow slots 擴編（NFE 總量變大）再啟用。
+4. **SCFM 蒸餾線降優先級**：Gate 0 判負後蒸餾的角色從「免費減時」變「補 st2 缺口」，但 flow 段省時上限實測 <0.1s/case（st8 warm 0.117s），投報不足。蒸餾腳本已落地留存（flow worktree `src/solver/flow_distill_claude.py`，22 tests 綠，SCFM arXiv 2510.17858 方案，設計文件 `docs/superpowers/plans/2026-07-29-flow-distill-design.md`）——若 final 期 flow slots 擴編（NFE 總量變大）再啟用。
 5. **DM 軸全 wash**（2.0/1.5/1.0 家族 rep 均值全在 1.128-1.129 帶內）：dpmpp10 把 GPU 段縮到 ~0.16s 後，DIRECT_MIN 閘門對 budget 1-2s 案的邊際貢獻歸零——這些案的 flow+heuristic 種子已足夠，direct 通道開不開無感。單 rep 的 0.003 下沿（DM1.0 rep1）被 rep2 回歸修正，「調校即承重」再驗。
 
 ## 同日交叉判定（本輪 final 衝刺的其他戰線）
@@ -56,7 +56,7 @@ PARTNER_DIRECT_SOLVER=dpmpp PARTNER_DDIM_STEPS=10
 
 ## 補記（0729 晚）：legalizer cherry-pick 第一批判負
 
-**`_fastsa_temp` 與 stall early-stop 均不促轉**（三輪同期 A/B 疊 dpmpp10 基準，9 runs 100/100 feasible）：fastsa dNoRT +0.0012/dProj +0.0018、stallstop dNoRT +0.0016/dProj +0.0015（dRT 僅 −2.4s/100 案）；tailQ 三輪符號一致退化（+0.001~0.002），判真實小退化非噪音。代碼留存 default off（`PARTNER_FASTSA_TEMP`/`PARTNER_SA_STALL_STOP`，partner/legalizer_claude.py +138 行；tests/test_partner_sa_cherry1.py 11 綠、206 tests 無回歸）。artifacts：`artifacts/partner_eval/cherry1_*.json`。
+**`_fastsa_temp` 與 stall early-stop 均不促轉**（三輪同期 A/B 疊 dpmpp10 基準，9 runs 100/100 feasible）：fastsa dNoRT +0.0012/dProj +0.0018、stallstop dNoRT +0.0016/dProj +0.0015（dRT 僅 −2.4s/100 案）；tailQ 三輪符號一致退化（+0.001~0.002），判真實小退化非噪音。代碼留存 default off（`PARTNER_FASTSA_TEMP`/`PARTNER_SA_STALL_STOP`，src/solver/legalizer_claude.py +138 行；tests/test_partner_sa_cherry1.py 11 綠、206 tests 無回歸）。artifacts：`artifacts/partner_eval/cherry1_*.json`。
 
 機制（結構性）：
 1. **fastsa**：該溫度律為長鏈設計（src 給 3× 預算）；3.5s 檔位 worker chain span 僅 0.7-1.5s，stage-2 深淬火（1/6 預算 @T≈5e-5）把搜索鎖進 seed basin，stage-3 再加熱又拆掉成果。
@@ -71,7 +71,7 @@ PARTNER_DIRECT_SOLVER=dpmpp PARTNER_DDIM_STEPS=10
 
 **聯動版（+`PARTNER_SA_STALL_STOP`）不促轉**：rep1 +0.0055 反彈、均值 −0.0017 弱於單獨版——SA stall 維持判負。
 
-實作：`partner/refiner_claude.py`（+69，window=phase span×0.25 自縮放、eps=0.002 相對、default off bit 級不變）；`tests/test_partner_refine_stall.py` 綠、partner 全家 175 綠。
+實作：`src/solver/refiner_claude.py`（+69，window=phase span×0.25 自縮放、eps=0.002 相對、default off bit 級不變）；`tests/test_partner_refine_stall.py` 綠、partner 全家 175 綠。
 
 **0729 最終定案 env（本日三項疊加）**：
 ```bash
@@ -111,8 +111,8 @@ CSF「換引擎」判死後的唯一倖存後代（`docs/design/2026-07-29-csf-a
 4. 兩種落點都測了，排除「時機」解釋：`stall`（迴圈內、median sweep 不動點處，與 squeeze 搶同一份 slack）與 `end`（終端、從 caller span 內 carve 出，squeeze 已先把 bbox 面積入袋）。end 臂 rep1 的 `d_tail_hpwl +0.0098` 顯示 carve 掉的 8% 搜索時間比 CSA 撿回的多。
 
 **代碼留存 default off**（`PARTNER_CSA_REFINE=1` 啟用，`_WHERE` = stall|end|both，`_SHARE`/`_ITERS`/`_STEP`/`_DECAY`/`_MS`）：
-- `partner/csa_coordinate_solver.py`（新，216 行）：`AxisHpwlObjective`（值 + 解析次梯度，向量化）、`ShiftPolytope`（refiner 自己的可行集 + retraction）、`csa_shifts`（Polak-Ribière、scale-free `c/‖p‖` 步長、幾何衰減取代論文 Q-table）。
-- `partner/layout_refiner.py`：`_axis_constraints` 從 `_axis_pass` **逐字抽出**（兩邊共用同一多面體，任何分歧都是合法性漏洞）；`_csa_problem` / `_csa_pass`。
+- `src/solver/csa_coordinate_solver.py`（新，216 行）：`AxisHpwlObjective`（值 + 解析次梯度，向量化）、`ShiftPolytope`（refiner 自己的可行集 + retraction）、`csa_shifts`（Polak-Ribière、scale-free `c/‖p‖` 步長、幾何衰減取代論文 Q-table）。
+- `src/solver/layout_refiner.py`：`_axis_constraints` 從 `_axis_pass` **逐字抽出**（兩邊共用同一多面體，任何分歧都是合法性漏洞）；`_csa_problem` / `_csa_pass`。
 - **retraction 是唯一新的數學**，也是第一版失敗處：單用拓撲 clip 會把「鏈頭往右、鏈尾往左」的步整個壓成 0（實測直接把 CSA 釘死在座標下降不動點）；縮短步長也無效（飽和 packing 上接觸約束是緊的 ⇒ λ=0）。定案：Cimmino 平滑 → **兩側單向鏈修復**（down/up）→ 拓撲 clip 作合法性保證，由目標函數挑。
 - 合法性：只動 xy 不動 wh（area 繼承）、移動限於 refiner 多面體（零重疊 by construction、已滿足 boundary tag 釘死、preplaced 凍結、cluster 剛性）、整個 pass 除非 `_key()` 嚴格改善且無重疊否則整體回滾、例外封裝。off 時 `csa_share == 0.0` 使所有謂詞成死枝，且 pass 不抽 `self.rng` ⇒ 決策邏輯與 rng 流 bit 級不變。
 - 測試 `tests/test_partner_csa_refine.py` 19 綠（env 佈線、off 惰性、形狀/凍結塊/零重疊不變量、proxy 單調、目標 vs `opt._hpwl`、次梯度 vs 有限差分、投影可行性與冪等、逃逸不動點、終端落點不超時）；partner 全家 **243 綠**，全套 623 passed / 1 skipped。

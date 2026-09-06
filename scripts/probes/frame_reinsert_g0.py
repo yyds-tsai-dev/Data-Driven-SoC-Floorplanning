@@ -16,15 +16,15 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[2]
-for _path in (ROOT / "partner", ROOT / "FloorSet",
+for _path in (ROOT / "src" / "solver", ROOT / "FloorSet",
               ROOT / "FloorSet" / "iccad2026contest"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
 from column_sa_legalizer import _ColumnOptimizer  # noqa: E402
 from frame_reinsert import frame_reinsert, weighted_score  # noqa: E402
-from icdc.data import load_test_cases  # noqa: E402
-from icdc.dump_bank import official_cost  # noqa: E402
+from icdc_engine.data import load_test_cases  # noqa: E402
+from icdc_engine.dump_bank import official_cost  # noqa: E402
 
 
 def _load_evaluator():

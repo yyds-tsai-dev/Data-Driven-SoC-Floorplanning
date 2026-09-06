@@ -129,10 +129,10 @@ they do not conflict.
 
 ## Code changes
 
-- `partner/flow_matching_claude.py`: new pure helpers
+- `src/solver/flow_matching_claude.py`: new pure helpers
   `endpoint_snr_weight(t, gamma)` and
   `sample_flow_t(n, device, generator, term_prob, term_band)`.
-- `partner/flow_train_claude.py`:
+- `src/solver/flow_train_claude.py`:
   - `checkpoint_method` now accepts the family `{flow_matching_v1,
     flow_matching_v2}` (v1 must stay loadable for `flow_candidate_probe.py`);
     training tags checkpoints `flow_matching_v2`.
@@ -148,7 +148,7 @@ they do not conflict.
 
 ```bash
 cd FloorSet/iccad2026contest   # via the eval/train script env, or set PYTHONPATH to partner/
-uv run python3 ../../partner/flow_train_claude.py \
+uv run python3 ../../src/solver/flow_train_claude.py \
     --checkpoint-dir checkpoints/flow_matching_v2 \
     --max-steps 800000 \
     --batch-size 12 --d-model 640 --layers 14 --heads 10 \

@@ -25,11 +25,11 @@ import torch
 
 
 _REPO = Path(__file__).resolve().parents[2]
-for _path in (_REPO / "partner", _REPO / "scripts", _REPO / "FloorSet"):
+for _path in (_REPO / "src" / "solver", _REPO / "scripts", _REPO / "FloorSet"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from icdc.g0_v2 import (  # noqa: E402
+from icdc_engine.g0_v2 import (  # noqa: E402
     G0CaseResult,
     G0Summary,
     PopulationAccumulator,
@@ -37,7 +37,7 @@ from icdc.g0_v2 import (  # noqa: E402
     evaluate_case,
     transient_fp_xywh,
 )
-from icdc.topology_data import (  # noqa: E402
+from icdc_engine.topology_data import (  # noqa: E402
     CorpusSourceReceipt,
     TopologyLabel,
     _sanitize,

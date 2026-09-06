@@ -9,7 +9,7 @@ for kv in "$@"; do export "$kv"; done
 OUT="$ROOT/artifacts/shadow"; mkdir -p "$OUT"
 echo "TAG=$TAG DATA=$DATA"; echo "load_before: $(uptime)"
 cd "$ROOT/FloorSet/iccad2026contest"
-uv run python "$ROOT/scripts/iccad2026_evaluate.py" --data-path "$DATA" --evaluate "$ROOT/partner/contest_optimizer.py" --output "$OUT/${TAG}.json" 2>&1 | tee "$OUT/${TAG}.log" | tail -4
+uv run python "$ROOT/scripts/iccad2026_evaluate.py" --data-path "$DATA" --evaluate "$ROOT/src/solver/contest_optimizer.py" --output "$OUT/${TAG}.json" 2>&1 | tee "$OUT/${TAG}.log" | tail -4
 grep -h "\[selfcheck\]\|\[flowtail\]\|\[pool-fallback\]" "$OUT/${TAG}.log" | head -3
 uv run python - "$OUT/${TAG}.json" <<'PY'
 import json, sys, math

@@ -68,14 +68,14 @@ def _default_loader(test_id: int, row: dict[str, Any]):
     # The probe intentionally loads inputs only for scoring; it never invokes an optimizer.
     root = Path(__file__).resolve().parents[2]
     ev = _load_evaluator()
-    from partner.icdc.data import load_test_cases
+    from icdc_engine.data import load_test_cases
     return load_test_cases(ev, data_path=str(root / "FloorSet"))[test_id]
 
 
 def _default_cases():
     root = Path(__file__).resolve().parents[2]
     ev = _load_evaluator()
-    from partner.icdc.data import load_test_cases
+    from icdc_engine.data import load_test_cases
     cases = load_test_cases(ev, data_path=str(root / "FloorSet"))
     out = []
     for case in cases:
@@ -136,7 +136,7 @@ def _source_hygiene_text(text: str) -> bool:
 
 
 def _source_hygiene() -> bool:
-    root = Path(__file__).resolve().parents[2] / "partner" / "violation_killer.py"
+    root = Path(__file__).resolve().parents[2] / "src" / "solver" / "violation_killer.py"
     return _source_hygiene_text(root.read_text())
 
 
@@ -162,7 +162,7 @@ def replay(args, *, case_loader=_default_loader, bridge_fn=None, evaluate_fn=_de
     cached_cases = None
     if production_mode:
         cached_cases = _default_cases()
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "partner"))
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "solver"))
         from violation_killer import bridge_grouping_violations_dag
         bridge_fn = lambda context, positions, budget: bridge_grouping_violations_dag(context["optimizer"], positions, budget)
 

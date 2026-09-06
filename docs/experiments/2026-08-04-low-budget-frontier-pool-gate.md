@@ -47,7 +47,7 @@ direct/flow `sample_fn` 的路徑;early-exit 時間解剖獨立發現同一結�
 
 ## 實驗 3:`PARTNER_POOL_GATE`(patch + chain `scratchpad/lbf_poolgate_chain.sh`)
 
-Patch(`partner/column_sa_legalizer.py` 兩處,default bit-exact):
+Patch(`src/solver/column_sa_legalizer.py` 兩處,default bit-exact):
 1. `budget > 3.0` → `budget > PARTNER_POOL_GATE`(env,default 3.0)。
 2. worker margin `deadline_A − 0.30` → `deadline_A − min(0.30, 0.15·remaining)`
    (remaining ≥2s 時數學上恆等於 0.30,舊路徑 bit 級不變)。

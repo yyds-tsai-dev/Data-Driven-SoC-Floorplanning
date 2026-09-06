@@ -10,20 +10,20 @@ import pytest
 import torch
 import numpy as np
 
-from icdc.engine import verify_hard_legal
-from icdc.qa_contract import (
+from icdc_engine.engine import verify_hard_legal
+from icdc_engine.qa_contract import (
     QA_RELATIVE_PATH,
     SCORER_RELATIVE_PATH,
     preflight_qa_contract,
     qa_manifest_fields,
     score_provided_local_no_runtime,
 )
-from icdc.topology_artifact_guard import (
+from icdc_engine.topology_artifact_guard import (
     assert_no_dense_fp_artifact,
     canonical_json_bytes,
     write_checked_json,
 )
-from icdc.topology_data import (
+from icdc_engine.topology_data import (
     CorpusSourceReceipt,
     validate_raw_source,
     verified_training_fp_row,

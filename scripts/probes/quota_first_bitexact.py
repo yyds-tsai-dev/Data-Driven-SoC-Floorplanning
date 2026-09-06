@@ -36,7 +36,7 @@ FLOW_CKPT = (
     "submission/cadc1013/checkpoints/flow_matching_v1_final.pt")
 
 ROOT = Path(__file__).resolve().parents[2]
-PARTNER = ROOT / "partner"
+PARTNER = ROOT / "src" / "solver"
 CONTEST = ROOT / "FloorSet" / "iccad2026contest"
 FLOORSET = ROOT / "FloorSet"
 sys.path.insert(0, str(PARTNER))

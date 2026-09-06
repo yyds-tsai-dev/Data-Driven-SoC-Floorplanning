@@ -67,4 +67,4 @@ A 級:§1 全部、harvest 表、frame 相關性、_wmedian 論證。B 級:斷�
 未驗證:通道歸因 B 級(T1 dump 坐實)、frame 因果性(oracle probe 是唯一判準)、`n_soft_den` vs `max_possible_violations` 一致性(tid 84 前科)。
 **memory 更正兩則**:①軟約束全滿分 1.0722 → 0.3s 檔 1.0964 / 3.5 檔 1.0562;② learned C* 的「每 config 2-3× 退火」論證在 24-worker 架構下不成立。
 
-關鍵位置:`partner/column_sa_legalizer.py`(選擇器 3731-3755、`_w_star_from_tags` 3570、pool init 3105)、`partner/layout_refiner.py`(`_wmedian` 576、`_median_shift` 583、`_axis_pass` 700、`run()` 3896)、`partner/refine_numeric_kernel.py`(Scope 1-80)。
+關鍵位置:`src/solver/column_sa_legalizer.py`(選擇器 3731-3755、`_w_star_from_tags` 3570、pool init 3105)、`src/solver/layout_refiner.py`(`_wmedian` 576、`_median_shift` 583、`_axis_pass` 700、`run()` 3896)、`src/solver/refine_numeric_kernel.py`(Scope 1-80)。

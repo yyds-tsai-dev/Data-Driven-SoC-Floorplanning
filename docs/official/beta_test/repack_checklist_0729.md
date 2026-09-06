@@ -60,10 +60,10 @@ DISQUALIFICATION）。本次重打取代 0728 舊包，理由有二：**舊包�
 
 lazy-import 化（只搬 import 位置，不改任何功能行為）：
 
-- `partner/my_opt_claude.py`：刪頂層 L41-43 三個 `retrieval_*` import，改到
+- `src/solver/my_opt_claude.py`：刪頂層 L41-43 三個 `retrieval_*` import，改到
   `_sample_retrieval_preds` 內第一個 `try:` 區塊（在 `self.retrieval_index is None` 早退之後，
   且 ImportError 會被既有的 `except Exception` 收斂成空 batch）。
-- `partner/direct_train_claude.py`：`from diffusion_train import known_target_positions_from_fp`
+- `src/solver/direct_train_claude.py`：`from diffusion_train import known_target_positions_from_fp`
   由頂層搬進 `train_step`。
 - `tests/test_partner_retrieval_integration.py`：spy 從 `my_opt_claude.remap_boundary_node_features`
   改掛到來源模組 `retrieval_transfer_claude`（lazy import 在呼叫時才綁定，patch 來源模組才生效）。

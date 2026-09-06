@@ -24,7 +24,7 @@ changed.
 
 ## Implementation
 
-- `partner/constructive_g01.py`: isolated NumPy constructor and gate math.
+- `src/solver/constructive_g01.py`: isolated NumPy constructor and gate math.
 - `scripts/probes/constructive_g01_probe.py`: official evaluator G0/G1 runner.
 - `tests/test_partner_constructive_g01.py`: hard legality, MIB, cluster,
   policy-diversity, oracle-code, boundary, and aggregation tests.

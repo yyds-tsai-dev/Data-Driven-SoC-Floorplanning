@@ -46,7 +46,7 @@ def _verify_scorer_source_file(path: Path, expected_sha: str) -> str:
         raise ValueError("scorer_sha256") from exc
 
 
-for _path in (_REPO / "FloorSet" / "iccad2026contest", _REPO / "FloorSet", _REPO / "scripts", _REPO / "partner"):
+for _path in (_REPO / "FloorSet" / "iccad2026contest", _REPO / "FloorSet", _REPO / "scripts", _REPO / "src" / "solver"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
@@ -57,20 +57,20 @@ import iccad2026_evaluate as _EVALUATOR
 import torch
 from direct_diffusion_model import DirectDenoiser, DirectModelConfig, sample_direct_dpmpp
 from diffusion_model import DiffusionSchedule
-import icdc.engine as _ENGINE
-import icdc.energy as _ENERGY
-from icdc.energy import decode_rects
-from icdc.topology_prior import ProposalConfig, generate_proposals, pin_feasible_then_exact_tfdl, extract_sparse_label, _proposal_fingerprint
-from icdc.qa_contract import preflight_qa_contract, qa_manifest_fields
-from icdc.topology_data import (
+import icdc_engine.engine as _ENGINE
+import icdc_engine.energy as _ENERGY
+from icdc_engine.energy import decode_rects
+from icdc_engine.topology_prior import ProposalConfig, generate_proposals, pin_feasible_then_exact_tfdl, extract_sparse_label, _proposal_fingerprint
+from icdc_engine.qa_contract import preflight_qa_contract, qa_manifest_fields
+from icdc_engine.topology_data import (
     CorpusSourceReceipt,
     fingerprint_case,
     split_for_id,
     validate_raw_source,
 )
-from icdc.topology_data import _sanitize as _sanitize_case
+from icdc_engine.topology_data import _sanitize as _sanitize_case
 
-from icdc.checkpoint_identity import (  # noqa: E402
+from icdc_engine.checkpoint_identity import (  # noqa: E402
     IDENTITY_SCHEMA,
     canonical_checkpoint_identity,
 )

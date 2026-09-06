@@ -32,9 +32,9 @@ PARTNER_OVERSAMPLE=4    # GPU 採樣 2×→4×(與 pool SA 併行,48 樣本內�
 
 ## 新增 env 旋鈕(全部 opt-in,bare defaults = partner 原行為)
 
-- `partner/my_opt_claude.py`:`PARTNER_BUDGET_SCALE/_TAU/_MIN/_MAX`(時間預算)、`PARTNER_OVERSAMPLE`、`PARTNER_PRESCREEN_V(W)`、`VKILL`(=1 啟用,搭配 `VKILL_CARVE/MIN_N/RESERVE_MAX/STAGE2_*`)
-- `partner/legalizer_claude.py`:`PARTNER_NREF(_MIN_N)`、`PARTNER_REFINE_VW_MIX`、`PARTNER_VW_ANNEAL(_AT)`
-- `partner/vkill_claude.py`(新檔):違規獵殺後處理(stage1 外科手術 + stage2 v_weight 深度重排),evaluator 容差全對齊,失敗靜默返回原結果
+- `src/solver/my_opt_claude.py`:`PARTNER_BUDGET_SCALE/_TAU/_MIN/_MAX`(時間預算)、`PARTNER_OVERSAMPLE`、`PARTNER_PRESCREEN_V(W)`、`VKILL`(=1 啟用,搭配 `VKILL_CARVE/MIN_N/RESERVE_MAX/STAGE2_*`)
+- `src/solver/legalizer_claude.py`:`PARTNER_NREF(_MIN_N)`、`PARTNER_REFINE_VW_MIX`、`PARTNER_VW_ANNEAL(_AT)`
+- `src/solver/vkill_claude.py`(新檔):違規獵殺後處理(stage1 外科手術 + stage2 v_weight 深度重排),evaluator 容差全對齊,失敗靜默返回原結果
 
 ## 殘餘缺口與下一步
 

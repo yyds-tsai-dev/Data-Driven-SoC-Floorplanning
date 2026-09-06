@@ -2,13 +2,13 @@
 """Probe: analytical global-placement (ePlace-style) arm vs the production
 column-slicing backbone, on the 100 official validation cases.
 
-Loads the 100-case validation set the same way ``partner/icdc/data.py``
+Loads the 100-case validation set the same way ``src/icdc_engine/data.py``
 (``load_test_cases``) does (backed by ``FloorplanDatasetLiteTest`` from
 ``FloorSet/iccad2026contest/iccad2026_evaluate.py``, the same class
 ``scripts/iccad2026_evaluate.py`` uses).  For each case, runs
 ``partner.eplace_arm.generate_candidates`` and separately runs the
-production ``partner/contest_optimizer.py`` (``MyOptimizer``) under the
-canonical G1 solver environment (``partner/icdc/g1_runtime.py``
+production ``src/solver/contest_optimizer.py`` (``MyOptimizer``) under the
+canonical G1 solver environment (``src/icdc_engine/g1_runtime.py``
 ``_SOLVER_ENV``, plus ``DIRECT_OFF=1 PARTNER_FLOW_SLOTS=0`` to keep the
 probe CPU/light) as the production-champion baseline.
 
@@ -40,13 +40,13 @@ for _p in (REPO / "partner", REPO / "FloorSet" / "iccad2026contest",
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from icdc.data import load_test_cases  # noqa: E402
+from icdc_engine.data import load_test_cases  # noqa: E402
 import iccad2026_evaluate as ev  # noqa: E402
 
 from eplace_arm import generate_candidates  # noqa: E402
 
 # --legalize mode replicates the production direct-candidate consumption
-# sequence (partner/contest_optimizer.py `_direct_worker`, around line
+# sequence (src/solver/contest_optimizer.py `_direct_worker`, around line
 # 1694-1717: build a rect list from the raw prediction, wrap it in a fresh
 # `_ColumnOptimizer` scorer, then call `layout_refiner.refine_prediction`
 # with a deadline) so the ePlace candidates get the SAME legalize+refine
@@ -122,7 +122,7 @@ def run_legalize_compare(candidates, eplace_all, case, tid, column_opt,
     legalize+refine sequence the production direct arm uses, then compare
     official cost_no_runtime against the column-backbone champion.
 
-    Mirrors partner/contest_optimizer.py `_direct_worker` (~line 1694-1717):
+    Mirrors src/solver/contest_optimizer.py `_direct_worker` (~line 1694-1717):
     for each raw prediction P, build ``rect_list`` from P, wrap it in a
     fresh ``_ColumnOptimizer`` scorer (same ctor args the production path
     passes: area targets, constraints, target_positions, b2b, p2b, pins,
@@ -209,11 +209,11 @@ def run_legalize_compare(candidates, eplace_all, case, tid, column_opt,
 
 # ---------------------------------------------------------------------------
 def load_column_optimizer():
-    """Instantiate partner/contest_optimizer.py MyOptimizer under the
+    """Instantiate src/solver/contest_optimizer.py MyOptimizer under the
     canonical G1 solver env, the way pseudo_hidden_eval.py's load_optimizer
     does, but with DIRECT_OFF=1 PARTNER_FLOW_SLOTS=0 to keep this probe
     CPU-only and fast (per task spec)."""
-    from icdc.g1_runtime import _SOLVER_ENV  # noqa: WPS433 (local import, optional dep)
+    from icdc_engine.g1_runtime import _SOLVER_ENV  # noqa: WPS433 (local import, optional dep)
 
     env = dict(_SOLVER_ENV)
     env["DIRECT_OFF"] = "1"
@@ -221,7 +221,7 @@ def load_column_optimizer():
     for k, v in env.items():
         os.environ[k] = str(v)
 
-    optimizer_path = REPO / "partner" / "contest_optimizer.py"
+    optimizer_path = REPO / "src" / "solver" / "contest_optimizer.py"
     spec = importlib.util.spec_from_file_location("eplace_probe_optimizer", optimizer_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

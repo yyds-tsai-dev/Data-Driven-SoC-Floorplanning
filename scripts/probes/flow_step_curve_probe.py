@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 ROOT = str(Path(__file__).resolve().parents[2])
-for p in (f"{ROOT}/partner", f"{ROOT}/FloorSet/iccad2026contest", f"{ROOT}/FloorSet"):
+for p in (f"{ROOT}/src/solver", f"{ROOT}/FloorSet/iccad2026contest", f"{ROOT}/FloorSet"):
     if p not in sys.path:
         sys.path.insert(0, p)
 

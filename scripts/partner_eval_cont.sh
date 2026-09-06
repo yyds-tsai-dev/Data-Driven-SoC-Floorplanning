@@ -21,7 +21,7 @@ export VKILL_OFF=1 PARTNER_PRESCREEN_V=1 PARTNER_NREF=15 \
 cd "$ROOT/FloorSet/iccad2026contest"
 uv run python "$ROOT/scripts/iccad2026_evaluate.py" \
   --data-path ../ \
-  --evaluate "$ROOT/partner/contest_optimizer.py" \
+  --evaluate "$ROOT/src/solver/contest_optimizer.py" \
   --verbose \
   --output "$ROOT/artifacts/partner_eval/cont_${TAG}.json" \
   2>&1 | tail -20

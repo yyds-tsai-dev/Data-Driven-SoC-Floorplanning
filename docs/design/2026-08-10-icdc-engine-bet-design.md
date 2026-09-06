@@ -278,7 +278,7 @@ T+20~21 緩衝
 
 ### 9.1 harness 補丁(唯一的 `partner/` 改動,~15 行)
 
-**`partner/column_sa_legalizer.py`** — 擴充 `oracle_pred_override`(:3636-3664):
+**`src/solver/column_sa_legalizer.py`** — 擴充 `oracle_pred_override`(:3636-3664):
 - 新增 `PARTNER_ORACLE_PRED_MULTI=1`:JSON 值允許是 `[[ [x,y,w,h], ... ], ...]`(每案 **K 張不同版圖**)。
 - 語義:`preds` 的前 `min(K, len(preds))` 項逐一替換為不同版圖(不再是 `[P.copy() for _ in preds]`)。
 - **硬要求**:`_ORACLE_PRED_FILE` 為空時整段仍是 falsy 常數測試,production 路徑位元不變;新增 3-5 個單測(空檔、K<len、K>len、blockcount 不符 degrade 回 control)。
@@ -290,7 +290,7 @@ T+20~21 緩衝
 |---|---|---|
 | `energy.py` | `decode_rects(z, area, cons, tp)`(exact-area 參數化 + MIB aspect 綁定 + known-channel 覆寫)、`hpwl_centroid_manhattan()`、`bbox_area()`、`v_boundary_soft()`、`v_group_soft()`、`energy()`(§4.2 log-cost 形式)、`official_cost_reference()`(numpy,對拍用) | 逐行對齊 `iccad2026_evaluate.py:180-342, 427-540` |
 | `legalize.py` | **TFDL**:`extract_topology(rects) -> (E_x, E_y)`(detach)、`compact(rects, E, sizes)`(前向推 + 後向拉,torch,可微)、`tfdl(x0) -> legal rects` | 參考 `icdc_assets/alpha_legal.py:project`、`gr_lib.py:build_topology/longest_path_bounds` |
-| `sampler.py` | `sample_differentiable(model, cond, schedule, steps=2, K=8)` — 複製 `direct_diffusion_model.sample_direct_dpmpp` 的更新式但**移除 `@torch.no_grad`**、支援 K 樣本 batch、保留 anchor clamp | import `partner/direct_diffusion_model.py` |
+| `sampler.py` | `sample_differentiable(model, cond, schedule, steps=2, K=8)` — 複製 `direct_diffusion_model.sample_direct_dpmpp` 的更新式但**移除 `@torch.no_grad`**、支援 K 樣本 batch、保留 anchor clamp | import `src/solver/direct_diffusion_model.py` |
 | `train_energy.py` | fine-tune 迴圈:floorset_lite dataloader(**只取 `input_data`**)→ `fast_condition` → `sample_differentiable` → `tfdl` → `energy` → group soft-min + L2 錨 → AdamW + EMA;`spread_K` 監控與停訓條款;L4 etiquette 旗標照抄 `direct_diffusion_train.py:227-231`;SIGTERM 續跑 | import `partner/direct_diffusion_train.fast_condition` |
 | `dump_preds.py` | 對 `LiteTensorDataTest` 100 案各抽 K 張,寫成 MULTI 格式 JSON | — |
 | `__init__.py` | — | — |

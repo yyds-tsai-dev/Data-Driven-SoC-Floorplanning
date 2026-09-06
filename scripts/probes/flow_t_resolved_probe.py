@@ -35,7 +35,7 @@ def main():
 
     torch.set_num_threads(args.threads)
     repo = Path(args.repo)
-    sys.path.insert(0, str(repo / "partner"))
+    sys.path.insert(0, str(repo / "src" / "solver"))
     sys.path.insert(0, str(repo / "FloorSet" / "iccad2026contest"))
     sys.path.insert(0, str(repo / "FloorSet"))
 

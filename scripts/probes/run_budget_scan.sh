@@ -13,7 +13,7 @@ for MAX in 8 6 4; do
   echo "=== PARTNER_BUDGET_MAX=$MAX ==="
   PARTNER_BUDGET_MAX=$MAX uv run python "$ROOT/scripts/iccad2026_evaluate.py" \
     --data-path ../ \
-    --evaluate "$ROOT/partner/contest_optimizer.py" \
+    --evaluate "$ROOT/src/solver/contest_optimizer.py" \
     --output "$ROOT/artifacts/partner_eval/budget_scan_max${MAX}.json" \
     2>&1 | tail -3
 done

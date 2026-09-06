@@ -14,7 +14,7 @@ runtime `0.290269905 s`, and 100/100 hard feasible.
 
 ## Implementation
 
-- `partner/frame_reinsert.py` derives attainable wall targets exclusively from
+- `src/solver/frame_reinsert.py` derives attainable wall targets exclusively from
   preplaced constraint geometry, enumerates deterministic obstacle-edge slots,
   and contains every failure by returning the original layout.
 - `scripts/probes/frame_reinsert_g0.py` applies the pure pass to saved layouts,

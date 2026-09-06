@@ -213,10 +213,10 @@ elsewhere dominates.
 
 ## Code changes (v2.1)
 
-- `partner/flow_matching_claude.py`: `endpoint_time_weight(t, mode, gamma)`
+- `src/solver/flow_matching_claude.py`: `endpoint_time_weight(t, mode, gamma)`
   dispatches `none` (identity) / `snr`; `endpoint_snr_weight` retained with its
   disproof recorded in the docstring; `sample_flow_t` default `term_prob=0.0`.
-- `partner/flow_train_claude.py`: `parse_flow_extras()` lifted to module level
+- `src/solver/flow_train_claude.py`: `parse_flow_extras()` lifted to module level
   (testable defaults); `--x0-time-weighting {none,snr}` (default `none`),
   `--term-t-prob` default `0.0`; tag `flow_matching_v2_1`; `checkpoint_method`
   accepts `{v1, v2, v2_1}`; default checkpoint dir
@@ -265,7 +265,7 @@ Run from the eval/train script environment so `PYTHONPATH` reaches `partner/`.
 ```bash
 # Arm A — control / variance floor.  Run this first: it is the only arm whose
 # result is required before the others can be interpreted.
-uv run python3 partner/flow_train_claude.py \
+uv run python3 src/solver/flow_train_claude.py \
     --checkpoint-dir checkpoints/flow_v2_1_armA --max-steps 200000 --seed 4321 \
     --batch-size 12 --d-model 640 --layers 14 --heads 10 --node-feat-dim 32 \
     --lr 8e-5 --warmup 4000 --ema-decay 0.9998 --amp \
@@ -273,7 +273,7 @@ uv run python3 partner/flow_train_claude.py \
     --x0-time-weighting none --term-t-prob 0.0
 
 # Arm B — terminal-t in isolation
-uv run python3 partner/flow_train_claude.py \
+uv run python3 src/solver/flow_train_claude.py \
     --checkpoint-dir checkpoints/flow_v2_1_armB --max-steps 200000 --seed 4321 \
     --batch-size 12 --d-model 640 --layers 14 --heads 10 --node-feat-dim 32 \
     --lr 8e-5 --warmup 4000 --ema-decay 0.9998 --amp \
@@ -343,7 +343,7 @@ way `hp_loss` is already hinged at `hp_gt`.
 
 ## IV.3 Implementation
 
-`mib_objective(mib_pred, mib_gt, hinge)` in `partner/flow_train_claude.py`:
+`mib_objective(mib_pred, mib_gt, hinge)` in `src/solver/flow_train_claude.py`:
 
 - **Granularity: per-sample**, matching `mib_aspect`'s `(B,)` output and
   `hp_loss`'s existing per-sample hinge, then `* endpoint_weight` then `.mean()`.
@@ -444,7 +444,7 @@ maximally clean v1 comparison, not evidence that 1M is needed.
 ## IV.5 Launch command
 
 ```bash
-uv run python3 partner/flow_train_claude.py \
+uv run python3 src/solver/flow_train_claude.py \
     --data-path FloorSet/ \
     --checkpoint-dir checkpoints/flow_matching_v3 \
     --max-steps 1000000 --seed 1234 \

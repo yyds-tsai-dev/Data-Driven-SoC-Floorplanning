@@ -20,7 +20,7 @@ HPWL per case), never with two independent full runs.
 
 ## What was built (commits on `fable5`)
 
-1. `feat(legalizer)` — vendored `partner/legalizer_claude_v2.py` as
+1. `feat(legalizer)` — vendored `src/solver/legalizer_claude_v2.py` as
    `src/floorset_arch/legalizer/column_slicing.py` + `column_backbone.py`
    (heuristic seed, exp time budget `clamp(0.06·e^{n/20}, 0.8, 24)`, row
    fallback). Toggle `FLOORSET_COLUMN_BACKBONE=1` in `optimizer.py`.

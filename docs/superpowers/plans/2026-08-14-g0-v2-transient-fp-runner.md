@@ -25,7 +25,7 @@
 ### Task 1: Fail-closed two-slot oracle core
 
 **Files:**
-- Create: `partner/icdc/g0_v2.py`
+- Create: `src/icdc_engine/g0_v2.py`
 - Create: `tests/test_icdc_g0_v2.py`
 
 **Interfaces:**
@@ -127,7 +127,7 @@ Expected: all Task 1 tests pass.
 - [ ] **Step 8: Commit Task 1**
 
 ```bash
-git add partner/icdc/g0_v2.py tests/test_icdc_g0_v2.py
+git add src/icdc_engine/g0_v2.py tests/test_icdc_g0_v2.py
 git commit -m "feat: add transient fp g0 oracle core"
 ```
 
@@ -196,7 +196,7 @@ Run:
 ```bash
 uv run pytest tests/test_icdc_g0_v2.py -q
 uv run pytest tests/test_icdc_tfdl.py tests/test_icdc_topology_prior.py -q
-uv run python -m py_compile partner/icdc/g0_v2.py scripts/probes/icdc_fp_teacher_g0.py
+uv run python -m py_compile src/icdc_engine/g0_v2.py scripts/probes/icdc_fp_teacher_g0.py
 git diff --check
 graphify update .
 ```

@@ -2,8 +2,8 @@
 
 - 狀態:**default off**,off 路徑 bit 級不變(單元測試 39 綠佐證)
 - 旗標:`PARTNER_GPU_ARM=1`(+ `_TARGET` / `_MIN_A` / `_K` / `_TS0` / `_SEED` / `_DEBUG`)
-- 代碼:`partner/column_sa_legalizer.py`(模組頭輔助函式 + `_parallel_solve`)、
-  `partner/contest_optimizer.py`(sampler 的 `gen_seed` 偏移)
+- 代碼:`src/solver/column_sa_legalizer.py`(模組頭輔助函式 + `_parallel_solve`)、
+  `src/solver/contest_optimizer.py`(sampler 的 `gen_seed` 偏移)
 - 測試:`tests/test_partner_gpu_arm.py`
 
 ---

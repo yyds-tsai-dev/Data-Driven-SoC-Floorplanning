@@ -6,7 +6,7 @@
 
 **Architecture:** P1 consumes P0's transient verified fp row, QA preflight, local scorer adapter, and artifact guard. A focused extractor owns canonical sparse topology; a focused realizer accepts only that topology, a base seed, and sanitized input; the existing teacher probe remains a transaction adapter that calls one offline lifecycle module. P1 is non-blocking for the initial G0 critical path and adds no online production runtime behavior.
 
-**Tech Stack:** Python 3.12, PyTorch CPU float64 tensors, NumPy, pytest, `uv`, SHA256/canonical JSON, existing `partner/icdc/tfdl.py`, `partner/icdc/engine.py`, and the P0 QA scorer contract.
+**Tech Stack:** Python 3.12, PyTorch CPU float64 tensors, NumPy, pytest, `uv`, SHA256/canonical JSON, existing `src/icdc_engine/tfdl.py`, `src/icdc_engine/engine.py`, and the P0 QA scorer contract.
 
 ## Global Constraints
 
@@ -30,11 +30,11 @@
 
 | File | Responsibility |
 | --- | --- |
-| `partner/icdc/topology_data.py` | Own `TopologyLabel` and its immutable winner-linkage dataclasses; retain the P0 source row contract. |
-| `partner/icdc/fp_topology.py` | Extract, validate, canonically serialize, and hash `fp_topology_v1` sparse records. |
-| `partner/icdc/topology_realizer.py` | Translate sparse topology plus a base seed and sanitized input into deterministic offline realization attempts, without audit/scoring/fp-rectangle arguments. |
-| `partner/icdc/topology_teacher_pipeline.py` | Turn exactly six ordered realization attempts into admitted/rejected/duplicate slots, exact-audit/scorer evidence, and one winner-linked label. |
-| `partner/icdc/topology_manifest.py` | Construct and validate the no-dense, SHA-pinned teacher manifest and its extractor/TFDL/scorer evidence fields. |
+| `src/icdc_engine/topology_data.py` | Own `TopologyLabel` and its immutable winner-linkage dataclasses; retain the P0 source row contract. |
+| `src/icdc_engine/fp_topology.py` | Extract, validate, canonically serialize, and hash `fp_topology_v1` sparse records. |
+| `src/icdc_engine/topology_realizer.py` | Translate sparse topology plus a base seed and sanitized input into deterministic offline realization attempts, without audit/scoring/fp-rectangle arguments. |
+| `src/icdc_engine/topology_teacher_pipeline.py` | Turn exactly six ordered realization attempts into admitted/rejected/duplicate slots, exact-audit/scorer evidence, and one winner-linked label. |
+| `src/icdc_engine/topology_manifest.py` | Construct and validate the no-dense, SHA-pinned teacher manifest and its extractor/TFDL/scorer evidence fields. |
 | `scripts/probes/icdc_topology_teacher.py` | Call the P1 lifecycle/manifest APIs from its existing staged transaction; do not add geometry, selector, or scorer copies. |
 | `tests/test_fp_topology_v1.py` | Canonical record, extraction, invariance, contact, and forbidden-field tests. |
 | `tests/test_topology_teacher_pipeline.py` | Realizer boundary, fixed slots, exact admission, scorer count, winner, and linkage tests. |
@@ -90,13 +90,13 @@ def evaluate_topology_case(
 
 For every task, first perform a RED-review with an independent read-only Terra (`gpt-5.6-terra`, `xhigh`) against the specified test, source boundary, and P0 handoff. Then use a fresh Luna (`gpt-5.6-luna`, `low`) with ownership limited to that task's files; it preserves concurrent work and creates the named atomic commit. A different Terra re-reviews the actual diff, command output, no-dense scan, and P0 interface use. Important or Critical findings are corrected by a fresh Luna and re-reviewed before the next task; Sol accepts only inspected evidence.
 
-Never edit `partner/icdc/{tfdl.py,engine.py,energy.py}`, the contest evaluator, production optimizer/submission modules, checkpoints, artifacts, or `scratchpad/`. After every code modification run `graphify update .` and never stage expected graph artifacts. P1 never runs G0.
+Never edit `src/icdc_engine/{tfdl.py,engine.py,energy.py}`, the contest evaluator, production optimizer/submission modules, checkpoints, artifacts, or `scratchpad/`. After every code modification run `graphify update .` and never stage expected graph artifacts. P1 never runs G0.
 
 ### Task 1: Add immutable winner linkage to sparse labels
 
 **Files:**
 
-- Modify: `partner/icdc/topology_data.py:42-91`
+- Modify: `src/icdc_engine/topology_data.py:42-91`
 - Test: `tests/test_topology_teacher_pipeline.py`
 
 **Interfaces:**
@@ -166,13 +166,13 @@ Expected: PASS; loss-batch tensors remain unchanged and label provenance cannot 
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/topology_data.py tests/test_topology_teacher_pipeline.py tests/test_icdc_topology_prior.py && git commit -m "feat: link topology labels to winners"`
+Run: `git add src/icdc_engine/topology_data.py tests/test_topology_teacher_pipeline.py tests/test_icdc_topology_prior.py && git commit -m "feat: link topology labels to winners"`
 
 ### Task 2: Canonicalize and validate `fp_topology_v1`
 
 **Files:**
 
-- Create: `partner/icdc/fp_topology.py`
+- Create: `src/icdc_engine/fp_topology.py`
 - Test: `tests/test_fp_topology_v1.py`
 
 **Interfaces:**
@@ -245,13 +245,13 @@ Expected: PASS; records reject bad type/order/digest/duplicate/endpoint/axis/boo
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/fp_topology.py tests/test_fp_topology_v1.py && git commit -m "feat: add canonical fp topology records"`
+Run: `git add src/icdc_engine/fp_topology.py tests/test_fp_topology_v1.py && git commit -m "feat: add canonical fp topology records"`
 
 ### Task 3: Extract invariant axis DAGs and contact forests
 
 **Files:**
 
-- Modify: `partner/icdc/fp_topology.py`
+- Modify: `src/icdc_engine/fp_topology.py`
 - Test: `tests/test_fp_topology_v1.py`
 
 **Interfaces:**
@@ -318,13 +318,13 @@ Expected: PASS; tests cover gx/gy tie-to-x, center tie-to-lower-ID, transitive r
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/fp_topology.py tests/test_fp_topology_v1.py && git commit -m "feat: extract invariant fp topology"`
+Run: `git add src/icdc_engine/fp_topology.py tests/test_fp_topology_v1.py && git commit -m "feat: extract invariant fp topology"`
 
 ### Task 4: Build a sparse-only topology realizer boundary
 
 **Files:**
 
-- Create: `partner/icdc/topology_realizer.py`
+- Create: `src/icdc_engine/topology_realizer.py`
 - Test: `tests/test_topology_teacher_pipeline.py`
 
 **Interfaces:**
@@ -400,13 +400,13 @@ Expected: PASS; AST/signature checks reject fp rectangle arguments and tests cov
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/topology_realizer.py tests/test_topology_teacher_pipeline.py && git commit -m "feat: add sparse topology realizer"`
+Run: `git add src/icdc_engine/topology_realizer.py tests/test_topology_teacher_pipeline.py && git commit -m "feat: add sparse topology realizer"`
 
 ### Task 5: Evaluate six fixed slots through exact admission and local scoring
 
 **Files:**
 
-- Create: `partner/icdc/topology_teacher_pipeline.py`
+- Create: `src/icdc_engine/topology_teacher_pipeline.py`
 - Test: `tests/test_topology_teacher_pipeline.py`
 
 **Interfaces:**
@@ -469,7 +469,7 @@ def _exact_admit(rects: torch.Tensor, case: Mapping[str, object]) -> tuple[torch
     return legal[0], hard
 ```
 
-For each `_SLOTS` entry generate the intended sparse realization, first run nonexact TFDL from the original seed with literal zero drift, then `_exact_admit` from that same original seed. Canonically fingerprint the realized sparse topology; first fingerprint is candidate and later equal fingerprints become `duplicate` with earliest ordinal. Any failure becomes `rejected` with an explicit reason. If slot 0 is not candidate, return `state="KILLED_LEGALITY_OR_COVERAGE"` before a scorer call. For every candidate, call P0 `score_provided_local_no_runtime` once, retain soft V counts even when feasible, and select the winner by `(cost_no_runtime, ordinal, name)`. Build `WinnerTopologyLinkage(topology["topology_sha256"], f"{case['instance_id']}:{sample_seed}:{ordinal}:{name}", ordinal, name, cost)` and derive the sparse label only after winning. Parse `partner/icdc/tfdl.py` with `ast` before processing and reject if the chosen public path can call `shelf_fallback`.
+For each `_SLOTS` entry generate the intended sparse realization, first run nonexact TFDL from the original seed with literal zero drift, then `_exact_admit` from that same original seed. Canonically fingerprint the realized sparse topology; first fingerprint is candidate and later equal fingerprints become `duplicate` with earliest ordinal. Any failure becomes `rejected` with an explicit reason. If slot 0 is not candidate, return `state="KILLED_LEGALITY_OR_COVERAGE"` before a scorer call. For every candidate, call P0 `score_provided_local_no_runtime` once, retain soft V counts even when feasible, and select the winner by `(cost_no_runtime, ordinal, name)`. Build `WinnerTopologyLinkage(topology["topology_sha256"], f"{case['instance_id']}:{sample_seed}:{ordinal}:{name}", ordinal, name, cost)` and derive the sparse label only after winning. Parse `src/icdc_engine/tfdl.py` with `ast` before processing and reject if the chosen public path can call `shelf_fallback`.
 
 - [ ] **Step 4: Run the green and lifecycle-regression commands.**
 
@@ -485,13 +485,13 @@ Expected: PASS; fixtures cover base rejection kill before scoring, duplicate no-
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/topology_teacher_pipeline.py tests/test_topology_teacher_pipeline.py && git commit -m "feat: evaluate fixed topology slots"`
+Run: `git add src/icdc_engine/topology_teacher_pipeline.py tests/test_topology_teacher_pipeline.py && git commit -m "feat: evaluate fixed topology slots"`
 
 ### Task 6: Bind P1 manifests and wire the existing teacher adapter
 
 **Files:**
 
-- Create: `partner/icdc/topology_manifest.py`
+- Create: `src/icdc_engine/topology_manifest.py`
 - Modify: `scripts/probes/icdc_topology_teacher.py:63-65,794-1014,2015-2058,2329-2331`
 - Test: `tests/test_topology_manifest.py`
 
@@ -506,8 +506,8 @@ Run: `git add partner/icdc/topology_teacher_pipeline.py tests/test_topology_teac
 def test_topology_manifest_binds_concrete_sources_and_rejects_dense_payload(tmp_path):
     manifest = build_topology_manifest(
         receipts=[{"relative_path": "worker_0/layouts_0.th", "source_sha256": "a" * 64, "row": 0}],
-        qa=_qa_evidence(), extractor_path=Path("partner/icdc/fp_topology.py"),
-        tfdl_path=Path("partner/icdc/tfdl.py"), scorer_path=Path("scripts/iccad2026_evaluate.py"),
+        qa=_qa_evidence(), extractor_path=Path("src/icdc_engine/fp_topology.py"),
+        tfdl_path=Path("src/icdc_engine/tfdl.py"), scorer_path=Path("scripts/iccad2026_evaluate.py"),
     )
     validate_topology_manifest(manifest)
     assert set(("source_receipt_set_sha256", "extractor_source_sha256", "extractor_config_sha256",
@@ -569,7 +569,7 @@ Expected: PASS; manifest output contains concrete P0/P1 SHA fields and no dense 
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/topology_manifest.py scripts/probes/icdc_topology_teacher.py tests/test_topology_manifest.py && git commit -m "feat: bind fp topology evidence"`
+Run: `git add src/icdc_engine/topology_manifest.py scripts/probes/icdc_topology_teacher.py tests/test_topology_manifest.py && git commit -m "feat: bind fp topology evidence"`
 
 ## P1 acceptance evidence and kill behavior
 

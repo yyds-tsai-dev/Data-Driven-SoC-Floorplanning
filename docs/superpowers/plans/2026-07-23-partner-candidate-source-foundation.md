@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extract a behavior-preserving candidate ranking and fixed-slot allocation boundary from `partner/my_opt_claude.py` so Direct-v2, retrieval, and Flow Matching can be compared without changing total runtime capacity.
+**Goal:** Extract a behavior-preserving candidate ranking and fixed-slot allocation boundary from `src/solver/my_opt_claude.py` so Direct-v2, retrieval, and Flow Matching can be compared without changing total runtime capacity.
 
 **Architecture:** A small `candidate_supply_claude.py` module owns source-neutral candidate records, deterministic quota allocation, and the existing HPWL/overlap prescreen. `MyOptimizer` remains the orchestrator and keeps the current Direct-v2 behavior byte-for-byte when no new source is enabled.
 
@@ -20,15 +20,15 @@
 
 ## File Structure
 
-- Create `partner/candidate_supply_claude.py`: source-neutral candidate records, quota allocation, and prescreen ranking.
-- Modify `partner/my_opt_claude.py`: call the extracted functions without changing default behavior.
+- Create `src/solver/candidate_supply_claude.py`: source-neutral candidate records, quota allocation, and prescreen ranking.
+- Modify `src/solver/my_opt_claude.py`: call the extracted functions without changing default behavior.
 - Modify `tests/conftest.py`: make standalone `partner/` modules importable in tests.
 - Create `tests/test_partner_candidate_supply.py`: unit and parity tests.
 
 ### Task 1: Candidate Records and Fixed-Slot Allocation
 
 **Files:**
-- Create: `partner/candidate_supply_claude.py`
+- Create: `src/solver/candidate_supply_claude.py`
 - Modify: `tests/conftest.py`
 - Test: `tests/test_partner_candidate_supply.py`
 
@@ -87,7 +87,7 @@ Expected: FAIL during collection with `ModuleNotFoundError: No module named 'can
 
 - [ ] **Step 3: Implement the records and allocator**
 
-Create `partner/candidate_supply_claude.py`:
+Create `src/solver/candidate_supply_claude.py`:
 
 ```python
 from __future__ import annotations
@@ -147,14 +147,14 @@ Expected: `3 passed`.
 - [ ] **Step 5: Commit the contracts**
 
 ```bash
-git add partner/candidate_supply_claude.py tests/conftest.py tests/test_partner_candidate_supply.py
+git add src/solver/candidate_supply_claude.py tests/conftest.py tests/test_partner_candidate_supply.py
 git commit -m "refactor: add partner candidate source contracts"
 ```
 
 ### Task 2: Extract Deterministic Prescreen Ranking
 
 **Files:**
-- Modify: `partner/candidate_supply_claude.py`
+- Modify: `src/solver/candidate_supply_claude.py`
 - Modify: `tests/test_partner_candidate_supply.py`
 
 **Interfaces:**
@@ -196,7 +196,7 @@ Expected: FAIL importing `rank_predictions`.
 
 - [ ] **Step 3: Implement source-neutral ranking**
 
-Append to `partner/candidate_supply_claude.py`:
+Append to `src/solver/candidate_supply_claude.py`:
 
 ```python
 def _hpwl_proxy(prediction: np.ndarray, b2b: np.ndarray) -> float:
@@ -260,14 +260,14 @@ Expected: `5 passed`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add partner/candidate_supply_claude.py tests/test_partner_candidate_supply.py
+git add src/solver/candidate_supply_claude.py tests/test_partner_candidate_supply.py
 git commit -m "refactor: extract partner candidate prescreen"
 ```
 
 ### Task 3: Wire the Boundary into the Direct-v2 Baseline
 
 **Files:**
-- Modify: `partner/my_opt_claude.py:311-445`
+- Modify: `src/solver/my_opt_claude.py:311-445`
 - Modify: `tests/test_partner_candidate_supply.py`
 
 **Interfaces:**
@@ -298,7 +298,7 @@ Expected: PASS; this freezes the intended ordering before integration.
 
 - [ ] **Step 3: Replace only the inline HPWL/overlap ordering**
 
-At the top of `partner/my_opt_claude.py`, import:
+At the top of `src/solver/my_opt_claude.py`, import:
 
 ```python
 from candidate_supply_claude import rank_predictions
@@ -339,7 +339,7 @@ Expected: submission-interface validation succeeds with 100% feasible smoke outp
 - [ ] **Step 6: Commit**
 
 ```bash
-git add partner/my_opt_claude.py partner/candidate_supply_claude.py tests/test_partner_candidate_supply.py
+git add src/solver/my_opt_claude.py src/solver/candidate_supply_claude.py tests/test_partner_candidate_supply.py
 git commit -m "refactor: route direct candidates through shared prescreen"
 ```
 

@@ -36,8 +36,8 @@ from constructive_g01 import (  # noqa: E402
     summarize_g1,
     weighted_score,
 )
-from icdc import data as icdc_data  # noqa: E402
-from icdc.engine import verify_hard_legal  # noqa: E402
+from icdc_engine import data as icdc_data  # noqa: E402
+from icdc_engine.engine import verify_hard_legal  # noqa: E402
 
 
 G0_POLICY = ConstructivePolicy(

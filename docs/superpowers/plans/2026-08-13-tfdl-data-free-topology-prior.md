@@ -6,7 +6,7 @@
 
 **Architecture:** Freeze `partner/checkpoints/direct_v2_cont/eval_step1p2M.pt`; deterministically propose axis/order exchanges, pin repairs, and grouping contacts; admit only float64 exact-TFDL, exact-hard-legal, zero-drift proposals. Distill transitive-reduced sparse topology labels through three samples of the production Direct DPM++ two-step differentiable sampler, with detached teacher weights and base/EMA anchors. Test the selected same-shape Direct checkpoint only inside a frozen total-six portfolio of exactly 3 Direct + 3 Flow.
 
-**Tech Stack:** Python 3.12, PyTorch, NumPy, pytest, `uv`, JSONL/SHA256, existing `partner/icdc/{tfdl,energy,engine,sampler}.py`.
+**Tech Stack:** Python 3.12, PyTorch, NumPy, pytest, `uv`, JSONL/SHA256, existing `src/icdc_engine/{tfdl,energy,engine,sampler}.py`.
 
 ## Global Constraints
 
@@ -26,12 +26,12 @@
 
 ## File map
 
-The shared checkpoint codec is solely `partner/icdc/checkpoint_identity.py`.
+The shared checkpoint codec is solely `src/icdc_engine/checkpoint_identity.py`.
 Task 4 may import/re-export private helper aliases for its probe tests; Task 5
 imports/re-exports `canonical_checkpoint_identity` and never duplicates the
 codec.
 
-Create only `partner/icdc/checkpoint_identity.py`, `partner/icdc/topology_data.py`, `partner/icdc/topology_prior.py`, `partner/icdc/train_topology_prior.py`, `tests/test_icdc_topology_prior.py`, `scripts/probes/icdc_topology_teacher.py`, `scripts/probes/icdc_topology_gate.py`, `scripts/probes/icdc_topology_3d3f_wrapper.py`, and `scripts/probes/run_icdc_topology_stage.sh`; generated evidence is under `artifacts/icdc_topology/` or `.superpowers/sdd/`, and generated gate artifacts are not committed. The Track-B wrapper may set the frozen environment and add fail-closed source-count/Flow-success receipts around inherited production methods; it may not change sampling, ranking, refinement, or selection.
+Create only `src/icdc_engine/checkpoint_identity.py`, `src/icdc_engine/topology_data.py`, `src/icdc_engine/topology_prior.py`, `src/icdc_engine/train_topology_prior.py`, `tests/test_icdc_topology_prior.py`, `scripts/probes/icdc_topology_teacher.py`, `scripts/probes/icdc_topology_gate.py`, `scripts/probes/icdc_topology_3d3f_wrapper.py`, and `scripts/probes/run_icdc_topology_stage.sh`; generated evidence is under `artifacts/icdc_topology/` or `.superpowers/sdd/`, and generated gate artifacts are not committed. The Track-B wrapper may set the frozen environment and add fail-closed source-count/Flow-success receipts around inherited production methods; it may not change sampling, ranking, refinement, or selection.
 
 ### Task 1: Data schema, sanitized corpus, split, manifest
 
@@ -50,7 +50,7 @@ are immutable provenance.  `source_root` and receipts are required save-time
 inputs and define the source verification boundary; later sealed index/manifest
 artifacts carry the experiment-level reproducibility boundary.
 
-**Files:** Create `partner/icdc/topology_data.py`; create/modify `tests/test_icdc_topology_prior.py`.
+**Files:** Create `src/icdc_engine/topology_data.py`; create/modify `tests/test_icdc_topology_prior.py`.
 
 **Interfaces:** Frozen dataclasses exactly as specified:
 `SparseEdge(src:int,dst:int,axis:int,margin:float,kind:str,weight:float)`,
@@ -96,11 +96,11 @@ without undefined `source_root`/`receipt` variables.
   Training instance IDs/fingerprints are retained for deterministic splitting
   and are not coordinate targets.
 - [ ] Run the targeted test plus `uv run pytest tests/test_icdc_topology_prior.py -q`; expect PASS; run `graphify update .` without staging unrelated `graphify-out/` dirt.
-- [ ] Commit `git add partner/icdc/topology_data.py tests/test_icdc_topology_prior.py && git commit -m "feat: add topology schemas and corpus manifests"`.
+- [ ] Commit `git add src/icdc_engine/topology_data.py tests/test_icdc_topology_prior.py && git commit -m "feat: add topology schemas and corpus manifests"`.
 
 ### Task 2: Sparse labels and topology losses
 
-**Files:** Create `partner/icdc/topology_prior.py`; modify `tests/test_icdc_topology_prior.py`.
+**Files:** Create `src/icdc_engine/topology_prior.py`; modify `tests/test_icdc_topology_prior.py`.
 
 **Interfaces:** Import `Any, Dict, Iterator, Mapping, Optional, Sequence, Tuple`,
 `torch`, and Task 1 types. Define
@@ -177,11 +177,11 @@ def test_contact_loss_respects_order_and_is_zero_at_exact_positive_contact():
   envelope/manifest keyed by `(instance_id, sample_seed)`, not TopologyLabel
   fields. Detach weights only, never `rects`; no energy import/call is allowed.
 - [ ] Run focused tests; expect PASS; run `graphify update .` without staging graph dirt.
-- [ ] Commit `git add partner/icdc/topology_prior.py tests/test_icdc_topology_prior.py && git commit -m "feat: add sparse topology labels and losses"`.
+- [ ] Commit `git add src/icdc_engine/topology_prior.py tests/test_icdc_topology_prior.py && git commit -m "feat: add sparse topology labels and losses"`.
 
 ### Task 3: Bounded proposals and exact teacher path
 
-**Files:** Modify `partner/icdc/topology_prior.py`; modify `tests/test_icdc_topology_prior.py`.
+**Files:** Modify `src/icdc_engine/topology_prior.py`; modify `tests/test_icdc_topology_prior.py`.
 
 **Interfaces:** Define frozen
 `ProposalConfig(axis_exchange_cap:int=8,pin_repair_cap:int=8,group_contact_cap:int=8,total_cap:int=32)`
@@ -280,11 +280,11 @@ def test_group_contact_requires_exact_abutment_and_positive_overlap():
   every `ProposalResult`; Task 3 never imports/calls energy or
   `extract_sparse_label`. Task 4 recomputes the evaluator-faithful soft
   profile/cost and extracts labels.
-- [ ] Run focused tests; expect PASS; run `graphify update .` without staging graph dirt; commit `git add partner/icdc/topology_prior.py tests/test_icdc_topology_prior.py && git commit -m "feat: add exact topology proposal path"`.
+- [ ] Run focused tests; expect PASS; run `graphify update .` without staging graph dirt; commit `git add src/icdc_engine/topology_prior.py tests/test_icdc_topology_prior.py && git commit -m "feat: add exact topology proposal path"`.
 
 ### Task 4: Deterministic teacher and G0
 
-**Files:** Create `partner/icdc/checkpoint_identity.py` and
+**Files:** Create `src/icdc_engine/checkpoint_identity.py` and
 `scripts/probes/icdc_topology_teacher.py`; modify
 `tests/test_icdc_topology_prior.py`.
 
@@ -467,7 +467,7 @@ manifest bytes. Never use `topology_data.write_sha256_manifest` for this schema.
 
 ### Task 5: Same-shape trainer and contract
 
-**Files:** Create `partner/icdc/train_topology_prior.py`; modify `tests/test_icdc_topology_prior.py`.
+**Files:** Create `src/icdc_engine/train_topology_prior.py`; modify `tests/test_icdc_topology_prior.py`.
 
 **Interface:** `checkpoint_contract(base: Mapping[str, Any],
 candidate: Mapping[str, Any], *, sampler_method: str = "dpmpp",
@@ -476,7 +476,7 @@ portfolio_contract_sha256: str)->Dict[str, Any]` verifies config, Direct
 sampler, total candidate count, portfolio hash, state keys, shapes, and dtypes.
 Also export `frozen_portfolio_contract(flow_slots:int=3,nref:int=6)` and
 re-export `canonical_checkpoint_identity(checkpoint)->Dict[str,str]` from the
-sole codec in `partner/icdc/checkpoint_identity.py`. Use
+sole codec in `src/icdc_engine/checkpoint_identity.py`. Use
 `canonical_state_sha256` for source EMA/C0 comparisons; do not create another
 state encoder.
 
@@ -507,7 +507,7 @@ def test_checkpoint_contract_requires_six_candidates_and_3d3f_portfolio_hash():
 
 
 def test_trainer_ast_forbids_validation_and_golden_reads():
-    path = Path("partner/icdc/train_topology_prior.py")
+    path = Path("src/icdc_engine/train_topology_prior.py")
     tree = ast.parse(path.read_text())
     forbidden = {"load_test_cases", "FloorplanDatasetLiteTest"}
     findings = []
@@ -579,7 +579,7 @@ uv run python -m partner.icdc.train_topology_prior \
   Expect `latest.pt`, held-out-selected `best.pt`, `source_contract.json`,
   `contract.json`, and `train_log.jsonl`; run `graphify update .` without
   staging graph dirt. Neither mutable checkpoint is authorized for full100.
-- [ ] Commit `git add partner/icdc/train_topology_prior.py tests/test_icdc_topology_prior.py && git commit -m "feat: train same-shape topology prior"`.
+- [ ] Commit `git add src/icdc_engine/train_topology_prior.py tests/test_icdc_topology_prior.py && git commit -m "feat: train same-shape topology prior"`.
 
 ### Task 6: Freeze G1 contract, implement fail-closed gates, then run once
 

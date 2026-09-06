@@ -5,7 +5,7 @@ proxy + micro-run evidence only; the paired full-100 is the scheduler's).
 Flag surface: `PARTNER_ANYTIME_LADDER`, `PARTNER_ANYTIME_SECURE_MIN`,
 `PARTNER_ANYTIME_SECURE_MAX`, `PARTNER_ANYTIME_BUILD_MULT`,
 `PARTNER_ANYTIME_SECURE`, `PARTNER_ANYTIME_TIGHTEN`.
-Code: `partner/layout_refiner.py` (`refine_prediction` only).
+Code: `src/solver/layout_refiner.py` (`refine_prediction` only).
 Tests: `tests/test_partner_anytime_ladder.py` (30).
 Prior art: `docs/design/2026-08-04-early-exit-true-time-reduction.md` (time
 anatomy), `docs/experiments/2026-08-04-low-budget-frontier-pool-gate.md`

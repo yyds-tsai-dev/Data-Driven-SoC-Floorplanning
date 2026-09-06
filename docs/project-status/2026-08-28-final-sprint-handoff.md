@@ -17,8 +17,8 @@ Full evidence log: `docs/experiments/2026-08-21-post-beta-p0-execution.md` §15�
   Fallbacks: `cadc1013_0828_final.tar.gz` (md5 `b25aaa7e…`, same minus the guard) and
   `cadc1013_0827_final.tar.gz` (md5 `163b8854…`, flow v1).
 - Built by `bash scripts/pack_cadc1013.sh <out_dir>` from the working tree (import closure of
-  `partner/contest_optimizer.py` → `op_src.py`, `partner/shipping/op_wrapper.py`,
-  `partner/shipping/requirements.txt`, `tests/synth_instances.py`, flow ckpt + v2 student ckpt).
+  `src/solver/contest_optimizer.py` → `op_src.py`, `src/shipping/op_wrapper.py`,
+  `src/shipping/requirements.txt`, `src/solver/synth_instances.py`, flow ckpt + v2 student ckpt).
   **Always rebuild with the script; a hand-assembled package once shipped stale modules.**
 - Dry run 7 (08-28 ~15:00, fresh extract, clean Python 3.13 venv built today from requirements.txt only —
   torch 2.6.0+cu124 / scipy 1.18.1 / numba 0.67.0 — official evaluator, load 24–28):
@@ -31,7 +31,7 @@ Full evidence log: `docs/experiments/2026-08-21-post-beta-p0-execution.md` §15�
   column-only regime) → expect hidden raw ≈ local +0.01–0.02. Adversarial synthetic sweep of the package
   (106 instances): 0 exceptions, runtime bounded (n=120 max 1.33 s), the solver introduced zero overlaps
   (all 37 infeasibles were unsatisfiable inputs from the synthetic generator).
-- Shipping env (in `partner/shipping/op_wrapper.py` and README): mid budget table +
+- Shipping env (in `src/shipping/op_wrapper.py` and README): mid budget table +
   Flow-only (`FLOW_SLOTS=10 NREF=9`) + `DIRECT_SEAT_FIX=1` + `REFINE_RES_FRAC=0.45` +
   `WALL_REPAIR=1` + `FLOW_WARM=1` + `EARLY_EXIT=1` + `REFINE_SECURE_FALLBACK=1`,
   `OVERSAMPLE=1 KS_CAP=6`, TAG_COMPRESS/GROUP_BRIDGE=1, **polish OFF** (`PARTNER_COORD_POLISH` unset), `FLOW_ANTITHETIC=1`, `FLOW_CKPT_TAIL` unset (router off). Unchanged from 0827 except the flow checkpoint.

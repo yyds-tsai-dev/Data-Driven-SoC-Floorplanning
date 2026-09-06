@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline construction check for `PARTNER_COL_BALANCE` (no full evaluation):
 for all 100 official validation cases, build a `_ColumnOptimizer` under the
-canonical G1 solver env (`partner/icdc/g1_runtime.py` `_SOLVER_ENV`), call
+canonical G1 solver env (`src/icdc_engine/g1_runtime.py` `_SOLVER_ENV`), call
 `_init_columns(C0)` with the flag off vs on, and report the realized initial
 column width sum (`sum_c max(A_c/(H-R_c), maxrigid_w_c)`, the same formula
 `_layout_full` uses per column) vs `W_est`.
@@ -24,8 +24,8 @@ for _p in (REPO / "partner", REPO / "FloorSet" / "iccad2026contest",
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from icdc.data import load_test_cases  # noqa: E402
-from icdc.g1_runtime import _SOLVER_ENV  # noqa: E402
+from icdc_engine.data import load_test_cases  # noqa: E402
+from icdc_engine.g1_runtime import _SOLVER_ENV  # noqa: E402
 import iccad2026_evaluate as ev  # noqa: E402
 
 import column_sa_legalizer as csl  # noqa: E402

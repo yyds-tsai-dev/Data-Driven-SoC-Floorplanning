@@ -13,7 +13,7 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-for import_path in (REPO_ROOT / "FloorSet", REPO_ROOT / "partner"):
+for import_path in (REPO_ROOT / "FloorSet", REPO_ROOT / "src" / "solver"):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 

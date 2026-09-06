@@ -3,15 +3,11 @@
 Thumbs.db
 .nfs*
 
-# Partner reference checkpoint (178MB) and the harness symlink to it
-partner/*.pt
-partner/harness/checkpoints/
-
-# Partner training checkpoints: direct_v2 snapshots are 1.7GB each and the
-# periodic step_*.pt ladder alone is ~31GB. Never let these reach git.
-partner/checkpoints/
-partner/direct_v2/
-partner/**/*.pt
+# Model checkpoints never reach git (direct_v2 snapshots are 1.7GB each, the
+# periodic step_*.pt ladders are tens of GB). Shipped checkpoints live under
+# submission/ (git-ignored) and artifacts/ (git-ignored).
+*.pt
+!checkpoints/*.pt
 
 # Python
 __pycache__/

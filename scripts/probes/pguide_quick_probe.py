@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "partner"))
+sys.path.insert(0, str(ROOT / "src" / "solver"))
 
 CASES = [0, 49, 79, 88, 93, 96, 99]
 GRID = [dict(k=0), dict(k=3, eta=0.05), dict(k=5, eta=0.05),

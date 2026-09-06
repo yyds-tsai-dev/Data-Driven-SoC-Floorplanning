@@ -10,7 +10,7 @@ Branch：`codex/5.6-sol-partner-candidate-research`
 
 ## 固定實驗契約
 
-- Evaluator-facing solver：`partner/my_opt_claude.py`
+- Evaluator-facing solver：`src/solver/my_opt_claude.py`
 - Direct checkpoint：step 1,139,000；control/treatment 使用同一份 checkpoint snapshot
 - Retrieval index：`artifacts/retrieval/pilot64`
   - FloorSet training split only

@@ -5,10 +5,10 @@ micro-benchmark + bit-exactness evidence only; the paired full-100 is the
 scheduler's).
 Flag surface: `PARTNER_REFINE_KERNEL=numba`, `PARTNER_REFINE_KERNEL_WARMUP`,
 `PARTNER_REFINE_FASTBUILD`.
-Code: `partner/refine_numeric_kernel.py`, four dispatch sites in
-`partner/layout_refiner.py`.
+Code: `src/solver/refine_numeric_kernel.py`, four dispatch sites in
+`src/solver/layout_refiner.py`.
 Tests: `tests/test_partner_refine_kernel.py`.
-Prior art: `partner/sa_numeric_kernel.py` (`PARTNER_SA_KERNEL`, the template),
+Prior art: `src/solver/sa_numeric_kernel.py` (`PARTNER_SA_KERNEL`, the template),
 `docs/design/2026-08-04-anytime-ladder.md` (the failure this unblocks),
 `docs/design/2026-08-04-early-exit-true-time-reduction.md` (time anatomy).
 
@@ -71,7 +71,7 @@ scope.
 
 ## 2. What is ported, and what is not
 
-Ported (`partner/refine_numeric_kernel.py`):
+Ported (`src/solver/refine_numeric_kernel.py`):
 
 * `_axis_pass` **with `hold=True` only** — sections A+B+C+D+E fused into one
   `njit` call. This is the legalization sweep (`legalize`, `_legal_check`),
@@ -206,7 +206,7 @@ pays the 3.3 s compile once; that must not happen inside a timed run.
 Off path: `PARTNER_REFINE_KERNEL` unset ⇒ `_Refiner._nk is None`,
 `_fast_build is False`, each dispatch site is a single `is None` test and
 `numba` is never imported. `scratchpad/refine_kernel_offpath.py` measures the
-stronger claim — the pre-port module (`git show ad3b26e:partner/layout_refiner.py`)
+stronger claim — the pre-port module (`git show ad3b26e:src/solver/layout_refiner.py`)
 and the patched module, flag off, on spans long enough that every stage
 converges (so the pristine module is self-reproducible, verified by running it
 twice) — **4/4 byte-identical**:

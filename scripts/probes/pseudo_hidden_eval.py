@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Pseudo-hidden evaluation harness.
 
-Evaluates the production partner solver (``partner/contest_optimizer.py``,
+Evaluates the production partner solver (``src/solver/contest_optimizer.py``,
 ``MyOptimizer``) on a deterministic sample of held-out rows drawn from
 ``FloorSet/floorset_lite`` (the 1M-sample training set), producing an
 evaluator-style JSON comparable to the official 100-case runs.
 
 This is a *new* probe file only -- it reuses (does not reimplement) the
-row -> solve()-input conversion in ``partner/icdc/data.py``
+row -> solve()-input conversion in ``src/icdc_engine/data.py``
 (``BandFileSampler._instance`` / ``target_positions_from_rects``), the
-heldout/train split in ``partner/icdc/topology_data.py``
+heldout/train split in ``src/icdc_engine/topology_data.py``
 (``split_for_id``), and the official cost/violation math in
 ``scripts/iccad2026_evaluate.py`` (``evaluate_solution``,
 ``compute_total_score``).
@@ -51,8 +51,8 @@ for _p in (REPO / "partner", REPO / "FloorSet" / "iccad2026contest",
         sys.path.insert(0, str(_p))
 
 # Reused conversion machinery -- do NOT reimplement.
-from icdc.data import BandFileSampler, target_positions_from_rects  # noqa: E402
-from icdc.topology_data import split_for_id  # noqa: E402
+from icdc_engine.data import BandFileSampler, target_positions_from_rects  # noqa: E402
+from icdc_engine.topology_data import split_for_id  # noqa: E402
 
 # Reused official cost/violation machinery -- do NOT reimplement.
 import iccad2026_evaluate as ev  # noqa: E402
@@ -247,7 +247,7 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=None,
                      help="cap total cases (smoke testing)")
     ap.add_argument("--optimizer-path", type=str,
-                     default=str(REPO / "partner" / "contest_optimizer.py"))
+                     default=str(REPO / "src" / "solver" / "contest_optimizer.py"))
     ap.add_argument("--index-cache", type=str,
                      default=str(REPO / "artifacts" / "p0_newbox" / "lite_index_cache.json"))
     ap.add_argument("--mib-max-spread", type=float, default=0.02,

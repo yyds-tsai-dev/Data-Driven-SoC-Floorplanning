@@ -1,21 +1,21 @@
 #!/bin/bash
-# Assemble the contest package cadc1013.tar.gz from the CURRENT partner tree.
+# Assemble the contest package cadc1013.tar.gz from the CURRENT src/solver tree.
 # Usage: bash scripts/pack_cadc1013.sh <out_dir>
 #   out_dir/cadc1013/  and  out_dir/cadc1013.tar.gz
-# Contents: import closure of partner/contest_optimizer.py (shipped as op_src.py),
-# tests/synth_instances.py (op_wrapper JIT warm-up), partner/shipping/op_wrapper.py,
-# partner/shipping/requirements.txt, checkpoints (flow ft0828-300k EMA + v2 student as direct).
+# Contents: import closure of src/solver/contest_optimizer.py (shipped as op_src.py),
+# src/solver/synth_instances.py (op_wrapper JIT warm-up), src/shipping/op_wrapper.py,
+# src/shipping/requirements.txt, checkpoints (flow ft0828-300k EMA + v2 student as direct).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:?out_dir}"; PK="$OUT/cadc1013"
 rm -rf "$PK"; mkdir -p "$PK/checkpoints"
 for m in $(cd "$ROOT" && uv run python scripts/probes/package_closure.py 2>/dev/null); do
-  [ -f "$ROOT/partner/$m.py" ] && cp "$ROOT/partner/$m.py" "$PK/$m.py"
+  [ -f "$ROOT/src/solver/$m.py" ] && cp "$ROOT/src/solver/$m.py" "$PK/$m.py"
 done
-cp "$ROOT/partner/contest_optimizer.py" "$PK/op_src.py"
-cp "$ROOT/tests/synth_instances.py" "$PK/synth_instances.py"
-cp "$ROOT/partner/shipping/op_wrapper.py" "$PK/op_wrapper.py"
-cp "$ROOT/partner/shipping/requirements.txt" "$PK/requirements.txt"
+cp "$ROOT/src/solver/contest_optimizer.py" "$PK/op_src.py"
+cp "$ROOT/src/solver/synth_instances.py" "$PK/synth_instances.py"
+cp "$ROOT/src/shipping/op_wrapper.py" "$PK/op_wrapper.py"
+cp "$ROOT/src/shipping/requirements.txt" "$PK/requirements.txt"
 # Flow prior = tail-tilted fine-tune of v1, 300k-step cosine anneal, EMA-only export
 # (docs .../post-beta-p0-execution.md Sec.17x-17ab; promoted 2026-08-28).
 cp "$ROOT/submission/cadc1013/checkpoints/flow_matching_ft0831_soupa50_250k_ema.pt" "$PK/checkpoints/flow_matching_ft0831_soupa50_250k_ema.pt"

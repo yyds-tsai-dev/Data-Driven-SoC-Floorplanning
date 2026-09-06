@@ -21,19 +21,19 @@
 
 ## File Structure
 
-- Create `partner/retrieval_features_claude.py`: global/node feature extraction and typed query/source records.
-- Create `partner/retrieval_index_claude.py`: per-`n` train-only shards, manifest validation, and top-K query.
-- Create `partner/retrieval_matching_claude.py`: O(n^3) Hungarian assignment with compatibility guards.
-- Create `partner/retrieval_transfer_claude.py`: D4-aware coherent layout transfer and hard-anchor projection.
+- Create `src/solver/retrieval_features_claude.py`: global/node feature extraction and typed query/source records.
+- Create `src/solver/retrieval_index_claude.py`: per-`n` train-only shards, manifest validation, and top-K query.
+- Create `src/solver/retrieval_matching_claude.py`: O(n^3) Hungarian assignment with compatibility guards.
+- Create `src/solver/retrieval_transfer_claude.py`: D4-aware coherent layout transfer and hard-anchor projection.
 - Create `scripts/build_partner_retrieval_index.py`: bounded, reproducible training-index builder.
 - Create `scripts/probes/retrieval_probe.py`: held-out query, raw-transfer, and repaired-candidate diagnostics.
-- Modify `partner/my_opt_claude.py`: opt-in retrieval source using fixed quotas.
+- Modify `src/solver/my_opt_claude.py`: opt-in retrieval source using fixed quotas.
 - Create focused tests under `tests/test_partner_retrieval_*.py`.
 
 ### Task 1: Permutation-Invariant Retrieval Features
 
 **Files:**
-- Create: `partner/retrieval_features_claude.py`
+- Create: `src/solver/retrieval_features_claude.py`
 - Test: `tests/test_partner_retrieval_features.py`
 
 **Interfaces:**
@@ -191,14 +191,14 @@ Expected: `2 passed`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add partner/retrieval_features_claude.py tests/test_partner_retrieval_features.py
+git add src/solver/retrieval_features_claude.py tests/test_partner_retrieval_features.py
 git commit -m "feat: add permutation-invariant retrieval features"
 ```
 
 ### Task 2: Train-Only Sharded Index
 
 **Files:**
-- Create: `partner/retrieval_index_claude.py`
+- Create: `src/solver/retrieval_index_claude.py`
 - Test: `tests/test_partner_retrieval_index.py`
 
 **Interfaces:**
@@ -316,15 +316,15 @@ Expected: `2 passed`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add partner/retrieval_index_claude.py tests/test_partner_retrieval_index.py
+git add src/solver/retrieval_index_claude.py tests/test_partner_retrieval_index.py
 git commit -m "feat: add train-only retrieval index"
 ```
 
 ### Task 3: Block Matching and Coherent Transfer
 
 **Files:**
-- Create: `partner/retrieval_matching_claude.py`
-- Create: `partner/retrieval_transfer_claude.py`
+- Create: `src/solver/retrieval_matching_claude.py`
+- Create: `src/solver/retrieval_transfer_claude.py`
 - Test: `tests/test_partner_retrieval_transfer.py`
 
 **Interfaces:**
@@ -524,7 +524,7 @@ Expected: `2 passed`.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add partner/retrieval_matching_claude.py partner/retrieval_transfer_claude.py tests/test_partner_retrieval_transfer.py
+git add src/solver/retrieval_matching_claude.py src/solver/retrieval_transfer_claude.py tests/test_partner_retrieval_transfer.py
 git commit -m "feat: match and transfer retrieved layouts"
 ```
 
@@ -616,7 +616,7 @@ git commit -m "feat: build and probe train-only retrieval index"
 ### Task 5: Opt-In Partner Candidate Source
 
 **Files:**
-- Modify: `partner/my_opt_claude.py`
+- Modify: `src/solver/my_opt_claude.py`
 - Create: `tests/test_partner_retrieval_integration.py`
 - Create: `scripts/probes/run_retrieval_gate.sh`
 
@@ -700,7 +700,7 @@ Expected: interface validation succeeds.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add partner/my_opt_claude.py tests/test_partner_retrieval_integration.py scripts/probes/run_retrieval_gate.sh
+git add src/solver/my_opt_claude.py tests/test_partner_retrieval_integration.py scripts/probes/run_retrieval_gate.sh
 git commit -m "feat: add time-neutral retrieval candidates"
 ```
 

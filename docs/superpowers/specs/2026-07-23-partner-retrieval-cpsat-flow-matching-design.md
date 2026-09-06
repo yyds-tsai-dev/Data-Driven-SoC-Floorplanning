@@ -20,7 +20,7 @@
 
 ### 2.1 主管線與對照組
 
-`partner/my_opt_claude.py` 是目前研究主管線：
+`src/solver/my_opt_claude.py` 是目前研究主管線：
 
 ```text
 heuristic / legacy diffusion seed
@@ -271,7 +271,7 @@ HPWL 以每條 net 的 `min_x/max_x/min_y/max_y` 輔助變數表達；pin offset
 
 ### F0：替換目標
 
-第一優先替換 `partner/direct_model_claude.py::sample_direct()` 的 50-step DDIM candidate generator，而不是先重寫 legacy 4-step graph diffusion seed。理由是 Direct-v2 是目前經驗上最強的候選來源，而且 50 neural-function evaluations（NFE）留下實際降本空間。
+第一優先替換 `src/solver/direct_model_claude.py::sample_direct()` 的 50-step DDIM candidate generator，而不是先重寫 legacy 4-step graph diffusion seed。理由是 Direct-v2 是目前經驗上最強的候選來源，而且 50 neural-function evaluations（NFE）留下實際降本空間。
 
 保留以下 contract：
 

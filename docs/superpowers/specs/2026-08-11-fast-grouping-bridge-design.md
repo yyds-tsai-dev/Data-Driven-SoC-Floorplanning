@@ -55,7 +55,7 @@ hard guards, a soft 20ms deadline, and evaluator-level paired promotion gates.
 ### Grouping-only public operation
 
 Add `bridge_grouping_violations(opt, out, budget_s=0.02)` to
-`partner/violation_killer.py`.  It is a narrow public wrapper around the
+`src/solver/violation_killer.py`.  It is a narrow public wrapper around the
 existing `_components`, `_Ctx`, `_fix_grouping`, and `_final_guards_ok`
 machinery.  It does not invoke boundary repair, MIB repair, sliver repair,
 LNS, stage-2 refinement, or any VKILL carve logic.
@@ -87,7 +87,7 @@ Add these default-off environment controls:
 - `PARTNER_GROUP_BRIDGE_DEBUG=1` enables self-paired diagnostic output.
 
 The existing `MyOptimizer._tag_compress` hook in
-`partner/contest_optimizer.py` already constructs or reuses the final
+`src/solver/contest_optimizer.py` already constructs or reuses the final
 `_ColumnOptimizer` scorer.  Extend that hook as follows:
 
 1. If both `PARTNER_TAG_COMPRESS` and `PARTNER_GROUP_BRIDGE` are off, return
@@ -107,12 +107,12 @@ grouping wrapper and exact violation counter import outside evaluator-timed
 
 ### Packaging boundary
 
-Experiment first against `partner/contest_optimizer.py`; do not change the
+Experiment first against `src/solver/contest_optimizer.py`; do not change the
 verified submission package during G0/G1.  Only after promotion gates pass:
 
-- synchronize `partner/contest_optimizer.py` to
+- synchronize `src/solver/contest_optimizer.py` to
   `submission/cadc1013/op_src.py`;
-- synchronize `partner/violation_killer.py` to the packaged copy;
+- synchronize `src/solver/violation_killer.py` to the packaged copy;
 - add the promoted setdefault to `submission/cadc1013/op_wrapper.py`;
 - rebuild the archive and verify the synchronized sources byte-for-byte;
 - evaluate a freshly extracted archive rather than the working tree.

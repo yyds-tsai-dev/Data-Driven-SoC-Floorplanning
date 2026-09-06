@@ -37,7 +37,7 @@
 **Files:**
 - Add: `docs/official/beta_test/cadc1013.{tar.gz,xlsx}`
 - Add: `docs/research/{前端報告,後端報告}.md`
-- Add: `partner/icdc/causal_smoke.py`
+- Add: `src/icdc_engine/causal_smoke.py`
 - Add: `scratchpad/` experiment programs, harnesses, and small evidence files
 - Modify: `.gitignore`
 

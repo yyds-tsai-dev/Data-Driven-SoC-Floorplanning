@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "partner"))
+sys.path.insert(0, str(ROOT / "src" / "solver"))
 
 DEFAULT_FLOW = ("/nashome/NVL4/vdalab/yyds-dev/codex-worktrees/"
                 "flow-matching-f1-f3/checkpoints/flow_matching_overfit/final.pt")

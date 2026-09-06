@@ -7,7 +7,7 @@ leaf functions that dominate SA cumtime. This is the SA worker's true inner work
 
 Usage (from repo root):
     cd FloorSet/iccad2026contest
-    PYTHONPATH=$ROOT/partner:$ROOT/FloorSet/iccad2026contest:$ROOT/FloorSet \
+    PYTHONPATH=$ROOT/src/solver:$ROOT/FloorSet/iccad2026contest:$ROOT/FloorSet \
       uv run python $ROOT/scripts/probes/profile_partner_sa.py --case 99 --budget 3.5
 """
 from __future__ import annotations

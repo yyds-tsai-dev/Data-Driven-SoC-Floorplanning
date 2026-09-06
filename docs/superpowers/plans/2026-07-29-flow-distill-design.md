@@ -3,9 +3,9 @@
 **Date** 2026-07-29 · **Branch** `5.6-sol-flow-matching` · **Status** design + script landed, unrun
 **Primary source** Cai et al., *Shortcutting Pre-trained Flow Matching Diffusion Models is Almost
 Free Lunch* (SCFM), arXiv:2510.17858, NeurIPS 2025 · local copy `artifacts/papers/2510.17858.pdf`
-**Deliverables** `partner/flow_distill_claude.py` (trainer), `tests/test_partner_flow_distill.py`
+**Deliverables** `src/solver/flow_distill_claude.py` (trainer), `tests/test_partner_flow_distill.py`
 (Gate-1 invariants), `scripts/probes/flow_step_curve_probe.py` (step-count quality curve),
-one-line tag registration in `partner/flow_train_claude.py`, this document (method + gates)
+one-line tag registration in `src/solver/flow_train_claude.py`, this document (method + gates)
 
 ---
 
@@ -229,7 +229,7 @@ Everything else (`--augment`, `--file-shuffle`, `--vram-fraction`, `--gpu-util-c
 ```bash
 cd /nashome/NVL4/vdalab/yyds-dev/codex-worktrees/flow-matching-f1-f3
 PYTHONPATH="$PWD/FloorSet/iccad2026contest:$PWD/FloorSet:$PWD/partner" \
-uv run python partner/flow_distill_claude.py \
+uv run python src/solver/flow_distill_claude.py \
   --teacher-checkpoint checkpoints/flow_matching_v3/final.pt \
   --data-path FloorSet --checkpoint-dir checkpoints/flow_distill_v1_st1 \
   --steps-target 1 --max-steps 8000 --batch-size 12 --amp \
@@ -300,7 +300,7 @@ single number that decides the project's value, and it is a ten-minute job.
 
 ## 7. What was verified today
 
-- `partner/flow_distill_claude.py`, 646 lines, syntax-clean, no unused imports.
+- `src/solver/flow_distill_claude.py`, 646 lines, syntax-clean, no unused imports.
 - **`uv run pytest tests/test_partner_flow_distill.py` → 22 passed**, including: empirical
   `teacher_frac` 0.405 vs 0.4 nominal; **straight field is an exact fixed point of `scfm_target`**;
   **`z_t1 + (d1+d2)·target ==` two Euler sub-steps** (Eq. 11).

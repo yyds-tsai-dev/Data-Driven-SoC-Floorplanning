@@ -1,7 +1,7 @@
 import re, sys, os
 
 import os as _os
-ROOT = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))), "partner")
+ROOT = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))), "src", "solver")
 IGNORE = {"iccad2026_evaluate"}
 
 seen = set()

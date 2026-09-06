@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 for import_path in (
     REPO_ROOT / "FloorSet" / "iccad2026contest",
     REPO_ROOT / "FloorSet",
-    REPO_ROOT / "partner",
+    REPO_ROOT / "src" / "solver",
     REPO_ROOT / "scripts" / "probes",
 ):
     if str(import_path) not in sys.path:

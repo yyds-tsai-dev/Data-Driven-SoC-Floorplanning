@@ -25,7 +25,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[2]
-for import_path in (ROOT / "src", ROOT / "FloorSet", ROOT / "FloorSet" / "iccad2026contest", ROOT / "partner"):
+for import_path in (ROOT / "src", ROOT / "FloorSet", ROOT / "FloorSet" / "iccad2026contest", ROOT / "src" / "solver"):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 

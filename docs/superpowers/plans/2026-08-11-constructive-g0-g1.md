@@ -24,7 +24,7 @@
 
 ## File Structure
 
-- Create `partner/constructive_g01.py`: policy records, graph features, joint shape assignment, sparse legal placement, and gate aggregation helpers.
+- Create `src/solver/constructive_g01.py`: policy records, graph features, joint shape assignment, sparse legal placement, and gate aggregation helpers.
 - Create `tests/test_partner_constructive_g01.py`: focused TDD coverage for hard legality, compound constraints, policy diversity, determinism, quantization, and gate math.
 - Create `scripts/probes/constructive_g01_probe.py`: official-data G0/G1 runner and JSON evidence writer.
 - Create `docs/experiments/2026-08-11-constructive-g0-g1.md`: measured gate result and decision.
@@ -33,7 +33,7 @@
 
 **Files:**
 - Create: `tests/test_partner_constructive_g01.py`
-- Create: `partner/constructive_g01.py`
+- Create: `src/solver/constructive_g01.py`
 
 **Interfaces:**
 - `ConstructivePolicy(name, order_mode, bbox_weight, hpwl_weight, anchor_weight, constraint_weight)` describes one deterministic arm.
@@ -50,7 +50,7 @@
 
 **Files:**
 - Modify: `tests/test_partner_constructive_g01.py`
-- Modify: `partner/constructive_g01.py`
+- Modify: `src/solver/constructive_g01.py`
 
 **Interfaces:**
 - `assign_shapes(...) -> np.ndarray` assigns a common exact shape to compatible MIB members before placement.
@@ -67,7 +67,7 @@
 
 **Files:**
 - Modify: `tests/test_partner_constructive_g01.py`
-- Modify: `partner/constructive_g01.py`
+- Modify: `src/solver/constructive_g01.py`
 
 **Interfaces:**
 - `default_policies()` returns `net_closure`, `constraint_first`, `large_first`, and `pin_gravity` in stable order.

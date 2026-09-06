@@ -3,14 +3,14 @@
 Status: implemented, **default off**, no evaluator evidence yet.
 Flag surface: `PARTNER_EARLY_EXIT`, `PARTNER_EARLY_EXIT_WINDOW`,
 `PARTNER_EARLY_EXIT_MIN_WINDOW`, `PARTNER_EARLY_EXIT_DEBUG`.
-Code: `partner/column_sa_legalizer.py`, `partner/layout_refiner.py`,
-`partner/contest_optimizer.py`. Tests: `tests/test_partner_early_exit.py`.
+Code: `src/solver/column_sa_legalizer.py`, `src/solver/layout_refiner.py`,
+`src/solver/contest_optimizer.py`. Tests: `tests/test_partner_early_exit.py`.
 
 ---
 
 ## 1. Time anatomy of one case
 
-`_time_budget` (`partner/contest_optimizer.py` L86) sets
+`_time_budget` (`src/solver/contest_optimizer.py` L86) sets
 `budget = clamp(0.06·e^(n/20), BUDGET_MIN, BUDGET_MAX)` and every loop below
 is `while time.time() < deadline`. The fork is *deadline-bounded*: official
 runtime **is** the budget. Nothing sleeps — the whole chain is

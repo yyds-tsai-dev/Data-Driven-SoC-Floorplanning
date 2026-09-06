@@ -1,6 +1,6 @@
 """Opt-in production backbone (FLOORSET_COLUMN_BACKBONE).
 
-Ported from partner/my_opt_claude_v2.py: the pure-heuristic seed layout and
+Ported from src/solver/my_opt_claude_v2.py: the pure-heuristic seed layout and
 row fallback, plus the column-slicing legalizer call, with the diffusion
 refinement step removed (heuristic seed is passed straight into
 legalize_rectangles).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Vendored from partner/legalizer_claude_v2.py (column-slicing + SA legalizer,
+# Vendored from src/solver/legalizer_claude_v2.py (column-slicing + SA legalizer,
 # teammate contribution, 2026-07-05). Do not hand-edit without eval evidence.
 """Column-slicing legalizer + simulated-annealing HPWL optimizer.
 

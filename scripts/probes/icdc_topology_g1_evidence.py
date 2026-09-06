@@ -11,12 +11,12 @@ from typing import Optional, Sequence
 
 
 _REPO = Path(__file__).resolve().parents[2]
-_PARTNER = _REPO / "partner"
+_PARTNER = _REPO / "src" / "solver"
 if str(_PARTNER) not in sys.path:
     sys.path.insert(0, str(_PARTNER))
 
-from icdc.g1_evidence import G1ArmEvidence, compare_g1_arms  # noqa: E402
-from icdc.topology_artifact_guard import write_checked_json  # noqa: E402
+from icdc_engine.g1_evidence import G1ArmEvidence, compare_g1_arms  # noqa: E402
+from icdc_engine.topology_artifact_guard import write_checked_json  # noqa: E402
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

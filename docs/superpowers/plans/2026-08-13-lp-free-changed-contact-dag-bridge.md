@@ -4,13 +4,13 @@
 
 **Goal:** Add a default-off, LP-free changed-contact DAG bridge that can create one missing evaluator-semantic grouping contact while preserving all hard constraints and the current baseline on failure.
 
-**Architecture:** Keep all production geometry and acceptance logic in `partner/violation_killer.py`. Model each axis as affine equalities plus separation edges, eliminate/merge equality roots, tighten a reduced DAG by deterministic forward/reverse projections, and reject every inconsistent, pinned, cyclic, bounded, non-finite, or soft-regressing candidate. Integrate only after the existing local bridge; the final `contest_optimizer.py` hook is serialized and owned by the integrator after core review.
+**Architecture:** Keep all production geometry and acceptance logic in `src/solver/violation_killer.py`. Model each axis as affine equalities plus separation edges, eliminate/merge equality roots, tighten a reduced DAG by deterministic forward/reverse projections, and reject every inconsistent, pinned, cyclic, bounded, non-finite, or soft-regressing candidate. Integrate only after the existing local bridge; the final `contest_optimizer.py` hook is serialized and owned by the integrator after core review.
 
 **Tech Stack:** Python 3.12, NumPy, pytest, `time.perf_counter`, existing evaluator/scorer and `uv`.
 
 ## Global Constraints
 
-- Production code remains in `partner/violation_killer.py`; no new production module.
+- Production code remains in `src/solver/violation_killer.py`; no new production module.
 - The feature is controlled by default-off `PARTNER_GROUP_DAG_BRIDGE`; budget/debug variables are `PARTNER_GROUP_DAG_BRIDGE_BUDGET` and `PARTNER_GROUP_DAG_BRIDGE_DEBUG`.
 - Dimensions, areas, preplaced origins, pins, hard legality, and evaluator grouping semantics must remain exact; corner-only touch is invalid and positive shared-edge overlap is required.
 - Caps are components `12`, contact choices `4`, reduced edges `8192`, and two projection sweeps; use only a secondary `perf_counter` deadline.
@@ -24,16 +24,16 @@
 
 ## Files and ownership
 
-- Modify `partner/violation_killer.py`: frozen axis/contact/profile dataclasses, DAG solver, contact construction/projection, diagnostics, wrapper.
+- Modify `src/solver/violation_killer.py`: frozen axis/contact/profile dataclasses, DAG solver, contact construction/projection, diagnostics, wrapper.
 - Modify `tests/test_partner_group_bridge.py`: primitive, geometry, acceptance, determinism, and mechanism tests.
 - Modify `tests/test_partner_tag_compress.py`: flag/order/shared-scorer/diagnostic integration tests.
 - Create `scripts/probes/group_dag_bridge_probe.py`: stable G0 replay probe and source-hygiene scan.
-- Final hook in `partner/contest_optimizer.py` is serialized and owned by the integrator after the core review; no package/checkpoint files.
+- Final hook in `src/solver/contest_optimizer.py` is serialized and owned by the integrator after the core review; no package/checkpoint files.
 
 ### Task 1: Axis DAG primitives
 
 **Files:**
-- Modify: `partner/violation_killer.py`
+- Modify: `src/solver/violation_killer.py`
 - Test: `tests/test_partner_group_bridge.py`
 
 **Interfaces:**
@@ -198,12 +198,12 @@ than trusting the reduced representation.
 - [ ] **Step 5: Refresh the graph** with `graphify update .`; expected success.
   Inspect `git status --short graphify-out` but do not stage unrelated graph
   dirt in this task.
-- [ ] **Step 6: Commit** `git add partner/violation_killer.py tests/test_partner_group_bridge.py && git commit -m "feat: add affine separation dag solver"`.
+- [ ] **Step 6: Commit** `git add src/solver/violation_killer.py tests/test_partner_group_bridge.py && git commit -m "feat: add affine separation dag solver"`.
 
 ### Task 2: Changed-contact construction and public wrapper
 
 **Files:**
-- Modify: `partner/violation_killer.py`
+- Modify: `src/solver/violation_killer.py`
 - Test: `tests/test_partner_group_bridge.py`
 
 **Interfaces:**
@@ -420,12 +420,12 @@ call `_fix_grouping` or `coord_polish`.
 - [ ] **Step 5: Run** focused tests; expected PASS, including corner invalidity and pinned-origin exactness.
 - [ ] **Step 6: Refresh the graph** with `graphify update .`; inspect but do
   not stage unrelated graph dirt.
-- [ ] **Step 7: Commit** `git add partner/violation_killer.py tests/test_partner_group_bridge.py && git commit -m "feat: add changed-contact dag grouping bridge"`.
+- [ ] **Step 7: Commit** `git add src/solver/violation_killer.py tests/test_partner_group_bridge.py && git commit -m "feat: add changed-contact dag grouping bridge"`.
 
 ### Task 3: Serialized hook, flags, and diagnostics
 
 **Files:**
-- Modify: `partner/contest_optimizer.py` (integrator-owned, after Task 2 review)
+- Modify: `src/solver/contest_optimizer.py` (integrator-owned, after Task 2 review)
 - Test: `tests/test_partner_tag_compress.py`
 
 **Interfaces:**
@@ -569,7 +569,7 @@ use one scorer, and do not alter Track B/package paths.
 - [ ] **Step 4: Run** targeted tests and `bash scripts/validate.sh`; expected PASS.
 - [ ] **Step 5: Refresh the graph** with `graphify update .`; inspect but do
   not stage unrelated graph dirt.
-- [ ] **Step 6: Commit** `git add partner/contest_optimizer.py tests/test_partner_tag_compress.py && git commit -m "feat: gate dag bridge after local bridge"`.
+- [ ] **Step 6: Commit** `git add src/solver/contest_optimizer.py tests/test_partner_tag_compress.py && git commit -m "feat: gate dag bridge after local bridge"`.
 
 ### Task 4: G0 stable replay probe and evidence
 

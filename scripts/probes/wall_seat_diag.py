@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 _REPO = Path(__file__).resolve().parents[2]
-for _p in (str(_REPO / "partner"),
+for _p in (str(_REPO / "src" / "solver"),
            str(_REPO / "FloorSet" / "iccad2026contest"),
            str(_REPO / "FloorSet")):
     if _p not in sys.path:

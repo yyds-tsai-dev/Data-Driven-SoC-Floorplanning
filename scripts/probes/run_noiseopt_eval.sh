@@ -26,7 +26,7 @@ cd "$ROOT/FloorSet/iccad2026contest"
 echo "NOISE_OPT=$PARTNER_NOISE_OPT TOPM=$PARTNER_NOPT_TOPM ITERS=$PARTNER_NOPT_ITERS -> $OUT"
 uv run python "$ROOT/scripts/iccad2026_evaluate.py" \
   --data-path ../ \
-  --evaluate "$ROOT/partner/contest_optimizer.py" \
+  --evaluate "$ROOT/src/solver/contest_optimizer.py" \
   --output "$OUT" \
   2>&1 | tail -6
 

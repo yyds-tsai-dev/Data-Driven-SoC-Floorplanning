@@ -16,13 +16,13 @@ import numpy as np
 
 
 _REPO = Path(__file__).resolve().parents[2]
-for _dependency in (_REPO / "partner", _REPO / "FloorSet" / "iccad2026contest"):
+for _dependency in (_REPO / "src" / "solver", _REPO / "FloorSet" / "iccad2026contest"):
     if str(_dependency) not in sys.path:
         sys.path.insert(0, str(_dependency))
 
 import column_sa_legalizer as _legalizer  # noqa: E402
 import contest_optimizer as _contest  # noqa: E402
-from icdc.g1_runtime import (  # noqa: E402
+from icdc_engine.g1_runtime import (  # noqa: E402
     PortfolioContractError,
     assert_solver_environment,
     environment_identities,

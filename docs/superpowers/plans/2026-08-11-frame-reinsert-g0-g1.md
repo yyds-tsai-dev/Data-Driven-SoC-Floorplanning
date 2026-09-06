@@ -24,7 +24,7 @@
 
 **Files:**
 - Create: `tests/test_partner_frame_reinsert.py`
-- Create: `partner/frame_reinsert.py`
+- Create: `src/solver/frame_reinsert.py`
 
 **Interfaces:**
 - Produces: `FrameTarget(axis: int, side: int, line: float, owner: int)`.
@@ -47,13 +47,13 @@ def test_reinserts_movable_top_outlier_inside_preplaced_wall():
 - [ ] **Step 2: Run RED** with `uv run pytest tests/test_partner_frame_reinsert.py -q`; expect import failure for `frame_reinsert`.
 - [ ] **Step 3: Implement minimal target derivation and slot search.** Candidate low coordinates are the frame walls, HPWL weighted-median target, and every retained rectangle edge (`lo-size`, `hi`). Enumerate deterministic Cartesian products, reject overlaps vectorially, and choose minimum `(hpwl, displacement, x, y)`.
 - [ ] **Step 4: Run GREEN** with the same pytest command; expect all Task-1 tests to pass.
-- [ ] **Step 5: Commit** `partner/frame_reinsert.py` and `tests/test_partner_frame_reinsert.py`.
+- [ ] **Step 5: Commit** `src/solver/frame_reinsert.py` and `tests/test_partner_frame_reinsert.py`.
 
 ### Task 2: Monotone Guarded Pass
 
 **Files:**
 - Modify: `tests/test_partner_frame_reinsert.py`
-- Modify: `partner/frame_reinsert.py`
+- Modify: `src/solver/frame_reinsert.py`
 
 **Interfaces:**
 - Produces: `FrameReinsertResult(rects, attempted, accepted, elapsed_s, reason)`.
@@ -108,7 +108,7 @@ def test_guard_accepts_only_strict_v_drop_without_quality_regression():
 ### Task 5: Conditional G1 Production Hook
 
 **Files:**
-- Modify only after G0 GO: `partner/contest_optimizer.py`
+- Modify only after G0 GO: `src/solver/contest_optimizer.py`
 - Modify only after G0 GO: `tests/test_partner_frame_reinsert.py`
 - Modify only after G0 GO: `.env`
 

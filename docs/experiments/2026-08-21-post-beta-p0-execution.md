@@ -66,7 +66,7 @@ Deep-reasoner 審計(以 0806/0807 工件 + 本夜新 audit)改寫作戰圖:
 ## 5. ePlace arm(user 指定方向)— 完整證據鏈,終判 KILL
 
 - Paper 調研(12+ 篇/5 repos):CSF(n100 GP 0.22s/50-200 iters,C++)、PeF(soft 寬度一級變數)、Cortadella 2026(convex log-legalization;AR [1/3,3] 同題)、DREAMPlace 3.0 region 機制、MAGICAL 對稱組(=MIB 共享維度模板)。舊 kill(CSF 需 2e4 iters)實為其合法化階段;GP 只要 50–200 iters——預算重審後可行。
-- v0(`partner/eplace_arm.py` + probe):負訊號(median HPWL ratio 1.72、3/10 發散、overlap 壓到 0.001 = 解錯 tradeoff)。
+- v0(`src/solver/eplace_arm.py` + probe):負訊號(median HPWL ratio 1.72、3/10 發散、overlap 壓到 0.001 = 解錯 tradeoff)。
 - **deep-reasoner 數值修復**:根因 = ①項間無正規化(overlap 力/HPWL 力 = 1.3e3–1.1e4,Adam whitening 下 HPWL 貢獻 <0.1%)②soft-shape 梯度漏 `dh/dw` 項 → 全部寬度單調塌到 1:3 clip ③隨機 init(改 QP wirelength seed)④sign-descent 無幅度。修復後 raw probe **全過**:median ratio **0.7458**(21/21 ≤0.95)、overlap 9–18%、bbox 反而小 4%、0 發散、4 configs 0.285s/case。
 - **決勝實驗(合法化後)**:餵入產線同款 `refine_prediction` 消費端(0.5s/候選,ids 79–99)→ **21/21 全敗,weighted delta +0.31**;精修後 HPWL ratio 只剩 0.9–1.05,官方 cost 被 violation/area 反噬(refine 路徑無法重建 boundary/grouping 結構——與 C-2「diagonal separation = refiner 簽名」一致)。
 - **終判:KILL(此整合路徑)**。機制 = 賽季核心教訓重演:「raw 幾何更好,只有後端能保留其拓撲差異才有價值」。rank-3 的 ePlace 成立是因其整個後端圍繞 analytic 輸出構建;替代路(為 ePlace 建專屬合法化器/convex log-legalization 後端)= 週級工程,決賽窗內不可行。scaffold 保留(kernel+兩個 probe+JSON)。
@@ -136,7 +136,7 @@ Arms-ON table 平均 runtime 0.441s(canonical+arms 0.270s);M=2.1 下 58 案超 f
 - **Provenance 還原**:train-split 標籤來自 `scripts/probes/icdc_fp_teacher_g0.py --population-split train --sample-mod S --emit-corpus`(commit `9379002`,綁密封 G0 manifest `30902df2…`);heldout 語料由 `export_corpus.py` 自密封 G0 labels 導出(hash `b4ebef4d…` 逐位元相同)。`tracer_step1` 為 89 秒 trainer smoke,非正式跑。
 - **規模裁定**:計畫未授權語料大小;全規模(sample_mod=1,~190k rows)投影 94 小時 → 採 `--sample-mod 32`:5,911 rows,2.4 小時,`TRAINING_LABELS_COMPLETE`,delta_h 0.2287(密封 G0 0.1858)。
 - 所有 sha256 身分閘門 PASS(source/C0/flow/scorer/QA/G0 manifest;`source_ema = control_model = control_ema = 92838740…`);floorset_lite HF 重下載 receipts 逐位元吻合密封值(25 shard tracer,98/98 rows)。
-- 順帶修復:`submission/cadc1013/{op_wrapper,op_src}.py` 遷移時漏傳,自 LFS tar 還原,hash 精確符合凍結常數;`--device cuda` 的 EMA device 錯位(`partner/icdc/train_topology_prior.py` 5 行修正,CPU 無作用;7 測試綠)。
+- 順帶修復:`submission/cadc1013/{op_wrapper,op_src}.py` 遷移時漏傳,自 LFS tar 還原,hash 精確符合凍結常數;`--device cuda` 的 EMA device 錯位(`src/icdc_engine/train_topology_prior.py` 5 行修正,CPU 無作用;7 測試綠)。
 - **阻塞與修正(scheduler 裁定,明確計畫修正)**:凍結 CLI 的 `--batch 4` 與 Task-3 的 padding 守衛(`topology_prior.py:620` 拒絕 energy.py 零填充 rects)衝突,任何 >1 batch 必敗;`--batch 1` 端到端可跑(推定即 tracer 先例)。**採 `--batch 1`,其餘參數不變**;方案 (B)(放寬守衛跑 batch 4)留待 G1 有望時審查。
 - Per-case teacher 結果不可逐位元重現(wall-clock deadline 多執行緒 solver),聚合值一致(probe base_h 1.3468/delta_h 0.2039 vs 密封 1.3259/0.1858)。
 - **訓練結果(`--batch 1`,5000 步,35 分,GPU3)**:best.pt @ step 5000,heldout topology loss 0.024764 → **0.022216(−10.3%)**,20 次 eval 全單調;separation −11.5%、contact −9.8%;spread 0.383→0.26→0.279(不塌縮);anchor ~2.6e-8(同形、貼近基底)。`checkpoint_contract.ok=true`。sha256 `4231d70e…`。曲線在 5000 步仍下降 → 步數預算為綁定限制。
@@ -429,7 +429,7 @@ PARTNER_QUOTA_FIRST 不設(default off);建議打包加 PARTNER_FLOW_WARM=1(消�
 - 累計機制:①中段開臂(mid 表)−0.011 ②候選違規修復 reserve 0.3→0.45 −0.010(三套 CI 皆排除 0)。兩者皆為「讓 HPWL 好 10–25% 的模型候選活過仲裁」。
 - 本日否決(全部 default off / 未採):去 TAG+BRIDGE、COL_BALANCE、v4 aug 學生、partner 微調、mid2/mid3 表、QUOTA_FIRST(wash,碼保留)、FLOW_STEPS=4、FRAME_SCALE 1.00/1.01、NREF=12、RES_FRAC 0.35/0.6(平台)。
 - **Raw 1.10 目標**:候選 1.112–1.125;tail 預算 ×1.3 可到 1.109–1.111 但 total +0.03~+0.04(超 floor 案 52→56),依「field 只會更快」不建議;決定權在使用者(§15i 有定價)。剩餘殘量結構:tail 違規(88/89 雙軸釘死,v_rel 0.08–0.11)、tail area gap ≈0.05(rung-0 框常數已是甜蜜點)、a1 型 pin 拓撲(column fallback 地板)。
-- 程式變更(工作樹,未 commit):`partner/layout_refiner.py`(RES_FRAC knob,6 行)、`partner/contest_optimizer.py`(quota-first + toggle,bit-exact off)、`scripts/probes/quota_first_bitexact.py`、`artifacts/p0_newbox/budget_table_{mid,mid2,mid3,tail13}.txt`。回歸:14 個 partner 測試檔 169 passed / 8 skipped / 0 failed。
+- 程式變更(工作樹,未 commit):`src/solver/layout_refiner.py`(RES_FRAC knob,6 行)、`src/solver/contest_optimizer.py`(quota-first + toggle,bit-exact off)、`scripts/probes/quota_first_bitexact.py`、`artifacts/p0_newbox/budget_table_{mid,mid2,mid3,tail13}.txt`。回歸:14 個 partner 測試檔 169 passed / 8 skipped / 0 failed。
 
 ### 15k. Chain J — 開臂閘門重校(`PARTNER_DIRECT_SEAT_R0=0.16`,補償 reserve 0.45 後 span 縮小;×3)
 
@@ -554,7 +554,7 @@ CPU 暖機 0.996s = contest 機每案多付的 ~1s;adapt 後 runtime 回到預�
 
 ### 16a. 打包演練第一輪(08-27 04:30)發現
 
-- 乾淨 venv 只裝我們的 requirements 後,**官方 evaluator 自己 import 失敗**(`FloorSet/lite_dataset_test.py` 需要 `requests`;其 requirements 還有 matplotlib/shapely/tqdm)。Case B 規則是「venv 只用我們的檔案建」且 evaluator 也在裡面跑 → requirements 必須 = 我們的依賴 ∪ 官方 `FloorSet/iccad2026contest/requirements.txt`(torch/numpy/shapely/matplotlib/tqdm/requests)+ 指南列出的 scipy/numba/threadpoolctl。已更新 `partner/shipping/requirements.txt`。
+- 乾淨 venv 只裝我們的 requirements 後,**官方 evaluator 自己 import 失敗**(`FloorSet/lite_dataset_test.py` 需要 `requests`;其 requirements 還有 matplotlib/shapely/tqdm)。Case B 規則是「venv 只用我們的檔案建」且 evaluator 也在裡面跑 → requirements 必須 = 我們的依賴 ∪ 官方 `FloorSet/iccad2026contest/requirements.txt`(torch/numpy/shapely/matplotlib/tqdm/requests)+ 指南列出的 scipy/numba/threadpoolctl。已更新 `src/shipping/requirements.txt`。
 - 未釘版的 `torch` 在 PyPI 解成 **2.13.0+cu130**(本機 driver 580/CUDA 13.0 可用);contest A100 的 driver 未知,cu130 wheel 需 driver ≥580,否則 `cuda_available=False` → 重演 beta。改釘 **`torch==2.6.0`**(預設 wheel = cu124,driver ≥525 即可)。
 - **本機主 venv 也沒有 scipy**:08-21 遷移後所有 gate 跑都印了 `[polish] scipy unavailable; pass disabled`(每跑 26 案)→ 出貨候選的所有數字都是 coord_polish **OFF** 量的;打包 venv 有 scipy 會變 ON。已 `uv add scipy`,chain P 同鏈量 `PARTNER_COORD_POLISH=1` vs `0`(×2)決定包內設定。
 
@@ -572,7 +572,7 @@ CPU 暖機 0.996s = contest 機每案多付的 ~1s;adapt 後 runtime 回到預�
 - venv:torch **2.6.0+cu124**、`cuda_available=True`、scipy 1.18.1、numba 0.67.0、numpy 2.2.6、requests/shapely/matplotlib 齊。
 - log:`[selfcheck] cuda_available=True device=cuda flow_warm_latency=0.069s seat_ts=kept 0.148`;`loaded direct model step 18000`(v2 學生)、`loaded flow model step 1000000`;`scipy unavailable` 0 行(polish ON)。
 - 官方 evaluator:**1.0935,100/100 feasible**;逐案 runtime 與本機同組態(pOn_r1)中位差 −0.001s,tail hpwl 0.00–0.16 → 模型通道正常。
-- **抓到一個打包 bug**:worker 以 `contest_optimizer.py` 的 import 閉包組包,漏掉 `op_wrapper.py` 自己 import 的 `tests/synth_instances.py`(JIT 暖機用)→ 暖機靜默失敗,**第一案(n=21)付 10.5–11.2s numba 編譯**(beta 舊包有帶,hidden 第一案 0.08s)。補入後冷 cache 第一案 0.052s。包內 __pycache__ 清掉後重打:`cadc1013.tar.gz` 31 條目。
+- **抓到一個打包 bug**:worker 以 `contest_optimizer.py` 的 import 閉包組包,漏掉 `op_wrapper.py` 自己 import 的 `src/solver/synth_instances.py`(JIT 暖機用)→ 暖機靜默失敗,**第一案(n=21)付 10.5–11.2s numba 編譯**(beta 舊包有帶,hidden 第一案 0.08s)。補入後冷 cache 第一案 0.052s。包內 __pycache__ 清掉後重打:`cadc1013.tar.gz` 31 條目。
 - 包內無絕對路徑;tar 全部在 `cadc1013/` 下。
 
 ### 16d. Chain Q — polish 時間上限掃描 + 出貨決定
@@ -711,7 +711,7 @@ runtime 持平(0.381→0.382);runtime-aware M=1.45 D=0.6 0.918→0.906。疊在 
 
 ### 17k. 打包演練 3/4 與一個自傷 bug
 
-- 演練 3(md5 11d7969a):包內模組是 04:27 的舊版(缺 SECURE_FALLBACK 等後續碼)→ **打包必須從工作樹重組**;已寫 `scripts/pack_cadc1013.sh`(import 閉包 + op_src + `partner/shipping/op_wrapper.py` 模板 + requirements + ckpt + synth_instances,內容與手工包逐檔 md5 相同)。
+- 演練 3(md5 11d7969a):包內模組是 04:27 的舊版(缺 SECURE_FALLBACK 等後續碼)→ **打包必須從工作樹重組**;已寫 `scripts/pack_cadc1013.sh`(import 閉包 + op_src + `src/shipping/op_wrapper.py` 模板 + requirements + ckpt + synth_instances,內容與手工包逐檔 md5 相同)。
 - 演練 4(重組後,md5 eb5b1937):`[selfcheck] … cpu_ratio=1.91 seat_r0=adapted->0.2386` → **CPU 自校準在共用機負載下誤判 1.91×,把 R0 門檻抬高、關掉大半模型臂,official 1.1315**。而 ÷1.45 模擬已證明慢 CPU 上開臂仍划算(1.137 vs 關臂 1.155)→ R0 自校準改為 **opt-in(default off)**,只印 cpu_ratio 供診斷;TS 自校準(sampler 真的 1s 時關臂)維持。
 
 - 演練 5(R0 自校準 off,`scripts/pack_cadc1013.sh` 組包,md5 **163b885410c02ec021b6c3699d8cd62d**):`[selfcheck] cuda_available=True … seat_ts=kept 0.148 cpu_ratio=0.62 seat_r0=kept`(cpu_ratio 在同一台機器上 0.62↔1.91 漂移,證明它不能當閘門)、polish off、**noRT 1.1042,100/100,avg rt 0.370,max 1.39,第一案 0.051s**(load 29)。→ `submission/cadc1013_0827_final.tar.gz` 更新為此包(含 EARLY_EXIT + SECURE_FALLBACK)。
@@ -940,7 +940,7 @@ runtime avg:polish +1%(off)~+10%(v6);anti0 off −8%、其他持平。official �
 ### 17af. `fixedheavy_n21_s1` 追根因(deep-reasoner)→ **不是 solver bug**;加 `PARTNER_FINAL_LEGAL_GUARD`(default on)當最後防線
 
 - 該案 block 15/20 都是 **preplaced**(constraints[:,1]=1),`build_instance` 預設 `n_preplaced=2` 把兩個強制矩形撒成互相重疊(15:(15.66,22.47,9.47,9.47)、20:(21.63,13.76,11.46,11.46),重疊 3.50×2.76 = 輸出裡看到的那個重疊);solver 只是照辦。全 106 案:輸入 preplaced 互疊對數 ≥1 的集合 **恰好等於** infeasible 集合(37 = 37),**solver 自己引入的重疊 = 0**。7/12 那對在兩個入口皆無法重現(只有 15/20)。對所有 post-pass knob(WALL_REPAIR/SECURE_FALLBACK/FLOW_SLOTS=0/TAG_COMPRESS/SEAT_FINAL/EDGE_SEAT_V2/GROUP_BRIDGE 關掉)輸出 byte-identical。
-- 守門(defence-in-depth,`partner/contest_optimizer.py` +166):`solve()` 末端 `_final_legal_guard` = evaluator 的 `is_feasible` 謂詞鏡像(overlap >1e-6、fixed/preplaced 尺寸 tol 1e-4、1% area 含 skip_indices)+ 結構檢查;合法 → 回傳**同一物件**(bit-exact);非法 → 依序取第一個「自身驗證合法」的備援(post-pick `out` → column 冠軍 → 惰性建的 row fallback);全都不合法(輸入本身不可行)→ 保留原輸出(row fallback 也會違反 preplaced,換了只會更差)。`PARTNER_FINAL_LEGAL_GUARD=0` 關;觸發時 stderr `[legal-guard]`。成本 83/161/324 µs(n=21/60/120)。
+- 守門(defence-in-depth,`src/solver/contest_optimizer.py` +166):`solve()` 末端 `_final_legal_guard` = evaluator 的 `is_feasible` 謂詞鏡像(overlap >1e-6、fixed/preplaced 尺寸 tol 1e-4、1% area 含 skip_indices)+ 結構檢查;合法 → 回傳**同一物件**(bit-exact);非法 → 依序取第一個「自身驗證合法」的備援(post-pick `out` → column 冠軍 → 惰性建的 row fallback);全都不合法(輸入本身不可行)→ 保留原輸出(row fallback 也會違反 preplaced,換了只會更差)。`PARTNER_FINAL_LEGAL_GUARD=0` 關;觸發時 stderr `[legal-guard]`。成本 83/161/324 µs(n=21/60/120)。
 - 測試 `tests/test_partner_final_legal_guard.py` 13/13(含把該案釘為「輸入不可滿足」);與 psel/router 測試合跑 40 passed;所有 import contest_optimizer 的 22 個測試檔 208 passed。全 grid 經工作樹重跑:可滿足 69/69 feasible、不可滿足 37/37 如預期,守門在 69 案 0 次觸發;official 100 過去每跑 overlap=0 → 輸出不變。
 - 決定:重打包(dry run 7)讓守門入包;官方 100 案應 100/100 且 `[legal-guard]` 0 次。
 
@@ -1017,9 +1017,9 @@ slots 16 送四套 ×4 交替序確認鏈(`chainW16.sh`,結果 `artifacts/shadow
 ### 18h. 守門觸發根因 + 守門強化(deep-reasoner,08-30 07:00–08:10 UTC)
 
 - **重現**:v3 tid 85(n=106)×10 預算、守門關 → evaluator `area_violations=1`:block 32(soft、cluster 3、boundary tag 2)出貨 24×13 = 312 vs 目標 650。
-- **根因**:`partner/layout_refiner.py:6688-6702`(`refine_prediction` 的「MIB shape unification」)與 `:7469-7480`:MIB 群組取第一個 fixed/preplaced 成員的 (rw, rh) 直接覆寫所有 soft 成員,**沒有面積一致性檢查**。v3 tid 85 的 MIB 群組 {6, 32, 53} 面積異質(6 fixed 24×13=312;32/53 soft 650)→ 32 被寫成 312。只在 direct 臂勝出且長預算分支(`:7469` 在 `t_hard − _tg(0.4,0.25)` 之後、`V0>0`)才浮現;單案冷啟動(direct 臂關)不重現。
+- **根因**:`src/solver/layout_refiner.py:6688-6702`(`refine_prediction` 的「MIB shape unification」)與 `:7469-7480`:MIB 群組取第一個 fixed/preplaced 成員的 (rw, rh) 直接覆寫所有 soft 成員,**沒有面積一致性檢查**。v3 tid 85 的 MIB 群組 {6, 32, 53} 面積異質(6 fixed 24×13=312;32/53 soft 650)→ 32 被寫成 312。只在 direct 臂勝出且長預算分支(`:7469` 在 `t_hard − _tg(0.4,0.25)` 之後、`V0>0`)才浮現;單案冷啟動(direct 臂關)不重現。
 - **資料面**:面積異質 MIB 群組數:official 0/100、v5 0、v6 0、**v3 20**(v3 產生器的工件)。official 與 hidden 用同一官方產生器、public 已含噪音仍 0 → hidden 觸發機率極低。**MIB 修法(跳過面積不同的成員)不入包**(對 official/v5/v6 逐位元相同、零期望值、純風險)。
-- **守門強化(入包;`partner/contest_optimizer.py:318-479`)**:失敗路徑先 `_repair_soft_areas`(對 >1% 的 soft block 依 keep-w / keep-h / 等比、兩個錨角共 6 種變體,`_clear_of_others` 不重疊才收)→ 通過原 `_legal_ok` 才出貨;合法路徑同物件 bit-exact。另修 fallback 接線:原本 fallbacks 裡的「column 冠軍」是 edge-seat 之後的版面,exact-area 的 raw 冠軍 `column_raw` 根本不在清單(`:1255-1262, :1374`),現已加為第三個 fallback。測試 `tests/test_partner_final_legal_guard.py` 13→18 passed;`-k "guard or legal or partner_final"` 151 passed。
+- **守門強化(入包;`src/solver/contest_optimizer.py:318-479`)**:失敗路徑先 `_repair_soft_areas`(對 >1% 的 soft block 依 keep-w / keep-h / 等比、兩個錨角共 6 種變體,`_clear_of_others` 不重疊才收)→ 通過原 `_legal_ok` 才出貨;合法路徑同物件 bit-exact。另修 fallback 接線:原本 fallbacks 裡的「column 冠軍」是 edge-seat 之後的版面,exact-area 的 raw 冠軍 `column_raw` 根本不在清單(`:1255-1262, :1374`),現已加為第三個 fallback。測試 `tests/test_partner_final_legal_guard.py` 13→18 passed;`-k "guard or legal or partner_final"` 151 passed。
 - 工件:`~/.claude/jobs/06af0e53/tmp/wt_areabug`(worktree,`PARTNER_AREA_TRACE`)、`atrace85.sh`;`artifacts/shadow/guardOff_x10_v3.json`。
 
 ### 18i. Chain W16 — FLOW_SLOTS=16 / NREF=12 vs FT2 現包 env(四套 ×4 交替序;06:40–07:16 UTC)→ **promote**

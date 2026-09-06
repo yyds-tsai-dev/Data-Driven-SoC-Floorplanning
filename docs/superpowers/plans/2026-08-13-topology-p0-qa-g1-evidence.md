@@ -30,10 +30,10 @@
 
 | File | Responsibility |
 | --- | --- |
-| `partner/icdc/topology_data.py` | Validate the seven-tensor source and expose an in-memory, receipt-bound training row containing sanitized input plus transient `(x,y,w,h)` fp geometry. |
-| `partner/icdc/topology_artifact_guard.py` | Canonically encode evidence and reject any dense fp/rectangle/coordinate payload before persistence. |
-| `partner/icdc/qa_contract.py` | Pin the QA PDF and provided/local evaluator identities, expose QA manifest fields, and produce a score/audit record with hard versus soft semantics. |
-| `partner/icdc/g1_evidence.py` | Validate, canonically serialize, seal, and compare matched 100-row G1 arm evidence. |
+| `src/icdc_engine/topology_data.py` | Validate the seven-tensor source and expose an in-memory, receipt-bound training row containing sanitized input plus transient `(x,y,w,h)` fp geometry. |
+| `src/icdc_engine/topology_artifact_guard.py` | Canonically encode evidence and reject any dense fp/rectangle/coordinate payload before persistence. |
+| `src/icdc_engine/qa_contract.py` | Pin the QA PDF and provided/local evaluator identities, expose QA manifest fields, and produce a score/audit record with hard versus soft semantics. |
+| `src/icdc_engine/g1_evidence.py` | Validate, canonically serialize, seal, and compare matched 100-row G1 arm evidence. |
 | `scripts/probes/icdc_topology_teacher.py` | Remain an I/O and transaction adapter; replace private raw-source and QA checks with P0 imports and add no duplicate policy logic. |
 | `scripts/probes/icdc_topology_g1_evidence.py` | Fixture-safe CLI that reads two sealed arm JSON files and writes one canonical comparison evidence file. |
 | `tests/test_topology_p0_contracts.py` | Source-role, QA, artifact-hygiene, and evaluator regression fixtures. |
@@ -90,13 +90,13 @@ class LocalScoreAudit:
 
 For every task below, the scheduler first performs the RED-review gate: a separate Terra reviewer (`gpt-5.6-terra`, `xhigh`, read-only) checks the quoted test, exact contract, file ownership, and expected RED reason. A fresh Luna implementer (`gpt-5.6-luna`, `low`) then owns only the named files, preserves concurrent edits, runs the listed commands, and creates the listed atomic commit. A different Terra reviewer performs the re-review gate on the actual diff, test output, no-dense scan, and interface compatibility; Important or Critical findings return to a fresh Luna before the next task. Sol integrates only after inspecting the files and evidence itself.
 
-Do not edit `partner/icdc/{tfdl.py,engine.py,energy.py}`, production optimizer/submission files, evaluator source, checkpoints, artifacts, or unrelated tests. Never inspect or edit `scratchpad/`. After every code modification run `graphify update .`; leave its expected dirty graph artifacts out of each task commit.
+Do not edit `src/icdc_engine/{tfdl.py,engine.py,energy.py}`, production optimizer/submission files, evaluator source, checkpoints, artifacts, or unrelated tests. Never inspect or edit `scratchpad/`. After every code modification run `graphify update .`; leave its expected dirty graph artifacts out of each task commit.
 
 ### Task 1: Make raw-source roles and training-only fp conversion explicit
 
 **Files:**
 
-- Modify: `partner/icdc/topology_data.py`
+- Modify: `src/icdc_engine/topology_data.py`
 - Modify: `scripts/probes/icdc_topology_teacher.py:1597-1649,1991-2010,2222-2245`
 - Test: `tests/test_topology_p0_contracts.py`
 
@@ -188,13 +188,13 @@ Expected: PASS; the legacy receipt tests still receive the same sanitized schema
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/topology_data.py scripts/probes/icdc_topology_teacher.py tests/test_topology_p0_contracts.py && git commit -m "feat: bind topology source roles"`
+Run: `git add src/icdc_engine/topology_data.py scripts/probes/icdc_topology_teacher.py tests/test_topology_p0_contracts.py && git commit -m "feat: bind topology source roles"`
 
 ### Task 2: Block dense fp data from evidence artifacts
 
 **Files:**
 
-- Create: `partner/icdc/topology_artifact_guard.py`
+- Create: `src/icdc_engine/topology_artifact_guard.py`
 - Test: `tests/test_topology_p0_contracts.py`
 
 **Interfaces:**
@@ -276,13 +276,13 @@ Expected: PASS; canonical bytes reject NaN, tensors, and forbidden dense key pat
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/topology_artifact_guard.py tests/test_topology_p0_contracts.py && git commit -m "feat: guard topology evidence artifacts"`
+Run: `git add src/icdc_engine/topology_artifact_guard.py tests/test_topology_p0_contracts.py && git commit -m "feat: guard topology evidence artifacts"`
 
 ### Task 3: Pin QA authority and hard-versus-soft local scoring
 
 **Files:**
 
-- Create: `partner/icdc/qa_contract.py`
+- Create: `src/icdc_engine/qa_contract.py`
 - Test: `tests/test_topology_p0_contracts.py`
 
 **Interfaces:**
@@ -364,13 +364,13 @@ Expected: PASS; the fixture proves soft V remains feasible, hard preplacement re
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/qa_contract.py tests/test_topology_p0_contracts.py && git commit -m "feat: pin topology QA contract"`
+Run: `git add src/icdc_engine/qa_contract.py tests/test_topology_p0_contracts.py && git commit -m "feat: pin topology QA contract"`
 
 ### Task 4: Define canonical sealed G1 rows and Alpha binding
 
 **Files:**
 
-- Create: `partner/icdc/g1_evidence.py`
+- Create: `src/icdc_engine/g1_evidence.py`
 - Test: `tests/test_icdc_g1_evidence.py`
 
 **Interfaces:**
@@ -392,7 +392,7 @@ def _g1_receipts() -> tuple[G1PortfolioReceipt, ...]:
 def test_g1_arm_is_canonical_binds_alpha_and_uses_nearest_rank_p90():
     arm = seal_g1_arm("C0", _g1_rows(), _g1_receipts(), Path.cwd(),
                       feasible_count=100, error_count=0, freeze_sha256="a" * 64,
-                      calculator_path=Path("partner/icdc/g1_evidence.py"))
+                      calculator_path=Path("src/icdc_engine/g1_evidence.py"))
     assert arm.runtime_p90 == pytest.approx(sorted(row.runtime for row in _g1_rows())[89])
     assert arm.alpha_relative_path == "docs/official/alpha_test/C_Median Runtime per Testcase(Alpha).csv"
     assert arm.alpha_sha256 == "804c3432febb88a8f8ee0a8c0ede4b4598a5cf3c109d68de6a6ca86f05d211bd"
@@ -400,7 +400,7 @@ def test_g1_arm_is_canonical_binds_alpha_and_uses_nearest_rank_p90():
     with pytest.raises(ValueError, match="ordered rows"):
         seal_g1_arm("C0", tuple(reversed(_g1_rows())), _g1_receipts(), Path.cwd(),
                     feasible_count=100, error_count=0, freeze_sha256="a" * 64,
-                    calculator_path=Path("partner/icdc/g1_evidence.py"))
+                    calculator_path=Path("src/icdc_engine/g1_evidence.py"))
 ```
 
 - [ ] **Step 2: Run the node to verify RED.**
@@ -458,13 +458,13 @@ Expected: PASS; invalid floats, duplicate/missing IDs, Alpha mismatch, non-100 r
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/g1_evidence.py tests/test_icdc_g1_evidence.py && git commit -m "feat: seal topology G1 evidence"`
+Run: `git add src/icdc_engine/g1_evidence.py tests/test_icdc_g1_evidence.py && git commit -m "feat: seal topology G1 evidence"`
 
 ### Task 5: Compare matched frozen G1 arms without a runtime-only pass
 
 **Files:**
 
-- Modify: `partner/icdc/g1_evidence.py`
+- Modify: `src/icdc_engine/g1_evidence.py`
 - Create: `scripts/probes/icdc_topology_g1_evidence.py`
 - Test: `tests/test_icdc_g1_evidence.py`
 
@@ -545,7 +545,7 @@ Expected: PASS; failures cover a `+1e-12` comparison boundary, unmatched IDs/med
 
 Run: `graphify update .`
 
-Run: `git add partner/icdc/g1_evidence.py scripts/probes/icdc_topology_g1_evidence.py tests/test_icdc_g1_evidence.py && git commit -m "feat: compare sealed topology G1 arms"`
+Run: `git add src/icdc_engine/g1_evidence.py scripts/probes/icdc_topology_g1_evidence.py tests/test_icdc_g1_evidence.py && git commit -m "feat: compare sealed topology G1 arms"`
 
 ## P0 acceptance evidence and kill behavior
 

@@ -4,7 +4,7 @@
 
 **Goal:** Implement and evidence-gate the approved default-off fast grouping bridge, then promote it only if it improves the evaluator-facing solver while retaining 100/100 hard feasibility and average runtime at or below 0.300 seconds.
 
-**Architecture:** A narrow public wrapper in `partner/violation_killer.py` reuses the existing deterministic grouping candidate generator and exact hard guards under a soft per-case deadline. The existing final `_tag_compress` hook in `partner/contest_optimizer.py` becomes a two-pass final hook: tag compression first, grouping bridge second, with one shared scorer and per-stage failure containment. `submission/cadc1013/` remains untouched until the saved-layout G0 and three-pair online G1 gates both pass.
+**Architecture:** A narrow public wrapper in `src/solver/violation_killer.py` reuses the existing deterministic grouping candidate generator and exact hard guards under a soft per-case deadline. The existing final `_tag_compress` hook in `src/solver/contest_optimizer.py` becomes a two-pass final hook: tag compression first, grouping bridge second, with one shared scorer and per-stage failure containment. `submission/cadc1013/` remains untouched until the saved-layout G0 and three-pair online G1 gates both pass.
 
 **Tech Stack:** Python 3.12, NumPy, PyTorch fixtures, pytest, official ICCAD evaluator, `uv`.
 
@@ -30,10 +30,10 @@
 
 **Files:**
 - Create: `tests/test_partner_group_bridge.py`
-- Modify: `partner/violation_killer.py`
+- Modify: `src/solver/violation_killer.py`
 
 **Interfaces:**
-- Consumes: existing `_grouping_count`, `_violations_exact`, `_Ctx`, `_fix_grouping`, and `_final_guards_ok` in `partner/violation_killer.py`.
+- Consumes: existing `_grouping_count`, `_violations_exact`, `_Ctx`, `_fix_grouping`, and `_final_guards_ok` in `src/solver/violation_killer.py`.
 - Produces: `bridge_grouping_violations(opt, out, budget_s=0.02) -> List[Rect]`.
 
 - [ ] **Step 1: Write the failing direct-wrapper tests**
@@ -127,7 +127,7 @@ Expected: pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add partner/violation_killer.py tests/test_partner_group_bridge.py
+git add src/solver/violation_killer.py tests/test_partner_group_bridge.py
 git commit -m "feat: add bounded grouping bridge"
 ```
 
@@ -136,7 +136,7 @@ git commit -m "feat: add bounded grouping bridge"
 ### Task 2: Final-pipeline integration, warming, and diagnostics
 
 **Files:**
-- Modify: `partner/contest_optimizer.py`
+- Modify: `src/solver/contest_optimizer.py`
 - Modify: `tests/test_partner_group_bridge.py`
 - Modify: `tests/test_partner_tag_compress.py`
 
@@ -210,7 +210,7 @@ Run:
 
 ```bash
 graphify update .
-git add partner/contest_optimizer.py tests/test_partner_group_bridge.py tests/test_partner_tag_compress.py graphify-out
+git add src/solver/contest_optimizer.py tests/test_partner_group_bridge.py tests/test_partner_tag_compress.py graphify-out
 git commit -m "feat: integrate final grouping bridge"
 ```
 
@@ -302,7 +302,7 @@ Copy the reviewed partner sources byte-for-byte to their package counterparts an
 
 - [ ] **Step 2: Verify source closure and package hygiene**
 
-Assert byte equality for `partner/contest_optimizer.py` vs `submission/cadc1013/op_src.py` and `partner/violation_killer.py` vs the packaged copy. Build the archive without caches, compiled kernels, logs, artifacts, or scratchpad files; record its checksum and entries.
+Assert byte equality for `src/solver/contest_optimizer.py` vs `submission/cadc1013/op_src.py` and `src/solver/violation_killer.py` vs the packaged copy. Build the archive without caches, compiled kernels, logs, artifacts, or scratchpad files; record its checksum and entries.
 
 - [ ] **Step 3: Evaluate a fresh extraction**
 

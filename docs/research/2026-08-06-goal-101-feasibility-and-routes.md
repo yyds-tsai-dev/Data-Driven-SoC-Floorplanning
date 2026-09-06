@@ -134,7 +134,7 @@ alpha 榜(官網 CSV 一手):rank1-5 total = 0.879 / 0.955 / 1.020 / 1.028 / 1.1
 
 ### R0.7:proxy 目標函數對齊(零 runtime,機制級,先做)
 
-SA/選解 proxy(`partner/candidate_supply.py:78-101`、`column_sa_legalizer.py:1016 _key()`)若未反映 (i) V_rel 邊際 = gap 的 4 倍、(ii) gap 過 golden-baseline 即截斷,搜索就一直在買不加分的東西。稽核半天;若不符,修正 + 3-rep 成對 full-100。**hidden 可轉移(公式恆真)。**
+SA/選解 proxy(`src/solver/candidate_supply.py:78-101`、`column_sa_legalizer.py:1016 _key()`)若未反映 (i) V_rel 邊際 = gap 的 4 倍、(ii) gap 過 golden-baseline 即截斷,搜索就一直在買不加分的東西。稽核半天;若不符,修正 + 3-rep 成對 full-100。**hidden 可轉移(公式恆真)。**
 
 ### R1(首推新機制):拓撲固定的座標+形狀聯合凸精修(SOCP)
 
@@ -154,7 +154,7 @@ SA/選解 proxy(`partner/candidate_supply.py:78-101`、`column_sa_legalizer.py:1
 
 ### R1 實測裁決(0806 深夜,follow-on 全驗證)
 
-同一 LP 修復器接我方 0.3s 輸出(成對,同一截取 run):**A+B+C 完整版 −0.0276(1.1711→1.1435)但每案中位 0.68s = 2.4× 全預算 ⇒ 不促轉**;砍 B/C(51% 時間只帶 9% 增益)。**唯一存活切片 = cheap 單發 coordinate-polish:−0.0096、97/100 案不變差、內在成本中位 24.5ms(tail 145ms,accept 改用 V10 proxy 後)、可 scipy-free(重用 `refine/slack_solve.py` 機械,boundary/grouping 強制那部分本來就無效所以正好不需要 LP)**。**→ 3-rep 成對 gate 已通過(0807 凌晨)**:Δ = −0.0096 / −0.0125 / −0.0131,mean **−0.0117 ± se 0.0011**(≫2·se)。散布疑雲解決:三 rep base 1.1711/1.1768/1.1905 橫跨歷史兩鏈全區間 ⇒ **0.02 是此檔位真實 run-to-run 變異(家族 sd ≈0.008-0.010),非 config 漂移;促轉量測一律成對設計**。**產品化已交付(0807)**:`partner/coord_polish.py` + `contest_optimizer.py` hook(`PARTNER_COORD_POLISH`,default off、off 路徑回傳同一物件、877 tests 綠)。乾淨成對 ×2:**−0.0211 @ +0.0565s avg**(補償估算後淨 ≈−0.014;時間中性控制臂進行中)。**機制發現(推翻假設):增益 100% 來自 boundary 保存列**——自由 polish 會把塊拉離牆被 gate 全數否決;`BOUNDARY=2`(只保已滿足位元)是最優模式(−0.0116→−0.0146 離線)。scipy 為唯一有效後端(numpy CSA 實測值 0,auto=無 scipy 則整個 pass 靜默不跑)。**⚠ 提交風險:官方 requirements.txt 無 scipy(也無 numba!)→ final repack 時 submission requirements 必須加 scipy(並複核 numba「官方預裝」假設)**。加速:highs-ipm + 平行項合併(t_sum 19s→4s,最壞單案 0.55s)。
+同一 LP 修復器接我方 0.3s 輸出(成對,同一截取 run):**A+B+C 完整版 −0.0276(1.1711→1.1435)但每案中位 0.68s = 2.4× 全預算 ⇒ 不促轉**;砍 B/C(51% 時間只帶 9% 增益)。**唯一存活切片 = cheap 單發 coordinate-polish:−0.0096、97/100 案不變差、內在成本中位 24.5ms(tail 145ms,accept 改用 V10 proxy 後)、可 scipy-free(重用 `refine/slack_solve.py` 機械,boundary/grouping 強制那部分本來就無效所以正好不需要 LP)**。**→ 3-rep 成對 gate 已通過(0807 凌晨)**:Δ = −0.0096 / −0.0125 / −0.0131,mean **−0.0117 ± se 0.0011**(≫2·se)。散布疑雲解決:三 rep base 1.1711/1.1768/1.1905 橫跨歷史兩鏈全區間 ⇒ **0.02 是此檔位真實 run-to-run 變異(家族 sd ≈0.008-0.010),非 config 漂移;促轉量測一律成對設計**。**產品化已交付(0807)**:`src/solver/coord_polish.py` + `contest_optimizer.py` hook(`PARTNER_COORD_POLISH`,default off、off 路徑回傳同一物件、877 tests 綠)。乾淨成對 ×2:**−0.0211 @ +0.0565s avg**(補償估算後淨 ≈−0.014;時間中性控制臂進行中)。**機制發現(推翻假設):增益 100% 來自 boundary 保存列**——自由 polish 會把塊拉離牆被 gate 全數否決;`BOUNDARY=2`(只保已滿足位元)是最優模式(−0.0116→−0.0146 離線)。scipy 為唯一有效後端(numpy CSA 實測值 0,auto=無 scipy 則整個 pass 靜默不跑)。**⚠ 提交風險:官方 requirements.txt 無 scipy(也無 numba!)→ final repack 時 submission requirements 必須加 scipy(並複核 numba「官方預裝」假設)**。加速:highs-ipm + 平行項合併(t_sum 19s→4s,最壞單案 0.55s)。
 **失效機理(關鍵情報)**:我方 boundary 修掉率僅 7.4%(golden 實驗 90%)——不是違規少(136+47 條更多)也不是太緊(dead space 中位 10.3% vs golden 2.9%,更鬆),而是**違規太深**:離所需牆中位 11.2% 跨距、中間隔 9 塊(golden 殘餘全是 0.5-3% 的近失)。**保序 LP 只能修近失;我方是把帶約束的塊放錯區域 = placement 問題,post-pass 救不了。**
 **R6/R7 深診斷(0807 凌晨,加權校正後大幅翻案)**:
 - **「深違規」是未加權統計的誤導**:計分帶(n≥100,權重 82.6%)只有 29 bits / 23 blocks,深度中位 **1.4%** 跨距(96.6% 缺口 ≤12 單位)= **與 golden 殘餘同型的近失**;「11.2% 深、隔 9 塊」來自權重 0.6% 的 n<60。R7 因此遠比想像可修。

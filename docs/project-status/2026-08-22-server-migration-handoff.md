@@ -27,7 +27,7 @@ The source tree contains substantial completed solver and experiment work. Do no
 The implementation exists, but the following execution/evidence sequence is not complete:
 
 1. Export the deterministic receipt-bound training-split sparse-label corpus using the already approved two-slot teacher semantics.
-2. Train and heldout-select the same-shape Direct topology student using `partner/icdc/train_topology_prior.py`.
+2. Train and heldout-select the same-shape Direct topology student using `src/icdc_engine/train_topology_prior.py`.
 3. Run the retained-teacher-gain audit and require the frozen retention threshold.
 4. Run the non-validation causal smoke and bind the exact candidate identity.
 5. Freeze `g1_n100_3d3f` and run the one authorized blinded 3-Direct/3-Flow control/candidate pair.

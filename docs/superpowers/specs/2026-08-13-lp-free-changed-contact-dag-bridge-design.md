@@ -115,10 +115,10 @@ Add focused tests covering:
 - mechanism proof of no `_fix_grouping` or fixed-topology `coord_polish` call;
 - exact soft/hard acceptance and preservation of pre-existing soft relations.
 
-Anticipated implementation ownership is `partner/violation_killer.py`, Track-A
+Anticipated implementation ownership is `src/solver/violation_killer.py`, Track-A
 probes, `tests/test_partner_group_bridge.py`, and
 `tests/test_partner_tag_compress.py`. Any final hook in
-`partner/contest_optimizer.py` is serialized and owned by Sol after independent
+`src/solver/contest_optimizer.py` is serialized and owned by Sol after independent
 gates. No Track B files may be changed.
 
 ## Alternatives rejected
