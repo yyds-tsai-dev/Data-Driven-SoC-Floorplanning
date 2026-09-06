@@ -12,7 +12,7 @@ import pytest
 import torch
 from dataclasses import replace
 
-sys.path.insert(0, "partner")
+sys.path.insert(0, "src/solver")
 import column_sa_legalizer as csl
 import violation_killer as vk
 

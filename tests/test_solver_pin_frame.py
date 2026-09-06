@@ -35,7 +35,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _p in (ROOT / "partner", ROOT / "FloorSet",
+for _p in (ROOT / "src" / "solver", ROOT / "FloorSet",
            ROOT / "FloorSet" / "iccad2026contest"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))

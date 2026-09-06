@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "partner"))
+sys.path.insert(0, str(ROOT / "src" / "solver"))
 
 import postpass_router as pr  # noqa: E402
 import stage_receipt as sr  # noqa: E402

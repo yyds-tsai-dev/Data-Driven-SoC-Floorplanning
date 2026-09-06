@@ -4,8 +4,8 @@ from pathlib import Path
 import torch
 
 REPO = Path(__file__).resolve().parents[1]
-if str(REPO / "partner") not in sys.path:
-    sys.path.insert(0, str(REPO / "partner"))
+if str(REPO / "src" / "solver") not in sys.path:
+    sys.path.insert(0, str(REPO / "src" / "solver"))
 import contest_optimizer as co  # noqa: E402
 
 

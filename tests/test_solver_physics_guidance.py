@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "partner"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "solver"))
 
 from physics_guidance import (GuidanceContext, guidance_energy,
                                      rects_from_z)

@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[3] / "FloorSet" / "floorset_lite"
-OUT = Path(__file__).resolve().parents[3] / "artifacts/flow_finetune_round1_0828_tailT24_300k/file_n_index.json")
+OUT = Path(__file__).resolve().parents[3] / "artifacts/flow_finetune_round1_0828_tailT24_300k/file_n_index.json"
 
 
 def n_of(path):

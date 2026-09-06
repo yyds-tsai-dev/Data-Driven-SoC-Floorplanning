@@ -37,7 +37,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _p in (ROOT / "partner", ROOT / "FloorSet",
+for _p in (ROOT / "src" / "solver", ROOT / "FloorSet",
            ROOT / "FloorSet" / "iccad2026contest"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
@@ -202,7 +202,7 @@ def test_off_path_is_bit_identical_to_head(tmp_path):
     head = tmp_path / "head"
     for d in (live, head):
         d.mkdir()
-        for f in (ROOT / "partner").glob("*.py"):
+        for f in (ROOT / "src" / "solver").glob("*.py"):
             shutil.copy2(f, d / f.name)
     for name in _TOUCHED:
         blob = subprocess.run(
