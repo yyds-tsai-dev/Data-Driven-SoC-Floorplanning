@@ -20,7 +20,7 @@ for k, v in {
     # -0.003..-0.006 (7 paired reps, 1/3 the rep variance), v3 -0.008,
     # v5 -0.012, v6 wash; runtime +0-2%; same loader/architecture as v1.
     "DIRECT_CKPT": str(HERE / "checkpoints" / "direct_v2_student_s2.pt"),
-    "FLOW_CKPT": str(HERE / "checkpoints" / "flow_matching_ft0829_tailT12_250k_ema.pt"),
+    "FLOW_CKPT": str(HERE / "checkpoints" / "flow_matching_ft0831_soupa50_250k_ema.pt"),
     # Block-count-routed SECOND flow prior (docs/experiments/
     # 2026-08-21-post-beta-p0-execution.md Sec.17t).  DISABLED: uncomment both
     # lines only if the routed arm passes the five-suite gate; with them

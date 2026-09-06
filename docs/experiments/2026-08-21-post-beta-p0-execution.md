@@ -949,6 +949,7 @@ runtime avg:polish +1%(off)~+10%(v6);anti0 off −8%、其他持平。official �
 ### 18a. Runtime factor 在尾帶沒貼 floor(現包 dry run 7 逐案重算)
 
 `cost = quality × max(0.7,(rt/median)^0.3)`,floor 需 rt ≤ 0.305×median(0823 更新版 median 按 test_id;四套 shadow 的 n↔test_id 對映與 official 完全相同)。現包(M=1.0):D=1.0 total 0.769 / floor 0.771(貼);D=0.8 0.778、D=0.7 0.792、D=0.6 0.816;M=1.45 時 D=1.0 0.794。損失集中 tid 90–99(n=111–120,rt 0.8–1.2 s vs median 2.2–5.5 s)。solver 是 wall-clock 預算制(`deadline = start + budget`,尾帶 rt = 0.82–0.99×budget),所以 contest 機 runtime ≈ 同秒數,M 合理值 ≈1.0–1.2,M=1.45 是 beta 壞包(CPU sampler 不受預算約束)反推的悲觀上界。工具 `scratchpad/rtaware/rt_total.py`、`rt_pairs.py`。
+**08-31 校正(deep-reasoner,dryrun12 B′ 逐案重算)**:上行 0.769/0.771 是 dry run 7(0828b 包)混用產物。B′ 現包正確值:raw 1.0858、floor 0.7600、M=1.0 時 D=1.0 **0.7604**(全場超 floor 損失僅 0.0004、2 案超)/ D=0.9 0.7620 / D=0.8 0.7679 / D=0.7 0.7831 / D=0.6 0.8072。→ M=1.0 時 runtime 軸的全部可得空間 = 0.0004;κ=0.305 填滿 floor 在 D=0.9 即虧 +0.018。
 
 ### 18b. Chain RT — 尾帶表 k20/k25 vs mid 表(四套 ×2 同鏈反序;16:20–17:00 UTC,load 14–20)
 
@@ -1151,3 +1152,20 @@ Round 4(`artifacts/flow_ft_0830b/`,bd 1.5 / cg 1.5 / mib 0.5,從 round-2 續訓,
 
 掃過 B′ env 下從未 gate 的 knob:`PARTNER_FLOW_ZORDER`(會靜默跳過 antithetic、prescreen 機制 §18m 已量 +0.014)、`PARTNER_FLOW_NOPT`(10 輪 backprop ≈1.6–2.5 s vs 0.454 s 預算)、`PARTNER_NREF_MIN_N=76`(mid band 版 s16;EV ≈0.003–0.004 且有 §17t 型下檔)、WALL_REPAIR/GROUP_BRIDGE 預算(§18f 普查已封頂)、RUNG0_TIGHTEN(~0.002)。runtime 面:M=1.0 時已貼 floor(0.769 vs 0.771),refine worker 超時 45–105 ms 修了也不加分。
 **建議 B′**(mid 表;M=1.0 已貼 floor,k20 用 raw 換不到 factor)。殘留已知風險(不動):op_wrapper `PARTNER_POOL=24` 無條件,cgroup 限核容器下會超訂——selfcheck `cpu_ratio` 可觀察,七次演練皆此設定,臨時改風險更大。
+
+### 18v. 08-31 決賽日續壓(使用者「已繳交、請再試」授權後的最後兩條 gate)→ 皆不促轉,B′ 定案
+
+- **R1 尾帶預算 floor-safe 加時**(`budget_table_floorraise.txt`:`bud'_n = max(mid_n, 0.232×median_tid)`,κ=0.232=0.305×0.8×0.95,只加不減,13 案 +2%~+98%,集中 tid 79–90/95):四套 ×4 兩序 → off +0.0007 / v3 −0.0026 / v5 −0.0023 / v6 −0.0003,CI 全含 0,avg_rt +0.03 s。加時間買不到 raw(§18e 非單調性再確認);棄。
+- **QF = `PARTNER_REFINE_KERNEL_QSWEEP=1 + DISC=1`**(deep-reasoner 找到的 §18u 漏軸:refiner 品質半邊 numba 化,模組自測 1.18–1.25×、同 wall +23.6% 離散 swap;pre-flight 259 passed):official ×2 快篩 −0.0037 → 四套 ×4 → off −0.0022 / v3 +0.0014 / v5 −0.0030 / **v6 +0.0061 [+0.0000,+0.0121] 退步**,v6 76–89 col 出貨 3→6(§17t 型)。組合否決;DISC 單獨(無平手殘差的那半)最後一鏈確認中(chainD)。
+- deep-reasoner 兩輪反證掃描其餘裁決:LADDER_EXPANDS / ROUTE_CARVE = 死碼(REBUDGET/POST_ROUTER 不在 op_wrapper);POST_ROUTER 附加時間+三個已死 stage = 負 EV;SA_RACING 重複 pool 的 c_force 維度且只及 column 通道(~10%);FLOW_NOPT 的 sampler wall 1:1 從 refine slice 扣(`slice_ = wd − TS×n/100`,n=100 餘裕僅 32 ms)→ 開了會關掉中帶模型通道;tid 88/89/90 變異 = pool 內容問題,selector regret +0.00009 已 oracle。
+- GPU 相容風險關閉:torch 2.6.0+cu124 arch list 含 sm_80,官方 QA 評測機 = A100 80GB;seat_ts 自適應門檻 0.185 s vs H100 實測 0.074 s,A100 慢 2.76× 才觸發(實際 1.5–2.2×)。
+- **chainD(DISC 單獨)**:off +0.0003 / v3 +0.0012 / v5 +0.0010 / **v6 +0.0085 [+0.0010,+0.0173] 退**,v_rel v5/v6 皆升。與 QF 同型 → numba kernel 軸(QSWEEP/DISC)整條否決:同 wall 內多 swap 在 v6 上系統性走壞,非 load 噪音。**08-31 續壓收案:R1/QF/D 三鏈皆不促轉,B′(md5 3f2cda42)定案不換包。**
+
+### 18w. 08-31 model soup FT2×FT3(權重空間平均)— public 顯著進、shadows 不顯著退,備 C′ 包交使用者裁定
+
+- 動機:FT3 official 增益(90–120 帶 −0.005/−0.005)被 v3/v6 尾帶退步否決(§18q);α 內插試圖取部分增益、付部分傷害。soup = `(1−α)·FT2_ema + α·FT3_ema`(同架構,FT3 從 FT2 續訓;loader preflight OK,step=250000 保留)。
+- 快篩(official ×2):α=0.25 +0.0031 淘汰;**α=0.5 −0.0058** [−0.0149,+0.0015] 升級。
+- 主 gate chainSF(四套 ×4 兩序):**off −0.0070 [−0.0149,+0.0003] / v3 −0.0010 / v5 −0.0010 / v6 +0.0045 [−0.0057,+0.0162]**;runtime 持平、off v_rel −0.0015、mid 帶 column 出貨無 §17t 崩塌。6 個 official 配對 rep(篩+gate)一致負向。
+- 判準:FT2 促轉的鏡像(public 進 + shadows 不顯著退;v6 與 QF/D 的顯著退不同,CI 含 0)。official 產生器=hidden 產生器,為最佳 proxy。
+- 工件:`scratchpad/rtaware/soup_ft2ft3_{a25,a50}.pt`;出貨名 `flow_matching_ft0831_soupa50_250k_ema.pt`;chain log `chain{S,SF}.log`;dryrun14(C′ = B′+soup)進行中。
+- SF2 收窄(off/v6 各 +2 rep,6-rep 合併):**off −0.0066 [−0.0134, −0.0002](CI 排除 0)**;v6 +0.0059 [−0.0044,+0.0181](含 0)。dryrun14:C′ 1.0834/100/100/guard 0/首案 0.049s;候選包 `submission/cadc1013_0831_soupa50_final.tar.gz` md5 6d0ca94e。裁定:public(=hidden 產生器)顯著 vs v6 不顯著代價 → 建議換包,交使用者。

@@ -25,3 +25,20 @@ fine-tune round 3(x0/hpwl)與 round 4(bd/cg/mib 權重)、FLOW_SLOTS 20/24、ove
 
 ## 工具索引
 gate:`scripts/gate/{run_gate5.sh,run_shadow.sh,analyze_pairs.py,band_pairs.py,ev_rt.py}`;runtime-aware:`scratchpad/rtaware/rt_pairs.py`;打包變體:`scratchpad/rtaware/apply_pack_variant.sh`;演練:`scratchpad/rtaware/dryrun12.sh`(B′)/`dryrun13.sh`(D′);探針:`scratchpad/rtaware/{golden_probe.py,vprobe.py,group_diag.py,bridge_budget_probe.py,ls_seed_probe.py}`;對手面板:`shadow_hidden/ext_selfgen/`、`ext_proxy/`。
+
+## 08-31 續壓(使用者授權「已繳交、再試」)— 全部不促轉,B′ 定案
+- R1 尾帶 floor-safe 加時(κ=0.232):四套 wash(off +0.0007/v3 −0.0026/v5 −0.0023/v6 −0.0003,CI 全含 0)。
+- QSWEEP+DISC numba(deep-reasoner 找到的 §18u 漏軸):快篩 −0.0037 → 四套 v6 +0.0061 [+0.0000,+0.0121] 退,否決;DISC 單獨 v6 +0.0085 [+0.0010,+0.0173] 退,否決。
+- deep-reasoner 兩輪反證:其餘 knob 死碼/重複/負 EV;M=1.0 時 runtime 軸全部可得空間 = 0.0004(§18a 校正);GPU 風險關閉(A100=sm_80 在 wheel arch list、seat_ts 門檻餘裕 2.76×)。
+- 證據:experiments doc §18v;chain log `~/.claude/jobs/06af0e53/tmp/chain{R1,Q,QF,D}.log`。
+
+## 10:31 UTC 更新:soup a50 過 gate + 演練 → C′ 候選包就緒,**等使用者裁定是否重上傳**
+- chainSF 四套 ×4:off −0.0070 [−0.0149,+0.0003] / v3 −0.0010 / v5 −0.0010 / v6 +0.0045(CI 含 0);6 個 official 配對 rep 一致負向;runtime 持平。
+- dryrun14(C′ = B′ + FLOW_CKPT=`flow_matching_ft0831_soupa50_250k_ema.pt`):**1.0834、100/100、cuda=True、step 250000、guard 0、首案 0.049s**。
+- 候選包:`submission/cadc1013_0831_soupa50_final.tar.gz`(= pack_test12 同檔)。**線上仍是 B′(3f2cda42)= 保底**;要換就上傳候選包,不換不動作。
+- 工作樹現為 C′ 設定;回 B′:`bash scratchpad/rtaware/apply_pack_variant.sh ft2 s16`。
+
+## 15:01 UTC 收案
+- deadline 已過。兩包完好:B′ `FINAL_UPLOAD/cadc1013.tar.gz`(3f2cda42,原線上)、C′ `FINAL_UPLOAD_C/cadc1013.tar.gz`(6d0ca94e,QA 驗畢:34 檔、0 pycache、唯一 diff = flow ckpt + op_wrapper 一行;14:47 UTC 給出上傳綠燈與建議)。
+- **最終提交 = 使用者實際上傳者(待使用者確認:C′ 或 B′)。**
+- C′ 證據鏈:official 6-rep −0.0066 [−0.0134,−0.0002]、v3/v5 wash、v6 +0.0059(CI 含 0);dryrun14 1.0834/100/100。
