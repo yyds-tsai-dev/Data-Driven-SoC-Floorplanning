@@ -141,7 +141,7 @@ def test_arbitrate_champion_exact_v_empty_pool():
 # ---------------------------------------------------------------------------
 # R2: PARTNER_PICK_SCORE_REPAIRED -- unit-level against MyOptimizer._pick_best
 # with a monkeypatched _ensure_no_overlap and a mocked scorer, per the
-# existing partner test fixture pattern (see test_partner_pick_exact_v.py).
+# existing partner test fixture pattern (see test_solver_pick_exact_v.py).
 # ---------------------------------------------------------------------------
 
 class _FakeScorer:

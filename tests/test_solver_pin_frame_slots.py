@@ -1,7 +1,7 @@
 """`PARTNER_PIN_FRAME_SLOTS=k` (default 0): the pin-frame ladder as a
 PORTFOLIO SLOT instead of a global switch.
 
-`PARTNER_PIN_FRAME` (see tests/test_partner_pin_frame.py) turns every
+`PARTNER_PIN_FRAME` (see tests/test_solver_pin_frame.py) turns every
 reserved refine worker of every case onto the pinned ladder.  Measured that
 way it is net-negative -- official -0.0022 / shadow-v3 +0.0121 -- and the
 per-case decomposition says why: the locked cases win big (official tid 86
@@ -63,7 +63,7 @@ def _clean_env(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# synthetic instances (same shapes as tests/test_partner_pin_frame.py)
+# synthetic instances (same shapes as tests/test_solver_pin_frame.py)
 # ---------------------------------------------------------------------------
 
 def _opt(rects, cons, tpos, budget: float = 20.0):

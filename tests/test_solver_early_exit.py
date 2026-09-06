@@ -158,7 +158,7 @@ def test_min_window_floor(monkeypatch):
 # ==========================================================================
 def _stub_phases(r, key_step, batch_sleep=0.02):
     """Neutralize every move so only the loop control is under test (same
-    harness as tests/test_partner_refine_stall.py): `_discrete_batch` always
+    harness as tests/test_solver_refine_stall.py): `_discrete_batch` always
     accepts, improving the key by `key_step` relative per batch."""
     state = {"key": 1.0, "batches": 0}
     r._key = lambda: state["key"]

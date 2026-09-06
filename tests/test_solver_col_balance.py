@@ -46,7 +46,7 @@ def _clean_env(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# synthetic instances (reusing the shape of test_partner_seat_frame_narrow's
+# synthetic instances (reusing the shape of test_solver_seat_frame_narrow's
 # `_case` / `_opt` builders, varied so free-unit sizing differs per case)
 # ---------------------------------------------------------------------------
 

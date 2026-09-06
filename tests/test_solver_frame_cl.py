@@ -57,7 +57,7 @@ def _clean_env(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # fixture: preplaced, right-tagged (the W*-arm trigger), copied from
-# test_partner_seat_frame_narrow._case
+# test_solver_seat_frame_narrow._case
 # ---------------------------------------------------------------------------
 
 def _case(n: int = 24, s: float = 1.0, util: float = 5.0 * 5.0):

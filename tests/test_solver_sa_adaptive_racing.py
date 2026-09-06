@@ -148,7 +148,7 @@ import numpy as np, torch
 import column_sa_legalizer as csl
 
 sys.path.insert(0, r"__TESTS__")
-from test_partner_sa_adaptive_racing import _case          # noqa: E402
+from test_solver_sa_adaptive_racing import _case          # noqa: E402
 
 rects, at, cons, tpos, b2b, p2b, pins = _case()
 opt = csl._ColumnOptimizer(rects, at, cons, tpos, b2b, p2b, pins,
