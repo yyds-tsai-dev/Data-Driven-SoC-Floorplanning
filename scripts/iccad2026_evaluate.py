@@ -2222,8 +2222,7 @@ def save_predicted_floorplan_pngs(
             plot_diffusion_diagnostic,
         )
     except ImportError:
-        print("floorplan PNG output needs the retired floorset_arch diagnostics "
-              "(removed 2026-09-06); skipping PNGs")
+        print("matplotlib required for floorplan PNG output")
         return []
 
     out_dir = Path(output_dir)
