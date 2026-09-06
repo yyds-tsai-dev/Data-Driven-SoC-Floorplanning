@@ -31,7 +31,7 @@ Task 4 may import/re-export private helper aliases for its probe tests; Task 5
 imports/re-exports `canonical_checkpoint_identity` and never duplicates the
 codec.
 
-Create only `src/icdc_engine/checkpoint_identity.py`, `src/icdc_engine/topology_data.py`, `src/icdc_engine/topology_prior.py`, `src/icdc_engine/train_topology_prior.py`, `tests/test_icdc_topology_prior.py`, `scripts/probes/icdc_topology_teacher.py`, `scripts/probes/icdc_topology_gate.py`, `scripts/probes/icdc_topology_3d3f_wrapper.py`, and `scripts/probes/run_icdc_topology_stage.sh`; generated evidence is under `artifacts/icdc_topology/` or `.superpowers/sdd/`, and generated gate artifacts are not committed. The Track-B wrapper may set the frozen environment and add fail-closed source-count/Flow-success receipts around inherited production methods; it may not change sampling, ranking, refinement, or selection.
+Create only `src/icdc_engine/checkpoint_identity.py`, `src/icdc_engine/topology_data.py`, `src/icdc_engine/topology_prior.py`, `src/icdc_engine/train_topology_prior.py`, `tests/test_icdc_topology_prior.py`, `scripts/probes/icdc_topology_teacher.py`, `scripts/probes/icdc_topology_gate.py`, `scripts/probes/icdc_topology_3d3f_wrapper.py`, and `scripts/probes/run_icdc_topology_stage.sh`; generated evidence is under `artifacts/icdc_topology_prior_training/` or `.superpowers/sdd/`, and generated gate artifacts are not committed. The Track-B wrapper may set the frozen environment and add fail-closed source-count/Flow-success receipts around inherited production methods; it may not change sampling, ranking, refinement, or selection.
 
 ### Task 1: Data schema, sanitized corpus, split, manifest
 
@@ -384,9 +384,9 @@ def test_teacher_ast_forbids_validation_and_golden_reads():
 ```bash
 uv run python scripts/probes/icdc_topology_teacher.py \
   --data-root FloorSet/floorset_lite \
-  --index-out artifacts/icdc_topology/training_index.json \
+  --index-out artifacts/icdc_topology_prior_training/training_index.json \
   --checkpoint partner/checkpoints/direct_v2_cont/eval_step1p2M.pt \
-  --out-dir artifacts/icdc_topology \
+  --out-dir artifacts/icdc_topology_prior_training \
   --seed 20260813 --heldout-mod 10 --n-min 100
 ```
 Build the index by sorted approved worker/layout paths and in-file row,
@@ -567,11 +567,11 @@ uv run python -m partner.icdc.train_topology_prior \
   --checkpoint partner/checkpoints/direct_v2_cont/eval_step1p2M.pt \
   --control-checkpoint submission/cadc1013/checkpoints/direct_v2_final.pt \
   --flow-checkpoint submission/cadc1013/checkpoints/flow_matching_v1_final.pt \
-  --train-corpus artifacts/icdc_topology/train_corpus.jsonl \
-  --train-labels artifacts/icdc_topology/train_labels.jsonl \
-  --heldout-corpus artifacts/icdc_topology/heldout_corpus.jsonl \
-  --heldout-labels artifacts/icdc_topology/heldout_labels.jsonl \
-  --out-dir artifacts/icdc_topology/checkpoints \
+  --train-corpus artifacts/icdc_topology_prior_training/train_corpus.jsonl \
+  --train-labels artifacts/icdc_topology_prior_training/train_labels.jsonl \
+  --heldout-corpus artifacts/icdc_topology_prior_training/heldout_corpus.jsonl \
+  --heldout-labels artifacts/icdc_topology_prior_training/heldout_labels.jsonl \
+  --out-dir artifacts/icdc_topology_prior_training/checkpoints \
   --sampler-steps 2 --student-samples 3 --production-candidates 6 \
   --max-steps 5000 --batch 4 \
   --eval-every 250 --seed 20260813
@@ -821,18 +821,18 @@ PARTNER_GROUP_BRIDGE_DEBUG=""; PYTHONHASHSEED=0
 ```bash
 uv run python scripts/probes/icdc_topology_gate.py audit \
   --stage g1_n100_3d3f \
-  --corpus artifacts/icdc_topology/heldout_corpus.jsonl \
-  --labels artifacts/icdc_topology/heldout_labels.jsonl \
-  --teacher-manifest artifacts/icdc_topology/g0_manifest.json \
+  --corpus artifacts/icdc_topology_prior_training/heldout_corpus.jsonl \
+  --labels artifacts/icdc_topology_prior_training/heldout_labels.jsonl \
+  --teacher-manifest artifacts/icdc_topology_prior_training/g0_manifest.json \
   --base partner/checkpoints/direct_v2_cont/eval_step1p2M.pt \
-  --candidate artifacts/icdc_topology/checkpoints/best.pt \
-  --out artifacts/icdc_topology/g1_heldout.json
+  --candidate artifacts/icdc_topology_prior_training/checkpoints/best.pt \
+  --out artifacts/icdc_topology_prior_training/g1_heldout.json
 uv run python scripts/probes/icdc_topology_gate.py causal-smoke \
-  --corpus artifacts/icdc_topology/heldout_corpus.jsonl \
+  --corpus artifacts/icdc_topology_prior_training/heldout_corpus.jsonl \
   --control submission/cadc1013/checkpoints/direct_v2_final.pt \
-  --candidate artifacts/icdc_topology/checkpoints/best.pt \
+  --candidate artifacts/icdc_topology_prior_training/checkpoints/best.pt \
   --flow submission/cadc1013/checkpoints/flow_matching_v1_final.pt \
-  --out artifacts/icdc_topology/g1_causal_smoke.json
+  --out artifacts/icdc_topology_prior_training/g1_causal_smoke.json
 ```
   Audit requires the same-shape contract, exact TFDL, zero drift/shelf/hard
   errors, and weighted retained gain
@@ -844,7 +844,7 @@ uv run python scripts/probes/icdc_topology_gate.py causal-smoke \
   Both JSON artifacts must embed the candidate's full canonical
   file/model/EMA/keyset/config identity, not only its path.
 - [ ] Freeze `best.pt` atomically as
-  `artifacts/icdc_topology/checkpoints/g1_n100_3d3f.pt`, then write canonical
+  `artifacts/icdc_topology_prior_training/checkpoints/g1_n100_3d3f.pt`, then write canonical
   `g1_n100_3d3f.freeze.json`; chmod both `0444`. Bind file/model/EMA/keyset/config
   identities, C0 and Flow identities, portfolio/environment, teacher manifest,
   training index, held-out audit, causal smoke, canonical schedule, source
@@ -868,8 +868,8 @@ git commit -m "feat: freeze 3d3f topology prior g1 gate"
 ```bash
 bash scripts/probes/run_icdc_topology_stage.sh sealed-pair \
   --stage g1_n100_3d3f \
-  --freeze artifacts/icdc_topology/checkpoints/g1_n100_3d3f.freeze.json \
-  --out-dir artifacts/icdc_topology/g1_blind
+  --freeze artifacts/icdc_topology_prior_training/checkpoints/g1_n100_3d3f.freeze.json \
+  --out-dir artifacts/icdc_topology_prior_training/g1_blind
 ```
   Both subprocesses use the official evaluator and
   `scripts/probes/icdc_topology_3d3f_wrapper.py`; solver behavior differs only
@@ -889,9 +889,9 @@ bash scripts/probes/run_icdc_topology_stage.sh sealed-pair \
 ```bash
 uv run python scripts/probes/icdc_topology_gate.py adjudicate-sealed \
   --stage g1_n100_3d3f \
-  --freeze artifacts/icdc_topology/checkpoints/g1_n100_3d3f.freeze.json \
-  --pair-dir artifacts/icdc_topology/g1_blind \
-  --out artifacts/icdc_topology/g1_gate.json
+  --freeze artifacts/icdc_topology_prior_training/checkpoints/g1_n100_3d3f.freeze.json \
+  --pair-dir artifacts/icdc_topology_prior_training/g1_blind \
+  --out artifacts/icdc_topology_prior_training/g1_gate.json
 ```
 - [ ] Run `bash scripts/probes/run_icdc_topology_stage.sh --help`, focused
   tests, full `uv run pytest`, `git diff --check`, and `graphify update .`;
@@ -901,7 +901,7 @@ uv run python scripts/probes/icdc_topology_gate.py adjudicate-sealed \
 
 **Files:** Create
 `docs/experiments/2026-08-13-tfdl-data-free-topology-prior-gates.md` only after
-G1 adjudication. Generated evidence remains under `artifacts/icdc_topology/`.
+G1 adjudication. Generated evidence remains under `artifacts/icdc_topology_prior_training/`.
 
 - [ ] Record immutable source/checkpoint/portfolio/environment/schedule hashes,
   G0 and held-out results, causal smoke, sealed pair hashes, the one unmasked G1

@@ -28,7 +28,7 @@ Beta floor 發現(rt_adj ≥ 0.7,rf ≤ 0.3046 免費)驅動的預算實驗序�
 - 悲觀角(M=2.4, D=0.8)連 b1v2 都輸 base;
 - **per-n 逐檔選優(3 個實測檔位)在全部 9 情境贏 −0.01~−0.02**。
 
-**定案:`PARTNER_BUDGET_TABLE`**(新 env,100 個 per-n 秒數,n=21..120;`contest_optimizer._time_budget` 讀表,未設/壞值 fallback 原曲線,byte-identical)。表值 = 情境加權期望選檔(M∈{1.8,2.1,2.4}×D∈{0.8,1.0,1.3},中心加權),寫於 `artifacts/p0_newbox/budget_table_ev.txt`。離線期望:中性 −0.013,最壞角 ±0.000。確認鏈(base/table/b1v2 ×3)見 §9 補記。
+**定案:`PARTNER_BUDGET_TABLE`**(新 env,100 個 per-n 秒數,n=21..120;`contest_optimizer._time_budget` 讀表,未設/壞值 fallback 原曲線,byte-identical)。表值 = 情境加權期望選檔(M∈{1.8,2.1,2.4}×D∈{0.8,1.0,1.3},中心加權),寫於 `artifacts/newbox_gate_runs_0821/budget_table_ev.txt`。離線期望:中性 −0.013,最壞角 ±0.000。確認鏈(base/table/b1v2 ×3)見 §9 補記。
 過度平滑版(rolling-median + 0.9×floor cap)實測期望反而劣化(−0.003/+0.007)——建模工件疊加,棄。
 
 ## 3. P0-B violation 工作
@@ -85,7 +85,7 @@ Deep-reasoner 審計(以 0806/0807 工件 + 本夜新 audit)改寫作戰圖:
 
 ## 6. TFDL(5.6-sol 續作)狀態
 
-Task 5 精確配方已抽出(exact CLI/gates/hash 綁定)。**硬阻塞於舊機資產**:訓練源 ckpt `partner/checkpoints/direct_v2_cont/eval_step1p2M.pt`(sha256 綁定,不可重訓替代)、`submission/cadc1013/checkpoints/*`(在 LFS tar 內)、G0 語料 `artifacts/icdc_topology/` + `artifacts/icdc_g0_v2_area_full/`。G1 同阻塞。
+Task 5 精確配方已抽出(exact CLI/gates/hash 綁定)。**硬阻塞於舊機資產**:訓練源 ckpt `partner/checkpoints/direct_v2_cont/eval_step1p2M.pt`(sha256 綁定,不可重訓替代)、`submission/cadc1013/checkpoints/*`(在 LFS tar 內)、G0 語料 `artifacts/icdc_topology_prior_training/` + `artifacts/icdc_g0_v2_area_corpus/`。G1 同阻塞。
 
 ## 7. 其他
 
@@ -117,7 +117,7 @@ B.3 依審計設計實作(`PARTNER_FRAME_CL`:`_layout_full` 上對 H 的 secant 
 - 新旗標 `PARTNER_FASTSA_MIX=<frac>`(per-config 排程多樣性入 restart portfolio,16 測試綠):arms-ON 下 +0.0019 [−0.0059,+0.0111],wash(HPWL −0.012、v_rel +0.0036)。**FASTSA 家族擱置,default off。**
 - **舊機資產到位(08-22 01:38)**:LFS 15G、`eval_step1p2M.pt`、G0 語料、groupbridge 真身(兩顆 ckpt 解至 `submission/cadc1013/checkpoints/`)。
 - **Arms-ON 基線(3D/3F + table 預算,GPU3)= 1.1676 ± 0.0072 @ avg 0.438s;模型臂價值 = −0.105(vs column-only 1.2726,CI [−0.138,−0.073])**;weighted HPWL gap 0.114 回到舊機水準。
-- `artifacts/icdc_topology/tracer_step1/` 含一個 2,900-record 先導學生(contract hashes 合法)→ Task 5 pipeline 已驗通;正式 Task 5 執行中(deep-reasoner,GPU3)。
+- `artifacts/icdc_topology_prior_training/tracer_step1/` 含一個 2,900-record 先導學生(contract hashes 合法)→ Task 5 pipeline 已驗通;正式 Task 5 執行中(deep-reasoner,GPU3)。
 
 ## 7d. Arms-ON 旗標歸因(chain 10,3 臂 ×3,箱內噪音升高 σ≈0.01)
 
@@ -182,7 +182,7 @@ Chain 21(fl5 基線 1.1335,3–4 對):`FLOW_SLOTS=7` +0.0054、`KS_CAP=8` +0.005
 ## 8. 阻塞(需人工)— **已解除(08-22 01:38 轉移完成)**
 
 舊機 `/nashome/NVL4/vdalab/yyds-dev/Data-Driven-SoC-Floorplanning/` 最小轉移集(~18GB):
-`.git/lfs/objects/`(15GB)、`partner/checkpoints/direct_v2_cont/eval_step1p2M.pt`、`artifacts/icdc_topology/`、`artifacts/icdc_g0_v2_area_full/`。(floorset_lite 已 HF 還原,不必轉。)
+`.git/lfs/objects/`(15GB)、`partner/checkpoints/direct_v2_cont/eval_step1p2M.pt`、`artifacts/icdc_topology_prior_training/`、`artifacts/icdc_g0_v2_area_corpus/`。(floorset_lite 已 HF 還原,不必轉。)
 
 ## 9. 補記(chain 5 確認鏈)— **PARTNER_BUDGET_TABLE 本機促轉**
 
@@ -209,7 +209,7 @@ base/table/b1v2 ×3 同鏈交錯:
 | alpha_1 | official100,P2B 端點按距離重抽 | 1.2117 | 100 | 0.41/0.88/1.49 | 0.202 | 0.065 | 0.032 | 1.40/0.49/0 |
 | p2b_1__b2b_1 | P2B+B2B 皆重抽 | 1.1052 | 100 | 0.40/0.81/1.21 | −0.049 | 0.049 | 0.036 | 1.68/0.47/0 |
 
-讀法:四套皆 100/100 feasible、runtime 尾 ≤1.5s、bnd/grp 與 official100 同量級 → 分佈偏移不崩。v1 差額幾乎全是 MIB 工件;v3 +0.074(boundary 2.0/案 + area)。alpha_1 HPWL gap 翻倍(golden 基準因「pin 靠近 GT block」重抽而偏有利 GT)→ pin 驅動拓撲是最弱項。p2b+b2b 重抽後 golden 基準變鬆,HPWL gap 為負。工件:`artifacts/shadow/sh_*.json`;runner `run_shadow.sh`(job scratch)。
+讀法:四套皆 100/100 feasible、runtime 尾 ≤1.5s、bnd/grp 與 official100 同量級 → 分佈偏移不崩。v1 差額幾乎全是 MIB 工件;v3 +0.074(boundary 2.0/案 + area)。alpha_1 HPWL gap 翻倍(golden 基準因「pin 靠近 GT block」重抽而偏有利 GT)→ pin 驅動拓撲是最弱項。p2b+b2b 重抽後 golden 基準變鬆,HPWL gap 為負。工件:`artifacts/shadow_gate_runs/sh_*.json`;runner `run_shadow.sh`(job scratch)。
 
 Beta 時代組態(canonical 曲線 + 原 direct ckpt + FLOW3)對照(同箱同日):
 
@@ -219,7 +219,7 @@ Beta 時代組態(canonical 曲線 + 原 direct ckpt + FLOW3)對照(同箱同日
 | alpha_1 | 1.2307 | 1.2117 | −0.019 | hpwl −0.017 |
 | p2b+b2b | 1.1067 | 1.1052 | −0.001 | 已貼品質下限 |
 
-→ shipping 組態在偏移資料(v3)上的增益(−0.080)**大於** official100(−0.06):預算表/refine 容量的改善泛化到未見 instance。工件 `artifacts/shadow/shb_*.json`。
+→ shipping 組態在偏移資料(v3)上的增益(−0.080)**大於** official100(−0.06):預算表/refine 容量的改善泛化到未見 instance。工件 `artifacts/shadow_gate_runs/shb_*.json`。
 
 alpha_1 診斷:HPWL gap 隨 n 增大(n 90–109:0.254 vs official 0.136;110–120:0.177 vs 0.074),最慘案(90/74/110/50/106/76)自 gap≈0 跳至 0.3–0.4;p2b 佔 HPWL 19–27%。內部 proxy `_hpwl`(column_sa_legalizer.py:2477)與 evaluator 逐項同形 → 非目標失準,是「pin-heavy block 需放到 pin 側」的拓撲搜尋弱項(seed 通道已死,需新 SA move/prior)。定位為下一階段靶,alpha_1 作為診斷 gate(非 hidden 代理)。
 
@@ -227,7 +227,7 @@ alpha_1 診斷:HPWL gap 隨 n 增大(n 90–109:0.254 vs official 0.136;110–12
 
 - **Leaderboard 更新**(`docs/official/beta_test/C_beta_leaderboard_update_20260823.csv`):我們 raw 1.3207 不變、total 0.9266 → **第 4**(rank1 raw 改為 1.0845;rank5 raw 1.1705 但 133s 被罰;rank9 raw 1.1242/83s)。我們 total/raw=0.7016 仍貼 floor。
 - **Median 表更新**(`C_median_runtimes_beta_hidden_update_20260823.csv`):總和 295.7→216.1s(−27%,單案比 0.48–0.94)→ floor 點縮小。舊 EV 表在 arms-ON 下 70 案超新 floor;依新 median 重推的表(`budget_table_newmed.txt`,54 案回 canonical,平均 0.426→0.326s)離線期望 −0.008(vs 舊表)/−0.019(vs canonical);M=1.8 情境算出 0.9267 ≈ beta 實際 0.9266 → M 校準中心改 1.8。三套 gate 確認中。
-- **Partner handover v1**(`shadow_hidden/handover_v1.tar.gz`,scratch 解至 job tmp):與本線收斂(runtime headroom 為第一槓桿;pool 40/mix 更差;ePlace 只 probe)。可驗證分歧:①拿掉 TAG_COMPRESS/GROUP_BRIDGE 反而 −0.028(2/2)②Flow-only(FLOW_SLOTS=10)優於 3D/3F ③coord_polish 的 headroom gate(−0.0026 noRT/−0.037 runtime-aware)④postpass router(v3 −0.0024)⑤MIB decouple(8/24)。①②以三套 gate 在本線驗證中;③④⑤待 diff 抽取後決定移植。其 public 1.1356 / v3 1.1987 vs 本線 1.137 / 1.211。
+- **Partner handover v1**(`artifacts/shadow_hidden_suites/handover_v1.tar.gz`,scratch 解至 job tmp):與本線收斂(runtime headroom 為第一槓桿;pool 40/mix 更差;ePlace 只 probe)。可驗證分歧:①拿掉 TAG_COMPRESS/GROUP_BRIDGE 反而 −0.028(2/2)②Flow-only(FLOW_SLOTS=10)優於 3D/3F ③coord_polish 的 headroom gate(−0.0026 noRT/−0.037 runtime-aware)④postpass router(v3 −0.0024)⑤MIB decouple(8/24)。①②以三套 gate 在本線驗證中;③④⑤待 diff 抽取後決定移植。其 public 1.1356 / v3 1.1987 vs 本線 1.137 / 1.211。
 
 Chain 22(sn+fl5 基線,3 對):`PARTNER_POOL=32` **−0.0055 [−0.0107,+0.0004]**(runtime 中性;partner 測 40 反而 +0.016 → 32 為甜蜜點,待三套 gate 確認);`PARTNER_NREF_MIN_N=80` −0.0031 [−0.0097,+0.0032] wash。
 
@@ -306,7 +306,7 @@ comboC official 逐案(§14 組態,load 60):n≥102 的案 hpwl gap 0.00–0.08�
 - 舊 EV/fast 表是用 column-only 三檔品質資料推的,看不到這個臂的階躍(column-only 在 n=100 從 0.32s→0.73s 只值 −0.03,arms 開臂值 −0.23)。
 - 帶內加權殘量:n<76 0.006、**76–101 0.045**、102–120 0.077–0.087(權重 0.023/0.182/0.795)。把 16 個 canonical 案拉到 1.17 ≈ **−0.017~−0.02 raw**。
 
-`artifacts/p0_newbox/budget_table_mid.txt` = fast 表,但 n∈[76,101] 取 max(fast, 開臂線+0.07s)(0.324@76 … 0.460@101;16 個 n 改動,平均預算 0.351→0.386s)。runtime 面:這些值在 D≥0.8 全在 0.3006·median/1.45 免費區內;D=0.7 時 n=78–87 超出 5–15%(單案 rt 罰 +3~5%,遠小於 −12% 的品質增益)。鏈 qMid vs qC ×3(GPU3)量測中。
+`artifacts/newbox_gate_runs_0821/budget_table_mid.txt` = fast 表,但 n∈[76,101] 取 max(fast, 開臂線+0.07s)(0.324@76 … 0.460@101;16 個 n 改動,平均預算 0.351→0.386s)。runtime 面:這些值在 D≥0.8 全在 0.3006·median/1.45 免費區內;D=0.7 時 n=78–87 超出 5–15%(單案 rt 罰 +3~5%,遠小於 −12% 的品質增益)。鏈 qMid vs qC ×3(GPU3)量測中。
 
 ### 15b. 進行中
 
@@ -406,8 +406,8 @@ Raw 1.10 目標的位置:出貨候選 official 1.112–1.125(load 17–21);再�
 **出貨候選 env**(= run_shadow.sh 基底 + 下列覆寫;`submission/cadc1013/op_wrapper.py` 現行預設 NREF 6/OVERSAMPLE 4/無 SEAT_FIX/canonical 曲線與此不同,打包必須改成此組):
 
 ```
-PARTNER_BUDGET_TABLE=$(cat artifacts/p0_newbox/budget_table_mid.txt)   # mid 表(fast 表 + n76–101 開臂)
-DIRECT_CKPT=artifacts/icdc_topology/checkpoints_s2_20k/best.pt          # v2 學生(只為開臂;Direct 0 席)
+PARTNER_BUDGET_TABLE=$(cat artifacts/newbox_gate_runs_0821/budget_table_mid.txt)   # mid 表(fast 表 + n76–101 開臂)
+DIRECT_CKPT=artifacts/icdc_topology_prior_training/checkpoints_s2_20k/best.pt          # v2 學生(只為開臂;Direct 0 席)
 FLOW_CKPT=submission/cadc1013/checkpoints/flow_matching_v1_final.pt
 PARTNER_DIRECT_SEAT_FIX=1 PARTNER_NREF=9 PARTNER_FLOW_SLOTS=10
 PARTNER_REFINE_RES_FRAC=0.45                                              # 新 knob(layout_refiner.py)
@@ -429,7 +429,7 @@ PARTNER_QUOTA_FIRST 不設(default off);建議打包加 PARTNER_FLOW_WARM=1(消�
 - 累計機制:①中段開臂(mid 表)−0.011 ②候選違規修復 reserve 0.3→0.45 −0.010(三套 CI 皆排除 0)。兩者皆為「讓 HPWL 好 10–25% 的模型候選活過仲裁」。
 - 本日否決(全部 default off / 未採):去 TAG+BRIDGE、COL_BALANCE、v4 aug 學生、partner 微調、mid2/mid3 表、QUOTA_FIRST(wash,碼保留)、FLOW_STEPS=4、FRAME_SCALE 1.00/1.01、NREF=12、RES_FRAC 0.35/0.6(平台)。
 - **Raw 1.10 目標**:候選 1.112–1.125;tail 預算 ×1.3 可到 1.109–1.111 但 total +0.03~+0.04(超 floor 案 52→56),依「field 只會更快」不建議;決定權在使用者(§15i 有定價)。剩餘殘量結構:tail 違規(88/89 雙軸釘死,v_rel 0.08–0.11)、tail area gap ≈0.05(rung-0 框常數已是甜蜜點)、a1 型 pin 拓撲(column fallback 地板)。
-- 程式變更(工作樹,未 commit):`src/solver/layout_refiner.py`(RES_FRAC knob,6 行)、`src/solver/contest_optimizer.py`(quota-first + toggle,bit-exact off)、`scripts/probes/quota_first_bitexact.py`、`artifacts/p0_newbox/budget_table_{mid,mid2,mid3,tail13}.txt`。回歸:14 個 partner 測試檔 169 passed / 8 skipped / 0 failed。
+- 程式變更(工作樹,未 commit):`src/solver/layout_refiner.py`(RES_FRAC knob,6 行)、`src/solver/contest_optimizer.py`(quota-first + toggle,bit-exact off)、`scripts/probes/quota_first_bitexact.py`、`artifacts/newbox_gate_runs_0821/budget_table_{mid,mid2,mid3,tail13}.txt`。回歸:14 個 partner 測試檔 169 passed / 8 skipped / 0 failed。
 
 ### 15k. Chain J — 開臂閘門重校(`PARTNER_DIRECT_SEAT_R0=0.16`,補償 reserve 0.45 後 span 縮小;×3)
 
@@ -782,7 +782,7 @@ runtime 持平(0.384→0.382);runtime-aware official 中性(+0.002)。public was
 
 ### 17r. Flow fine-tune gate #1 — step 90k EMA vs v1(四套 ×2 對調;load 56→28 遞減,base r1 吃到 56–61)
 
-Fine-tune 配方見 `scratchpad/flow_ft_0828/STATUS.md`(tail-tilt 檔案抽樣 T=24、worker 0–89、lr 2e-5 cosine 300k、目標函數與 v1 bit-exact)。候選 = `artifacts/flow_ft_0828/flow_ft0828_tailT24_lr2e-5_step90k.pt`(EMA;preflight 用 `_load_flow_model` 同路徑載入 OK,`flow_matching_v3`)。
+Fine-tune 配方見 `scratchpad/flow_ft_0828/STATUS.md`(tail-tilt 檔案抽樣 T=24、worker 0–89、lr 2e-5 cosine 300k、目標函數與 v1 bit-exact)。候選 = `artifacts/flow_finetune_round1_0828_tailT24_300k/flow_ft0828_tailT24_lr2e-5_step90k.pt`(EMA;preflight 用 `_load_flow_model` 同路徑載入 OK,`flow_matching_v3`)。
 
 | 套 | v1 r1/r2 | ft90k r1/r2 | paired Δ [95% CI] | 分解 |
 |---|---|---|---|---|
@@ -966,7 +966,7 @@ k25 幾乎不省時間只付 raw,淘汰。k20 = 押 field 加速(D):M=1.0 損益
 
 ### 18c. Flow fine-tune round 2(deep-reasoner 設計;`scratchpad/flow_ft_0829/STATUS.md`)
 
-從 round-1 300k 退火 EMA 續訓,只改一個變數:tilt 溫度 T=24→**12**(= evaluator 權重 exp((n−120)/12) 的精確重要性抽樣;尾帶抽樣占比 0.50→0.74、n<76 0.145→0.024);lr 1e-5(round 1 的一半)、warmup 1k、cosine 到 0.01×、250k 步(確保退火完成)、EMA 0.9998、目標函數與 v1 bit-exact。GPU0,10–15 it/s,16:25–22:57 UTC。工件 `artifacts/flow_ft_0829/flow_ft0829_tailT12_lr1e-5_250k_ema.pt`(EMA-only 匯出,step 250000,preflight OK)。
+從 round-1 300k 退火 EMA 續訓,只改一個變數:tilt 溫度 T=24→**12**(= evaluator 權重 exp((n−120)/12) 的精確重要性抽樣;尾帶抽樣占比 0.50→0.74、n<76 0.145→0.024);lr 1e-5(round 1 的一半)、warmup 1k、cosine 到 0.01×、250k 步(確保退火完成)、EMA 0.9998、目標函數與 v1 bit-exact。GPU0,10–15 it/s,16:25–22:57 UTC。工件 `artifacts/flow_finetune_round2_0829_tailT12_250k/flow_ft0829_tailT12_lr1e-5_250k_ema.pt`(EMA-only 匯出,step 250000,preflight OK)。
 
 ### 18d. Chain Final — 四臂 ×4 輪序(ABCD/DCBA/BDAC/CADB)× 四套;22:58–00:09 UTC,load 8→26
 
@@ -1012,7 +1012,7 @@ A = 現包 env(ft0828 300k EMA + mid 表)、B = FT2、C = k20、D = FT2+k20。�
 | **slots 16 / nref 12** | 1.0914 | **−0.0057**(尾帶 −0.0067) | 0.936(+4%) | −0.0005(wash) |
 | slots 20 / nref 18 | 1.0934 | −0.0038 | 1.074(+20%) | +0.021(否決) |
 
-slots 16 送四套 ×4 交替序確認鏈(`chainW16.sh`,結果 `artifacts/shadow/w16{A,W}_r{1..4}_*.json`)。
+slots 16 送四套 ×4 交替序確認鏈(`chainW16.sh`,結果 `artifacts/shadow_gate_runs/w16{A,W}_r{1..4}_*.json`)。
 
 ### 18h. 守門觸發根因 + 守門強化(deep-reasoner,08-30 07:00–08:10 UTC)
 
@@ -1020,7 +1020,7 @@ slots 16 送四套 ×4 交替序確認鏈(`chainW16.sh`,結果 `artifacts/shadow
 - **根因**:`src/solver/layout_refiner.py:6688-6702`(`refine_prediction` 的「MIB shape unification」)與 `:7469-7480`:MIB 群組取第一個 fixed/preplaced 成員的 (rw, rh) 直接覆寫所有 soft 成員,**沒有面積一致性檢查**。v3 tid 85 的 MIB 群組 {6, 32, 53} 面積異質(6 fixed 24×13=312;32/53 soft 650)→ 32 被寫成 312。只在 direct 臂勝出且長預算分支(`:7469` 在 `t_hard − _tg(0.4,0.25)` 之後、`V0>0`)才浮現;單案冷啟動(direct 臂關)不重現。
 - **資料面**:面積異質 MIB 群組數:official 0/100、v5 0、v6 0、**v3 20**(v3 產生器的工件)。official 與 hidden 用同一官方產生器、public 已含噪音仍 0 → hidden 觸發機率極低。**MIB 修法(跳過面積不同的成員)不入包**(對 official/v5/v6 逐位元相同、零期望值、純風險)。
 - **守門強化(入包;`src/solver/contest_optimizer.py:318-479`)**:失敗路徑先 `_repair_soft_areas`(對 >1% 的 soft block 依 keep-w / keep-h / 等比、兩個錨角共 6 種變體,`_clear_of_others` 不重疊才收)→ 通過原 `_legal_ok` 才出貨;合法路徑同物件 bit-exact。另修 fallback 接線:原本 fallbacks 裡的「column 冠軍」是 edge-seat 之後的版面,exact-area 的 raw 冠軍 `column_raw` 根本不在清單(`:1255-1262, :1374`),現已加為第三個 fallback。測試 `tests/test_partner_final_legal_guard.py` 13→18 passed;`-k "guard or legal or partner_final"` 151 passed。
-- 工件:`~/.claude/jobs/06af0e53/tmp/wt_areabug`(worktree,`PARTNER_AREA_TRACE`)、`atrace85.sh`;`artifacts/shadow/guardOff_x10_v3.json`。
+- 工件:`~/.claude/jobs/06af0e53/tmp/wt_areabug`(worktree,`PARTNER_AREA_TRACE`)、`atrace85.sh`;`artifacts/shadow_gate_runs/guardOff_x10_v3.json`。
 
 ### 18i. Chain W16 — FLOW_SLOTS=16 / NREF=12 vs FT2 現包 env(四套 ×4 交替序;06:40–07:16 UTC)→ **promote**
 
@@ -1085,7 +1085,7 @@ oracle 探針(tid 81–99,n=102–120,加權;`refine_prediction` + 出貨 post-p
 
 ### 18n. Flow fine-tune round 3(08-30 09:55 UTC 起,GPU0;`scratchpad/flow_ft_0830/STATUS.md`)
 
-從 round-2 250k 續訓,T=12 不變,lr 5e-6、warmup 1k、cosine→0.01×、150k 步、EMA 0.9998,**x0_loss 1.0→2.0、hpwl_loss 0.3→0.6**(對準 §18l 的缺口:尾帶預測座標精度)。種子用 `make_seed_checkpoint.py` 重建(lr 才會生效;loss 權重每步讀 args,resume-safe,已用 smoke jsonl 反證權重生效)。9.5–12 it/s,ETA 14:05–15:00 UTC。ckpt `artifacts/flow_ft_0830/flow_ft0830_ft250k_tailT12_lr5e-6_x02_hp06_s150k/step_00150000.pt`;匯出 `export_ema_only.py` → `artifacts/flow_ft_0830/flow_ft0830_tailT12_lr5e-6_x02_hp06_150k_ema.pt`。
+從 round-2 250k 續訓,T=12 不變,lr 5e-6、warmup 1k、cosine→0.01×、150k 步、EMA 0.9998,**x0_loss 1.0→2.0、hpwl_loss 0.3→0.6**(對準 §18l 的缺口:尾帶預測座標精度)。種子用 `make_seed_checkpoint.py` 重建(lr 才會生效;loss 權重每步讀 args,resume-safe,已用 smoke jsonl 反證權重生效)。9.5–12 it/s,ETA 14:05–15:00 UTC。ckpt `artifacts/flow_finetune_round3_0830_x0_hpwl_150k/flow_ft0830_ft250k_tailT12_lr5e-6_x02_hp06_s150k/step_00150000.pt`;匯出 `export_ema_only.py` → `artifacts/flow_finetune_round3_0830_x0_hpwl_150k/flow_ft0830_tailT12_lr5e-6_x02_hp06_150k_ema.pt`。
 Gate 已排隊 `scratchpad/rtaware/chainFT3.sh`:B′ env(FT2+s16)vs FT3+s16,四套 ×4 交替序,鏈尾印配對 Δ 與 76–89 帶 column 出貨數。風險:objective 改動(v2 postmortem +0.027 的類別),gate 沒過就不上。
 
 ### 18o. 解析式(LS / quadratic)seed 探針(deep-reasoner;`scratchpad/rtaware/ls_seed_probe.py`,同 §18l 的 19 案與 ladder 鏈)→ **否決,0/19 勝**
@@ -1100,7 +1100,7 @@ Gate 已排隊 `scratchpad/rtaware/chainFT3.sh`:B′ env(FT2+s16)vs FT3+s16,四�
 
 LS 的原始幾何不差(hpwl +2.6%),但 ladder 無法從純線長版面重建 boundary/grouping 結構(post V 0.105 vs golden seed 0.017)——與已否決的 ePlace 臂同一機制(§早期紀錄 :66-73,21/21 經 refine 後輸)。單案最好 tid 97 1.183 vs 出貨 1.075,沒有任何案能進 pool。另 LS 解未綁執行緒時 429 ms(OpenBLAS),也不預算中性。
 
-### 18p. 對手提供的面板(`shadow_hidden/self_gen_v2_1x_2x_3x.tar.gz`、`proxy.tar.gz`)— B′(FT2+s16)單 rep,08-30 13:50–14:07 UTC,load ~30
+### 18p. 對手提供的面板(`artifacts/shadow_hidden_suites/self_gen_v2_1x_2x_3x.tar.gz`、`proxy.tar.gz`)— B′(FT2+s16)單 rep,08-30 13:50–14:07 UTC,load ~30
 
 | 面板 | B′ noRT | hpwl / area / v_rel | 對手 A / B / C |
 |---|---|---|---|
@@ -1128,7 +1128,7 @@ LS 的原始幾何不差(hpwl +2.6%),但 ladder 無法從純線長版面重建 b
 
 official 進但 v3/v6 四 rep 一致退、v6 mid band column 出貨 0→9(§17t 型態輕微重現)→ 依「public + v3 + v5/v6」判準不上。x0/hpwl 加權讓模型更貼 public 分佈、shadow 退步。
 違規來源探針(deep-reasoner,`scratchpad/rtaware/vprobe.py`):Flow 原始樣本 V_rel **0.80**(bnd 29.6 / grp 15.0 / mib 3.6 加權計數),幾何卻貼 golden(hpwl −0.0006、area +0.013、overlap 0.45%);ladder 修掉 97.4% → 0.021(bnd 1.05 / grp 0.23 / mib 0),代價 hpwl 0.020 / area 0.041。訓練 loss 對齊審計:boundary_touch 對齊;cluster_gap 是弱代理(cluster 裂 15 塊仍 3.8e-5,加權無效);mib_aspect 對齊但 ladder 已修到 0。
-Round 4(`artifacts/flow_ft_0830b/`,bd 1.5 / cg 1.5 / mib 0.5,從 round-2 續訓,lr 5e-6,140k,ETA ~18:00 UTC)gate 鏈 `chainFT4.sh` 已排隊。
+Round 4(`artifacts/flow_finetune_round4_0830b_bd_cg_mib_140k/`,bd 1.5 / cg 1.5 / mib 0.5,從 round-2 續訓,lr 5e-6,140k,ETA ~18:00 UTC)gate 鏈 `chainFT4.sh` 已排隊。
 
 ### 18r. Runtime 剖析與微優化(deep-reasoner,08-30 16:00–16:56 UTC;patch `~/.claude/jobs/06af0e53/tmp/runtime_opt.patch`,備份 `backup_runtime/`)
 

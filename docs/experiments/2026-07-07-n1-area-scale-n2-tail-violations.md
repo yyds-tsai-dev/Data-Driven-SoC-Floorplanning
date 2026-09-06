@@ -48,5 +48,5 @@ D1/A/B/N1/N2 五連殺 + Q2 規則 INVALID + Q4 已內建 + Q5 無標的。**Tra
 ```bash
 FLOORSET_AREA_SCALE=0.991 bash scripts/eval_total.sh --output scale.json   # N1
 bash scripts/eval_total.sh --output control.json                            # 配對 control
-# N2:artifacts/eval_v11/floorplans/total_20260707_082831_2834378/top_cost_rank_*.png
+# N2:artifacts/legacy_floorset_arch_eval_floorplans/floorplans/total_20260707_082831_2834378/top_cost_rank_*.png
 ```

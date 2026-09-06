@@ -49,7 +49,7 @@ Final artifact hashes:
   `b4ebef4dcf625ae8a3b8271ff762b5e849e72d3f0f97a49f2641e2d92ec4b7ea`
 
 The immutable generated directory is
-`artifacts/icdc_g0_v2_area_full/` and remains ignored by Git.
+`artifacts/icdc_g0_v2_area_corpus/` and remains ignored by Git.
 
 ## Independent final checks
 

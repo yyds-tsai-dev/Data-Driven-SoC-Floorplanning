@@ -56,7 +56,7 @@ _SOURCE_SHA256 = "6b31e01c87ff1d8e157a116551dac31115b9de82ce7fe68e3ab1670daf872a
 _G0_AUTHORITY_MANIFEST_SHA256 = (
     "30902df28356748a0d83414eda193af9db2430274d6532a72b2e09b64d7b70dc"
 )
-_G0_AUTHORITY_PATH = _REPO / "artifacts/icdc_g0_v2_area_full/manifest.json"
+_G0_AUTHORITY_PATH = _REPO / "artifacts/icdc_g0_v2_area_corpus/manifest.json"
 _CANONICAL_DATA_ROOT = (_REPO / "FloorSet" / "floorset_lite").resolve()
 _FORBIDDEN_SOLVER_KEYS = {
     "PARTNER_GPU_ARM",

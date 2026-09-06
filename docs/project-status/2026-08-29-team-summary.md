@@ -96,6 +96,6 @@ public 1.08 沒達到。剩下的 ≈0.02 幾乎全在「column 通道出貨」�
 - 交接總覽:`docs/project-status/2026-08-28-final-sprint-handoff.md`(打包流程、方法鐵律、否決清單)
 - 逐項證據:`docs/experiments/2026-08-21-post-beta-p0-execution.md` §17o–17af
 - 官方 QA:`docs/official/C_QA_20260827.{pdf,txt}`
-- gate 結果 JSON/log:`artifacts/shadow/{p3,n,ft,rt,fc,fd,po,pl300,em}*`;dry run:`artifacts/shadow/dryrun{6,7}_pack_off.json`
+- gate 結果 JSON/log:`artifacts/shadow_gate_runs/{p3,n,ft,rt,fc,fd,po,pl300,em}*`;dry run:`artifacts/shadow_gate_runs/dryrun{6,7}_pack_off.json`
 - 今天用的鏈與工具:`scratchpad/gate_chains_0828/`(含 `dryrun7.sh`、壓力測試、beta 重放);fine-tune 配方:`scratchpad/flow_ft_0828/STATUS.md`
 - gate 工具:`scripts/gate/{run_gate5.sh,run_shadow.sh,analyze_pairs.py,band_pairs.py,ev_rt.py}`

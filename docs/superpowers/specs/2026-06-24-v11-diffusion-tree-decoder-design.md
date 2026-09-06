@@ -343,7 +343,7 @@ Full eval must save the ten highest-cost predicted floorplan PNGs after the run 
 Recommended output shape:
 
 ```text
-artifacts/eval_v11/floorplans/<run-stem>/
+artifacts/legacy_floorset_arch_eval_floorplans/floorplans/<run-stem>/
   top_cost_rank_01_case_<id>_cost_<value>.png
   top_cost_rank_02_case_<id>_cost_<value>.png
   top_cost_rank_03_case_<id>_cost_<value>.png
@@ -359,7 +359,7 @@ artifacts/eval_v11/floorplans/<run-stem>/
 Single-case eval should save:
 
 ```text
-artifacts/eval_v11/floorplans/<run-stem>/case_<id>_cost_<value>.png
+artifacts/legacy_floorset_arch_eval_floorplans/floorplans/<run-stem>/case_<id>_cost_<value>.png
 ```
 
 The evaluator already records per-case positions and costs, so the visualization change should render predicted solution positions rather than only ground truth. PNG generation failures should be reported but must not hide the numeric eval result.

@@ -57,7 +57,7 @@ One additional merged-main full-suite failure exposed a wall-clock-dependent any
 
 Do not add these directories to ordinary Git. They are generated, ignored by repository policy, or far above GitHub's practical limits.
 
-- Main worktree `artifacts/`: about 57 GB. This includes the immutable formal G0 evidence (`artifacts/icdc_g0_v2_area_full/`, about 946 MB) and topology work (`artifacts/icdc_topology/`, about 821 MB).
+- Main worktree `artifacts/`: about 57 GB. This includes the immutable formal G0 evidence (`artifacts/icdc_g0_v2_area_corpus/`, about 946 MB) and topology work (`artifacts/icdc_topology_prior_training/`, about 821 MB).
 - Main worktree `checkpoints/`: about 1.8 GB, excluding the separate flow worktree runs below.
 - Main worktree `wandb/`: about 624 MB.
 - Local `.git/lfs/objects/`: about 15 GB. This contains LFS payloads that are not yet on GitHub, including the requested flow-v1 checkpoint and newest submission archive.

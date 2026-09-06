@@ -2,7 +2,7 @@
 
 ## 已上傳
 - **`submission/FINAL_UPLOAD/cadc1013.tar.gz`,md5 `3f2cda42c88338fbb32d7670052fc895`**(B′:FT2 flow prior + FLOW_SLOTS16/NREF12 + legal guard 面積修復 + runtime 微優化 + mid 預算表)。
-- 最終演練(dry run 12,乾淨 py3.13 venv、官方 evaluator):**1.0858、100/100、avg 0.363 s、max 1.31 s、首案 0.050 s、cuda_available=True、flow step 250000、legal-guard 0 次**。逐案 JSON `artifacts/shadow/dryrun12_final_off.json`。
+- 最終演練(dry run 12,乾淨 py3.13 venv、官方 evaluator):**1.0858、100/100、avg 0.363 s、max 1.31 s、首案 0.050 s、cuda_available=True、flow step 250000、legal-guard 0 次**。逐案 JSON `artifacts/shadow_gate_runs/dryrun12_final_off.json`。
 - 隊友獨立複測:1.1174(他機、load 不同)、100/100、0 exception、兩顆模型載入——健康。
 - QA 合規核對:A14/A20/A21/A22/A25/A27、48 核/128GB、34 檔、無絕對路徑、requirements 全 pin(scipy 在列)。舊包 11 顆在 `submission/old_packages/`。
 
@@ -24,7 +24,7 @@ fine-tune round 3(x0/hpwl)與 round 4(bd/cg/mib 權重)、FLOW_SLOTS 20/24、ove
 3. locked 牆線類:由 boundary tag 線定框的表示法(現行「先定框後貼」到不了)。
 
 ## 工具索引
-gate:`scripts/gate/{run_gate5.sh,run_shadow.sh,analyze_pairs.py,band_pairs.py,ev_rt.py}`;runtime-aware:`scratchpad/rtaware/rt_pairs.py`;打包變體:`scratchpad/rtaware/apply_pack_variant.sh`;演練:`scratchpad/rtaware/dryrun12.sh`(B′)/`dryrun13.sh`(D′);探針:`scratchpad/rtaware/{golden_probe.py,vprobe.py,group_diag.py,bridge_budget_probe.py,ls_seed_probe.py}`;對手面板:`shadow_hidden/ext_selfgen/`、`ext_proxy/`。
+gate:`scripts/gate/{run_gate5.sh,run_shadow.sh,analyze_pairs.py,band_pairs.py,ev_rt.py}`;runtime-aware:`scratchpad/rtaware/rt_pairs.py`;打包變體:`scratchpad/rtaware/apply_pack_variant.sh`;演練:`scratchpad/rtaware/dryrun12.sh`(B′)/`dryrun13.sh`(D′);探針:`scratchpad/rtaware/{golden_probe.py,vprobe.py,group_diag.py,bridge_budget_probe.py,ls_seed_probe.py}`;對手面板:`artifacts/shadow_hidden_suites/ext_selfgen/`、`ext_proxy/`。
 
 ## 08-31 續壓(使用者授權「已繳交、再試」)— 全部不促轉,B′ 定案
 - R1 尾帶 floor-safe 加時(κ=0.232):四套 wash(off +0.0007/v3 −0.0026/v5 −0.0023/v6 −0.0003,CI 全含 0)。

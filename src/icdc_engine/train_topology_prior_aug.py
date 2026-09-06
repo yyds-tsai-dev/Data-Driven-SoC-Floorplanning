@@ -10,8 +10,8 @@ student is trained to be robust to the connectivity shift used by the
 ``alpha_1`` / ``p2b_1__b2b_1`` shadow-suite probes: pins/nets re-attached to
 blocks proportional to ``(1 - z)^alpha``, where ``z`` is a per-pin (P2B) or
 per-layout (B2B) min-max-normalized Manhattan distance computed against the
-*golden* layout for that instance.  See ``shadow_hidden/alpha_1/alpha_1/
-proxy_manifest.json`` and ``shadow_hidden/p2b_1__b2b_1/p2b_1__b2b_1/
+*golden* layout for that instance.  See ``artifacts/shadow_hidden_suites/alpha_1/alpha_1/
+proxy_manifest.json`` and ``artifacts/shadow_hidden_suites/p2b_1__b2b_1/p2b_1__b2b_1/
 proxy_manifest.json`` for the reference semantics this mirrors.
 
 Only training-time conditioning is perturbed; the sparse topology labels

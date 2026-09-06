@@ -19,7 +19,7 @@ cp "$ROOT/src/shipping/requirements.txt" "$PK/requirements.txt"
 # Flow prior = tail-tilted fine-tune of v1, 300k-step cosine anneal, EMA-only export
 # (docs .../post-beta-p0-execution.md Sec.17x-17ab; promoted 2026-08-28).
 cp "$ROOT/submission/cadc1013/checkpoints/flow_matching_ft0831_soupa50_250k_ema.pt" "$PK/checkpoints/flow_matching_ft0831_soupa50_250k_ema.pt"
-cp "$ROOT/artifacts/icdc_topology/checkpoints_s2_20k/best.pt" "$PK/checkpoints/direct_v2_student_s2.pt"
+cp "$ROOT/artifacts/icdc_topology_prior_training/checkpoints_s2_20k/best.pt" "$PK/checkpoints/direct_v2_student_s2.pt"
 # Optional block-count-routed TAIL flow prior (docs .../post-beta-p0-execution.md
 # Sec.17t).  Copied ONLY when FLOW_CKPT_TAIL points at an existing file at pack
 # time; op_wrapper ships the two env vars COMMENTED OUT, so a packaged tail

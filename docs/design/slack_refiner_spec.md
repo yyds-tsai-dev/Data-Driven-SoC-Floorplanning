@@ -3,7 +3,7 @@
 Status: approved for Step-1 implementation. Origin: deep-reasoner design pass,
 cross-checked by Codex peer review. Production backbone context: column-slicing
 legalizer (`src/floorset_arch/legalizer/`), measured total_score_no_runtime
-1.2428, 100/100 feasible (artifacts/eval_v11/phase0_column_backbone.json).
+1.2428, 100/100 feasible (artifacts/legacy_floorset_arch_eval_floorplans/phase0_column_backbone.json).
 
 ## Decision
 

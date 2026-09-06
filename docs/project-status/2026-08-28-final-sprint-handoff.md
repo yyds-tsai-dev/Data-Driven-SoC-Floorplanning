@@ -24,7 +24,7 @@ Full evidence log: `docs/experiments/2026-08-21-post-beta-p0-execution.md` §15�
   torch 2.6.0+cu124 / scipy 1.18.1 / numba 0.67.0 — official evaluator, load 24–28):
   `[selfcheck] cuda_available=True … flow_warm_latency=0.068s … seat_ts=kept 0.148 cpu_ratio=0.61 seat_r0=kept`,
   `loaded flow model step 300000`, `[legal-guard]` fired 0×, no `[pool-fallback]`/`[flowtail]`,
-  **1.1009, 100/100 feasible, avg 0.37 s, max 1.21 s, first case 0.052 s** (`artifacts/shadow/dryrun7_pack_off.json`).
+  **1.1009, 100/100 feasible, avg 0.37 s, max 1.21 s, first case 0.052 s** (`artifacts/shadow_gate_runs/dryrun7_pack_off.json`).
   Dry run 6 (same minus guard, load 36–43) was 1.1102; dry run 5 (0827 package, load 29) 1.1042 — all within ±0.01 rep noise.
 - Robustness evidence (§17ae/§17af): hidden has the SAME block-count distribution as public per test_id;
   under the same failure signature hidden is ≈ public except the n≥105 band (+0.04/case in area+violations,
@@ -46,7 +46,7 @@ Full evidence log: `docs/experiments/2026-08-21-post-beta-p0-execution.md` §15�
 |---|---|---|
 | public (official100) | 1.09–1.10 | 1.135–1.152 at session start (08-26) |
 | shadow v3 (stress) | 1.145–1.155 | |
-| shadow v5 (quantile 0.20, zero-MIB) | 1.11–1.13 | best hidden proxy (see README in shadow_hidden/) |
+| shadow v5 (quantile 0.20, zero-MIB) | 1.11–1.13 | best hidden proxy (see README in artifacts/shadow_hidden_suites/) |
 | shadow v6 (quantile 0.50) | 1.12–1.14 | |
 | alpha_1 | 1.20–1.22 | synthetic pin shift; secondary only |
 
@@ -62,7 +62,7 @@ Pessimistic contest estimate (M = 1.45 CPU factor, gate thresholds scaled): publ
   run_shadow.sh exports the canonical base env INCLUDING `PARTNER_COORD_POLISH=1` — always pass
   `PARTNER_COORD_POLISH=` (empty) to keep polish off; `=0` does NOT disable it.
 - **New (08-28, §17y/§17aa): a knob only enters the package after `full candidate env vs current package env` in ONE chain, ×4 with both arm orders.** Two knobs that each gated "significant" in their own 4-rep chains (polish headroom 0.6, ANTITHETIC=0) were +0.005 / runtime +8% when stacked and measured directly against the package env; ±0.01 effects are not resolvable on this box (bootstrap-over-cases CIs ignore rep-level load variance).
-- `run_shadow.sh` now tees the full evaluator output to `artifacts/shadow/<tag>.log` (selfcheck lines visible); `scripts/gate/band_pairs.py` gives per-band paired deltas + column/direct-shipped counts.
+- `run_shadow.sh` now tees the full evaluator output to `artifacts/shadow_gate_runs/<tag>.log` (selfcheck lines visible); `scripts/gate/band_pairs.py` gives per-band paired deltas + column/direct-shipped counts.
 - Always pass `PARTNER_SEAT_R0_ADAPT=0` (it is the default now; the CPU benchmark is unusable as a gate).
 - Single-case runs are useless for the model arms (first-case sampler cold start closes the arm).
 - One evaluator at a time on the box; chains run as `setsid nohup bash chain.sh`; GPU 3 for evals.
@@ -81,7 +81,7 @@ LADDER_REBUDGET (+SECURE_MIN): v6 −0.009 but public wash with 3× rep variance
 ## 5. Running / open (updated 08-28 12:00)
 
 - Nothing is running and nothing is queued. Ladder/seat track closed (§17ad: ≤0.002 headroom); slow-CPU emulation confirms the 300k swap is safe (§17ac). GPU 2/3 are free; the fine-tune finished at step 300000
-  (`artifacts/flow_ft_0828/flow_ft0828_ftv1_tailT24_w0-89_lr2e-5_wu1k_bs12_s300k/`, recipe in
+  (`artifacts/flow_finetune_round1_0828_tailT24_300k/flow_ft0828_ftv1_tailT24_w0-89_lr2e-5_wu1k_bs12_s300k/`, recipe in
   `scratchpad/flow_ft_0828/STATUS.md`; launcher/exporters copied to `scratchpad/flow_ft_0828/`).
 - (Closed 08-28 13:00: user decided to focus on our own solver; the classmate-model thread is dropped.) For the record: a classmate's model reportedly scores 1.005–1.02 on the official 100.
   Interface cannot leak (target_positions carries only preplaced xywh / fixed wh); the validation
@@ -105,7 +105,7 @@ them; frame pinning trades HPWL for it) + area 0.018 (rung-0 frame 1.02·area_re
   v3 31/100, weighted excess ≈+0.009 each; §17ad) — a candidate-quality (model) problem. Every solver-side
   knob family has now been measured to the noise floor; do not re-open them.
 - Evidence for every decision today: `docs/experiments/2026-08-21-post-beta-p0-execution.md` §17o–17ab;
-  gate JSONs + full logs in `artifacts/shadow/{p3*,n*,ft*,rt*,fc*,fd*,po*,pl300*}_*.{json,log}`;
+  gate JSONs + full logs in `artifacts/shadow_gate_runs/{p3*,n*,ft*,rt*,fc*,fd*,po*,pl300*}_*.{json,log}`;
   chain scripts archived in `scratchpad/gate_chains_0828/`.
 - Official QA 0827 (Q17–Q29) summarised in §17u: same hidden set as beta; op_wrapper used as shipped;
   init warm-up untimed; eval box driver 580 / CUDA 13.0 / torch 2.12+cu130 — our pinned torch 2.6.0

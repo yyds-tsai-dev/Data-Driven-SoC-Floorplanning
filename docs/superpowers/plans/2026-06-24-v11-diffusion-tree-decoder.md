@@ -2091,7 +2091,7 @@ if written_pngs:
 In `scripts/eval_single.sh`, before running evaluator, define:
 
 ```bash
-FLOORPLAN_DIR="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/single_case_${TESTID}}"
+FLOORPLAN_DIR="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/legacy_floorset_arch_eval_floorplans/floorplans/single_case_${TESTID}}"
 ```
 
 Add to the evaluator command:
@@ -2103,7 +2103,7 @@ Add to the evaluator command:
 In `scripts/eval_total.sh`, inside `run_evaluator()`, define:
 
 ```bash
-local floorplan_dir="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/eval_v11/floorplans/latest_total}"
+local floorplan_dir="${FLOORSET_EVAL_FLOORPLAN_DIR:-$ROOT/artifacts/legacy_floorset_arch_eval_floorplans/floorplans/latest_total}"
 ```
 
 Add to the evaluator command:
@@ -2288,13 +2288,13 @@ Expected: PASS and output identifies `ArchitectureV11Optimizer`.
 Run:
 
 ```bash
-bash scripts/eval_single.sh 95 --output artifacts/eval_v11/single_95.json
+bash scripts/eval_single.sh 95 --output artifacts/legacy_floorset_arch_eval_floorplans/single_95.json
 ```
 
 Expected:
 
-- evaluator writes `artifacts/eval_v11/single_95.json`
-- one PNG exists under `artifacts/eval_v11/floorplans/single_case_95/`
+- evaluator writes `artifacts/legacy_floorset_arch_eval_floorplans/single_95.json`
+- one PNG exists under `artifacts/legacy_floorset_arch_eval_floorplans/floorplans/single_case_95/`
 - if no diffusion checkpoint exists, result metadata or trace shows `v5_no_diffusion_checkpoint`
 
 - [ ] **Step 5: Run graphify update**

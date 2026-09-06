@@ -17,7 +17,7 @@ heldout/train split in ``src/icdc_engine/topology_data.py``
 Usage:
     uv run scripts/probes/pseudo_hidden_eval.py \\
         --sample-per-n 5 --n-min 21 --n-max 120 --seed 20260821 \\
-        --split heldout --out artifacts/p0_newbox/pseudo_hidden_<tag>.json \\
+        --split heldout --out artifacts/newbox_gate_runs_0821/pseudo_hidden_<tag>.json \\
         --tag <tag> [--limit N]
 
 The caller is responsible for exporting whatever ``PARTNER_*`` /

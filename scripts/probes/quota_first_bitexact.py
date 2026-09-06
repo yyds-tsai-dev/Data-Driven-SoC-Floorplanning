@@ -30,7 +30,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
 os.environ.setdefault(
     "DIRECT_CKPT",
     "/ldaphome/yyds-tsai-dev/Data-Driven-SoC-Floorplanning/"
-    "artifacts/icdc_topology/checkpoints_s2_20k/best.pt")
+    "artifacts/icdc_topology_prior_training/checkpoints_s2_20k/best.pt")
 FLOW_CKPT = (
     "/ldaphome/yyds-tsai-dev/Data-Driven-SoC-Floorplanning/"
     "submission/cadc1013/checkpoints/flow_matching_v1_final.pt")

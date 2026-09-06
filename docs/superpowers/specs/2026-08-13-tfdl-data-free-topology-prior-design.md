@@ -527,7 +527,7 @@ Direct/3 Flow, Direct raw hashes differ, Flow raw hashes are identical, and at
 least one predeclared witness changes after ranking or in the final layout.
 
 Freeze the held-out-selected candidate at
-`artifacts/icdc_topology/checkpoints/g1_n100_3d3f.pt` plus an immutable manifest.
+`artifacts/icdc_topology_prior_training/checkpoints/g1_n100_3d3f.pt` plus an immutable manifest.
 The manifest binds the candidate, the C0 submission Direct checkpoint, the Flow
 checkpoint, source training checkpoint, portfolio, teacher data, held-out
 audit, schedule, seeds, and source commit by SHA256. The known input identities
