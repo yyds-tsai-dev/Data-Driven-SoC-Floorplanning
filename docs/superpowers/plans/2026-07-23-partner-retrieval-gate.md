@@ -25,7 +25,7 @@
 - Create `src/solver/retrieval_index_claude.py`: per-`n` train-only shards, manifest validation, and top-K query.
 - Create `src/solver/retrieval_matching_claude.py`: O(n^3) Hungarian assignment with compatibility guards.
 - Create `src/solver/retrieval_transfer_claude.py`: D4-aware coherent layout transfer and hard-anchor projection.
-- Create `scripts/build_partner_retrieval_index.py`: bounded, reproducible training-index builder.
+- Create `scripts/build_retrieval_index.py`: bounded, reproducible training-index builder.
 - Create `scripts/probes/retrieval_probe.py`: held-out query, raw-transfer, and repaired-candidate diagnostics.
 - Modify `src/solver/my_opt_claude.py`: opt-in retrieval source using fixed quotas.
 - Create focused tests under `tests/test_partner_retrieval_*.py`.
@@ -531,7 +531,7 @@ git commit -m "feat: match and transfer retrieved layouts"
 ### Task 4: Reproducible Index Builder and Offline Probe
 
 **Files:**
-- Create: `scripts/build_partner_retrieval_index.py`
+- Create: `scripts/build_retrieval_index.py`
 - Create: `scripts/probes/retrieval_probe.py`
 - Test: `tests/test_partner_retrieval_scripts.py`
 
@@ -550,7 +550,7 @@ import sys
 
 def test_retrieval_builder_help_is_noninteractive():
     result = subprocess.run(
-        [sys.executable, "scripts/build_partner_retrieval_index.py", "--help"],
+        [sys.executable, "scripts/build_retrieval_index.py", "--help"],
         capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0
@@ -558,7 +558,7 @@ def test_retrieval_builder_help_is_noninteractive():
 
 
 def test_builder_source_split_is_not_configurable():
-    text = Path("scripts/build_partner_retrieval_index.py").read_text()
+    text = Path("scripts/build_retrieval_index.py").read_text()
     assert "--source-split" not in text
     assert 'source_split="train"' in text
 ```
@@ -602,14 +602,14 @@ Run: `uv run pytest tests/test_partner_retrieval_scripts.py -q`
 
 Expected: both tests PASS.
 
-Run: `uv run python scripts/build_partner_retrieval_index.py --data-path FloorSet --output artifacts/retrieval/pilot --max-per-n 2 --seed 17`
+Run: `uv run python scripts/build_retrieval_index.py --data-path FloorSet --output artifacts/retrieval/pilot --max-per-n 2 --seed 17`
 
 Expected: manifest reports `source_split=train`, at most two records per present block count, and `RetrievalIndex.load()` succeeds.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add scripts/build_partner_retrieval_index.py scripts/probes/retrieval_probe.py tests/test_partner_retrieval_scripts.py
+git add scripts/build_retrieval_index.py scripts/probes/retrieval_probe.py tests/test_partner_retrieval_scripts.py
 git commit -m "feat: build and probe train-only retrieval index"
 ```
 

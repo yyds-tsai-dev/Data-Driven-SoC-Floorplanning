@@ -1092,7 +1092,7 @@ git commit -m "feat: add endpoint guidance hook to flow sampler"
 ### Task 12: numba SA 內迴圈(profile 先行;獨立軌)
 
 **Files:**
-- Create: `scripts/probes/profile_partner_sa.py`;視 profile 結果 Modify `src/solver/legalizer_claude.py`
+- Create: `scripts/probes/profile_solver_sa.py`;視 profile 結果 Modify `src/solver/legalizer_claude.py`
 - Test: `tests/test_partner_sa_numba_equiv.py`(new)
 
 - [ ] **Step 1: Profile 單案(n=120)找熱點**
@@ -1128,7 +1128,7 @@ def _pack_cost_nb(order, widths, heights, col_break, frame_w):
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/solver/legalizer_claude.py scripts/probes/profile_partner_sa.py tests/test_partner_sa_numba_equiv.py
+git add src/solver/legalizer_claude.py scripts/probes/profile_solver_sa.py tests/test_partner_sa_numba_equiv.py
 git commit -m "perf: numba-accelerate SA inner loop"
 ```
 

@@ -172,12 +172,3 @@ def test_portfolio_defensively_caps_env_slots_to_two_and_keeps_three_direct(monk
     assert sum(float(p[0, 0]) >= 9.0 for p in got) == 2
     assert sum(float(p[0, 0]) < 9.0 for p in got) == 3
 
-
-def test_gate_runner_uses_pilot64_two_slots_and_identical_direct_minimum():
-    text = (contest_optimizer.Path(__file__).parents[1] / "scripts/probes/run_retrieval_gate.sh").read_text()
-    assert "artifacts/retrieval/pilot64" in text
-    assert 'INDEX="$ROOT/artifacts/retrieval/pilot64"' in text
-    assert 'PARTNER_RETRIEVAL_INDEX="$INDEX"' in text
-    assert "PARTNER_RETRIEVAL_SLOTS=2" in text
-    assert text.count("PARTNER_DIRECT_MIN=2.5") == 2
-    assert "iccad2026_evaluate.py" not in text

@@ -7,7 +7,6 @@ Thumbs.db
 # periodic step_*.pt ladders are tens of GB). Shipped checkpoints live under
 # submission/ (git-ignored) and artifacts/ (git-ignored).
 *.pt
-!checkpoints/*.pt
 
 # Python
 __pycache__/
@@ -55,7 +54,7 @@ tmp/
 *_results.json
 *.log
 artifacts/
-checkpoints/*/
+checkpoints/
 LiteTensorDataTest/*
 smoke.*
 wandb/

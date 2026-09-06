@@ -37,7 +37,7 @@ sys.path.insert(0, str(ROOT / "src" / "solver"))
 
 DEFAULT_FLOW = ("/nashome/NVL4/vdalab/yyds-dev/codex-worktrees/"
                 "flow-matching-f1-f3/checkpoints/flow_matching_overfit/final.pt")
-DEFAULT_DIRECT = str(ROOT / "partner/checkpoints/direct_v2_cont/eval_retrieval_direct_control.pt")
+DEFAULT_DIRECT = str(ROOT / "artifacts/direct_v2_continuation_checkpoints/direct_v2_cont/eval_retrieval_direct_control.pt")
 CASES = [0, 49, 79, 88, 93, 96, 99]
 
 

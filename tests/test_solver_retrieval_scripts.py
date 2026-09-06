@@ -14,8 +14,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_builder_module():
-    path = REPO_ROOT / "scripts" / "build_partner_retrieval_index.py"
-    spec = importlib.util.spec_from_file_location("build_partner_retrieval_index", path)
+    path = REPO_ROOT / "scripts" / "build_retrieval_index.py"
+    spec = importlib.util.spec_from_file_location("build_retrieval_index", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -78,7 +78,7 @@ def _evaluation_sample(area, constraints=None, polygons=None):
 
 def test_retrieval_builder_help_is_noninteractive_and_exposes_required_flags():
     result = subprocess.run(
-        [sys.executable, "scripts/build_partner_retrieval_index.py", "--help"],
+        [sys.executable, "scripts/build_retrieval_index.py", "--help"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -105,7 +105,7 @@ def test_probe_help_is_noninteractive_and_exposes_required_flags():
 
 
 def test_builder_is_hard_coded_to_the_training_split_only():
-    text = (REPO_ROOT / "scripts" / "build_partner_retrieval_index.py").read_text()
+    text = (REPO_ROOT / "scripts" / "build_retrieval_index.py").read_text()
 
     assert "--source-split" not in text
     assert 'source_split="train"' in text
