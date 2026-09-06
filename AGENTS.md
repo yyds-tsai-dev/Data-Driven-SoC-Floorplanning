@@ -2,28 +2,28 @@
 
 ## Project Structure & Module Organization
 
-This is a Python 3.12 `uv` project for the ICCAD 2026 FloorSet SoC floorplanning challenge. Active solver code lives in `src/floorset_arch/`; `src/architecture_v5_optimizer.py` is the evaluator-facing wrapper. Training code is under `src/floorset_arch/training/`, neural models under `src/floorset_arch/nn/`, and focused solver modules include `optimizer.py`, `repair.py`, `budget_layer.py`, `v10_proxy.py`, and `quality_portfolio.py`. `tests/` contains pytest coverage. `scripts/` holds install, train, validate, and evaluator workflows. `FloorSet/` is the contest submodule/data area. Treat `checkpoints/`, `artifacts/`, and `wandb/` as generated or evidence outputs unless a doc explicitly references a file.
+Python 3.12 `uv` project for the ICCAD 2026 FloorSet SoC floorplanning challenge (team `cadc1013`). Since the 2026-09-06 cleanup the repo holds only the final-submission path: `src/solver/` is the shipped solver (flat import closure of `contest_optimizer.py`; module names are the names inside the contest tarball, keep them), `src/shipping/` the contest entry point `op_wrapper.py` plus `requirements.txt` and the budget table, `src/icdc_engine/` the topology-prior trainer behind the shipped direct checkpoint. `scripts/` holds packaging (`pack_cadc1013.sh`), evaluation (`eval_*.sh`, `validate.sh`), release rehearsal (`release/`), gate chains (`gate/`), flow fine-tune launchers (`training/flow_finetune/`) and probes. `tests/` is pytest (`test_solver_*`, `test_icdc_engine_*`). `docs/` is the complete evidence trail. `FloorSet/` is the contest submodule. `artifacts/` and `submission/` are git-ignored outputs (packages, checkpoints, gate results, shadow suites).
 
 ## Build, Test, and Development Commands
 
-- `bash scripts/install.sh`: initialize submodules, install `uv`, create the venv, install dependencies, and run a smoke evaluator check.
-- `uv run pytest`: run the full test suite configured by `pyproject.toml`.
-- `uv run pytest tests/test_budget_layer.py -q`: run a targeted test file during solver-policy changes.
-- `bash scripts/validate.sh`: validate the submission interface for `src/architecture_v5_optimizer.py`.
-- `bash scripts/eval_single.sh 95`: evaluate one validation case with diagnostics.
-- `bash scripts/eval_total.sh`: run the full 100-case evaluator and report runtime plus no-runtime totals.
+- `bash scripts/install.sh`: initialize submodules, install `uv`, create the venv, install dependencies, run a smoke evaluator check.
+- `uv run pytest`: full suite; `uv run pytest tests/test_solver_final_legal_guard.py -q` for a targeted file.
+- `bash scripts/pack_cadc1013.sh <out_dir>`: build the contest package from `src/`.
+- `bash scripts/validate.sh` / `bash scripts/eval_single.sh 95` / `bash scripts/eval_total.sh`: official evaluator on the package (packs into `artifacts/eval_package/` on demand; `REPACK=1` forces a rebuild; pass an unpacked package dir to evaluate that instead).
+- `bash scripts/release/rehearse_package.sh`: pre-upload rehearsal in a clean venv built from the package's own requirements.
+- `bash scripts/gate/run_gate5.sh <tag> KEY=VAL ...`: official + shadow v3/v5/v6 gate chain.
 
 ## Coding Style & Naming Conventions
 
-Use 4-space indentation, `snake_case` for functions and variables, `PascalCase` for classes, and typed dataclasses where they clarify solver state. Keep imports grouped as standard library, third party, then local modules. Prefer small, explicit functions around geometry, scoring, and repair decisions. Environment toggles should use the `FLOORSET_` prefix and be documented near the workflow that consumes them.
+Use 4-space indentation, `snake_case` for functions and variables, `PascalCase` for classes, and typed dataclasses where they clarify solver state. Keep imports grouped as standard library, third party, then local modules. Prefer small, explicit functions around geometry, scoring, and repair decisions. Solver toggles use the `PARTNER_` prefix, are read via `os.environ`, and are set for the package in `src/shipping/op_wrapper.py`; document each near the code that consumes it and cite its gate evidence.
 
 ## Testing Guidelines
 
-Tests use `pytest`; new tests should be named `tests/test_<feature>.py` and should cover both normal placement behavior and edge cases around constraints, runtime gates, or v10 scoring. For solver changes, run targeted pytest first, then `uv run pytest`; use `scripts/validate.sh` or evaluator scripts when the submission path changes.
+Tests use `pytest`; new tests should be named `tests/test_<feature>.py` and should cover both normal placement behavior and edge cases around constraints, budgets and the legal guard. For solver changes, run targeted pytest first, then `uv run pytest`; any change to a shipped module needs a gate run (`scripts/gate/`) and a repack check (`scripts/pack_cadc1013.sh`, `diff -r` against the uploaded package).
 
 ## Commit & Pull Request Guidelines
 
-Recent history uses concise Conventional-style subjects such as `docs: ...`, `refactor: ...`, and `chore: ...`. Keep commits focused and avoid bundling checkpoint noise with code or docs. PRs should summarize the changed solver path, list tests/evaluator commands run, and include score evidence when behavior affects v10 ranking or runtime.
+Recent history uses concise Conventional-style subjects such as `docs: ...`, `refactor: ...`, and `chore: ...`. Keep commits focused and avoid bundling checkpoint noise with code or docs. PRs should summarize the changed solver path, list tests/evaluator commands run, and include gate evidence (official + shadow suites, paired reps) when behavior affects score or runtime.
 
 ## Agent-Specific Instructions
 

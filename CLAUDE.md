@@ -4,108 +4,79 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A solver for the **ICCAD 2026 FloorSet SoC floorplanning challenge**. Given a set of blocks with area targets, connectivity, pins, and hard/soft constraints, the solver produces non-overlapping rectilinear block placements that are scored by an official evaluator. Python 3.12, managed with `uv`.
+Team `cadc1013`'s solver for the **ICCAD 2026 FloorSet SoC floorplanning challenge** (Problem C). Given blocks with area targets, connectivity, pins and hard/soft constraints, produce non-overlapping `(x, y, w, h)` placements scored by the official evaluator. Python 3.12, managed with `uv`.
 
-The contest harness, data loaders, cost functions, and official evaluator live in the `FloorSet/` git submodule (`https://github.com/IntelLabs/FloorSet.git`) — treat it as read-only vendored code. Active solver code lives in `src/floorset_arch/`.
+The contest closed 2026-08-31. On 2026-09-06 the repo was pruned to the **final-submission path only**: the shipped package source (`src/`), the tooling that produced its checkpoints and packages, and the full evidence trail in `docs/`. Mapping of everything that moved or was removed: [docs/project-status/2026-09-06-repo-cleanup.md](docs/project-status/2026-09-06-repo-cleanup.md). The official harness, loaders and evaluator live in the read-only `FloorSet/` submodule.
 
 ## Commands
 
-Everything runs through `uv run` (the venv is uv-managed; never call `python` directly). Scripts are `#!/bin/bash` — invoke them with `bash scripts/...` even though the interactive shell here is tcsh.
+Everything runs through `uv run` (never call `python` directly). Scripts are `#!/bin/bash`; invoke them with `bash scripts/...`.
 
 ```bash
-bash scripts/install.sh              # init submodules, create venv, install deps, smoke-test evaluator
-uv run pytest                        # full test suite (pyproject sets -s, testpaths=tests)
-uv run pytest tests/test_v10_proxy.py -q   # single test file (do this first for solver-policy changes)
-uv run pytest tests/test_repair.py::test_name  # single test
+bash scripts/install.sh                         # submodules, venv, deps, evaluator smoke test
+uv run pytest                                   # full suite (pyproject: -s, testpaths=tests)
+uv run pytest tests/test_solver_final_legal_guard.py -q
 
-bash scripts/validate.sh             # validate the submission interface (src/architecture_v11_optimizer.py)
-bash scripts/eval_single.sh 95       # evaluate ONE validation case (id 95) with diagnostics
-bash scripts/eval_total.sh           # full 100-case evaluator; reports runtime + no-runtime totals
+bash scripts/pack_cadc1013.sh <out_dir>         # build <out_dir>/cadc1013.tar.gz from src/solver + src/shipping
+bash scripts/validate.sh                        # official --validate on the package (packs into artifacts/eval_package/ if needed)
+bash scripts/eval_single.sh 95                  # one validation case
+bash scripts/eval_total.sh                      # all 100 cases -> artifacts/eval_runs/total_<ts>.json + summary line
+REPACK=1 bash scripts/eval_total.sh             # force a fresh pack first
+bash scripts/eval_total.sh <package_dir>        # evaluate an existing unpacked package
+
+bash scripts/release/rehearse_package.sh        # pack -> extract -> clean venv from the package's requirements -> official evaluator
+bash scripts/release/apply_pack_variant.sh ft2 s16   # switch the working tree to the B' shipping variant (no args = 0828b)
+bash scripts/gate/run_gate5.sh <tag> ENV=VAL ... # official + shadow v3/v5/v6 gate run
 ```
 
-**Evaluating checkpoints** (`eval_total.sh` argument forms):
-
-```bash
-bash scripts/eval_total.sh some_gnn_best.pt                 # GNN guidance checkpoint (checkpoints/ relative)
-bash scripts/eval_total.sh --diffusion-checkpoint diffusion_latest.pt --diffusion-use-ema
-bash scripts/eval_total.sh --best-since-0512                # rank all dated *best*.pt checkpoints
-bash scripts/eval_total.sh <ckpt> --output eval.json        # write full result JSON
-```
-
-The eval/validate scripts `cd` into `FloorSet/iccad2026contest`, set `PYTHONPATH`, and source `.env`. Run the evaluator through these scripts — invoking `iccad2026_evaluate.py` by hand without that setup will fail on imports.
-
-**Training** (each script exposes tunables as `UPPER_CASE` env overrides and tees a `train_arch_v11_*.log`):
-
-```bash
-bash scripts/train_diffusion.sh      # v11 graph-conditioned diffusion prior (current focus) -> floorset_arch.training.train_diffusion
-bash scripts/train_hgt.sh            # Anchor-GNN, HGT encoder    -> floorset_arch.training.train
-bash scripts/train.sh                # Anchor-GNN, MPNN encoder (default)
-bash scripts/train_transformer.sh    # Anchor-GNN, graph-transformer encoder
-bash scripts/train_diffusion_eval_probe.sh   # deliberate overfit probe on the 100 eval cases (diagnostic only)
-bash scripts/promote_checkpoint.sh   # promote a checkpoint -> floorset_arch.training.promote_checkpoint
-```
-
-`scripts/update.sh` auto-`git add -A` + commit + push — do not run it casually.
+The eval scripts `cd` into `FloorSet/iccad2026contest` and set `PYTHONPATH`; run the evaluator through them.
 
 ## Architecture
 
-### Submission interface
+### The shipped package
 
-The contest calls a `FloorplanOptimizer` subclass's `solve(block_count, area_targets, b2b_connectivity, p2b_connectivity, pins_pos, constraints, target_positions)` and expects a list of `(x, y, w, h)` rectangles. The contest-facing entrypoint is [src/architecture_v11_optimizer.py](src/architecture_v11_optimizer.py), a thin wrapper exposing `MyOptimizer`/`ContestOptimizer = ArchitectureV11Optimizer`. `src/architecture_v5_optimizer.py` is a compatibility alias. The real logic is `ArchitectureV11Optimizer` in [src/floorset_arch/optimizer.py](src/floorset_arch/optimizer.py).
+`scripts/pack_cadc1013.sh` copies the import closure of `src/solver/contest_optimizer.py` (26 modules, listed by `scripts/probes/package_closure.py`) flat into `cadc1013/`, renames the entry to `op_src.py`, adds `src/solver/synth_instances.py` (JIT warm-up), `src/shipping/op_wrapper.py` (the contest entry point: sets every promoted env knob via `os.environ.setdefault`, warms numba kernels and the worker pool in `__init__`), `src/shipping/requirements.txt`, and two checkpoints (`flow_matching_*.pt` from `submission/cadc1013/checkpoints/`, `direct_v2_student_s2.pt` from `artifacts/icdc_topology_prior_training/checkpoints_s2_20k/best.pt`).
 
-### `solve()` — the Production Solver Path
+**Module names inside `src/solver/` are the module names inside the tarball. Do not rename them, and do not edit shipped modules without gate evidence** — a repack from `src/` is expected to `diff -r` clean against the uploaded package.
 
-**Production path (promoted 2026-07-05 on Evaluator Evidence: 1.238–1.246 vs 2.1158, 100/100 feasible; see [docs/experiments/2026-07-05-column-backbone-pivot.md](docs/experiments/2026-07-05-column-backbone-pivot.md)):** when `FLOORSET_COLUMN_BACKBONE=1` (the `.env` default), `solve()` short-circuits into the **column-slicing backbone** in `src/floorset_arch/legalizer/` (vendored teammate solver): heuristic centroid seed → column-slicing + parallel-restart SA legalizer (overlap-free / exact-area / MIB-consistent **by construction**) → optional slack refiner in `src/floorset_arch/refine/` (`FLOORSET_SLACK_REFINE`, `_ASPECT`, `_VSNAP`; pure function that returns its input on any guard failure) → guaranteed-feasible row fallback on exception. Pure CPU; consumes **no** model checkpoint — the backbone's seed channel is measured dead (GT-coordinate seeds move the total < 0.002; probe: `scripts/probes/gt_seed_optimizer.py`).
+### `solve()` pipeline (`src/solver/contest_optimizer.py`)
 
-Legacy paths (unset `FLOORSET_COLUMN_BACKBONE` to reach them): `solve()` parses inputs into an `Instance` (`parser.py`), then chooses ONE of two priors:
+Per case, a wall-clock budget from `PARTNER_BUDGET_TABLE` (per-n seconds, `src/shipping/budget_table_mid.txt`):
 
-1. **v11 diffusion path** — taken when `FLOORSET_DIFFUSION_CHECKPOINT` is set. Sample a graph-conditioned diffusion prior → concretize to placements → repair → rank → best. Lives in `src/floorset_arch/diffusion/` (`sampling.py`, `concretize.py`, `ranking.py`). Validation: 3.3894.
-2. **v5 Anchor-GNN path** — fallback when no diffusion checkpoint. Load Anchor-GNN guidance (or a deterministic `surrogate_guidance` when no GNN checkpoint) → build candidates with the hetero-graph beam decoder over MER/skyline slots → select best via the v10 proxy. Validation: 2.1007–2.19 across checkpoints.
+1. **Candidates** — `candidate_supply.py` allocates slots to the flow prior (`flow_matching_model.py`, `FLOW_CKPT`, 8-step Euler antithetic, 16 slots), the direct topology-prior student (`direct_diffusion_model.py` / `direct_diffusion_train_v2.py`, `DIRECT_CKPT`, DPM++ 2 steps) and a deterministic heuristic seed. Retrieval (`retrieval_*.py`) is opt-in and not shipped.
+2. **Column-slicing SA legalizer** — `column_sa_legalizer.py` + `sa_numeric_kernel.py` (+ `csa_coordinate_solver.py`, `column_lns.py`): overlap-free / exact-area / fixed-and-preplaced-preserving **by construction**, then a numba SA under the budget on HPWL, bbox area and soft violations, 24 parallel restart workers.
+3. **Refine ladder** — `layout_refiner.py` + `refine_numeric_kernel.py`, `violation_killer.py` (grouping DAG bridge), `frame_repack.py`, `tag_compress.py`, `coord_polish.py`, `noise_optimization.py`, `physics_guidance.py`: edge seat, wall repair, tag compress, frame scale 1.02, final seat.
+4. **Selection + guard** — candidates ranked on evaluator-form cost; `PARTNER_FINAL_LEGAL_GUARD=1` re-checks the final layout with evaluator-faithful predicates and falls back (area repair, then a verified-legal column layout) only on failure.
 
-Both priors are advisory; the decoder + repair + ranking produce the final legal layout. Hard legality (no overlaps/missing blocks/fixed-shape or preplaced violations) always precedes soft-constraint refinement.
+`src/icdc_engine/` is the IC/DC engine and the topology-prior trainer that produced the shipped direct checkpoint (`train_topology_prior.py`, `engine.py`, `g1_runtime.py` holds the canonical solver env for gate runs). `scripts/training/flow_finetune/` holds the round 1–4 fine-tune launchers behind the shipped flow prior (trainer = `src/solver/flow_matching_train.py`).
 
-### `src/floorset_arch/` module map
+### Data
 
-- `optimizer.py` — orchestrates `solve()`; reads all `FLOORSET_*` runtime toggles.
-- `legalizer/` — **production backbone**: `column_slicing.py` (vendored column-slicing + parallel-restart SA legalizer; do not hand-edit without eval evidence) and `column_backbone.py` (seed, time budget, refiner budget carve-out, row fallback).
-- `refine/` — slack refiner on top of the legal layout: `constraint_graph.py` (axis separation DAGs), `slack_solve.py` (weighted-median projected sweeps), `aspect.py`, `vsnap.py` (boundary wall snap + bounded reorder), `guards.py` (evaluator-faithful, shapely-backed), `api.py` (failure containment). Spec in [docs/design/slack_refiner_spec.md](docs/design/slack_refiner_spec.md); invariant tests in `tests/test_refine_invariants.py`.
-- `parser.py`, `hetero_graph.py`, `features.py` — build the `Instance` and the Heterogeneous Floorplan Graph (typed block/pin/cluster/MIB/boundary nodes).
-- `constructive.py`, `geometry.py`, `relative_order.py` — beam decoder, MER/skyline slot candidates, geometry helpers.
-- `repair.py` — hard-legality + soft-constraint repair (multiple repair profiles).
-- `scoring.py`, `v10_proxy.py` — evaluator-style scoring, and the solver-internal V10 no-runtime acceptance proxy for candidate/repair selection.
-- `budget_layer.py`, `risk_budget.py`, `quality_portfolio.py` — the V10 Evidence-Gated / Conditional Runtime budget layer and opt-in sample-local quality portfolio, gating extra per-sample search.
-- `surrogate_guidance.py` — deterministic guidance when running with no GNN checkpoint.
-- `models.py` — `SolverConfig`, `Placement`, `CandidateSpec`, and other dataclasses.
-- `nn/model.py` — Anchor-GNN (selectable MPNN / graph-transformer / HGT encoder; shared anchor/priority/aspect/pairwise heads).
-- `diffusion/` — v11: `contracts.py`, `graph_inputs.py`, `targets.py`, `model.py`, `sampling.py`, `concretize.py`, `ranking.py`, `layout_losses.py`, `training.py`.
-- `training/` — `train.py` (Anchor-GNN), `train_diffusion.py` (v11), plus `checkpoint.py`, `promote_checkpoint.py`, `selection.py`, `eval_probe_dataset.py`.
-
-### Data & datasets
-
-Blocks range 21–120. Training set = 1M samples (`LiteTensorData/`), validation set = 100 samples (`LiteTensorDataTest/`), test set = 100 hidden cases (final ranking). `fp_sol` golden layouts are geometric references only — per contest QA they may themselves violate soft constraints, so treat them as imitation targets, not constraint oracles.
+Blocks 21–120. Training set 1M samples (`FloorSet/LiteTensorData/`), validation 100 (`LiteTensorDataTest/`), hidden test 100 (same block-count distribution as validation per test_id). `fp_sol` golden layouts may violate soft constraints; treat as geometric references only. Shadow suites for gating (v3/v5/v6, alpha_1) live in `artifacts/shadow_hidden_suites/`.
 
 ## Project conventions that aren't obvious from the code
 
-- **Checkpoints are promoted on Evaluator Evidence, never on supervised validation loss.** The primary architecture-tuning metric is the full-validation **No-Runtime Quality Score** (`total_score_no_runtime`); supervised val loss is only a training-health signal. Report score evidence when a change affects ranking or runtime.
-- **Never hard-code validation `test_id` behavior into the solver.** Trigger heavier per-sample search from reusable instance statistics (block count, boundary/group/MIB density, fixed/preplaced structure, net density), not from case IDs. Validation-tail cases may guide *design direction* only.
-- **Extra runtime work is gated.** A no-runtime score win does not by itself justify enabling extra candidate/repair/portfolio work — it must clear the budget layer (score evidence + reusable risk signals + raw runtime tail).
-- **Runtime toggles use the `FLOORSET_` prefix**, are read via `os.environ` (mostly in `optimizer.py`), and should be documented near the code that consumes them. `.env` holds the defaults the eval scripts source; presence of `FLOORSET_DIFFUSION_CHECKPOINT` is what switches on the v11 path.
-- **Checkpoint/log filenames encode their config** (e.g. `diffusion_best_evaluator_0701_ns1000000_ep6_diffhgt_lite_h128_l2_steps1000_acc32_bs1.pt` = date `0701`, 1M samples, 6 epochs, `hgt_lite` variant, hidden 128, 2 layers, 1000 diffusion steps, accum 32, batch 1). Preserve this scheme when producing new artifacts.
-- `checkpoints/`, `artifacts/`, `wandb/`, and `*.log` are generated/evidence outputs — don't hand-edit them or bundle them into code/doc commits.
-- Style: 4-space indent, `snake_case` functions/vars, `PascalCase` classes, typed dataclasses for solver state; group imports stdlib / third-party / local.
+- **Promotion needs gate evidence, not local intuition.** A knob enters the package only after the complete candidate env vs the current package env runs on the same chain, 4 reps, both arm orders, across official + shadow v3/v5/v6, with the CI excluding 0. Same-chain rule and rejected-knob list: `docs/project-status/2026-08-28-final-sprint-handoff.md`, `docs/experiments/2026-08-21-post-beta-p0-execution.md` §17–18.
+- **Primary metric is `total_score_no_runtime`** (weighted by `exp((n-120)/12)`); runtime-aware expectations are computed separately (`scripts/release/runtime_aware_*.py`) because the runtime factor depends on the field median.
+- **Never key solver behaviour on validation `test_id`.** Use reusable instance statistics (block count, constraint density).
+- **Runtime toggles use the `PARTNER_` prefix**, read via `os.environ`, set in `src/shipping/op_wrapper.py` for the package; `.env` is a decision record, not a consumed config.
+- **Rehearse before any upload** (`scripts/release/rehearse_package.sh`): clean venv from the package's own `requirements.txt`, look for `[selfcheck] cuda_available=True`, `loaded flow model step 250000`, `legal-guard fires: 0`, 100/100 feasible. The beta 1.314 came from a 0-byte requirements file, not from the solver.
+- Repacking changes the tarball md5 (mtimes); verify content with an extracted `diff -r`.
+- `artifacts/`, `submission/`, `*.pt`, `*.log` are generated / evidence outputs — never hand-edit or commit them.
+- Style: 4-space indent, `snake_case` functions/vars, `PascalCase` classes; imports grouped stdlib / third-party / local.
 
-## Model orchestration (Fable 5 scheduler)
+## Model orchestration (Fable 5.1 scheduler)
 
 This project runs a multi-model team to spend the expensive scheduler budget
-sparingly. **Fable 5 (max reasoning) is the scheduler**, set in
-`.claude/settings.json` (`model: claude-fable-5`, `effortLevel: xhigh`) — takes
+sparingly. **Fable 5.1 (max reasoning) is the scheduler**, set in
+`.claude/settings.json` (`model: claude-fable-5-1`, `effortLevel: xhigh`) — takes
 effect on the next session, not retroactively. The scheduler plans, decomposes,
 delegates, and integrates results; it should keep its own context lean and push
 the actual work down to the specialists rather than burning Fable budget on it.
 
 Division of labour:
 
-- **Scheduler — Fable 5 (this main thread).** Understand the request, break it
+- **Scheduler — Fable 5.1 (this main thread).** Understand the request, break it
   into well-scoped units, route each to the cheapest capable executor below,
   then stitch the results together and verify. Do the thinking about *what* and
   *who*; delegate the *doing*.
@@ -141,6 +112,9 @@ scheduler thread.
 
 ## Deeper references
 
-- [CONTEXT.md](CONTEXT.md) — the authoritative domain glossary (Production Solver Path, V10 proxy, budget layer, diffusion terms) and resolved ambiguities. Read it before proposing solver-policy changes; the precise vocabulary matters.
-- [AGENTS.md](AGENTS.md) — repo guidelines plus the `graphify` (knowledge graph in `graphify-out/`) and `semble` code-search tooling. For codebase questions prefer `graphify query "<question>"` when `graphify-out/graph.json` exists; run `graphify update .` after code changes.
-- [README.md](README.md) — detailed (bilingual EN/中文) walkthrough of the problem, scoring, scripts, and module architecture.
+- [docs/project-status/2026-08-31-final-handoff.md](docs/project-status/2026-08-31-final-handoff.md) — final state: B' (uploaded, md5 3f2cda42) vs C' candidate (md5 6d0ca94e); which is the final upload awaits the user's confirmation.
+- [docs/project-status/2026-08-29-team-summary.md](docs/project-status/2026-08-29-team-summary.md) — team-facing shipping summary.
+- [docs/experiments/2026-08-21-post-beta-p0-execution.md](docs/experiments/2026-08-21-post-beta-p0-execution.md) — every gate of the final sprint (§1–18w).
+- [CONTEXT.md](CONTEXT.md) — glossary (includes retired floorset_arch vocabulary, kept for reading the 05–07 docs).
+- [AGENTS.md](AGENTS.md) — repo guidelines plus `graphify` / `semble` tooling notes.
+- [README.md](README.md) — 中文 walkthrough of the problem, the final package, scripts and layout.

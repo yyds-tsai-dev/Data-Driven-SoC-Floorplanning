@@ -1,7 +1,7 @@
 [project]
 name = "data-driven-soc-floorplanning"
 version = "0.1.0"
-description = "Add your description here"
+description = "ICCAD 2026 FloorSet SoC floorplanning solver (team cadc1013): shipped package source, training and gate tooling"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

@@ -1,5 +1,12 @@
 # FloorSet Floorplanning
 
+> **2026-09-06 note.** This glossary was written for the 2026-05..07 `floorset_arch` line
+> (Anchor-GNN / diffusion / column backbone, V10 proxy, budget layer). That code was
+> retired from the repo on 2026-09-06 (see `docs/project-status/2026-09-06-repo-cleanup.md`);
+> the terms are kept so the 05–07 docs stay readable. The shipped solver is
+> `src/solver/contest_optimizer.py` (diffusion/flow-seeded column-slicing SA + refine
+> ladder), documented in `README.md`, `CLAUDE.md` and `src/shipping/README.md`.
+
 This context describes the solver architecture and domain language for the FloorSet SoC floorplanning optimizer.
 
 ## Language
