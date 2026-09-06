@@ -393,7 +393,7 @@ def test_teacher_checkpoint_identity_schema_and_ema_requirements():
 
 
 def test_checkpoint_identity_codec_has_canonical_vectors():
-    codec = importlib.import_module("icdc.checkpoint_identity")
+    codec = importlib.import_module("icdc_engine.checkpoint_identity")
     assert codec.IDENTITY_SCHEMA == "icdc_canonical_state_v1"
 
     logical = torch.arange(12, dtype=torch.float64).reshape(2, 6)[:, ::2]
@@ -422,7 +422,7 @@ def test_checkpoint_identity_codec_has_canonical_vectors():
 
 
 def test_checkpoint_identity_streams_tensor_bytes_incrementally(monkeypatch):
-    codec = importlib.import_module("icdc.checkpoint_identity")
+    codec = importlib.import_module("icdc_engine.checkpoint_identity")
     real_sha256 = hashlib.sha256
     updates = []
 
@@ -520,7 +520,7 @@ def _task4_static_forbidden(source, *, require_exact_loads=False):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"_sample_direct_once", "_build_teacher_batches"}:
             if any(
                 isinstance(x, ast.Call)
-                and not (node.name == "_sample_direct_once" and resolve(x.func) == "icdc.energy.decode_rects")
+                and not (node.name == "_sample_direct_once" and resolve(x.func) == "icdc_engine.energy.decode_rects")
                 and any(part in resolve(x.func).lower() for part in forbidden_runtime)
                 for x in ast.walk(node)
             ):
@@ -5890,7 +5890,7 @@ def test_extractor_is_independent_of_non_constraint_metadata():
 def test_topology_prior_ast_has_no_forbidden_data_dependencies():
     path = Path(__file__).parents[1] / "src/icdc_engine/topology_prior.py"
     tree = ast.parse(path.read_text())
-    allowed = {"math", "typing", "dataclasses", "torch", "icdc.topology_data", "topology_data", "tfdl", "engine"}
+    allowed = {"math", "typing", "dataclasses", "torch", "icdc_engine.topology_data", "topology_data", "tfdl", "engine"}
     imports = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module is not None}
     imports |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     assert imports <= allowed | {"__future__", "topology_data"}
